@@ -11,5 +11,6 @@
 
 ## Build / test
 - Keep `cargo clippy --all-targets -- -D warnings` clean.
+- Keep `cargo fmt --check` clean (run `cargo fmt` to fix).
 - `cargo run` — no path arg: config from env only; with a path arg: TOML merged
   with `REFLECTOR_*` env.
