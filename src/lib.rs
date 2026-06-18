@@ -6,6 +6,7 @@
 
 pub mod config;
 mod error;
+pub mod reactor;
 
 pub use error::{Error, Result};
 
