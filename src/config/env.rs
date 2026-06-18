@@ -166,7 +166,7 @@ fn env_bool(value: &str, var: &str) -> Result<bool, ConfigError> {
 
 #[cfg(test)]
 mod tests {
-    use crate::config::{Config, ConfigError, LogLevel, ParseValueError, RequiredField};
+    use crate::config::{Config, ConfigError, LogLevel, ParseValueError, Protocol, RequiredField};
 
     fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs
@@ -421,6 +421,33 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(cfg.reflectors[0].name.as_str(), "Living Room");
+    }
+
+    #[test]
+    fn conflict_detected_across_sources() {
+        let toml = r#"
+            [reflectors.tv]
+            source_if = "lan"
+            target_if = "iot"
+            mdns = true
+        "#;
+        // Env reflector "radio" bridges the same interfaces with mDNS.
+        let e = Config::from_sources(
+            Some(toml),
+            env(&[
+                ("REFLECTOR_RADIO_SOURCE_IF", "lan"),
+                ("REFLECTOR_RADIO_TARGET_IF", "iot"),
+                ("REFLECTOR_RADIO_MDNS", "true"),
+            ]),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            e,
+            ConfigError::ConflictingReflectors {
+                protocol: Protocol::Mdns,
+                ..
+            }
+        ));
     }
 
     #[test]

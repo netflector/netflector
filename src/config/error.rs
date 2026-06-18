@@ -66,6 +66,16 @@ pub enum ConfigError {
     #[error("reflector \"{name}\" is defined in both the configuration file and the environment")]
     DuplicateReflector { name: String },
 
+    /// Two reflectors would reflect the same protocol's packets twice.
+    #[error("reflectors \"{first}\" and \"{second}\" both reflect {protocol} on {source_if} -> {target_if} with overlapping MAC selection and address family")]
+    ConflictingReflectors {
+        protocol: Protocol,
+        first: ReflectorName,
+        second: ReflectorName,
+        source_if: InterfaceName,
+        target_if: InterfaceName,
+    },
+
     /// An environment variable was not of the form `REFLECTOR_<tag>_<param>`.
     #[error("environment variable \"{var}\" is malformed (expected REFLECTOR_<tag>_<param>)")]
     EnvMalformedVar { var: String },
@@ -109,6 +119,27 @@ impl fmt::Display for RequiredField {
         f.write_str(match self {
             Self::SourceIf => "source_if",
             Self::TargetIf => "target_if",
+        })
+    }
+}
+
+/// A reflected discovery protocol, named in [`ConfigError::ConflictingReflectors`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protocol {
+    /// Wake-on-LAN.
+    Wol,
+    /// Multicast DNS.
+    Mdns,
+    /// Simple Service Discovery Protocol.
+    Ssdp,
+}
+
+impl fmt::Display for Protocol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Wol => "WoL",
+            Self::Mdns => "mDNS",
+            Self::Ssdp => "SSDP",
         })
     }
 }

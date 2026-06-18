@@ -24,7 +24,7 @@ mod error;
 mod raw;
 mod value;
 
-pub use error::{ConfigError, ParseBoolError, ParseValueError, RequiredField};
+pub use error::{ConfigError, ParseBoolError, ParseValueError, Protocol, RequiredField};
 pub use value::{
     AddressFamily, InterfaceName, LogLevel, MacAddr, ParseAddressFamilyError,
     ParseInterfaceNameError, ParseLogLevelError, ParseMacAddrError, ParseReflectorNameError,
@@ -153,6 +153,7 @@ impl TryFrom<RawConfig> for Config {
         if reflectors.is_empty() {
             return Err(ConfigError::NoReflectors);
         }
+        check_conflicts(&reflectors)?;
 
         Ok(Config {
             log_level: raw.log_level.unwrap_or_default(),
@@ -219,6 +220,66 @@ impl TryFrom<(String, RawReflector)> for Reflector {
             ssdp,
         })
     }
+}
+
+impl Reflector {
+    /// The protocol on which `self` and `other` would reflect the same packet
+    /// twice, if any: same direction, overlapping MAC selection and address
+    /// family, and a shared enabled protocol (for `WoL`, also a shared port).
+    fn conflicts_with(&self, other: &Reflector) -> Option<Protocol> {
+        if self.source_if != other.source_if || self.target_if != other.target_if {
+            return None;
+        }
+        if !macs_overlap(self.mac, other.mac)
+            || !families_overlap(self.address_family, other.address_family)
+        {
+            return None;
+        }
+        if let (Some(a), Some(b)) = (&self.wol, &other.wol)
+            && a.ports.iter().any(|port| b.ports.contains(port))
+        {
+            return Some(Protocol::Wol);
+        }
+        if self.mdns && other.mdns {
+            return Some(Protocol::Mdns);
+        }
+        if self.ssdp.is_some() && other.ssdp.is_some() {
+            return Some(Protocol::Ssdp);
+        }
+        None
+    }
+}
+
+/// Two MAC selections overlap when both name the same address or either is
+/// absent (an absent filter matches any device).
+fn macs_overlap(a: Option<MacAddr>, b: Option<MacAddr>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => a == b,
+        _ => true,
+    }
+}
+
+/// Two address families overlap when they both carry the same IP version.
+fn families_overlap(a: AddressFamily, b: AddressFamily) -> bool {
+    (a.uses_ipv4() && b.uses_ipv4()) || (a.uses_ipv6() && b.uses_ipv6())
+}
+
+/// Reject any pair of reflectors that would reflect the same packet twice.
+fn check_conflicts(reflectors: &[Reflector]) -> Result<(), ConfigError> {
+    for (i, a) in reflectors.iter().enumerate() {
+        for b in &reflectors[i + 1..] {
+            if let Some(protocol) = a.conflicts_with(b) {
+                return Err(ConfigError::ConflictingReflectors {
+                    protocol,
+                    first: a.name.clone(),
+                    second: b.name.clone(),
+                    source_if: a.source_if.clone(),
+                    target_if: a.target_if.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -323,7 +384,7 @@ mod tests {
 
             [reflectors.alpha]
             source_if = "a"
-            target_if = "b"
+            target_if = "c"
             mdns = true
             "#,
         )
@@ -581,5 +642,162 @@ mod tests {
             mdns = true
         "#;
         assert!(matches!(err(text), ConfigError::EmptyReflectorName { .. }));
+    }
+
+    #[test]
+    fn conflicting_mdns_reflectors_rejected() {
+        let text = r#"
+            [reflectors.a]
+            source_if = "lan"
+            target_if = "iot"
+            mdns = true
+
+            [reflectors.b]
+            source_if = "lan"
+            target_if = "iot"
+            mdns = true
+        "#;
+        assert!(matches!(
+            err(text),
+            ConfigError::ConflictingReflectors {
+                protocol: Protocol::Mdns,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn reverse_direction_does_not_conflict() {
+        // lan->iot and iot->lan reflect opposite directions; not a duplicate.
+        let text = r#"
+            [reflectors.a]
+            source_if = "lan"
+            target_if = "iot"
+            mdns = true
+
+            [reflectors.b]
+            source_if = "iot"
+            target_if = "lan"
+            mdns = true
+        "#;
+        assert!(Config::from_toml_str(text).is_ok());
+    }
+
+    #[test]
+    fn different_protocols_do_not_conflict() {
+        let text = r#"
+            [reflectors.a]
+            source_if = "lan"
+            target_if = "iot"
+            mdns = true
+
+            [reflectors.b]
+            source_if = "lan"
+            target_if = "iot"
+            wol = true
+        "#;
+        assert!(Config::from_toml_str(text).is_ok());
+    }
+
+    #[test]
+    fn distinct_macs_do_not_conflict() {
+        let text = r#"
+            [reflectors.a]
+            source_if = "lan"
+            target_if = "iot"
+            mdns = true
+            mac = "00:00:00:00:00:01"
+
+            [reflectors.b]
+            source_if = "lan"
+            target_if = "iot"
+            mdns = true
+            mac = "00:00:00:00:00:02"
+        "#;
+        assert!(Config::from_toml_str(text).is_ok());
+    }
+
+    #[test]
+    fn omitted_mac_conflicts_with_any() {
+        // An absent MAC filter matches any device, so it overlaps a specific one.
+        let text = r#"
+            [reflectors.a]
+            source_if = "lan"
+            target_if = "iot"
+            mdns = true
+            mac = "00:00:00:00:00:01"
+
+            [reflectors.b]
+            source_if = "lan"
+            target_if = "iot"
+            mdns = true
+        "#;
+        assert!(matches!(
+            err(text),
+            ConfigError::ConflictingReflectors {
+                protocol: Protocol::Mdns,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn disjoint_address_families_do_not_conflict() {
+        let text = r#"
+            [reflectors.a]
+            source_if = "lan"
+            target_if = "iot"
+            mdns = true
+            address_family = "ipv4"
+
+            [reflectors.b]
+            source_if = "lan"
+            target_if = "iot"
+            mdns = true
+            address_family = "ipv6"
+        "#;
+        assert!(Config::from_toml_str(text).is_ok());
+    }
+
+    #[test]
+    fn overlapping_wol_ports_conflict() {
+        let text = r#"
+            [reflectors.a]
+            source_if = "lan"
+            target_if = "iot"
+            wol = true
+            wol_ports = [7, 9]
+
+            [reflectors.b]
+            source_if = "lan"
+            target_if = "iot"
+            wol = true
+            wol_ports = [9, 4000]
+        "#;
+        assert!(matches!(
+            err(text),
+            ConfigError::ConflictingReflectors {
+                protocol: Protocol::Wol,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn disjoint_wol_ports_do_not_conflict() {
+        let text = r#"
+            [reflectors.a]
+            source_if = "lan"
+            target_if = "iot"
+            wol = true
+            wol_ports = [7, 9]
+
+            [reflectors.b]
+            source_if = "lan"
+            target_if = "iot"
+            wol = true
+            wol_ports = [4000]
+        "#;
+        assert!(Config::from_toml_str(text).is_ok());
     }
 }
