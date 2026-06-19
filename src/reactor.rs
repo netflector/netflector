@@ -71,16 +71,24 @@ impl Reactor {
     /// interest starts disarmed. The key is the only way to unregister or
     /// re-target the registration later.
     pub fn register(&mut self, fd: RawFd, handler: Box<dyn Handler>) -> Key {
-        self.registrations.insert(Registration {
+        let key = self.registrations.insert(Registration {
             fd,
             write_interest: false,
             handler: Some(handler),
-        })
+        });
+        log::debug!("registered fd {fd}");
+        key
     }
 
     /// Drop the registration `key` addresses. Returns whether it was still live.
     pub fn unregister(&mut self, key: Key) -> bool {
-        self.registrations.remove(key).is_some()
+        if let Some(reg) = self.registrations.remove(key) {
+            log::debug!("unregistered fd {}", reg.fd);
+            true
+        } else {
+            log::trace!("unregister: {key:?} already gone");
+            false
+        }
     }
 
     /// Arm or disarm delivery of write readiness for the registration `key`
@@ -88,8 +96,14 @@ impl Reactor {
     pub fn set_write_interest(&mut self, key: Key, enabled: bool) -> bool {
         if let Some(reg) = self.registrations.get_mut(key) {
             reg.write_interest = enabled;
+            log::trace!(
+                "fd {}: write interest {}",
+                reg.fd,
+                if enabled { "armed" } else { "disarmed" }
+            );
             true
         } else {
+            log::trace!("set_write_interest: {key:?} already gone");
             false
         }
     }
@@ -105,28 +119,39 @@ impl Reactor {
     pub fn dispatch(&mut self, key: Key, readiness: Readiness) {
         // Take the handler out so `self` is free to be borrowed for the call. The
         // slot stays put, so `key` stays valid and the handler can be returned.
-        let (fd, mut handler) = match self.registrations.get_mut(key) {
-            Some(reg) => {
-                let fd = reg.fd;
-                match reg.handler.take() {
-                    Some(handler) => (fd, handler),
-                    None => return, // reentrant dispatch of a slot already in flight
-                }
-            }
-            None => return, // stale key — the registration is gone
+        let Some(reg) = self.registrations.get_mut(key) else {
+            // stale key — the registration is gone
+            log::trace!("dispatch: {key:?} is stale, ignored");
+            return;
         };
+        let fd = reg.fd;
+        let Some(mut handler) = reg.handler.take() else {
+            // reentrant dispatch of a slot already in flight
+            log::trace!("dispatch: fd {fd} already in flight, ignored");
+            return;
+        };
+
+        log::trace!(
+            "dispatch fd {fd}: readable={} writable={}",
+            readiness.readable,
+            readiness.writable
+        );
 
         if readiness.readable {
             handler.on_readable(fd, self);
         }
-        // The read handler may have unregistered this fd or disarmed its write.
-        if readiness.writable
-            && self
+        // Write is re-gated after the read phase: the read handler may have
+        // unregistered the fd or disarmed write interest in between.
+        if readiness.writable {
+            if self
                 .registrations
                 .get(key)
                 .is_some_and(|reg| reg.write_interest)
-        {
-            handler.on_writable(fd, self);
+            {
+                handler.on_writable(fd, self);
+            } else {
+                log::trace!("dispatch fd {fd}: write suppressed after read phase");
+            }
         }
 
         // Return the handler — unless the registration was removed during the

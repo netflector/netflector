@@ -9,7 +9,7 @@ use std::str::FromStr;
 
 use super::error::{ConfigError, ParseBoolError, ParseValueError, RequiredField};
 use super::raw::{RawConfig, RawReflector};
-use super::value::{AddressFamily, InterfaceName, MacAddr, ReflectorName, WolPorts};
+use super::value::{AddressFamily, InterfaceName, LogLevel, MacAddr, ReflectorName, WolPorts};
 
 /// Accumulates a reflector's fields as its `REFLECTOR_<tag>_<param>` variables
 /// are seen, then converts to a [`RawReflector`] once all are consumed.
@@ -93,10 +93,12 @@ pub(super) fn parse_env(
         };
         match rest {
             "LOG_LEVEL" => {
+                log::trace!("env {key} = {value}");
                 log_level = Some(env_value(&value, &key)?);
                 continue;
             }
             "DEBUG_MEMORY" => {
+                log::trace!("env {key} = {value}");
                 debug_memory = Some(env_bool(&value, &key)?);
                 continue;
             }
@@ -116,10 +118,9 @@ pub(super) fn parse_env(
         if tag == "log" || tag == "debug" {
             return Err(ConfigError::EnvReservedTag { var: key.clone() });
         }
-        partials
-            .entry(tag)
-            .or_default()
-            .set(&param.to_ascii_lowercase(), &value, &key)?;
+        let param = param.to_ascii_lowercase();
+        log::trace!("env {key}: reflector {tag} {param} = {value}");
+        partials.entry(tag).or_default().set(&param, &value, &key)?;
     }
 
     let mut reflectors = BTreeMap::new();
@@ -132,6 +133,19 @@ pub(super) fn parse_env(
         debug_memory,
         reflectors,
     })
+}
+
+/// Resolve `REFLECTOR_LOG_LEVEL` alone, ignoring the rest of the environment.
+///
+/// Used to raise the logger to the configured verbosity *before* the full parse
+/// runs, so that parse (env merge, reflector build) can be logged at that level.
+pub(super) fn log_level_from_env(
+    vars: &[(String, String)],
+) -> Result<Option<LogLevel>, ConfigError> {
+    vars.iter()
+        .find(|(key, _)| key == "REFLECTOR_LOG_LEVEL")
+        .map(|(key, value)| env_value::<LogLevel>(value, key))
+        .transpose()
 }
 
 /// Parse an environment value through its `FromStr` type, tagging a failure with

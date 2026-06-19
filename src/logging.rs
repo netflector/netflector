@@ -24,13 +24,23 @@ struct StderrLogger;
 
 static LOGGER: StderrLogger = StderrLogger;
 
-/// Install the global logger and set the minimum severity from `level`.
+/// Install the global logger backend with the default severity threshold.
+///
+/// Installing a process-global logger is the binary's responsibility, not a
+/// library's, so this is called once from `main`; [`set_level`] then applies the
+/// configured threshold once the configuration has been loaded.
 ///
 /// # Panics
 /// Panics if called more than once in the process — a second call would try to
 /// replace the already-installed global logger.
-pub fn init(level: LogLevel) {
+pub fn init() {
     log::set_logger(&LOGGER).expect("logging::init called more than once");
+    log::set_max_level(LevelFilter::from(LogLevel::default()));
+}
+
+/// Set the minimum severity that will be logged. Cheap and idempotent — the
+/// library calls this once the configured level is known.
+pub fn set_level(level: LogLevel) {
     log::set_max_level(LevelFilter::from(level));
 }
 

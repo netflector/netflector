@@ -10,6 +10,7 @@ mod logging;
 pub mod reactor;
 
 pub use self::error::{Error, Result};
+pub use self::logging::init as init_logging;
 
 use self::config::Config;
 
@@ -22,8 +23,20 @@ use self::config::Config;
 /// # Errors
 /// Returns [`Error`] if configuration loading or validation fails.
 pub fn run(args: &[String]) -> Result<()> {
-    let config = Config::load(args.first().map(String::as_str), std::env::vars())?;
-    logging::init(config.log_level);
+    let path = args.first().map(String::as_str);
+    let toml_text = path.map(config::read_config_file).transpose()?;
+    let env: Vec<(String, String)> = std::env::vars().collect();
+
+    // Resolve the log level first, from a minimal read of env + file, so the full
+    // parse below is logged at the configured verbosity (see resolve_log_level).
+    logging::set_level(config::resolve_log_level(toml_text.as_deref(), &env)?);
+    if let Some(path) = path {
+        log::debug!("loading configuration from {path} with REFLECTOR_* overrides");
+    } else {
+        log::debug!("loading configuration from REFLECTOR_* environment only");
+    }
+
+    let config = Config::from_sources(toml_text.as_deref(), env)?;
     let count = config.reflectors.len();
     log::info!(
         "loaded {count} reflector{}",

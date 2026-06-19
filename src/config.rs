@@ -33,6 +33,8 @@ pub use self::value::{
 
 use std::str::FromStr;
 
+use serde::Deserialize;
+
 use self::raw::{RawConfig, RawReflector};
 
 /// Wake-on-LAN settings (present only when `WoL` is enabled for the reflector).
@@ -94,23 +96,6 @@ impl Config {
         Config::try_from(raw)
     }
 
-    /// Load from an optional TOML file plus `REFLECTOR_*` environment variables.
-    ///
-    /// The file (if given) is read first; environment variables then override the
-    /// global settings and contribute additional reflectors. This is the entry
-    /// point the binary uses, passing [`std::env::vars`].
-    ///
-    /// # Errors
-    /// Returns [`ConfigError::ReadFile`] if the file cannot be read, or any
-    /// parse/merge/validation error from [`Config::from_sources`].
-    pub fn load(
-        path: Option<&str>,
-        env: impl IntoIterator<Item = (String, String)>,
-    ) -> Result<Self, ConfigError> {
-        let text = path.map(read_config_file).transpose()?;
-        Self::from_sources(text.as_deref(), env)
-    }
-
     /// Build a configuration from optional TOML text plus environment variables.
     ///
     /// Environment variables take precedence over the file for the global
@@ -135,11 +120,48 @@ impl Config {
 }
 
 /// Read a configuration file, mapping I/O failure to [`ConfigError::ReadFile`].
-fn read_config_file(path: &str) -> Result<String, ConfigError> {
+pub(crate) fn read_config_file(path: &str) -> Result<String, ConfigError> {
     std::fs::read_to_string(path).map_err(|source| ConfigError::ReadFile {
         path: path.to_owned(),
         source,
     })
+}
+
+/// Resolve just the log level from the environment and TOML text, before the full
+/// configuration is parsed — so the logger can be raised to the configured
+/// verbosity and the rest of loading logged at that level. Environment overrides
+/// the file, which overrides the default.
+///
+/// Deliberately lightweight: it reads only `REFLECTOR_LOG_LEVEL` and the file's
+/// top-level `log_level`, never touching the reflector tables, so it can't fail
+/// on a reflector error that should instead surface (logged) from the full parse.
+///
+/// # Errors
+/// Returns [`ConfigError::Parse`] for malformed TOML, or [`ConfigError::EnvBadValue`]
+/// if `REFLECTOR_LOG_LEVEL` is not a valid level.
+pub(crate) fn resolve_log_level(
+    toml_text: Option<&str>,
+    env: &[(String, String)],
+) -> Result<LogLevel, ConfigError> {
+    if let Some(level) = env::log_level_from_env(env)? {
+        return Ok(level);
+    }
+    if let Some(text) = toml_text {
+        let probe: LogLevelProbe = toml::from_str(text)?;
+        if let Some(level) = probe.log_level {
+            return Ok(level);
+        }
+    }
+    Ok(LogLevel::default())
+}
+
+/// A view over the TOML file that reads only the top-level `log_level` and ignores
+/// everything else (note: no `deny_unknown_fields`), so [`resolve_log_level`] can
+/// extract the level without parsing or validating the reflector tables.
+#[derive(Deserialize)]
+struct LogLevelProbe {
+    #[serde(default)]
+    log_level: Option<LogLevel>,
 }
 
 impl TryFrom<RawConfig> for Config {
@@ -148,7 +170,16 @@ impl TryFrom<RawConfig> for Config {
     fn try_from(raw: RawConfig) -> Result<Self, ConfigError> {
         let mut reflectors = Vec::with_capacity(raw.reflectors.len());
         for (name, raw_reflector) in raw.reflectors {
-            reflectors.push(Reflector::try_from((name, raw_reflector))?);
+            let reflector = Reflector::try_from((name, raw_reflector))?;
+            log::debug!(
+                "reflector {}: {} -> {} [{}] family={:?}",
+                reflector.name,
+                reflector.source_if,
+                reflector.target_if,
+                protocol_list(&reflector),
+                reflector.address_family,
+            );
+            reflectors.push(reflector);
         }
         if reflectors.is_empty() {
             return Err(ConfigError::NoReflectors);
@@ -250,6 +281,27 @@ impl Reflector {
     }
 }
 
+/// The enabled protocols of `reflector` as a comma-separated summary — with
+/// `WoL` ports and the SSDP DIAL flag — for logging.
+fn protocol_list(reflector: &Reflector) -> String {
+    let mut protocols: Vec<String> = Vec::new();
+    if let Some(wol) = &reflector.wol {
+        let ports: Vec<String> = wol.ports.iter().map(ToString::to_string).collect();
+        protocols.push(format!("wol({})", ports.join(",")));
+    }
+    if reflector.mdns {
+        protocols.push("mdns".to_owned());
+    }
+    if let Some(ssdp) = &reflector.ssdp {
+        protocols.push(if ssdp.dial {
+            "ssdp+dial".to_owned()
+        } else {
+            "ssdp".to_owned()
+        });
+    }
+    protocols.join(", ")
+}
+
 /// Two MAC selections overlap when both name the same address or either is
 /// absent (an absent filter matches any device).
 fn macs_overlap(a: Option<MacAddr>, b: Option<MacAddr>) -> bool {
@@ -279,6 +331,7 @@ fn check_conflicts(reflectors: &[Reflector]) -> Result<(), ConfigError> {
             }
         }
     }
+    log::debug!("no reflector conflicts");
     Ok(())
 }
 

@@ -8,7 +8,7 @@ rust-version = "1.93"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 toml = "1"
-log = "0.4"
+log = { version = "0.4", features = ["release_max_level_debug"] }
 
 [lints.rust]
 warnings = "deny"
