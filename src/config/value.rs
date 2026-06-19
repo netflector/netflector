@@ -13,19 +13,22 @@ use std::str::FromStr;
 use serde::{Deserialize, Deserializer};
 use thiserror::Error;
 
-/// Minimum severity a log record must have to be emitted.
+/// Minimum severity a record must have to be logged; `Off` disables logging
+/// entirely. Ordered most-restrictive to most-verbose, mirroring `log`'s filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LogLevel {
-    Debug,
+    Off,
+    Error,
+    Warning,
     #[default]
     Info,
-    Warning,
-    Error,
+    Debug,
+    Trace,
 }
 
 /// Error returned when a string is not a valid [`LogLevel`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
-#[error("expected one of: debug, info, warning, error")]
+#[error("expected one of: off, error, warning, info, debug, trace")]
 pub struct ParseLogLevelError;
 
 impl FromStr for LogLevel {
@@ -33,10 +36,12 @@ impl FromStr for LogLevel {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
-            "debug" => Ok(Self::Debug),
-            "info" => Ok(Self::Info),
-            "warning" => Ok(Self::Warning),
+            "off" => Ok(Self::Off),
             "error" => Ok(Self::Error),
+            "warning" => Ok(Self::Warning),
+            "info" => Ok(Self::Info),
+            "debug" => Ok(Self::Debug),
+            "trace" => Ok(Self::Trace),
             _ => Err(ParseLogLevelError),
         }
     }
@@ -302,10 +307,12 @@ mod tests {
 
     #[test]
     fn log_level_parses_via_fromstr() {
-        assert_eq!("debug".parse::<LogLevel>().unwrap(), LogLevel::Debug);
-        assert_eq!("INFO".parse::<LogLevel>().unwrap(), LogLevel::Info);
-        assert_eq!("Warning".parse::<LogLevel>().unwrap(), LogLevel::Warning);
+        assert_eq!("off".parse::<LogLevel>().unwrap(), LogLevel::Off);
         assert_eq!("ERROR".parse::<LogLevel>().unwrap(), LogLevel::Error);
+        assert_eq!("Warning".parse::<LogLevel>().unwrap(), LogLevel::Warning);
+        assert_eq!("INFO".parse::<LogLevel>().unwrap(), LogLevel::Info);
+        assert_eq!("debug".parse::<LogLevel>().unwrap(), LogLevel::Debug);
+        assert_eq!("Trace".parse::<LogLevel>().unwrap(), LogLevel::Trace);
         assert_eq!("verbose".parse::<LogLevel>(), Err(ParseLogLevelError));
     }
 

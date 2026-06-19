@@ -6,6 +6,7 @@
 
 pub mod config;
 mod error;
+mod logging;
 pub mod reactor;
 
 pub use self::error::{Error, Result};
@@ -22,8 +23,9 @@ use self::config::Config;
 /// Returns [`Error`] if configuration loading or validation fails.
 pub fn run(args: &[String]) -> Result<()> {
     let config = Config::load(args.first().map(String::as_str), std::env::vars())?;
+    logging::init(config.log_level);
     let count = config.reflectors.len();
-    println!(
+    log::info!(
         "loaded {count} reflector{}",
         if count == 1 { "" } else { "s" }
     );
