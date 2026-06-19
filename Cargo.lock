@@ -49,7 +49,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ruflector"
+name = "reflector"
 version = "0.1.0"
 dependencies = [
  "log",
