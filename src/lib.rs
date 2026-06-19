@@ -8,9 +8,9 @@ pub mod config;
 mod error;
 pub mod reactor;
 
-pub use error::{Error, Result};
+pub use self::error::{Error, Result};
 
-use config::Config;
+use self::config::Config;
 
 /// Run the reflector to completion.
 ///

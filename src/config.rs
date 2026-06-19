@@ -24,8 +24,8 @@ mod error;
 mod raw;
 mod value;
 
-pub use error::{ConfigError, ParseBoolError, ParseValueError, Protocol, RequiredField};
-pub use value::{
+pub use self::error::{ConfigError, ParseBoolError, ParseValueError, Protocol, RequiredField};
+pub use self::value::{
     AddressFamily, InterfaceName, LogLevel, MacAddr, ParseAddressFamilyError,
     ParseInterfaceNameError, ParseLogLevelError, ParseMacAddrError, ParseReflectorNameError,
     ReflectorName, WolPorts, WolPortsError,
@@ -33,7 +33,7 @@ pub use value::{
 
 use std::str::FromStr;
 
-use raw::{RawConfig, RawReflector};
+use self::raw::{RawConfig, RawReflector};
 
 /// Wake-on-LAN settings (present only when `WoL` is enabled for the reflector).
 #[derive(Debug, Clone, PartialEq, Eq)]

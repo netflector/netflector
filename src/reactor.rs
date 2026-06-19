@@ -15,11 +15,11 @@
 
 mod arena;
 
-pub use arena::Key;
+pub use self::arena::Key;
 
 use std::os::fd::RawFd;
 
-use arena::Arena;
+use self::arena::Arena;
 
 /// Callbacks for a registered file descriptor.
 ///
