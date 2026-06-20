@@ -2,14 +2,14 @@
 //!
 //! Each builder writes the IPv4/IPv6 header and the UDP header + payload into a
 //! caller-provided buffer (no allocation on the data path) and returns the byte
-//! count, filling the IPv4-header and UDP checksums via [`crate::checksum`]. The
+//! count, filling the IPv4-header and UDP checksums via [`super::checksum`]. The
 //! L2 framing (Ethernet / loopback) wraps these and is added separately.
 
 use std::net::{SocketAddrV4, SocketAddrV6};
 
 use thiserror::Error;
 
-use crate::checksum;
+use super::checksum;
 
 const IPV4_HEADER_SIZE: usize = 20;
 const IPV6_HEADER_SIZE: usize = 40;
