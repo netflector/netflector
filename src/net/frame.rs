@@ -1,20 +1,26 @@
-//! Build the IP + UDP datagrams we inject on the egress path.
+//! Build the Ethernet frames we inject on the egress path.
 //!
-//! Each builder writes the IPv4/IPv6 header and the UDP header + payload into a
-//! caller-provided buffer (no allocation on the data path) and returns the byte
-//! count, filling the IPv4-header and UDP checksums via [`super::checksum`]. The
-//! L2 framing (Ethernet / loopback) wraps these and is added separately.
+//! The public builders write a full frame — destination/source MACs, ethertype,
+//! then an IPv4/IPv6 header and the UDP header + payload — into a caller-provided
+//! buffer (no allocation on the data path) and return the byte count, filling the
+//! IPv4-header and UDP checksums via [`super::checksum`]. The macOS `DLT_NULL`
+//! loopback framing will join them once the capture layer brings the platform
+//! address-family constants.
 
 use std::net::{SocketAddrV4, SocketAddrV6};
 
 use thiserror::Error;
 
 use super::checksum;
+use super::mac::MacAddr;
 
+const ETHERNET_HEADER_SIZE: usize = 14; // dst MAC(6) + src MAC(6) + ethertype(2)
 const IPV4_HEADER_SIZE: usize = 20;
 const IPV6_HEADER_SIZE: usize = 40;
 const UDP_HEADER_SIZE: usize = 8;
 const IP_PROTO_UDP: u8 = 17;
+const IPV4_ETHERTYPE: u16 = 0x0800;
+const IPV6_ETHERTYPE: u16 = 0x86dd;
 /// Don't-Fragment, in the IPv4 flags + fragment-offset field. These one-hop
 /// link-local datagrams are never fragmented, so DF is set and a zero IP
 /// identification stays RFC 6864-conformant.
@@ -31,16 +37,56 @@ pub enum FrameError {
     PayloadTooLarge { payload: usize },
 }
 
-/// Write an IPv4 + UDP datagram (headers and `payload`, with the IPv4-header and
-/// UDP checksums filled) into `out`, returning the number of bytes written.
-///
-/// `out` is written from offset 0; a caller prepending an L2 header passes the
-/// sub-slice that follows it.
+/// Build an Ethernet frame carrying an IPv4 UDP datagram into `out`, returning
+/// the frame length: the destination/source MAC header and ethertype, then the
+/// IPv4 + UDP datagram with checksums filled.
 ///
 /// # Errors
 /// [`FrameError::PayloadTooLarge`] if the datagram overflows the 16-bit length
 /// fields, or [`FrameError::BufferTooSmall`] if `out` cannot hold the frame.
-pub fn ipv4_udp(
+pub fn ethernet_ipv4_udp(
+    dst_mac: MacAddr,
+    src_mac: MacAddr,
+    src: SocketAddrV4,
+    dst: SocketAddrV4,
+    ttl: u8,
+    payload: &[u8],
+    out: &mut [u8],
+) -> Result<usize, FrameError> {
+    let (header, body) = split_l2(out, ETHERNET_HEADER_SIZE)?;
+    let datagram = ipv4_udp(src, dst, ttl, payload, body)
+        .map_err(|e| with_l2_header(e, ETHERNET_HEADER_SIZE))?;
+    write_ethernet_header(header, dst_mac, src_mac, IPV4_ETHERTYPE);
+    Ok(ETHERNET_HEADER_SIZE + datagram)
+}
+
+/// Build an Ethernet frame carrying an IPv6 UDP datagram into `out`, returning
+/// the frame length: the destination/source MAC header and ethertype, then the
+/// IPv6 + UDP datagram with the UDP checksum filled.
+///
+/// # Errors
+/// [`FrameError::PayloadTooLarge`] if the datagram overflows the 16-bit length
+/// fields, or [`FrameError::BufferTooSmall`] if `out` cannot hold the frame.
+pub fn ethernet_ipv6_udp(
+    dst_mac: MacAddr,
+    src_mac: MacAddr,
+    src: SocketAddrV6,
+    dst: SocketAddrV6,
+    hop_limit: u8,
+    payload: &[u8],
+    out: &mut [u8],
+) -> Result<usize, FrameError> {
+    let (header, body) = split_l2(out, ETHERNET_HEADER_SIZE)?;
+    let datagram = ipv6_udp(src, dst, hop_limit, payload, body)
+        .map_err(|e| with_l2_header(e, ETHERNET_HEADER_SIZE))?;
+    write_ethernet_header(header, dst_mac, src_mac, IPV6_ETHERTYPE);
+    Ok(ETHERNET_HEADER_SIZE + datagram)
+}
+
+/// Write an IPv4 + UDP datagram (headers and `payload`, with the IPv4-header and
+/// UDP checksums filled) into `out`, returning the number of bytes written. The
+/// internal datagram writer the Ethernet builders wrap.
+fn ipv4_udp(
     src: SocketAddrV4,
     dst: SocketAddrV4,
     ttl: u8,
@@ -78,15 +124,9 @@ pub fn ipv4_udp(
 
 /// Write an IPv6 + UDP datagram (headers and `payload`, with the UDP checksum
 /// filled) into `out`, returning the number of bytes written. The IPv6 header
-/// carries no checksum of its own.
-///
-/// `out` is written from offset 0; a caller prepending an L2 header passes the
-/// sub-slice that follows it.
-///
-/// # Errors
-/// [`FrameError::PayloadTooLarge`] if the datagram overflows the 16-bit length
-/// fields, or [`FrameError::BufferTooSmall`] if `out` cannot hold the frame.
-pub fn ipv6_udp(
+/// carries no checksum of its own. The internal datagram writer the Ethernet
+/// builders wrap.
+fn ipv6_udp(
     src: SocketAddrV6,
     dst: SocketAddrV6,
     hop_limit: u8,
@@ -140,6 +180,37 @@ fn write_udp_header(udp: &mut [u8], src_port: u16, dst_port: u16, length: u16) {
     udp[0..2].copy_from_slice(&src_port.to_be_bytes());
     udp[2..4].copy_from_slice(&dst_port.to_be_bytes());
     udp[4..6].copy_from_slice(&length.to_be_bytes());
+}
+
+/// Split `out` into its `l2_size`-byte L2 header and the body that follows, or
+/// report it as too small.
+fn split_l2(out: &mut [u8], l2_size: usize) -> Result<(&mut [u8], &mut [u8]), FrameError> {
+    if out.len() < l2_size {
+        return Err(FrameError::BufferTooSmall {
+            needed: l2_size,
+            available: out.len(),
+        });
+    }
+    Ok(out.split_at_mut(l2_size))
+}
+
+/// Re-base a datagram-relative [`FrameError::BufferTooSmall`] onto the whole
+/// frame, so the reported sizes account for the `l2_size`-byte L2 header.
+fn with_l2_header(error: FrameError, l2_size: usize) -> FrameError {
+    match error {
+        FrameError::BufferTooSmall { needed, available } => FrameError::BufferTooSmall {
+            needed: needed + l2_size,
+            available: available + l2_size,
+        },
+        FrameError::PayloadTooLarge { .. } => error,
+    }
+}
+
+/// Write the 14-byte Ethernet header: destination MAC, source MAC, ethertype.
+fn write_ethernet_header(out: &mut [u8], dst_mac: MacAddr, src_mac: MacAddr, ethertype: u16) {
+    out[0..6].copy_from_slice(&dst_mac.octets());
+    out[6..12].copy_from_slice(&src_mac.octets());
+    out[12..14].copy_from_slice(&ethertype.to_be_bytes());
 }
 
 #[cfg(test)]
@@ -286,6 +357,74 @@ mod tests {
         assert!(matches!(
             ipv6_udp(src, dst, 1, &payload, &mut buf),
             Err(FrameError::PayloadTooLarge { payload: 65_528 })
+        ));
+    }
+
+    #[test]
+    fn ethernet_ipv4_frame_wraps_the_datagram() {
+        let dst_mac = MacAddr::broadcast();
+        let src_mac = "b0:37:95:c5:60:be".parse::<MacAddr>().unwrap();
+        let src = SocketAddrV4::new(Ipv4Addr::new(192, 168, 0, 1), 5353);
+        let dst = SocketAddrV4::new(Ipv4Addr::new(224, 0, 0, 251), 5353);
+        let payload = [0xde, 0xad];
+        let mut buf = [0xAAu8; 64];
+
+        let n = ethernet_ipv4_udp(dst_mac, src_mac, src, dst, 1, &payload, &mut buf).unwrap();
+        assert_eq!(
+            n,
+            ETHERNET_HEADER_SIZE + IPV4_HEADER_SIZE + UDP_HEADER_SIZE + payload.len()
+        );
+        let frame = &buf[..n];
+
+        assert_eq!(&frame[0..6], dst_mac.octets().as_slice());
+        assert_eq!(&frame[6..12], src_mac.octets().as_slice());
+        assert_eq!(u16::from_be_bytes([frame[12], frame[13]]), IPV4_ETHERTYPE);
+
+        // Past the Ethernet header is exactly the standalone IPv4 datagram.
+        let mut datagram = [0u8; 64];
+        let dn = ipv4_udp(src, dst, 1, &payload, &mut datagram).unwrap();
+        assert_eq!(&frame[ETHERNET_HEADER_SIZE..], &datagram[..dn]);
+    }
+
+    #[test]
+    fn ethernet_ipv6_frame_wraps_the_datagram() {
+        let dst_mac = MacAddr::broadcast();
+        let src_mac = "b0:37:95:c5:60:be".parse::<MacAddr>().unwrap();
+        let src = SocketAddrV6::new(Ipv6Addr::LOCALHOST, 5353, 0, 0);
+        let dst = SocketAddrV6::new(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb), 5353, 0, 0);
+        let payload = [0xaa, 0xbb, 0xcc];
+        let mut buf = [0xAAu8; 80];
+
+        let n = ethernet_ipv6_udp(dst_mac, src_mac, src, dst, 255, &payload, &mut buf).unwrap();
+        assert_eq!(
+            n,
+            ETHERNET_HEADER_SIZE + IPV6_HEADER_SIZE + UDP_HEADER_SIZE + payload.len()
+        );
+        let frame = &buf[..n];
+
+        assert_eq!(&frame[0..6], dst_mac.octets().as_slice());
+        assert_eq!(&frame[6..12], src_mac.octets().as_slice());
+        assert_eq!(u16::from_be_bytes([frame[12], frame[13]]), IPV6_ETHERTYPE);
+
+        let mut datagram = [0u8; 80];
+        let dn = ipv6_udp(src, dst, 255, &payload, &mut datagram).unwrap();
+        assert_eq!(&frame[ETHERNET_HEADER_SIZE..], &datagram[..dn]);
+    }
+
+    #[test]
+    fn ethernet_buffer_too_small_counts_the_l2_header() {
+        let mac = MacAddr::broadcast();
+        let src = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1);
+        let dst = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 2);
+        // Holds the 14-byte Ethernet header but not the 28-byte datagram; the
+        // reported `needed` includes both.
+        let mut buf = [0u8; 20];
+        assert!(matches!(
+            ethernet_ipv4_udp(mac, mac, src, dst, 1, &[], &mut buf),
+            Err(FrameError::BufferTooSmall {
+                needed: 42,
+                available: 20
+            })
         ));
     }
 }
