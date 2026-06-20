@@ -4,3 +4,4 @@
 
 mod checksum;
 pub mod frame;
+pub mod mac;

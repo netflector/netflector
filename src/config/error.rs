@@ -10,8 +10,9 @@ use thiserror::Error;
 
 use super::value::{
     InterfaceName, ParseAddressFamilyError, ParseInterfaceNameError, ParseLogLevelError,
-    ParseMacAddrError, ParseReflectorNameError, ReflectorName, WolPortsError,
+    ParseReflectorNameError, ReflectorName, WolPortsError,
 };
+use crate::net::mac::ParseMacAddrError;
 
 /// Everything that can make a configuration invalid.
 ///

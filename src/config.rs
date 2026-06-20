@@ -26,9 +26,8 @@ mod value;
 
 pub use self::error::{ConfigError, ParseBoolError, ParseValueError, Protocol, RequiredField};
 pub use self::value::{
-    AddressFamily, InterfaceName, LogLevel, MacAddr, ParseAddressFamilyError,
-    ParseInterfaceNameError, ParseLogLevelError, ParseMacAddrError, ParseReflectorNameError,
-    ReflectorName, WolPorts, WolPortsError,
+    AddressFamily, InterfaceName, LogLevel, ParseAddressFamilyError, ParseInterfaceNameError,
+    ParseLogLevelError, ParseReflectorNameError, ReflectorName, WolPorts, WolPortsError,
 };
 
 use std::str::FromStr;
@@ -36,6 +35,7 @@ use std::str::FromStr;
 use serde::Deserialize;
 
 use self::raw::{RawConfig, RawReflector};
+use crate::net::mac::MacAddr;
 
 /// Wake-on-LAN settings (present only when `WoL` is enabled for the reflector).
 #[derive(Debug, Clone, PartialEq, Eq)]

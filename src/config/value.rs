@@ -106,50 +106,6 @@ impl<'de> Deserialize<'de> for AddressFamily {
     }
 }
 
-/// A 48-bit IEEE 802 MAC address.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MacAddr([u8; 6]);
-
-impl fmt::Display for MacAddr {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let [b0, b1, b2, b3, b4, b5] = self.0;
-        write!(f, "{b0:02x}:{b1:02x}:{b2:02x}:{b3:02x}:{b4:02x}:{b5:02x}")
-    }
-}
-
-/// Error returned when a string is not a valid [`MacAddr`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
-#[error("expected six colon-separated hex octets")]
-pub struct ParseMacAddrError;
-
-impl FromStr for MacAddr {
-    type Err = ParseMacAddrError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut bytes = [0u8; 6];
-        let mut parts = s.split(':');
-        for slot in &mut bytes {
-            let part = parts.next().ok_or(ParseMacAddrError)?;
-            if part.len() != 2 {
-                return Err(ParseMacAddrError);
-            }
-            *slot = u8::from_str_radix(part, 16).map_err(|_| ParseMacAddrError)?;
-        }
-        if parts.next().is_some() {
-            return Err(ParseMacAddrError);
-        }
-        Ok(MacAddr(bytes))
-    }
-}
-
-impl<'de> Deserialize<'de> for MacAddr {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        String::deserialize(deserializer)?
-            .parse()
-            .map_err(serde::de::Error::custom)
-    }
-}
-
 /// A non-empty network interface name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterfaceName(String);
@@ -314,17 +270,6 @@ mod tests {
         assert_eq!("debug".parse::<LogLevel>().unwrap(), LogLevel::Debug);
         assert_eq!("Trace".parse::<LogLevel>().unwrap(), LogLevel::Trace);
         assert_eq!("verbose".parse::<LogLevel>(), Err(ParseLogLevelError));
-    }
-
-    #[test]
-    fn mac_parses_via_fromstr() {
-        let upper = "B0:37:95:C5:60:BE".parse::<MacAddr>().unwrap();
-        let lower = "b0:37:95:c5:60:be".parse::<MacAddr>().unwrap();
-        let mixed = "b0:37:95:C5:60:bE".parse::<MacAddr>().unwrap();
-        assert_eq!(upper, lower);
-        assert_eq!(upper, mixed);
-        assert_eq!(upper.to_string(), "b0:37:95:c5:60:be");
-        assert_eq!("zz".parse::<MacAddr>(), Err(ParseMacAddrError));
     }
 
     #[test]

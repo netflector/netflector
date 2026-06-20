@@ -10,7 +10,8 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 
 use super::error::ConfigError;
-use super::value::{AddressFamily, InterfaceName, LogLevel, MacAddr, ReflectorName, WolPorts};
+use super::value::{AddressFamily, InterfaceName, LogLevel, ReflectorName, WolPorts};
+use crate::net::mac::MacAddr;
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]

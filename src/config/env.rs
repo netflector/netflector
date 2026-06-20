@@ -9,7 +9,8 @@ use std::str::FromStr;
 
 use super::error::{ConfigError, ParseBoolError, ParseValueError, RequiredField};
 use super::raw::{RawConfig, RawReflector};
-use super::value::{AddressFamily, InterfaceName, LogLevel, MacAddr, ReflectorName, WolPorts};
+use super::value::{AddressFamily, InterfaceName, LogLevel, ReflectorName, WolPorts};
+use crate::net::mac::MacAddr;
 
 /// Accumulates a reflector's fields as its `REFLECTOR_<tag>_<param>` variables
 /// are seen, then converts to a [`RawReflector`] once all are consumed.
