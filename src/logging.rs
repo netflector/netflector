@@ -68,18 +68,19 @@ impl Log for StderrLogger {
             return;
         }
         let mut stderr = std::io::stderr();
-        let _ = writeln!(
+        writeln!(
             stderr,
             "{} {:>5} {}: {}",
             Utc::now(),
             record.level(),
             record.target(),
             record.args(),
-        );
+        )
+        .ok();
     }
 
     fn flush(&self) {
-        let _ = std::io::stderr().flush();
+        std::io::stderr().flush().ok();
     }
 }
 

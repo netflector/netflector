@@ -13,8 +13,13 @@ libc = "0.2"
 
 [lints.rust]
 warnings = "deny"
+let_underscore_drop = "deny"
 unreachable_pub = "deny"
 
 [lints.clippy]
 all = "deny"
 pedantic = "deny"
+dbg_macro = "deny"
+mod_module_files = "deny"
+todo = "deny"
+unimplemented = "deny"
