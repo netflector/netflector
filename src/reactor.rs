@@ -14,6 +14,10 @@
 //! here nothing borrows the arena during the call, so it just works.
 
 mod arena;
+// Built and tested standalone for now; the reactor is wired to drive it in a
+// later increment, so nothing calls its API yet.
+#[allow(dead_code)]
+mod poll;
 
 pub use self::arena::Key;
 

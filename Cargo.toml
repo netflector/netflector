@@ -9,6 +9,7 @@ thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 log = { version = "0.4", features = ["release_max_level_debug"] }
+libc = "0.2"
 
 [lints.rust]
 warnings = "deny"
