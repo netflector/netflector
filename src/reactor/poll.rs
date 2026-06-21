@@ -5,12 +5,16 @@
 
 use super::{Key, Readiness};
 
-// The reactor re-exports and drives the platform Poller once it is wired in; for
-// now each backend stands alone with its own tests.
+// Exactly one backend compiles per target; the reactor drives the selected `Poller`.
 #[cfg(target_os = "linux")]
 mod epoll;
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 mod kqueue;
+
+#[cfg(target_os = "linux")]
+pub(crate) use self::epoll::Poller;
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+pub(crate) use self::kqueue::Poller;
 
 /// One ready fd from a [`Poller`] wait: the [`Key`] it was registered under and
 /// what it is ready for.
