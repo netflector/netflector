@@ -5,8 +5,10 @@
 
 use super::{Key, Readiness};
 
-// The reactor re-exports and drives `kqueue::Poller` once it is wired in; for now
-// the backend stands alone with its own tests.
+// The reactor re-exports and drives the platform Poller once it is wired in; for
+// now each backend stands alone with its own tests.
+#[cfg(target_os = "linux")]
+mod epoll;
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 mod kqueue;
 
