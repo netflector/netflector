@@ -11,6 +11,11 @@ toml = "1"
 log = { version = "0.4", features = ["release_max_level_debug"] }
 libc = "0.2"
 
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
 [lints.rust]
 warnings = "deny"
 let_underscore_drop = "deny"
