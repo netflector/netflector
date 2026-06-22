@@ -16,8 +16,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use libc::{c_uint, c_ulong, c_void};
 
-use super::LinkType;
 use super::filter::{BpfInsn, DLT_NULL_UDP_FILTER, ETHERNET_UDP_FILTER};
+use crate::net::LinkType;
 
 // DLT_EN10MB (Ethernet, 1) and DLT_NULL (0) are stable BPF link types,
 // but libc exposes them only on apple — define them locally, anchored to libc's

@@ -16,8 +16,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use libc::{c_int, c_void, socklen_t};
 
-use super::LinkType;
 use super::filter::{BpfInsn, DROP_OUTGOING_PROLOGUE, ETHERNET_UDP_FILTER};
+use crate::net::LinkType;
 
 /// Receive buffer sized for one frame at a typical Ethernet MTU plus headers.
 const RECV_BUFFER_SIZE: usize = 4096;

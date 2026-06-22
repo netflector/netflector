@@ -14,18 +14,6 @@ mod af_packet;
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 mod bpf;
 
-/// The link-layer framing a `Capture` reports for its interface. It selects the
-/// capture filter and tells a consumer how to strip the link header before parsing
-/// L3: a 14-byte Ethernet header, or — on BSD — `DLT_NULL`'s 4-byte host-order
-/// address family (loopback/tunnel interfaces), then the IP packet. Linux frames
-/// every interface, loopback included, as Ethernet.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum LinkType {
-    Ethernet,
-    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-    DltNull,
-}
-
 /// The platform `Capture` under one name, so consumers (the dispatch layer) and the
 /// tests need not name the backend.
 #[cfg(target_os = "linux")]
@@ -57,7 +45,8 @@ pub(crate) fn open_or_skip(if_name: &str, what: &str) -> std::io::Result<Option<
 
 #[cfg(test)]
 mod tests {
-    use super::{LinkType, open_or_skip};
+    use super::open_or_skip;
+    use crate::net::LinkType;
 
     // Live capture against a real interface (`REFLECTOR_TEST_IFACE`) — backend-neutral
     // because a real interface is Ethernet-framed on both backends (BPF reports

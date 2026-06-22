@@ -11,16 +11,12 @@ use std::net::{SocketAddrV4, SocketAddrV6};
 
 use thiserror::Error;
 
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+use super::DLT_NULL_HEADER_SIZE;
 use super::checksum;
 use super::mac::MacAddr;
+use super::{ETHERNET_HEADER_SIZE, IPV4_HEADER_SIZE, IPV6_HEADER_SIZE, UDP_HEADER_SIZE};
 
-const ETHERNET_HEADER_SIZE: usize = 14; // dst MAC(6) + src MAC(6) + ethertype(2)
-const IPV4_HEADER_SIZE: usize = 20;
-const IPV6_HEADER_SIZE: usize = 40;
-// DLT_NULL link header: a 4-byte address family in host byte order (BSD `lo0`).
-#[cfg(any(target_os = "macos", target_os = "freebsd"))]
-const DLT_NULL_HEADER_SIZE: usize = 4;
-const UDP_HEADER_SIZE: usize = 8;
 const IPV4_ETHERTYPE: u16 = 0x0800;
 const IPV6_ETHERTYPE: u16 = 0x86dd;
 /// Don't-Fragment, in the IPv4 flags + fragment-offset field. These one-hop
