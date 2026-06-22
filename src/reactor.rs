@@ -9,8 +9,11 @@
 //!
 //! The reactor owns a [`poll::Poller`] and drives the kernel (epoll/kqueue) as
 //! registrations come and go; [`Reactor::poll_once`] waits for readiness and
-//! dispatches it. It also owns each registered fd, so unregistering removes the
-//! kernel interest and closes the fd together — no stale-interest window.
+//! dispatches it. Each [`Handler`] **owns its fd** (it is `AsRawFd`); the reactor
+//! only watches it. Unregistering removes the kernel interest *first*, then the
+//! registration drops and the handler closes the fd — so interest is always gone
+//! before the fd closes: no stale-interest window, and no fd the reactor double-owns
+//! (a capture socket the handler also needs for I/O stays owned by the handler).
 //!
 //! Dispatch **takes the handler out of its slot** for the duration of its call,
 //! so `&mut Reactor` is free to hand to the handler. The handler can therefore
@@ -26,7 +29,7 @@ pub(crate) use self::arena::Key;
 
 use std::io;
 use std::num::NonZeroUsize;
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, RawFd};
 use std::time::Duration;
 
 use self::arena::Arena;
@@ -37,18 +40,23 @@ use self::poll::Poller;
 /// re-reports any overflow on the next wait, so a small buffer never loses events.
 const EVENT_CAPACITY: NonZeroUsize = NonZeroUsize::new(64).unwrap();
 
-/// Callbacks for a registered file descriptor.
+/// Callbacks for a registered file descriptor. The handler **owns** the fd (it is
+/// `AsRawFd`) and must report the *same* fd for as long as it is registered: the
+/// reactor caches it at registration and watches it without closing it, so a handler
+/// that swapped its fd mid-registration would leave the reactor watching the old one.
+/// To change the fd, unregister and re-register. Unregistering removes the kernel
+/// interest, then the handler drops and closes the fd.
 ///
-/// `on_readable` is required; `on_writable` defaults to a no-op and only fires
-/// while write interest is armed (see [`Reactor::set_write_interest`]). Each is
-/// handed the fd and `&mut Reactor`, so a handler can register or unregister
-/// others, arm/disarm its own write interest, etc.
-pub(crate) trait Handler {
-    /// The registered fd is readable.
-    fn on_readable(&mut self, fd: RawFd, reactor: &mut Reactor);
+/// `on_readable` is required; `on_writable` defaults to a no-op and only fires while
+/// write interest is armed (see [`Reactor::set_write_interest`]). Each is handed
+/// `&mut Reactor`, so a handler can register or unregister others, arm/disarm its
+/// own write interest, etc.
+pub(crate) trait Handler: AsRawFd {
+    /// The owned fd is readable.
+    fn on_readable(&mut self, reactor: &mut Reactor);
 
-    /// The registered fd is writable and write interest is armed.
-    fn on_writable(&mut self, _fd: RawFd, _reactor: &mut Reactor) {}
+    /// The owned fd is writable and write interest is armed.
+    fn on_writable(&mut self, _reactor: &mut Reactor) {}
 }
 
 /// What a registration is ready for in a given dispatch — the event a poll loop
@@ -61,10 +69,11 @@ pub(crate) struct Readiness {
     pub(crate) writable: bool,
 }
 
-/// One registered fd: the reactor owns the fd, tracks write interest, and holds
-/// the handler (taken out only transiently during dispatch).
+/// One registration: the handler owns the fd; the reactor caches its `RawFd` for
+/// poll operations, tracks write interest, and holds the handler (taken out only
+/// transiently during dispatch).
 struct Registration {
-    fd: OwnedFd,
+    raw: RawFd,
     write_interest: bool,
     handler: Option<Box<dyn Handler>>,
 }
@@ -90,17 +99,17 @@ impl Reactor {
         })
     }
 
-    /// Register `handler` for `fd`, returning the key that addresses it. The
-    /// reactor takes ownership of `fd`; write interest starts disarmed. The key is
-    /// the only way to unregister or re-target the registration later.
+    /// Register `handler` (which owns its fd), returning the key that addresses it.
+    /// Write interest starts disarmed. The key is the only way to unregister or
+    /// re-target the registration later.
     ///
     /// # Errors
     /// Returns an error if the kernel registration fails; the arena insert is
     /// rolled back so no partial registration remains.
-    pub(crate) fn register(&mut self, fd: OwnedFd, handler: Box<dyn Handler>) -> io::Result<Key> {
-        let raw = fd.as_raw_fd();
+    pub(crate) fn register(&mut self, handler: Box<dyn Handler>) -> io::Result<Key> {
+        let raw = handler.as_raw_fd();
         let key = self.registrations.insert(Registration {
-            fd,
+            raw,
             write_interest: false,
             handler: Some(handler),
         });
@@ -123,10 +132,11 @@ impl Reactor {
             log::trace!("unregister: {key:?} already gone");
             return Ok(false);
         };
-        let raw = reg.fd.as_raw_fd();
-        // Remove kernel interest before `reg` drops and closes the fd.
-        self.poll.remove(raw)?;
-        log::debug!("unregistered fd {raw}");
+        // `remove` moves the registration into `reg`, which keeps the handler — and
+        // its fd — alive until this function returns. Drop the kernel interest now,
+        // before `reg` drops at scope end and the handler closes the fd.
+        self.poll.remove(reg.raw)?;
+        log::debug!("unregistered fd {}", reg.raw);
         Ok(true)
     }
 
@@ -140,15 +150,15 @@ impl Reactor {
             log::trace!("set_write_interest: {key:?} already gone");
             return Ok(false);
         };
-        let raw = reg.fd.as_raw_fd();
         // Program the kernel first; flip the in-memory flag only on success, so the
         // arena and the kernel never disagree about write interest. (`self.poll` and
         // `self.registrations` are disjoint fields, so the `reg` borrow can stay live
         // across the syscall.)
-        self.poll.set_write(raw, key, enabled)?;
+        self.poll.set_write(reg.raw, key, enabled)?;
         reg.write_interest = enabled;
         log::trace!(
-            "fd {raw}: write interest {}",
+            "fd {}: write interest {}",
+            reg.raw,
             if enabled { "armed" } else { "disarmed" }
         );
         Ok(true)
@@ -183,8 +193,8 @@ impl Reactor {
     /// # Errors
     /// Returns an error if the shutdown handler cannot be installed or a wait fails.
     pub(crate) fn run(&mut self) -> io::Result<()> {
-        let (shutdown, read) = signal::ShutdownPipe::install()?;
-        let key = self.register(read, Box::new(signal::SignalPipe))?;
+        let (shutdown, pipe) = signal::ShutdownPipe::install()?;
+        let key = self.register(Box::new(pipe))?;
         self.shutdown = false;
         let result = self.run_loop();
         // Restore the signal handlers and unpublish the write fd *before* closing
@@ -221,21 +231,27 @@ impl Reactor {
             log::trace!("dispatch: {key:?} is stale, ignored");
             return;
         };
-        let fd = reg.fd.as_raw_fd();
+        let raw = reg.raw;
         let Some(mut handler) = reg.handler.take() else {
             // reentrant dispatch of a slot already in flight
-            log::trace!("dispatch: fd {fd} already in flight, ignored");
+            log::trace!("dispatch: fd {raw} already in flight, ignored");
             return;
         };
+        // The cached `raw` assumes a handler keeps its fd while registered (see `Handler`).
+        debug_assert_eq!(
+            handler.as_raw_fd(),
+            raw,
+            "handler changed its fd while registered"
+        );
 
         log::trace!(
-            "dispatch fd {fd}: readable={} writable={}",
+            "dispatch fd {raw}: readable={} writable={}",
             readiness.readable,
             readiness.writable
         );
 
         if readiness.readable {
-            handler.on_readable(fd, self);
+            handler.on_readable(self);
         }
         // Write is re-gated after the read phase: the read handler may have
         // unregistered the fd or disarmed write interest in between.
@@ -245,9 +261,9 @@ impl Reactor {
                 .get(key)
                 .is_some_and(|reg| reg.write_interest)
             {
-                handler.on_writable(fd, self);
+                handler.on_writable(self);
             } else {
-                log::trace!("dispatch fd {fd}: write suppressed after read phase");
+                log::trace!("dispatch fd {raw}: write suppressed after read phase");
             }
         }
 
@@ -264,6 +280,7 @@ mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
     use std::io::Write;
+    use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixStream;
     use std::rc::Rc;
 
@@ -291,60 +308,69 @@ mod tests {
         (OwnedFd::from(a), b)
     }
 
-    /// A handler whose behavior is supplied as closures, so each test wires up
-    /// only what it needs.
-    type Action = Box<dyn FnMut(RawFd, &mut Reactor)>;
+    /// A handler whose behavior is supplied as closures, so each test wires up only
+    /// what it needs. Like any real handler, it owns its fd.
+    type Action = Box<dyn FnMut(&mut Reactor)>;
 
     struct TestHandler {
+        fd: OwnedFd,
         on_read: Action,
         on_write: Option<Action>,
     }
 
     impl TestHandler {
-        fn read(action: impl FnMut(RawFd, &mut Reactor) + 'static) -> Box<dyn Handler> {
+        fn read(fd: OwnedFd, action: impl FnMut(&mut Reactor) + 'static) -> Box<dyn Handler> {
             Box::new(Self {
+                fd,
                 on_read: Box::new(action),
                 on_write: None,
             })
         }
 
         fn read_write(
-            read: impl FnMut(RawFd, &mut Reactor) + 'static,
-            write: impl FnMut(RawFd, &mut Reactor) + 'static,
+            fd: OwnedFd,
+            read: impl FnMut(&mut Reactor) + 'static,
+            write: impl FnMut(&mut Reactor) + 'static,
         ) -> Box<dyn Handler> {
             Box::new(Self {
+                fd,
                 on_read: Box::new(read),
                 on_write: Some(Box::new(write)),
             })
         }
     }
 
+    impl AsRawFd for TestHandler {
+        fn as_raw_fd(&self) -> RawFd {
+            self.fd.as_raw_fd()
+        }
+    }
+
     impl Handler for TestHandler {
-        fn on_readable(&mut self, fd: RawFd, reactor: &mut Reactor) {
-            (self.on_read)(fd, reactor);
+        fn on_readable(&mut self, reactor: &mut Reactor) {
+            (self.on_read)(reactor);
         }
 
-        fn on_writable(&mut self, fd: RawFd, reactor: &mut Reactor) {
+        fn on_writable(&mut self, reactor: &mut Reactor) {
             if let Some(write) = &mut self.on_write {
-                write(fd, reactor);
+                write(reactor);
             }
         }
     }
 
     #[test]
-    fn dispatch_calls_on_readable_with_the_fd() {
+    fn dispatch_calls_on_readable() {
         let mut reactor = Reactor::new().unwrap();
         let (a, _peer) = pair();
-        let fd = a.as_raw_fd();
-        let seen = Rc::new(Cell::new(0));
+        let seen = Rc::new(Cell::new(false));
         let key = reactor
-            .register(a, {
+            .register({
                 let seen = seen.clone();
-                TestHandler::read(move |f, _| seen.set(f))
+                TestHandler::read(a, move |_| seen.set(true))
             })
             .unwrap();
         reactor.dispatch(key, READABLE);
-        assert_eq!(seen.get(), fd);
+        assert!(seen.get());
     }
 
     #[test]
@@ -354,10 +380,10 @@ mod tests {
         let hits = Rc::new(Cell::new(0u32));
         let self_key = Rc::new(Cell::new(None));
         let key = reactor
-            .register(a, {
+            .register({
                 let hits = hits.clone();
                 let self_key = self_key.clone();
-                TestHandler::read(move |_, reactor| {
+                TestHandler::read(a, move |reactor| {
                     hits.set(hits.get() + 1);
                     if let Some(k) = self_key.get() {
                         reactor.unregister(k).unwrap();
@@ -388,12 +414,12 @@ mod tests {
         // The handler takes ownership of `c` out of this slot when it fires.
         let to_add = Rc::new(RefCell::new(Some(c)));
         let key = reactor
-            .register(a, {
+            .register({
                 let added = added.clone();
                 let to_add = to_add.clone();
-                TestHandler::read(move |_, reactor| {
+                TestHandler::read(a, move |reactor| {
                     let c = to_add.borrow_mut().take().unwrap();
-                    let new_key = reactor.register(c, TestHandler::read(|_, _| {})).unwrap();
+                    let new_key = reactor.register(TestHandler::read(c, |_| {})).unwrap();
                     added.set(Some(new_key));
                 })
             })
@@ -410,16 +436,16 @@ mod tests {
         let (actor_fd, _pa) = pair();
         let victim_hits = Rc::new(Cell::new(0u32));
         let victim = reactor
-            .register(victim_fd, {
+            .register({
                 let victim_hits = victim_hits.clone();
-                TestHandler::read(move |_, _| victim_hits.set(victim_hits.get() + 1))
+                TestHandler::read(victim_fd, move |_| victim_hits.set(victim_hits.get() + 1))
             })
             .unwrap();
         let victim_cell = Rc::new(Cell::new(Some(victim)));
         let actor = reactor
-            .register(actor_fd, {
+            .register({
                 let victim_cell = victim_cell.clone();
-                TestHandler::read(move |_, reactor| {
+                TestHandler::read(actor_fd, move |reactor| {
                     if let Some(v) = victim_cell.get() {
                         reactor.unregister(v).unwrap();
                     }
@@ -441,13 +467,10 @@ mod tests {
         let (a, _peer) = pair();
         let writes = Rc::new(Cell::new(0u32));
         let key = reactor
-            .register(
-                a,
-                TestHandler::read_write(|_, _| {}, {
-                    let writes = writes.clone();
-                    move |_, _| writes.set(writes.get() + 1)
-                }),
-            )
+            .register(TestHandler::read_write(a, |_| {}, {
+                let writes = writes.clone();
+                move |_| writes.set(writes.get() + 1)
+            }))
             .unwrap();
 
         // Disarmed: writable readiness does nothing.
@@ -466,23 +489,21 @@ mod tests {
         let writes = Rc::new(Cell::new(0u32));
         let self_key = Rc::new(Cell::new(None));
         let key = reactor
-            .register(
+            .register(TestHandler::read_write(
                 a,
-                TestHandler::read_write(
-                    {
-                        let self_key = self_key.clone();
-                        move |_, reactor| {
-                            if let Some(k) = self_key.get() {
-                                reactor.set_write_interest(k, false).unwrap();
-                            }
+                {
+                    let self_key = self_key.clone();
+                    move |reactor| {
+                        if let Some(k) = self_key.get() {
+                            reactor.set_write_interest(k, false).unwrap();
                         }
-                    },
-                    {
-                        let writes = writes.clone();
-                        move |_, _| writes.set(writes.get() + 1)
-                    },
-                ),
-            )
+                    }
+                },
+                {
+                    let writes = writes.clone();
+                    move |_| writes.set(writes.get() + 1)
+                },
+            ))
             .unwrap();
         self_key.set(Some(key));
         reactor.set_write_interest(key, true).unwrap();
@@ -499,23 +520,21 @@ mod tests {
         let writes = Rc::new(Cell::new(0u32));
         let self_key = Rc::new(Cell::new(None));
         let key = reactor
-            .register(
+            .register(TestHandler::read_write(
                 a,
-                TestHandler::read_write(
-                    {
-                        let self_key = self_key.clone();
-                        move |_, reactor| {
-                            if let Some(k) = self_key.get() {
-                                reactor.unregister(k).unwrap();
-                            }
+                {
+                    let self_key = self_key.clone();
+                    move |reactor| {
+                        if let Some(k) = self_key.get() {
+                            reactor.unregister(k).unwrap();
                         }
-                    },
-                    {
-                        let writes = writes.clone();
-                        move |_, _| writes.set(writes.get() + 1)
-                    },
-                ),
-            )
+                    }
+                },
+                {
+                    let writes = writes.clone();
+                    move |_| writes.set(writes.get() + 1)
+                },
+            ))
             .unwrap();
         self_key.set(Some(key));
         reactor.set_write_interest(key, true).unwrap();
@@ -530,7 +549,7 @@ mod tests {
         let mut reactor = Reactor::new().unwrap();
         let (a, _peer) = pair();
         let key = reactor
-            .register(a, TestHandler::read(|_, _| panic!("must not fire")))
+            .register(TestHandler::read(a, |_| panic!("must not fire")))
             .unwrap();
         assert!(reactor.unregister(key).unwrap());
         reactor.dispatch(key, READABLE); // no panic, no effect
@@ -542,9 +561,9 @@ mod tests {
         let (a, peer) = pair();
         let fired = Rc::new(Cell::new(false));
         reactor
-            .register(a, {
+            .register({
                 let fired = fired.clone();
-                TestHandler::read(move |_, _| fired.set(true))
+                TestHandler::read(a, move |_| fired.set(true))
             })
             .unwrap();
 
@@ -563,7 +582,7 @@ mod tests {
         let mut reactor = Reactor::new().unwrap();
         let (a, peer) = pair();
         reactor
-            .register(a, TestHandler::read(|_, r| r.request_shutdown()))
+            .register(TestHandler::read(a, Reactor::request_shutdown))
             .unwrap();
         // Readable before looping, so the first (blocking) wait returns at once.
         (&peer).write_all(b"x").unwrap();

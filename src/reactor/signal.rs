@@ -51,12 +51,13 @@ pub(crate) struct ShutdownPipe {
 
 impl ShutdownPipe {
     /// Create the self-pipe, publish its write end, and install the shutdown
-    /// handlers. Returns the guard plus the read end to register with the reactor.
+    /// handlers. Returns the guard plus the [`SignalPipe`] handler (owning the read
+    /// end) to register with the reactor.
     ///
     /// # Errors
     /// Returns an error if the pipe cannot be created, a handler cannot be
     /// installed, or a shutdown pipe is already installed.
-    pub(crate) fn install() -> io::Result<(Self, OwnedFd)> {
+    pub(crate) fn install() -> io::Result<(Self, SignalPipe)> {
         let (read, write) = self_pipe()?;
         // Publish the write fd for the handler, refusing a second concurrent install.
         if WRITE_FD
@@ -79,7 +80,7 @@ impl ShutdownPipe {
                 write_fd: write,
                 saved_actions: saved,
             },
-            read,
+            SignalPipe { read },
         ))
     }
 }
@@ -93,16 +94,26 @@ impl Drop for ShutdownPipe {
     }
 }
 
-/// Reactor handler for the self-pipe read end: drains it and asks the reactor to
-/// stop. The bytes carry nothing beyond "a shutdown signal arrived".
-pub(crate) struct SignalPipe;
+/// Reactor handler for the self-pipe read end (which it owns): drains the pipe and
+/// asks the reactor to stop. The bytes carry nothing beyond "a shutdown signal
+/// arrived".
+pub(crate) struct SignalPipe {
+    read: OwnedFd,
+}
+
+impl AsRawFd for SignalPipe {
+    fn as_raw_fd(&self) -> RawFd {
+        self.read.as_raw_fd()
+    }
+}
 
 impl Handler for SignalPipe {
-    fn on_readable(&mut self, fd: RawFd, reactor: &mut Reactor) {
+    fn on_readable(&mut self, reactor: &mut Reactor) {
         // Drain so a level-triggered wait does not keep re-reporting it.
         let mut buf = [0u8; 16];
-        // SAFETY: `fd` is the registered, non-blocking read end; draining stops at
-        // EOF (0) or EAGAIN (-1).
+        let fd = self.read.as_raw_fd();
+        // SAFETY: `self.read` is the registered, non-blocking read end; draining
+        // stops at EOF (0) or EAGAIN (-1).
         while unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
         reactor.request_shutdown();
     }
@@ -228,7 +239,7 @@ mod tests {
     // sibling: nothing else here installs handlers.
     #[test]
     fn installed_handler_writes_on_signal() {
-        let (guard, read) = ShutdownPipe::install().unwrap();
+        let (guard, pipe) = ShutdownPipe::install().unwrap();
 
         // Our handler must catch SIGINT (write a byte), not terminate the process.
         // SAFETY: `raise` just delivers a signal to the current process.
@@ -237,7 +248,7 @@ mod tests {
 
         let mut buf = [0u8; 4];
         // SAFETY: read up to `buf.len()` bytes into `buf` from the valid read-end fd.
-        let n = unsafe { libc::read(read.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+        let n = unsafe { libc::read(pipe.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
         assert!(n >= 1);
 
         drop(guard); // restores the previous SIGINT/SIGTERM dispositions
