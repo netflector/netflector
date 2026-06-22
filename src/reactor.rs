@@ -167,11 +167,10 @@ impl Reactor {
     /// Returns an error if the underlying wait fails. An interrupted wait reports
     /// no events rather than erroring.
     pub(crate) fn poll_once(&mut self, timeout: Option<Duration>) -> io::Result<()> {
-        let ready = self.poll.wait(timeout)?;
-        for i in 0..ready {
-            // Copy the event out (it is `Copy`) so the `self.poll` borrow ends
-            // before `dispatch` needs `&mut self`.
-            let event = self.poll.event(i);
+        self.poll.wait(timeout)?;
+        // `next_event` returns an owned (`Copy`) event, so the `self.poll` borrow
+        // ends before `dispatch` needs `&mut self`.
+        while let Some(event) = self.poll.next_event() {
             self.dispatch(event.key, event.readiness);
         }
         Ok(())

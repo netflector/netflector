@@ -27,6 +27,7 @@ pub(crate) struct Poller {
     poll_fd: OwnedFd,
     events: Box<[libc::kevent]>,
     ready: usize,
+    next: usize,
 }
 
 impl Poller {
@@ -46,6 +47,7 @@ impl Poller {
             poll_fd,
             events: vec![blank; capacity.get()].into_boxed_slice(),
             ready: 0,
+            next: 0,
         })
     }
 
@@ -93,8 +95,8 @@ impl Poller {
 
     /// Block until at least one fd is ready, or until `timeout` elapses (`None`
     /// blocks indefinitely), recording the ready events. Returns how many there
-    /// are; read each with [`event`](Self::event). `EINTR` yields `Ok(0)` so the
-    /// caller can re-check shutdown state and poll again.
+    /// are; drain them with [`next_event`](Self::next_event). `EINTR` yields
+    /// `Ok(0)` so the caller can re-check shutdown state and poll again.
     pub(crate) fn wait(&mut self, timeout: Option<Duration>) -> io::Result<usize> {
         let max_events = libc::c_int::try_from(self.events.len()).unwrap_or(libc::c_int::MAX);
         let ts = timeout.map(to_timespec);
@@ -121,29 +123,29 @@ impl Poller {
             return Err(err);
         }
         self.ready = usize::try_from(count).expect("kevent count is non-negative");
+        self.next = 0; // start draining the new batch from the front
         log::trace!("kqueue: {} ready", self.ready);
         Ok(self.ready)
     }
 
-    /// The `i`-th event from the last [`wait`](Self::wait); `i` must be less than
-    /// the count it returned.
-    pub(crate) fn event(&self, i: usize) -> PollEvent {
-        assert!(
-            i < self.ready,
-            "event index {i} is past the wait count {}",
-            self.ready
-        );
+    /// The next event from the last [`wait`](Self::wait), or `None` once the batch
+    /// is drained. Advances an internal cursor, so each event is yielded once.
+    pub(crate) fn next_event(&mut self) -> Option<PollEvent> {
+        if self.next >= self.ready {
+            return None;
+        }
         // Copy the (packed) kevent out so fields are read by value, never by ref.
-        let event = self.events[i];
+        let event = self.events[self.next];
+        self.next += 1;
         let filter = event.filter;
         let token = u64::try_from(event.udata.addr()).expect("udata holds a 64-bit token");
-        PollEvent {
+        Some(PollEvent {
             key: Key::from_u64(token),
             readiness: Readiness {
                 readable: filter == libc::EVFILT_READ,
                 writable: filter == libc::EVFILT_WRITE,
             },
-        }
+        })
     }
 
     fn change(&self, fd: RawFd, filter: i16, flags: u16, key: Key) -> io::Result<()> {
@@ -212,7 +214,7 @@ mod tests {
 
         (&b).write_all(b"x").unwrap();
         assert_eq!(poller.wait(Some(short())).unwrap(), 1);
-        let event = poller.event(0);
+        let event = poller.next_event().unwrap();
         assert_eq!(event.key, key);
         assert!(event.readiness.readable);
         assert!(!event.readiness.writable);
@@ -231,7 +233,7 @@ mod tests {
         // Armed: a fresh socket has room to send, so it is writable.
         poller.set_write(a.as_raw_fd(), key, true).unwrap();
         assert_eq!(poller.wait(Some(short())).unwrap(), 1);
-        let event = poller.event(0);
+        let event = poller.next_event().unwrap();
         assert_eq!(event.key, key);
         assert!(event.readiness.writable);
 
@@ -280,9 +282,10 @@ mod tests {
 
         (&b1).write_all(b"x").unwrap();
         (&b2).write_all(b"y").unwrap();
-        let count = poller.wait(Some(short())).unwrap();
-        assert_eq!(count, 2);
-        let keys: Vec<Key> = (0..count).map(|i| poller.event(i).key).collect();
+        assert_eq!(poller.wait(Some(short())).unwrap(), 2);
+        let keys: Vec<Key> = std::iter::from_fn(|| poller.next_event())
+            .map(|e| e.key)
+            .collect();
         assert!(keys.contains(&k1));
         assert!(keys.contains(&k2));
     }
