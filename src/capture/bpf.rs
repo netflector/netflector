@@ -16,13 +16,27 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use libc::{c_uint, c_ulong, c_void};
 
-use super::filter::{BpfInsn, ETHERNET_UDP_FILTER};
+use super::filter::{BpfInsn, DLT_NULL_UDP_FILTER, ETHERNET_UDP_FILTER};
 
-// DLT_EN10MB (Ethernet) is a stable BPF link type (1), but libc exposes it only
-// on apple — define it locally, anchored to libc's value where available.
+// DLT_EN10MB (Ethernet, 1) and DLT_NULL (0) are stable BPF link types,
+// but libc exposes them only on apple — define them locally, anchored to libc's
+// values where available.
 const DLT_EN10MB: c_uint = 1;
+const DLT_NULL: c_uint = 0;
 #[cfg(target_os = "macos")]
 const _: () = assert!(DLT_EN10MB == libc::DLT_EN10MB);
+#[cfg(target_os = "macos")]
+const _: () = assert!(DLT_NULL == libc::DLT_NULL);
+
+/// The link-layer framing BPF reports for the bound interface. It selects the
+/// capture filter and tells a consumer how to strip the link header before parsing
+/// L3: a 14-byte Ethernet header, or `DLT_NULL`'s 4-byte host-order address family
+/// (used on the BSD loopback and tunnel interfaces), then the IP packet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LinkType {
+    Ethernet,
+    DltNull,
+}
 
 /// `struct bpf_program` — the filter handed to `BIOCSETF`. libc provides this
 /// (and `bpf_insn`) on FreeBSD but not apple, so define it for both; the asserts
@@ -56,6 +70,7 @@ pub(crate) struct Capture {
     buf: Box<[u8]>,
     filled: usize,
     offset: usize,
+    link_type: LinkType,
 }
 
 impl Capture {
@@ -63,8 +78,8 @@ impl Capture {
     ///
     /// # Errors
     /// Returns an error if no BPF device is available, the interface can't be
-    /// bound, the link type isn't Ethernet (`DLT_NULL` loopback isn't supported
-    /// yet), or any setup ioctl fails.
+    /// bound, the link type is neither Ethernet nor `DLT_NULL`, or any
+    /// setup ioctl fails.
     pub(crate) fn open(if_name: &str) -> io::Result<Self> {
         let fd = open_bpf_device()?;
 
@@ -92,29 +107,39 @@ impl Capture {
         }
         ioctl(&fd, libc::BIOCSETIF, (&raw mut ifr).cast())?;
 
-        // Require Ethernet; DLT_NULL loopback (a different header + filter) is deferred.
+        // The link framing selects the filter and the see-sent handling below.
         let mut dlt: c_uint = 0;
         ioctl(&fd, libc::BIOCGDLT, (&raw mut dlt).cast())?;
-        if dlt != DLT_EN10MB {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!(
-                    "BPF link type {dlt} unsupported (need DLT_EN10MB; loopback not yet supported)"
-                ),
-            ));
-        }
+        let link_type = match dlt {
+            DLT_EN10MB => LinkType::Ethernet,
+            DLT_NULL => LinkType::DltNull,
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("unsupported BPF link type {other} (need DLT_EN10MB or DLT_NULL)"),
+                ));
+            }
+        };
 
         // Deliver each frame as it arrives instead of blocking until the buffer fills.
         let mut immediate: c_uint = 1;
         ioctl(&fd, libc::BIOCIMMEDIATE, (&raw mut immediate).cast())?;
 
-        // Don't hand us our own injected frames (loop prevention between mirrored
-        // reflector pairs).
-        let mut see_sent: c_uint = 0;
-        ioctl(&fd, libc::BIOCSSEESENT, (&raw mut see_sent).cast())?;
+        // Loop prevention on Ethernet: don't hand us our own egress, so two mirrored
+        // reflector entries don't ping-pong each other's frames. Skip it on DLT_NULL links
+        // — the BSD lo driver taps each frame once (and tags it outbound), so default
+        // BPF already delivers it; clearing see-sent (= receive-only) would instead
+        // silence the interface entirely.
+        if link_type == LinkType::Ethernet {
+            let mut see_sent: c_uint = 0;
+            ioctl(&fd, libc::BIOCSSEESENT, (&raw mut see_sent).cast())?;
+        }
 
-        // Install the UDP filter (and flush whatever queued before it).
-        let filter = ETHERNET_UDP_FILTER;
+        // Install the link-appropriate UDP filter (and flush whatever queued before it).
+        let filter: &[BpfInsn] = match link_type {
+            LinkType::Ethernet => &ETHERNET_UDP_FILTER,
+            LinkType::DltNull => &DLT_NULL_UDP_FILTER,
+        };
         let mut program = BpfProgram {
             bf_len: c_uint::try_from(filter.len()).expect("filter length fits c_uint"),
             bf_insns: filter.as_ptr().cast_mut(),
@@ -128,7 +153,7 @@ impl Capture {
         set_nonblocking(&fd)?;
 
         log::debug!(
-            "opened BPF capture on {if_name} (fd {}, {blen}-byte buffer)",
+            "opened BPF capture on {if_name} (fd {}, {link_type:?}, {blen}-byte buffer)",
             fd.as_raw_fd()
         );
         Ok(Self {
@@ -136,7 +161,14 @@ impl Capture {
             buf: vec![0u8; blen as usize].into_boxed_slice(),
             filled: 0,
             offset: 0,
+            link_type,
         })
+    }
+
+    /// The link-layer framing of the captured frames, so a consumer can strip the
+    /// right link header (Ethernet vs `DLT_NULL`) before parsing L3.
+    pub(crate) fn link_type(&self) -> LinkType {
+        self.link_type
     }
 
     /// The next captured frame, refilling from the kernel when the current batch
@@ -429,6 +461,7 @@ mod tests {
             }
             Err(e) => panic!("Capture::open({iface}) failed: {e}"),
         };
+        assert_eq!(capture.link_type(), LinkType::Ethernet);
 
         // Poll briefly for ambient UDP traffic and validate each frame's layout:
         // every frame the kernel filter passed must be an IPv4/IPv6 Ethernet frame,
@@ -451,5 +484,158 @@ mod tests {
             }
         }
         eprintln!("live_capture: validated {validated} frame(s) on {iface}");
+    }
+
+    /// Send a UDP probe to `bind` (a v4 or v6 loopback address) and confirm the BPF
+    /// backend captures it as a `DLT_NULL` frame: a 4-byte host-order `family`, then
+    /// an IP header whose version nibble is `version` (so the link header is exactly
+    /// 4 bytes), then our payload at the tail. Returns false if nothing matching
+    /// arrives within a short window.
+    fn captures_loopback_probe(
+        capture: &mut Capture,
+        bind: &str,
+        family: u32,
+        version: u8,
+    ) -> bool {
+        const PROBE: &[u8] = b"reflector-loopback-probe";
+        let receiver = std::net::UdpSocket::bind(bind).unwrap();
+        let target = receiver.local_addr().unwrap();
+        let sender = std::net::UdpSocket::bind(bind).unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            sender.send_to(PROBE, target).unwrap();
+            while let Some(frame) = capture.next_frame().unwrap() {
+                if frame.len() > 4
+                    && u32::from_ne_bytes(frame[..4].try_into().unwrap()) == family
+                    && frame[4] >> 4 == version
+                    && frame.ends_with(PROBE)
+                {
+                    return true;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        false
+    }
+
+    // Live loopback capture: `lo0` reports DLT_NULL, so this exercises `link_type()`,
+    // both branches of the DLT_NULL filter (the per-OS AF_INET/AF_INET6 constants and
+    // their host-order byte-swap, at different header offsets), and the see-sent skip.
+    // Traffic to 127.0.0.1 / ::1 is deterministic — no env var needed. Dynamically
+    // skips when BPF (or IPv6 loopback) is unavailable; fails on real errors.
+    #[test]
+    fn loopback_capture_decodes_known_frames() {
+        let mut capture = match Capture::open("lo0") {
+            Ok(capture) => capture,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::PermissionDenied | io::ErrorKind::NotFound
+                ) || e.raw_os_error() == Some(libc::EACCES) =>
+            {
+                eprintln!("skip loopback_capture: no BPF access ({e})");
+                return;
+            }
+            Err(e) => panic!("Capture::open(lo0) failed: {e}"),
+        };
+        assert_eq!(capture.link_type(), LinkType::DltNull);
+
+        assert!(
+            captures_loopback_probe(
+                &mut capture,
+                "127.0.0.1:0",
+                libc::AF_INET.cast_unsigned(),
+                4
+            ),
+            "did not capture a DLT_NULL IPv4 UDP probe on lo0",
+        );
+
+        // IPv6 loopback isn't guaranteed everywhere; cover the AF_INET6 branch only
+        // where ::1 is usable.
+        if std::net::UdpSocket::bind("[::1]:0").is_ok() {
+            assert!(
+                captures_loopback_probe(&mut capture, "[::1]:0", libc::AF_INET6.cast_unsigned(), 6),
+                "did not capture a DLT_NULL IPv6 UDP probe on lo0",
+            );
+        } else {
+            eprintln!("skip loopback IPv6: ::1 unavailable");
+        }
+    }
+
+    // Probe whether FreeBSD loops a BPF-injected frame back into the local stack.
+    // macOS does not (verified: send() is accepted but the frame is never delivered
+    // to a capture or a socket), but FreeBSD's loopback path is a separate
+    // implementation, so this builds valid DLT_NULL IPv4 and IPv6 UDP datagrams,
+    // injects each on lo0, and asserts a bound UDP socket receives it. FreeBSD-only;
+    // skips without BPF access (and IPv6 when ::1 is unavailable). A failure here
+    // means FreeBSD behaves like macOS — loopback send isn't observable this way.
+    #[cfg(target_os = "freebsd")]
+    #[test]
+    fn loopback_send_reaches_a_local_socket() {
+        use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6, UdpSocket};
+
+        const PROBE: &[u8] = b"reflector-loopback-send-probe";
+
+        let cap = match Capture::open("lo0") {
+            Ok(cap) => cap,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::PermissionDenied | io::ErrorKind::NotFound
+                ) || e.raw_os_error() == Some(libc::EACCES) =>
+            {
+                eprintln!("skip loopback_send: no BPF access ({e})");
+                return;
+            }
+            Err(e) => panic!("Capture::open(lo0) failed: {e}"),
+        };
+
+        // IPv4 is always available on lo0.
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dst_port = receiver.local_addr().unwrap().port();
+        let src = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 40000);
+        let dst = SocketAddrV4::new(Ipv4Addr::LOCALHOST, dst_port);
+        let mut frame = [0u8; 256];
+        let n = crate::net::frame::dlt_null_ipv4_udp(src, dst, 64, PROBE, &mut frame)
+            .expect("build DLT_NULL IPv4 frame");
+        expect_send_delivered(&cap, &receiver, &frame[..n], PROBE);
+
+        // IPv6 loopback isn't guaranteed everywhere; cover it only when ::1 is usable.
+        if let Ok(receiver) = UdpSocket::bind("[::1]:0") {
+            let dst_port = receiver.local_addr().unwrap().port();
+            let src = SocketAddrV6::new(Ipv6Addr::LOCALHOST, 40000, 0, 0);
+            let dst = SocketAddrV6::new(Ipv6Addr::LOCALHOST, dst_port, 0, 0);
+            let mut frame = [0u8; 256];
+            let n = crate::net::frame::dlt_null_ipv6_udp(src, dst, 64, PROBE, &mut frame)
+                .expect("build DLT_NULL IPv6 frame");
+            expect_send_delivered(&cap, &receiver, &frame[..n], PROBE);
+        } else {
+            eprintln!("skip loopback_send IPv6: ::1 unavailable");
+        }
+    }
+
+    /// Inject `frame` on `cap`'s interface and assert the bound `receiver` gets
+    /// `probe` within a short window — the shared half of the IPv4 and IPv6 probes.
+    #[cfg(target_os = "freebsd")]
+    fn expect_send_delivered(
+        cap: &Capture,
+        receiver: &std::net::UdpSocket,
+        frame: &[u8],
+        probe: &[u8],
+    ) {
+        receiver
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        cap.send(frame).expect("send on lo0");
+
+        let mut buf = [0u8; 256];
+        match receiver.recv_from(&mut buf) {
+            Ok((n, _)) => assert_eq!(&buf[..n], probe),
+            Err(e) => panic!(
+                "lo0 did not deliver the injected frame to {}: {e}",
+                receiver.local_addr().unwrap()
+            ),
+        }
     }
 }

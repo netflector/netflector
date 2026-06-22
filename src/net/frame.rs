@@ -1,11 +1,11 @@
-//! Build the Ethernet frames we inject on the egress path.
+//! Build the link-layer frames we inject on the egress path.
 //!
-//! The public builders write a full frame — destination/source MACs, ethertype,
-//! then an IPv4/IPv6 header and the UDP header + payload — into a caller-provided
-//! buffer (no allocation on the data path) and return the byte count, filling the
-//! IPv4-header and UDP checksums via [`super::checksum`]. The macOS `DLT_NULL`
-//! loopback framing will join them once the capture layer brings the platform
-//! address-family constants.
+//! The public builders write a full frame into a caller-provided buffer (no
+//! allocation on the data path) and return the byte count, filling the IPv4-header
+//! and UDP checksums via [`super::checksum`]. The Ethernet builders prefix
+//! destination/source MACs and an ethertype; the BSD `DLT_NULL` builders
+//! (macOS/FreeBSD) prefix a 4-byte host-order address family instead, matching the
+//! capture-side framing.
 
 use std::net::{SocketAddrV4, SocketAddrV6};
 
@@ -17,6 +17,9 @@ use super::mac::MacAddr;
 const ETHERNET_HEADER_SIZE: usize = 14; // dst MAC(6) + src MAC(6) + ethertype(2)
 const IPV4_HEADER_SIZE: usize = 20;
 const IPV6_HEADER_SIZE: usize = 40;
+// DLT_NULL link header: a 4-byte address family in host byte order (BSD `lo0`).
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+const DLT_NULL_HEADER_SIZE: usize = 4;
 const UDP_HEADER_SIZE: usize = 8;
 const IPV4_ETHERTYPE: u16 = 0x0800;
 const IPV6_ETHERTYPE: u16 = 0x86dd;
@@ -80,6 +83,50 @@ pub(crate) fn ethernet_ipv6_udp(
         .map_err(|e| with_l2_header(e, ETHERNET_HEADER_SIZE))?;
     write_ethernet_header(header, dst_mac, src_mac, IPV6_ETHERTYPE);
     Ok(ETHERNET_HEADER_SIZE + datagram)
+}
+
+/// Build a `DLT_NULL` frame carrying an IPv4 UDP datagram into `out` (BSD
+/// `lo0` framing): a 4-byte host-order address family, then the IPv4 + UDP datagram
+/// with checksums filled. Returns the frame length.
+///
+/// # Errors
+/// [`FrameError::PayloadTooLarge`] if the datagram overflows the 16-bit length
+/// fields, or [`FrameError::BufferTooSmall`] if `out` cannot hold the frame.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+pub(crate) fn dlt_null_ipv4_udp(
+    src: SocketAddrV4,
+    dst: SocketAddrV4,
+    ttl: u8,
+    payload: &[u8],
+    out: &mut [u8],
+) -> Result<usize, FrameError> {
+    let (header, body) = split_l2(out, DLT_NULL_HEADER_SIZE)?;
+    let datagram = ipv4_udp(src, dst, ttl, payload, body)
+        .map_err(|e| with_l2_header(e, DLT_NULL_HEADER_SIZE))?;
+    write_dlt_null_header(header, libc::AF_INET);
+    Ok(DLT_NULL_HEADER_SIZE + datagram)
+}
+
+/// Build a `DLT_NULL` frame carrying an IPv6 UDP datagram into `out` (BSD
+/// `lo0` framing): a 4-byte host-order address family, then the IPv6 + UDP datagram
+/// with the UDP checksum filled. Returns the frame length.
+///
+/// # Errors
+/// [`FrameError::PayloadTooLarge`] if the datagram overflows the 16-bit length
+/// fields, or [`FrameError::BufferTooSmall`] if `out` cannot hold the frame.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+pub(crate) fn dlt_null_ipv6_udp(
+    src: SocketAddrV6,
+    dst: SocketAddrV6,
+    hop_limit: u8,
+    payload: &[u8],
+    out: &mut [u8],
+) -> Result<usize, FrameError> {
+    let (header, body) = split_l2(out, DLT_NULL_HEADER_SIZE)?;
+    let datagram = ipv6_udp(src, dst, hop_limit, payload, body)
+        .map_err(|e| with_l2_header(e, DLT_NULL_HEADER_SIZE))?;
+    write_dlt_null_header(header, libc::AF_INET6);
+    Ok(DLT_NULL_HEADER_SIZE + datagram)
 }
 
 /// Write an IPv4 + UDP datagram (headers and `payload`, with the IPv4-header and
@@ -210,6 +257,12 @@ fn write_ethernet_header(out: &mut [u8], dst_mac: MacAddr, src_mac: MacAddr, eth
     out[0..6].copy_from_slice(&dst_mac.octets());
     out[6..12].copy_from_slice(&src_mac.octets());
     out[12..14].copy_from_slice(&ethertype.to_be_bytes());
+}
+
+/// Write the 4-byte `DLT_NULL` link header: the address family in host byte order.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn write_dlt_null_header(out: &mut [u8], family: libc::c_int) {
+    out[0..4].copy_from_slice(&family.cast_unsigned().to_ne_bytes());
 }
 
 #[cfg(test)]
@@ -425,5 +478,55 @@ mod tests {
                 available: 20
             })
         ));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    #[test]
+    fn dlt_null_ipv4_frame_prefixes_the_host_family() {
+        let src = SocketAddrV4::new(Ipv4Addr::new(192, 168, 0, 1), 5353);
+        let dst = SocketAddrV4::new(Ipv4Addr::new(224, 0, 0, 251), 5353);
+        let payload = [0xde, 0xad];
+        let mut buf = [0xAAu8; 64];
+
+        let n = dlt_null_ipv4_udp(src, dst, 1, &payload, &mut buf).unwrap();
+        assert_eq!(
+            n,
+            DLT_NULL_HEADER_SIZE + IPV4_HEADER_SIZE + UDP_HEADER_SIZE + payload.len()
+        );
+        let frame = &buf[..n];
+
+        // 4-byte address family in host byte order.
+        assert_eq!(
+            u32::from_ne_bytes(frame[0..4].try_into().unwrap()),
+            libc::AF_INET.cast_unsigned()
+        );
+        // Past the link header is exactly the standalone IPv4 datagram.
+        let mut datagram = [0u8; 64];
+        let dn = ipv4_udp(src, dst, 1, &payload, &mut datagram).unwrap();
+        assert_eq!(&frame[DLT_NULL_HEADER_SIZE..], &datagram[..dn]);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    #[test]
+    fn dlt_null_ipv6_frame_prefixes_the_host_family() {
+        let src = SocketAddrV6::new(Ipv6Addr::LOCALHOST, 5353, 0, 0);
+        let dst = SocketAddrV6::new(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb), 5353, 0, 0);
+        let payload = [0xaa, 0xbb, 0xcc];
+        let mut buf = [0xAAu8; 80];
+
+        let n = dlt_null_ipv6_udp(src, dst, 255, &payload, &mut buf).unwrap();
+        assert_eq!(
+            n,
+            DLT_NULL_HEADER_SIZE + IPV6_HEADER_SIZE + UDP_HEADER_SIZE + payload.len()
+        );
+        let frame = &buf[..n];
+
+        assert_eq!(
+            u32::from_ne_bytes(frame[0..4].try_into().unwrap()),
+            libc::AF_INET6.cast_unsigned()
+        );
+        let mut datagram = [0u8; 80];
+        let dn = ipv6_udp(src, dst, 255, &payload, &mut datagram).unwrap();
+        assert_eq!(&frame[DLT_NULL_HEADER_SIZE..], &datagram[..dn]);
     }
 }
