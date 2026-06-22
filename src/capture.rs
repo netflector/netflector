@@ -5,7 +5,7 @@
 //! into a reused buffer (no per-frame allocation), and injects built frames. Each
 //! backend exposes the same surface (`open` / `next_frame` / `has_buffered` /
 //! `send` / `link_type` / `AsRawFd`); the facade re-exports the platform `Capture`
-//! once a consumer (the reactor handler) is wired.
+//! under one name for the dispatch layer (and the tests).
 
 mod filter;
 
@@ -26,20 +26,19 @@ pub(crate) enum LinkType {
     DltNull,
 }
 
-// The platform `Capture` under one name, so the shared test helper and tests below
-// need not name the backend. Test-only for now; the reactor handler will promote
-// this to a real `pub(crate)` re-export once it consumes `Capture`.
-#[cfg(all(test, target_os = "linux"))]
-use self::af_packet::Capture;
-#[cfg(all(test, any(target_os = "macos", target_os = "freebsd")))]
-use self::bpf::Capture;
+/// The platform `Capture` under one name, so consumers (the dispatch layer) and the
+/// tests need not name the backend.
+#[cfg(target_os = "linux")]
+pub(crate) use self::af_packet::Capture;
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+pub(crate) use self::bpf::Capture;
 
 /// Open a capture on `if_name`, returning `Ok(None)` (and noting why) when the host
 /// can't — no BPF access / `CAP_NET_RAW`, or the interface is absent. A real error
-/// is returned for the caller to propagate with `?`. Shared by the backend tests and
-/// the live test below.
+/// is returned for the caller to propagate with `?`. Shared by the backend tests, the
+/// live test below, and the dispatch-layer tests.
 #[cfg(test)]
-fn open_or_skip(if_name: &str, what: &str) -> std::io::Result<Option<Capture>> {
+pub(crate) fn open_or_skip(if_name: &str, what: &str) -> std::io::Result<Option<Capture>> {
     match Capture::open(if_name) {
         Ok(capture) => Ok(Some(capture)),
         Err(e)
