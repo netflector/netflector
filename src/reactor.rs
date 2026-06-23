@@ -25,14 +25,13 @@ mod arena;
 mod poll;
 mod signal;
 
-pub(crate) use self::arena::Key;
+pub(crate) use self::arena::{Arena, Key};
 
 use std::io;
 use std::num::NonZeroUsize;
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::Duration;
 
-use self::arena::Arena;
 use self::poll::Poller;
 
 /// How many ready fds one [`wait`](poll::Poller::wait) reports. The reflector
