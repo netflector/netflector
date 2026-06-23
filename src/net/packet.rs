@@ -12,19 +12,23 @@ use thiserror::Error;
 
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 use super::DLT_NULL_HEADER_SIZE;
+use super::mac::MacAddr;
 use super::{
     ETHERNET_HEADER_SIZE, IP_PROTO_UDP, IPV4_HEADER_SIZE, IPV6_HEADER_SIZE, LinkType,
     UDP_HEADER_SIZE,
 };
 
-/// A parsed UDP datagram: the endpoints, the TTL/hop-limit to preserve on re-emit, and
-/// the payload borrowed from the capture buffer.
+/// A parsed UDP datagram: the endpoints, the TTL/hop-limit to preserve on re-emit, the
+/// L2 addresses (for filtering), and the payload borrowed from the capture buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Packet<'a> {
     pub(crate) source: SocketAddr,
     pub(crate) dest: SocketAddr,
     /// IPv4 TTL or IPv6 hop limit, as captured.
     pub(crate) ttl: u8,
+    /// Ethernet destination/source MAC, or `None` on `DLT_NULL` (loopback/tunnel — no L2).
+    pub(crate) dst_mac: Option<MacAddr>,
+    pub(crate) src_mac: Option<MacAddr>,
     pub(crate) payload: &'a [u8],
 }
 
@@ -55,30 +59,57 @@ impl<'a> Packet<'a> {
     /// Returns a [`ParseError`] if the frame is truncated, not IPv4/IPv6 UDP, an IPv4
     /// fragment, or carries an inconsistent length field.
     pub(crate) fn parse(link_type: LinkType, frame: &'a [u8]) -> Result<Self, ParseError> {
-        let l3 = strip_link_header(link_type, frame)?;
+        let link = parse_link_header(link_type, frame)?;
         // Dispatch on the IP version nibble, not the link-layer ethertype / address
         // family — the nibble governs the header layout we actually parse.
-        let &first = l3.first().ok_or(ParseError::Truncated)?;
+        let &first = link.l3.first().ok_or(ParseError::Truncated)?;
         match first >> 4 {
-            4 => parse_ipv4(l3),
-            6 => parse_ipv6(l3),
+            4 => parse_ipv4(link),
+            6 => parse_ipv6(link),
             version => Err(ParseError::BadIpVersion(version)),
         }
     }
 }
 
-/// Drop the `link_type` link header, returning the L3 bytes that follow.
-fn strip_link_header(link_type: LinkType, frame: &[u8]) -> Result<&[u8], ParseError> {
-    let header = match link_type {
-        LinkType::Ethernet => ETHERNET_HEADER_SIZE,
-        #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-        LinkType::DltNull => DLT_NULL_HEADER_SIZE,
-    };
-    frame.get(header..).ok_or(ParseError::Truncated)
+/// A frame's link header: its L2 addresses (absent on `DLT_NULL`) and the L3 bytes
+/// that follow.
+#[derive(Clone, Copy)]
+struct LinkHeader<'a> {
+    dst_mac: Option<MacAddr>,
+    src_mac: Option<MacAddr>,
+    l3: &'a [u8],
 }
 
-/// Parse an IPv4 datagram (header, options, then UDP) from `l3`.
-fn parse_ipv4(l3: &[u8]) -> Result<Packet<'_>, ParseError> {
+/// Parse the `link_type` link header into its L2 addresses and the L3 bytes that follow.
+fn parse_link_header(link_type: LinkType, frame: &[u8]) -> Result<LinkHeader<'_>, ParseError> {
+    match link_type {
+        LinkType::Ethernet => {
+            let l3 = frame
+                .get(ETHERNET_HEADER_SIZE..)
+                .ok_or(ParseError::Truncated)?;
+            // The Ethernet header is dst MAC(6) + src MAC(6) + ethertype(2); the L3
+            // slice above proves the frame holds all 14, so the MAC reads are in range.
+            Ok(LinkHeader {
+                dst_mac: Some(read_mac(&frame[0..6])?),
+                src_mac: Some(read_mac(&frame[6..12])?),
+                l3,
+            })
+        }
+        #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+        LinkType::DltNull => Ok(LinkHeader {
+            dst_mac: None,
+            src_mac: None,
+            l3: frame
+                .get(DLT_NULL_HEADER_SIZE..)
+                .ok_or(ParseError::Truncated)?,
+        }),
+    }
+}
+
+/// Parse an IPv4 datagram (header, options, then UDP) from `link`'s L3 bytes, carrying
+/// its L2 addresses onto the [`Packet`].
+fn parse_ipv4(link: LinkHeader<'_>) -> Result<Packet<'_>, ParseError> {
+    let l3 = link.l3;
     if l3.len() < IPV4_HEADER_SIZE {
         return Err(ParseError::Truncated);
     }
@@ -115,13 +146,17 @@ fn parse_ipv4(l3: &[u8]) -> Result<Packet<'_>, ParseError> {
         source: SocketAddr::new(IpAddr::V4(src_ip), src_port),
         dest: SocketAddr::new(IpAddr::V4(dst_ip), dst_port),
         ttl,
+        dst_mac: link.dst_mac,
+        src_mac: link.src_mac,
         payload,
     })
 }
 
-/// Parse an IPv6 datagram (fixed base header, then UDP) from `l3`. Extension headers
-/// are unsupported: a next header other than UDP is rejected.
-fn parse_ipv6(l3: &[u8]) -> Result<Packet<'_>, ParseError> {
+/// Parse an IPv6 datagram (fixed base header, then UDP) from `link`'s L3 bytes, carrying
+/// its L2 addresses onto the [`Packet`]. Extension headers are unsupported: a next
+/// header other than UDP is rejected.
+fn parse_ipv6(link: LinkHeader<'_>) -> Result<Packet<'_>, ParseError> {
+    let l3 = link.l3;
     if l3.len() < IPV6_HEADER_SIZE {
         return Err(ParseError::Truncated);
     }
@@ -145,6 +180,8 @@ fn parse_ipv6(l3: &[u8]) -> Result<Packet<'_>, ParseError> {
         source: SocketAddr::new(IpAddr::V6(src_ip), src_port),
         dest: SocketAddr::new(IpAddr::V6(dst_ip), dst_port),
         ttl: hop_limit,
+        dst_mac: link.dst_mac,
+        src_mac: link.src_mac,
         payload,
     })
 }
@@ -180,6 +217,13 @@ fn ipv6_addr(bytes: &[u8]) -> Result<Ipv6Addr, ParseError> {
         .map_err(|_| ParseError::Truncated)
 }
 
+/// Read a 6-byte MAC field — the [`ipv4_addr`] counterpart for an Ethernet address.
+fn read_mac(bytes: &[u8]) -> Result<MacAddr, ParseError> {
+    <[u8; 6]>::try_from(bytes)
+        .map(MacAddr::from)
+        .map_err(|_| ParseError::Truncated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,13 +239,18 @@ mod tests {
         let dst = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 20), 5354);
         let payload = [0xde, 0xad, 0xbe, 0xef];
         let mut buf = [0u8; 64];
-        let mac = MacAddr::broadcast();
-        let n = frame::ethernet_ipv4_udp(mac, mac, src, dst, 64, &payload, &mut buf).unwrap();
+        // Distinct dst/src MACs so a swapped read would fail.
+        let dst_mac = MacAddr::from([0x02, 0, 0, 0, 0, 0xaa]);
+        let src_mac = MacAddr::from([0x02, 0, 0, 0, 0, 0xbb]);
+        let n =
+            frame::ethernet_ipv4_udp(dst_mac, src_mac, src, dst, 64, &payload, &mut buf).unwrap();
 
         let packet = Packet::parse(LinkType::Ethernet, &buf[..n]).unwrap();
         assert_eq!(packet.source, SocketAddr::V4(src));
         assert_eq!(packet.dest, SocketAddr::V4(dst));
         assert_eq!(packet.ttl, 64);
+        assert_eq!(packet.dst_mac, Some(dst_mac));
+        assert_eq!(packet.src_mac, Some(src_mac));
         assert_eq!(packet.payload, &payload);
     }
 
@@ -211,13 +260,17 @@ mod tests {
         let dst = SocketAddrV6::new(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb), 5354, 0, 0);
         let payload = [0xaa, 0xbb, 0xcc];
         let mut buf = [0u8; 80];
-        let mac = MacAddr::broadcast();
-        let n = frame::ethernet_ipv6_udp(mac, mac, src, dst, 255, &payload, &mut buf).unwrap();
+        let dst_mac = MacAddr::from([0x33, 0x33, 0, 0, 0, 0xfb]);
+        let src_mac = MacAddr::from([0x02, 0, 0, 0, 0, 0xbb]);
+        let n =
+            frame::ethernet_ipv6_udp(dst_mac, src_mac, src, dst, 255, &payload, &mut buf).unwrap();
 
         let packet = Packet::parse(LinkType::Ethernet, &buf[..n]).unwrap();
         assert_eq!(packet.source, SocketAddr::V6(src));
         assert_eq!(packet.dest, SocketAddr::V6(dst));
         assert_eq!(packet.ttl, 255);
+        assert_eq!(packet.dst_mac, Some(dst_mac));
+        assert_eq!(packet.src_mac, Some(src_mac));
         assert_eq!(packet.payload, &payload);
     }
 
@@ -234,6 +287,9 @@ mod tests {
         assert_eq!(packet.source, SocketAddr::V4(src));
         assert_eq!(packet.dest, SocketAddr::V4(dst));
         assert_eq!(packet.ttl, 64);
+        // DLT_NULL has no L2 header — no MACs to report.
+        assert_eq!(packet.dst_mac, None);
+        assert_eq!(packet.src_mac, None);
         assert_eq!(packet.payload, &payload);
     }
 

@@ -50,6 +50,14 @@ impl MacAddr {
     }
 }
 
+/// The six bytes, in transmission order, *are* the address — mirroring `Ipv4Addr`'s
+/// `From<[u8; 4]>`; used to read a MAC off the wire.
+impl From<[u8; 6]> for MacAddr {
+    fn from(octets: [u8; 6]) -> Self {
+        MacAddr(octets)
+    }
+}
+
 impl fmt::Display for MacAddr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let [b0, b1, b2, b3, b4, b5] = self.0;
