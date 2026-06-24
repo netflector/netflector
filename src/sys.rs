@@ -33,6 +33,15 @@ pub(crate) fn set_cloexec_nonblock(fd: RawFd) -> io::Result<()> {
     if unsafe { libc::fcntl(fd, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC) } < 0 {
         return Err(io::Error::last_os_error());
     }
+    set_nonblock(fd)
+}
+
+/// Set `O_NONBLOCK` on `fd`, read-modify-write so the other status flags survive.
+///
+/// # Errors
+/// Returns the failing `fcntl`'s error.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+pub(crate) fn set_nonblock(fd: RawFd) -> io::Result<()> {
     // SAFETY: `fd` is valid; F_GETFL returns the status flags.
     let status = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if status < 0 {

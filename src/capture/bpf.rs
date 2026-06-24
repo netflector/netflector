@@ -142,7 +142,7 @@ impl Capture {
         let mut blen: c_uint = 0;
         ioctl(&fd, libc::BIOCGBLEN, (&raw mut blen).cast())?;
 
-        set_nonblocking(&fd)?;
+        crate::sys::set_nonblock(fd.as_raw_fd())?;
 
         log::debug!(
             "opened BPF capture on {if_name} (fd {}, {link_type:?}, {blen}-byte buffer)",
@@ -325,21 +325,6 @@ fn open_bpf_device() -> io::Result<OwnedFd> {
         }
     }
     Err(io::Error::other("all /dev/bpf devices are busy"))
-}
-
-/// Set `O_NONBLOCK` on `fd`.
-fn set_nonblocking(fd: &OwnedFd) -> io::Result<()> {
-    let raw = fd.as_raw_fd();
-    // SAFETY: `fd` is valid; F_GETFL returns the current status flags.
-    let flags = unsafe { libc::fcntl(raw, libc::F_GETFL) };
-    if flags < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: `fd` is valid; F_SETFL writes the status flags.
-    if unsafe { libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 /// One `ioctl` with a typed-but-opaque argument pointer, mapping failure to an error.
