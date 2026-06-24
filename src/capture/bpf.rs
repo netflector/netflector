@@ -54,14 +54,15 @@ const fn bpf_wordalign(x: usize) -> usize {
     (x + (BPF_ALIGN - 1)) & !(BPF_ALIGN - 1)
 }
 
-/// A raw-capture handle on one interface: an owned BPF fd plus a reused read
-/// buffer and a cursor over the current batch.
+/// A raw-capture handle on one interface: an owned BPF fd, a reused read buffer, a cursor
+/// over the current batch, the link type, and the interface name it is bound to.
 pub(crate) struct Capture {
     fd: OwnedFd,
     buf: Box<[u8]>,
     filled: usize,
     offset: usize,
     link_type: LinkType,
+    name: String,
 }
 
 impl Capture {
@@ -153,6 +154,7 @@ impl Capture {
             filled: 0,
             offset: 0,
             link_type,
+            name: if_name.into(),
         })
     }
 
@@ -160,6 +162,11 @@ impl Capture {
     /// right link header (Ethernet vs `DLT_NULL`) before parsing L3.
     pub(crate) fn link_type(&self) -> LinkType {
         self.link_type
+    }
+
+    /// The interface this capture is bound to.
+    pub(crate) fn if_name(&self) -> &str {
+        &self.name
     }
 
     /// The next captured frame, refilling from the kernel when the current batch

@@ -26,11 +26,12 @@ const RECV_BUFFER_SIZE: usize = 4096;
 const DROP_OUTGOING_FILTER_LEN: usize = DROP_OUTGOING_PROLOGUE.len() + ETHERNET_UDP_FILTER.len();
 
 /// A raw-capture handle on one interface: an owned `AF_PACKET` fd, a reused read
-/// buffer, and the prebuilt `sockaddr_ll` it injects to.
+/// buffer, the prebuilt `sockaddr_ll` it injects to, and the interface name it is on.
 pub(crate) struct Capture {
     fd: OwnedFd,
     buf: Box<[u8]>,
     send_addr: libc::sockaddr_ll,
+    name: String,
 }
 
 impl Capture {
@@ -83,6 +84,7 @@ impl Capture {
             fd,
             buf: vec![0u8; RECV_BUFFER_SIZE].into_boxed_slice(),
             send_addr,
+            name: if_name.into(),
         })
     }
 
@@ -90,6 +92,11 @@ impl Capture {
     #[allow(clippy::unused_self)] // uniform Capture API; the BPF backend reads self
     pub(crate) fn link_type(&self) -> LinkType {
         LinkType::Ethernet
+    }
+
+    /// The interface this capture is bound to.
+    pub(crate) fn if_name(&self) -> &str {
+        &self.name
     }
 
     /// The next captured frame, or `Ok(None)` when a read would block. Oversized

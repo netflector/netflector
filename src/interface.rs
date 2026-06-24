@@ -61,6 +61,28 @@ impl fmt::Display for InterfaceAddresses {
     }
 }
 
+/// One configured interface: its name (kept for re-resolution) and current source
+/// addresses. Built by [`open`](Self::open); the address monitor later refreshes `addrs`
+/// in place.
+pub(crate) struct Interface {
+    pub(crate) name: String,
+    pub(crate) addrs: InterfaceAddresses,
+}
+
+impl Interface {
+    /// Build an interface record, resolving `name`'s current source addresses.
+    ///
+    /// # Errors
+    /// Propagates a resolution syscall failure; an unknown interface yields all-absent
+    /// addresses (not an error).
+    pub(crate) fn open(name: &str) -> io::Result<Self> {
+        Ok(Self {
+            name: name.to_owned(),
+            addrs: resolve(name)?,
+        })
+    }
+}
+
 /// Rank an IPv6 source candidate: link-local > ULA > global > other. The reflector relays
 /// link-local service traffic, so a link-local source is preferred; a global address is
 /// the fallback when no link-local is usable.
