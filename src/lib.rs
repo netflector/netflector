@@ -15,6 +15,8 @@ mod capture;
 #[allow(dead_code)]
 mod dispatch;
 #[allow(dead_code)]
+mod interface;
+#[allow(dead_code)]
 mod net;
 #[allow(dead_code)]
 mod reactor;
