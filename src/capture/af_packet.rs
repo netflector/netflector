@@ -12,7 +12,7 @@
 
 use std::ffi::CString;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
 use libc::{c_int, c_void, socklen_t};
 
@@ -45,20 +45,14 @@ impl Capture {
         let send_addr = link_addr(ifindex);
 
         // Protocol 0: capture nothing until the filter + loop-prevention are in place.
-        // SAFETY: a `socket` call with a valid domain/type/protocol; returns a fresh
-        // fd or -1.
-        let raw = unsafe {
+        // SAFETY: a `socket` call with a valid domain/type/protocol returns a fresh fd or -1.
+        let fd = crate::sys::owned_fd_from(unsafe {
             libc::socket(
                 libc::AF_PACKET,
                 libc::SOCK_RAW | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
                 0,
             )
-        };
-        if raw < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: `socket` returned a fresh owned fd.
-        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        })?;
 
         // Loop prevention: stop the kernel from handing us our own injected frames.
         // PACKET_IGNORE_OUTGOING (Linux 4.20+) drops them at the socket; if the kernel

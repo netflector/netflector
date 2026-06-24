@@ -5,7 +5,7 @@
 
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::ptr;
 
 use libc::c_int;
@@ -109,18 +109,13 @@ pub(super) fn resolve(if_name: &str, ifindex: u32) -> io::Result<InterfaceAddres
 /// A `NETLINK_ROUTE` socket.
 fn netlink_socket() -> io::Result<OwnedFd> {
     // SAFETY: `socket` returns a fresh fd or -1.
-    let raw = unsafe {
+    crate::sys::owned_fd_from(unsafe {
         libc::socket(
             libc::AF_NETLINK,
             libc::SOCK_RAW | libc::SOCK_CLOEXEC,
             NETLINK_ROUTE,
         )
-    };
-    if raw < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: `raw` is a fresh owned socket fd.
-    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+    })
 }
 
 /// Send a dump request (`request_type` + `body`) and feed every reply of `reply_type` to

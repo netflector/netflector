@@ -1,11 +1,22 @@
-//! Small platform/syscall helpers shared across subsystems, each `cfg`-gated to the platforms
-//! that need it. For now just the macOS fd setup — no `pipe2` / `SOCK_*` type flags there, so
-//! close-on-exec and non-blocking go on by `fcntl`; Linux/BSD helpers can join as they arise.
+//! Small platform/syscall helpers shared across subsystems. Some are unconditional (fd
+//! ownership); others are `cfg`-gated to the platforms that need them — macOS lacks `pipe2`
+//! and the `SOCK_*` type flags, so it applies close-on-exec / non-blocking by `fcntl`.
 
-#[cfg(target_os = "macos")]
 use std::io;
-#[cfg(target_os = "macos")]
-use std::os::fd::RawFd;
+use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+
+/// Take ownership of a raw fd returned by a fd-returning syscall: a negative value is the
+/// POSIX error sentinel; a non-negative one is a fresh fd we own.
+///
+/// # Errors
+/// Returns the last OS error when `raw` is negative.
+pub(crate) fn owned_fd_from(raw: RawFd) -> io::Result<OwnedFd> {
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a non-negative return from a fd-returning syscall is a fresh fd we exclusively own.
+    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+}
 
 /// Set `FD_CLOEXEC` and `O_NONBLOCK` on `fd`, read-modify-write so any other flags survive.
 ///

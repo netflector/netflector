@@ -8,7 +8,7 @@
 use std::io;
 use std::mem;
 use std::num::NonZeroUsize;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::ptr;
 use std::time::Duration;
 
@@ -37,12 +37,8 @@ impl Poller {
     /// Create an epoll instance reporting up to `capacity` ready fds per [`wait`](Self::wait).
     pub(crate) fn new(capacity: NonZeroUsize) -> io::Result<Self> {
         // SAFETY: epoll_create1 takes only flags; it returns a fresh fd or -1.
-        let fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: `fd` is a fresh descriptor we exclusively own.
-        let poll_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let poll_fd =
+            crate::sys::owned_fd_from(unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) })?;
         // SAFETY: an all-zero epoll_event is a valid, inert entry; wait() overwrites it.
         let blank: libc::epoll_event = unsafe { mem::zeroed() };
         log::trace!("epoll poller created (capacity {capacity})");

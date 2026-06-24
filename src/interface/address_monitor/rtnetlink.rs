@@ -3,7 +3,7 @@
 //! resolver's — reused from [`super::super::rtnetlink`] rather than duplicated.
 
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::ptr;
 
 use libc::{c_int, socklen_t};
@@ -36,18 +36,13 @@ struct SockAddrNl {
 pub(super) fn open() -> io::Result<OwnedFd> {
     // SAFETY: `socket` returns a fresh fd or -1; the type arg carries CLOEXEC|NONBLOCK
     // (Linux applies both atomically, with no fcntl race).
-    let raw = unsafe {
+    let sock = crate::sys::owned_fd_from(unsafe {
         libc::socket(
             libc::AF_NETLINK,
             libc::SOCK_RAW | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
             NETLINK_ROUTE,
         )
-    };
-    if raw < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: `raw` is a fresh owned socket fd.
-    let sock = unsafe { OwnedFd::from_raw_fd(raw) };
+    })?;
     let addr = SockAddrNl {
         family: u16::try_from(libc::AF_NETLINK).expect("AF_NETLINK fits a u16"),
         groups: SUBSCRIBED_GROUPS,

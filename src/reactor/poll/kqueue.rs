@@ -7,7 +7,7 @@
 use std::io;
 use std::mem;
 use std::num::NonZeroUsize;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::ptr;
 use std::time::Duration;
 
@@ -34,12 +34,7 @@ impl Poller {
     /// Create a kqueue reporting up to `capacity` ready fds per [`wait`](Self::wait).
     pub(crate) fn new(capacity: NonZeroUsize) -> io::Result<Self> {
         // SAFETY: kqueue() takes no arguments; it returns a fresh fd or -1.
-        let fd = unsafe { libc::kqueue() };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: `fd` is a fresh descriptor we exclusively own.
-        let poll_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let poll_fd = crate::sys::owned_fd_from(unsafe { libc::kqueue() })?;
         // SAFETY: an all-zero kevent is a valid, inert entry; wait() overwrites it.
         let blank: libc::kevent = unsafe { mem::zeroed() };
         log::trace!("kqueue poller created (capacity {capacity})");

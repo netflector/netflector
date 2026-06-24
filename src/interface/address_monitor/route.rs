@@ -7,7 +7,7 @@
 use std::io;
 #[cfg(target_os = "macos")]
 use std::os::fd::AsRawFd;
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 
 use libc::c_int;
 
@@ -30,12 +30,7 @@ pub(super) fn open() -> io::Result<OwnedFd> {
     #[cfg(target_os = "macos")]
     let socktype = libc::SOCK_RAW;
     // SAFETY: `socket` returns a fresh fd or -1.
-    let raw = unsafe { libc::socket(libc::PF_ROUTE, socktype, 0) };
-    if raw < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: `raw` is a fresh owned socket fd.
-    let sock = unsafe { OwnedFd::from_raw_fd(raw) };
+    let sock = crate::sys::owned_fd_from(unsafe { libc::socket(libc::PF_ROUTE, socktype, 0) })?;
     // macOS lacks the `SOCK_*` type-arg flags, so apply close-on-exec + non-blocking by fcntl.
     #[cfg(target_os = "macos")]
     crate::sys::set_cloexec_nonblock(sock.as_raw_fd())?;
