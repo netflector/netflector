@@ -9,6 +9,8 @@
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
+use crate::sys::RecvOutcome;
+
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 mod route;
 #[cfg(target_os = "linux")]
@@ -66,28 +68,21 @@ impl AddressMonitor {
                     0,
                 )
             };
-            if n < 0 {
-                let err = io::Error::last_os_error();
-                let errno = err.raw_os_error();
-                if errno == Some(libc::EINTR) {
-                    continue; // interrupted before any data; retry
-                }
-                if errno == Some(libc::EAGAIN) || errno == Some(libc::EWOULDBLOCK) {
-                    return Ok(()); // no more queued notifications
-                }
-                if errno == Some(libc::ENOBUFS) {
-                    // A receive-buffer overflow dropped notifications: signal a full
-                    // re-resolve, then keep draining to clear the socket.
-                    on_change(0);
-                    continue;
-                }
-                return Err(err);
+            // ENOBUFS is the drain's own signal (a dropped-notification overflow → re-resolve
+            // everything), so handle it before the generic classifier.
+            if n < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ENOBUFS) {
+                on_change(0);
+                continue;
             }
-            let n = usize::try_from(n).expect("recv count is non-negative");
-            if n == 0 {
-                return Ok(()); // routing sockets don't EOF; defensive against a 0-length read
+            match crate::sys::classify_recv(n)? {
+                // No more queued notifications (or a defensive empty read — routing sockets
+                // don't EOF).
+                RecvOutcome::WouldBlock | RecvOutcome::Ready(0) => return Ok(()),
+                RecvOutcome::Ready(len) => {
+                    backend::for_each_change(&self.buf[..len], &mut on_change);
+                }
+                RecvOutcome::Interrupted => {} // EINTR: retry
             }
-            backend::for_each_change(&self.buf[..n], &mut on_change);
         }
     }
 }

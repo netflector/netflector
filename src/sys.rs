@@ -18,6 +18,39 @@ pub(crate) fn owned_fd_from(raw: RawFd) -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(raw) })
 }
 
+/// The outcome of triaging a `recv`/`read` return value via [`classify_recv`].
+pub(crate) enum RecvOutcome {
+    /// `n` bytes were read — possibly 0; the caller decides what an empty read means.
+    Ready(usize),
+    /// `EAGAIN`/`EWOULDBLOCK`: nothing available on a non-blocking fd.
+    WouldBlock,
+    /// `EINTR`: interrupted before any data; the caller should retry.
+    Interrupted,
+}
+
+/// Triage a `recv`/`read` return value `n`: a non-negative count is `Ready`, a negative one is
+/// classified by errno into the non-blocking-fd contract (`Interrupted`/`WouldBlock`) or a real
+/// error. Single-sources the would-block errno set — an OS contract, not a per-caller detail.
+///
+/// # Errors
+/// Returns the last OS error for any errno other than `EINTR`/`EAGAIN`/`EWOULDBLOCK`.
+pub(crate) fn classify_recv(n: isize) -> io::Result<RecvOutcome> {
+    if n >= 0 {
+        return Ok(RecvOutcome::Ready(
+            usize::try_from(n).expect("a non-negative recv count fits usize"),
+        ));
+    }
+    let err = io::Error::last_os_error();
+    let errno = err.raw_os_error();
+    if errno == Some(libc::EINTR) {
+        return Ok(RecvOutcome::Interrupted);
+    }
+    if errno == Some(libc::EAGAIN) || errno == Some(libc::EWOULDBLOCK) {
+        return Ok(RecvOutcome::WouldBlock);
+    }
+    Err(err)
+}
+
 /// Set `FD_CLOEXEC` and `O_NONBLOCK` on `fd`, read-modify-write so any other flags survive.
 ///
 /// # Errors

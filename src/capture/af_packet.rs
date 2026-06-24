@@ -18,6 +18,7 @@ use libc::{c_int, c_void, socklen_t};
 
 use super::filter::{BpfInsn, DROP_OUTGOING_PROLOGUE, ETHERNET_UDP_FILTER};
 use crate::net::LinkType;
+use crate::sys::RecvOutcome;
 
 /// Receive buffer sized for one frame at a typical Ethernet MTU plus headers.
 const RECV_BUFFER_SIZE: usize = 4096;
@@ -166,20 +167,11 @@ impl Capture {
                     libc::MSG_TRUNC,
                 )
             };
-            if n >= 0 {
-                return Ok(Some(
-                    usize::try_from(n).expect("recv result is non-negative"),
-                ));
+            match crate::sys::classify_recv(n)? {
+                RecvOutcome::Ready(len) => return Ok(Some(len)),
+                RecvOutcome::WouldBlock => return Ok(None),
+                RecvOutcome::Interrupted => {} // EINTR: retry
             }
-            let err = io::Error::last_os_error();
-            let errno = err.raw_os_error();
-            if errno == Some(libc::EINTR) {
-                continue;
-            }
-            if errno == Some(libc::EAGAIN) || errno == Some(libc::EWOULDBLOCK) {
-                return Ok(None);
-            }
-            return Err(err);
         }
     }
 }
