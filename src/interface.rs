@@ -120,20 +120,22 @@ fn v6_rank(addr: Ipv6Addr) -> u8 {
     }
 }
 
+// The loopback interface for tests: `lo` on Linux, `lo0` on the BSDs. An unhandled target
+// fails to compile rather than silently guess (`any(macos, freebsd)`, not the looser `not(linux)`).
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) const LOOPBACK_IFACE: &str = "lo";
+#[cfg(all(test, any(target_os = "macos", target_os = "freebsd")))]
+pub(crate) const LOOPBACK_IFACE: &str = "lo0";
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(target_os = "linux")]
-    const LOOPBACK: &str = "lo";
-    #[cfg(not(target_os = "linux"))]
-    const LOOPBACK: &str = "lo0";
 
     #[test]
     fn resolves_loopback_v4() {
         // Every host's loopback has 127.0.0.1; resolution needs no privileges, so this
         // exercises the full backend (the v4 path, and on Linux the rtnetlink round-trip).
-        let addrs = Interface::open(LOOPBACK).unwrap().addrs;
+        let addrs = Interface::open(LOOPBACK_IFACE).unwrap().addrs;
         assert_eq!(addrs.v4, Some(Ipv4Addr::LOCALHOST));
     }
 

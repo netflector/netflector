@@ -513,6 +513,7 @@ impl Handler for PacketDispatcher {
 mod tests {
     use super::*;
     use crate::capture::open_or_skip;
+    use crate::interface::LOOPBACK_IFACE;
     use crate::net::frame;
     use std::cell::RefCell;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
@@ -606,11 +607,6 @@ mod tests {
         assert!(!v6.matches(&packet("10.0.0.1:5353", "224.0.0.251:5353", None, None)));
     }
 
-    #[cfg(target_os = "linux")]
-    const LOOPBACK: &str = "lo";
-    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-    const LOOPBACK: &str = "lo0";
-
     const PROBE: &[u8] = b"reflector-dispatch-probe";
     /// The echo re-emits to this port — distinct from the filter's, so the looped-back
     /// echo can't re-match and amplify.
@@ -660,10 +656,10 @@ mod tests {
     // which re-emits on the *egress* key. Skips without capture access (no CAP_NET_RAW).
     #[test]
     fn routes_a_captured_packet_to_a_matching_reflector() -> io::Result<()> {
-        let Some(ingress_cap) = open_or_skip(LOOPBACK, "dispatch_ingress")? else {
+        let Some(ingress_cap) = open_or_skip(LOOPBACK_IFACE, "dispatch_ingress")? else {
             return Ok(());
         };
-        let Some(egress_cap) = open_or_skip(LOOPBACK, "dispatch_egress")? else {
+        let Some(egress_cap) = open_or_skip(LOOPBACK_IFACE, "dispatch_egress")? else {
             return Ok(());
         };
 
@@ -739,7 +735,7 @@ mod tests {
     // (calls == 2). Skips without capture access (no CAP_NET_RAW).
     #[test]
     fn reentrant_drain_on_the_same_ingress_hits_the_guard() -> io::Result<()> {
-        let Some(ingress_cap) = open_or_skip(LOOPBACK, "dispatch_reentrant")? else {
+        let Some(ingress_cap) = open_or_skip(LOOPBACK_IFACE, "dispatch_reentrant")? else {
             return Ok(());
         };
 
@@ -792,10 +788,10 @@ mod tests {
     // Exercises the per-fd `on_readable`. Skips without capture access (no CAP_NET_RAW).
     #[test]
     fn reactor_drives_the_dispatcher_to_route_a_packet() -> io::Result<()> {
-        let Some(ingress_cap) = open_or_skip(LOOPBACK, "dispatch_reactor_in")? else {
+        let Some(ingress_cap) = open_or_skip(LOOPBACK_IFACE, "dispatch_reactor_in")? else {
             return Ok(());
         };
-        let Some(egress_cap) = open_or_skip(LOOPBACK, "dispatch_reactor_eg")? else {
+        let Some(egress_cap) = open_or_skip(LOOPBACK_IFACE, "dispatch_reactor_eg")? else {
             return Ok(());
         };
 
@@ -887,7 +883,7 @@ mod tests {
     // `None`. Skips without capture access (no CAP_NET_RAW).
     #[test]
     fn ingress_resolves_and_drops_while_taken_out() -> io::Result<()> {
-        let Some(ingress_cap) = open_or_skip(LOOPBACK, "dispatch_mid_drain")? else {
+        let Some(ingress_cap) = open_or_skip(LOOPBACK_IFACE, "dispatch_mid_drain")? else {
             return Ok(());
         };
 
@@ -959,8 +955,8 @@ mod tests {
     #[test]
     fn refresh_by_ifindex_targets_the_matching_interface() -> io::Result<()> {
         let mut dispatcher = PacketDispatcher::new();
-        dispatcher.table.find_or_add_interface(LOOPBACK)?;
-        let ifindex = crate::interface::if_index(LOOPBACK).expect("loopback has an ifindex");
+        dispatcher.table.find_or_add_interface(LOOPBACK_IFACE)?;
+        let ifindex = crate::interface::if_index(LOOPBACK_IFACE).expect("loopback has an ifindex");
         assert!(
             dispatcher.table.refresh_by_ifindex(ifindex)?,
             "the loopback interface should match its ifindex and re-resolve",
