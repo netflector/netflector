@@ -4,6 +4,9 @@
 mod checksum;
 pub(crate) mod frame;
 pub(crate) mod mac;
+// Used by the mDNS reflector (built incrementally); allow dead code until it lands.
+#[allow(dead_code)]
+pub(crate) mod mdns;
 pub(crate) mod packet;
 
 /// The link-layer framing of a captured or injected frame. The capture layer reports
