@@ -8,9 +8,9 @@ mod config;
 mod error;
 mod logging;
 mod sys;
-// `net`/`capture`/`dispatch` have no caller until the reflectors are built, and a
-// few reactor APIs (set_write_interest, is_registered) have none until then. Allow
-// dead code until the data path lands.
+// `net`/`capture`/`dispatch`/`reflector` have no caller until `run()` wires the data
+// path, and a few reactor APIs (set_write_interest, is_registered) have none until
+// then. Allow dead code until that lands.
 #[allow(dead_code)]
 mod capture;
 #[allow(dead_code)]
@@ -21,6 +21,8 @@ mod interface;
 mod net;
 #[allow(dead_code)]
 mod reactor;
+#[allow(dead_code)]
+mod reflector;
 
 pub use self::error::{Error, Result};
 pub use self::logging::init as init_logging;
