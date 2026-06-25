@@ -29,11 +29,6 @@ const MAGIC_LEN: usize = PREFIX_LEN + MAC_REPS * MAC_LEN;
 /// equivalent of the IPv4 limited broadcast a magic packet re-emits to.
 const V6_ALL_NODES: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
 
-/// The per-handler reusable frame buffer. A magic packet (102 B, plus an optional `SecureOn`
-/// tail) with L2/IP/UDP headers fits comfortably; `send_udp_group` reports an overflow rather
-/// than truncating.
-const SCRATCH_LEN: usize = 2048;
-
 /// Whether `payload` opens with a Wake-on-LAN magic packet for an acceptable target: the
 /// `6×0xFF` prefix followed by one MAC repeated 16 times. Trailing bytes (a `SecureOn` password)
 /// are ignored — only the leading [`MAGIC_LEN`] are inspected — and the caller forwards them
@@ -59,15 +54,13 @@ fn is_magic_packet(payload: &[u8], target_mac: Option<MacAddr>) -> bool {
 }
 
 /// A built Wake-on-LAN reflector: re-emits each validated magic packet on its `egress` interface.
-/// One is registered per configured port. Holds a reused scratch buffer so the data path never
-/// allocates.
+/// One is registered per configured port.
 struct WolReflector {
     egress: CaptureKey,
     /// Optional device filter; `None` relays a wake for any device.
     target_mac: Option<MacAddr>,
     /// IP-version policy: which families this reflector re-emits.
     family: AddressFamily,
-    scratch: Box<[u8]>,
 }
 
 impl PacketHandler for WolReflector {
@@ -103,7 +96,6 @@ impl PacketHandler for WolReflector {
             packet.source.port(),
             packet.ttl,
             packet.payload,
-            &mut self.scratch,
         ) {
             Ok(()) => log::info!("reflected WoL packet from {} to {dst}", packet.source),
             Err(e) => log::warn!(
@@ -170,7 +162,6 @@ pub(crate) fn build(
                 egress,
                 target_mac: reflector.mac,
                 family: reflector.address_family,
-                scratch: vec![0u8; SCRATCH_LEN].into_boxed_slice(),
             }),
         );
     }

@@ -17,8 +17,6 @@
 //! [`drain_and_route`]: PacketDispatcher::drain_and_route
 //! [`send`]: PacketDispatcher::send
 
-// The multicast-join capability (mDNS/SSDP); allow dead code until a reflector joins a group.
-#[allow(dead_code)]
 mod multicast;
 
 use std::io;
@@ -45,6 +43,11 @@ const MAX_FRAMES_PER_EVENT: u32 = 64;
 /// The reactor `user_data` for the address monitor's fd. A [`CaptureKey`] packs a `u32`
 /// (via [`to_u64`](CaptureKey::to_u64)), so `u64::MAX` never collides with a real capture.
 const MONITOR_TAG: u64 = u64::MAX;
+
+/// The dispatcher's reused send-buffer size — a standard-MTU datagram fits. One buffer serves
+/// every reflector: the single-threaded loop runs one [`send_udp_group`](PacketDispatcher::send_udp_group)
+/// at a time. An oversized payload is a `BufferTooSmall` error, not a truncation.
+const SCRATCH_LEN: usize = 2048;
 
 /// A `Copy` handle to a capture the dispatcher owns: an index into the interface table's
 /// captures. A newtype, not a bare alias — so it can't be passed where an [`InterfaceKey`]
@@ -315,6 +318,8 @@ pub(crate) struct PacketDispatcher {
     /// The address-change monitor, opened best-effort in [`new`](Self::new). `None` is a
     /// degraded mode: addresses stay at their startup-resolved values.
     monitor: Option<AddressMonitor>,
+    /// The reused frame-build buffer shared by every reflector's send (see [`SCRATCH_LEN`]).
+    scratch: Box<[u8]>,
 }
 
 impl PacketDispatcher {
@@ -326,6 +331,7 @@ impl PacketDispatcher {
             table: InterfaceTable::new(),
             registrations: Vec::new(),
             monitor: Self::open_monitor(),
+            scratch: vec![0u8; SCRATCH_LEN].into_boxed_slice(),
         }
     }
 
@@ -392,7 +398,6 @@ impl PacketDispatcher {
     /// # Errors
     /// Propagates the join's OS error. A family with no address yet is *not* an error — it's
     /// recorded and retried on the next address-up event; only a hard failure surfaces here.
-    #[allow(dead_code)] // wired in when the mDNS reflector lands
     pub(crate) fn join_group(&mut self, capture: CaptureKey, group: IpAddr) -> io::Result<()> {
         let Some(interface) = self.table.interface_of(capture) else {
             log::warn!("join_group: capture {capture:?} unknown; group {group} not joined");
@@ -432,30 +437,33 @@ impl PacketDispatcher {
     /// Build a broadcast/multicast UDP datagram — sourced from the egress's own address —
     /// and inject it on `egress`. The link framing (Ethernet vs `DLT_NULL`) follows the
     /// egress's link type and the L2 destination MAC follows `dst`'s address class; the
-    /// source port, `ttl`, and `payload` are carried verbatim into the new datagram.
-    /// `scratch` is a caller-owned reusable buffer, so the data path never allocates. An
-    /// unknown or draining egress is a logged drop, like [`send`](Self::send).
+    /// source port, `ttl`, and `payload` are carried verbatim into the new datagram. Builds
+    /// into the dispatcher's reused [`scratch`](SCRATCH_LEN) buffer, so the data path never
+    /// allocates. An unknown or draining egress is a logged drop, like [`send`](Self::send).
     ///
     /// # Errors
     /// Propagates a send failure, and reports a frame that can't be built from the egress's
     /// current state — no source address/MAC for the datagram, or a payload that overflows
-    /// `scratch` or the datagram length fields.
+    /// the scratch buffer or the datagram length fields.
     pub(crate) fn send_udp_group(
-        &self,
+        &mut self,
         egress: CaptureKey,
         dst: SocketAddr,
         src_port: u16,
         ttl: u8,
         payload: &[u8],
-        scratch: &mut [u8],
     ) -> io::Result<()> {
-        let (Some(addrs), Some(link)) = (self.egress_addrs(egress), self.link_type(egress)) else {
+        // Copy the addresses out (they're `Copy`) so the borrow of the table ends before the
+        // mutable borrow of `self.scratch`.
+        let (Some(addrs), Some(link)) =
+            (self.egress_addrs(egress).copied(), self.link_type(egress))
+        else {
             log::warn!("egress {egress:?} unavailable (drained or unknown); datagram dropped");
             return Ok(());
         };
-        let n = build_udp_group(addrs, link, dst, src_port, ttl, payload, scratch)
+        let n = build_udp_group(&addrs, link, dst, src_port, ttl, payload, &mut self.scratch)
             .map_err(io::Error::other)?;
-        self.send(egress, &scratch[..n])
+        self.send(egress, &self.scratch[..n])
     }
 
     /// Drain the capture `ingress` addresses and route each parsed packet. Reads up to
@@ -1214,11 +1222,7 @@ mod tests {
         assert!(dispatcher.send(bogus, b"x").is_ok());
         // send_udp_group on an unknown egress is the same logged drop, not a build attempt.
         let dst = SocketAddr::from((Ipv4Addr::BROADCAST, 9));
-        assert!(
-            dispatcher
-                .send_udp_group(bogus, dst, 1, 64, b"x", &mut [0u8; 64])
-                .is_ok()
-        );
+        assert!(dispatcher.send_udp_group(bogus, dst, 1, 64, b"x").is_ok());
         Ok(())
     }
 

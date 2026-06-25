@@ -11,6 +11,7 @@ use crate::config::AddressFamily;
 use crate::dispatch::{CaptureKey, PacketDispatcher};
 use crate::interface::InterfaceAddresses;
 
+pub(crate) mod mdns;
 pub(crate) mod wol;
 
 /// A concrete IP version — the family a reflector requires of an interface. Distinct from the
