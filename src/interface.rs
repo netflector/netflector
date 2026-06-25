@@ -61,6 +61,24 @@ pub(crate) fn if_index(name: &str) -> Option<u32> {
     (index != 0).then_some(index)
 }
 
+/// Log a single source field's transition at `info` — the address churn an operator (and the
+/// address-change e2e) wants visible. Nothing is logged when the field is unchanged.
+fn log_field_change<A: PartialEq + fmt::Display>(
+    iface: &str,
+    family: &str,
+    old: Option<A>,
+    new: Option<A>,
+) {
+    match (old, new) {
+        (None, Some(now)) => log::info!("interface {iface}: gained {family} {now}"),
+        (Some(was), None) => log::info!("interface {iface}: lost {family} (was {was})"),
+        (Some(was), Some(now)) if was != now => {
+            log::info!("interface {iface}: {family} changed {was} -> {now}");
+        }
+        _ => {}
+    }
+}
+
 /// One configured interface: its name (kept for re-resolution), kernel ifindex (the address
 /// monitor's lookup key), and current source addresses. Built by [`open`](Self::open); the
 /// monitor later refreshes `addrs` in place.
@@ -99,6 +117,9 @@ impl Interface {
         #[cfg(target_os = "linux")]
         let addrs = self::rtnetlink::resolve(&self.name, self.ifindex)?;
         log::debug!("{}: resolved {addrs}", self.name);
+        log_field_change(&self.name, "MAC", self.addrs.mac, addrs.mac);
+        log_field_change(&self.name, "IPv4", self.addrs.v4, addrs.v4);
+        log_field_change(&self.name, "IPv6", self.addrs.v6, addrs.v6);
         self.addrs = addrs;
         Ok(())
     }
