@@ -3,10 +3,13 @@
 //! from config. Wake-on-LAN is the first; mDNS and SSDP follow.
 
 use std::fmt;
+use std::net::SocketAddr;
 
 use thiserror::Error;
 
-use crate::dispatch::CaptureKey;
+use crate::config::AddressFamily;
+use crate::dispatch::{CaptureKey, PacketDispatcher};
+use crate::interface::InterfaceAddresses;
 
 pub(crate) mod wol;
 
@@ -56,4 +59,63 @@ pub(crate) enum BuildError {
     /// reflect nothing for that family — a startup failure rather than a silent half-run.
     #[error("target interface \"{interface}\" cannot send {family}, required by the reflector")]
     RequiredFamilyUnavailable { interface: String, family: IpFamily },
+}
+
+/// Whether `egress` currently has a source address of `dst`'s family — what `send_udp_group` needs
+/// to build the frame. The per-packet gate a reflector applies before re-emitting, so a family
+/// whose address has gone away is dropped rather than mis-sent.
+fn egress_sources(dispatcher: &PacketDispatcher, egress: CaptureKey, dst: SocketAddr) -> bool {
+    dispatcher
+        .egress_addrs(egress)
+        .is_some_and(|addrs| match dst {
+            SocketAddr::V4(_) => addrs.v4.is_some(),
+            SocketAddr::V6(_) => addrs.v6.is_some(),
+        })
+}
+
+/// The family `addrs` cannot source but `family` requires, if any — the startup check's verdict.
+/// `None` means every required family is available (a v6-best-effort `Default` with no v6 passes).
+fn missing_required_family(family: AddressFamily, addrs: &InterfaceAddresses) -> Option<IpFamily> {
+    if family.requires_ipv4() && addrs.v4.is_none() {
+        Some(IpFamily::V4)
+    } else if family.requires_ipv6() && addrs.v6.is_none() {
+        Some(IpFamily::V6)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+
+    use super::*;
+
+    #[test]
+    fn missing_required_family_enforces_the_requires_policy() {
+        let none = InterfaceAddresses::default();
+        let v4_only = InterfaceAddresses {
+            v4: Some(Ipv4Addr::LOCALHOST),
+            ..Default::default()
+        };
+        // Default requires v4 only: a v4-less egress fails on v4, a v6-less one passes.
+        assert_eq!(
+            missing_required_family(AddressFamily::Default, &none),
+            Some(IpFamily::V4)
+        );
+        assert_eq!(
+            missing_required_family(AddressFamily::Default, &v4_only),
+            None
+        );
+        // Dual requires both: a v4-only egress still misses v6.
+        assert_eq!(
+            missing_required_family(AddressFamily::Dual, &v4_only),
+            Some(IpFamily::V6)
+        );
+        // Ipv6 requires v6.
+        assert_eq!(
+            missing_required_family(AddressFamily::Ipv6, &v4_only),
+            Some(IpFamily::V6)
+        );
+    }
 }

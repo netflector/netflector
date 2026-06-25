@@ -10,12 +10,11 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use crate::config::{AddressFamily, Reflector};
 use crate::dispatch::{CaptureKey, Filter, PacketDispatcher, PacketHandler};
-use crate::interface::InterfaceAddresses;
 use crate::net::mac::MacAddr;
 use crate::net::packet::Packet;
 use crate::reactor::Reactor;
 
-use super::{BuildError, InterfaceMap, IpFamily};
+use super::{BuildError, InterfaceMap, egress_sources, missing_required_family};
 
 /// The all-ones prefix that opens a magic packet.
 const PREFIX_LEN: usize = 6;
@@ -127,29 +126,6 @@ fn wol_destination(family: AddressFamily, packet: &Packet) -> Option<SocketAddr>
             Some(SocketAddr::from((V6_ALL_NODES, dest.port())))
         }
         _ => None,
-    }
-}
-
-/// Whether the egress currently has a source address of `dst`'s family — what `send_udp_group`
-/// needs to build the frame.
-fn egress_sources(dispatcher: &PacketDispatcher, egress: CaptureKey, dst: SocketAddr) -> bool {
-    dispatcher
-        .egress_addrs(egress)
-        .is_some_and(|addrs| match dst {
-            SocketAddr::V4(_) => addrs.v4.is_some(),
-            SocketAddr::V6(_) => addrs.v6.is_some(),
-        })
-}
-
-/// The family `addrs` cannot source but `family` requires, if any — the startup check's verdict.
-/// `None` means every required family is available (a v6-best-effort `Default` with no v6 passes).
-fn missing_required_family(family: AddressFamily, addrs: &InterfaceAddresses) -> Option<IpFamily> {
-    if family.requires_ipv4() && addrs.v4.is_none() {
-        Some(IpFamily::V4)
-    } else if family.requires_ipv6() && addrs.v6.is_none() {
-        Some(IpFamily::V6)
-    } else {
-        None
     }
 }
 
@@ -293,33 +269,5 @@ mod tests {
         // A single-family policy ignores the other family.
         assert_eq!(wol_destination(AddressFamily::Ipv4, &v6), None);
         assert_eq!(wol_destination(AddressFamily::Ipv6, &v4), None);
-    }
-
-    #[test]
-    fn missing_required_family_enforces_the_requires_policy() {
-        let none = InterfaceAddresses::default();
-        let v4_only = InterfaceAddresses {
-            v4: Some(Ipv4Addr::LOCALHOST),
-            ..Default::default()
-        };
-        // Default requires v4 only: a v4-less egress fails on v4, a v6-less one passes.
-        assert_eq!(
-            missing_required_family(AddressFamily::Default, &none),
-            Some(IpFamily::V4)
-        );
-        assert_eq!(
-            missing_required_family(AddressFamily::Default, &v4_only),
-            None
-        );
-        // Dual requires both: a v4-only egress still misses v6.
-        assert_eq!(
-            missing_required_family(AddressFamily::Dual, &v4_only),
-            Some(IpFamily::V6)
-        );
-        // Ipv6 requires v6.
-        assert_eq!(
-            missing_required_family(AddressFamily::Ipv6, &v4_only),
-            Some(IpFamily::V6)
-        );
     }
 }
