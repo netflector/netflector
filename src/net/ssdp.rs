@@ -6,6 +6,8 @@ pub(crate) mod dial;
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
+use crate::net::http::strip_prefix_ignore_ascii_case;
+
 /// The SSDP UDP port (`UPnP` Device Architecture).
 pub(crate) const SSDP_PORT: u16 = 1900;
 /// SSDP messages default to IP TTL 2 (`UPnP` Device Architecture). The reflector re-emits a fresh
@@ -82,12 +84,6 @@ pub(crate) fn parse_msearch_mx(payload: &[u8]) -> Option<u8> {
         );
     }
     None
-}
-
-/// `line` with `prefix` removed if it begins with it (ASCII case-insensitive), else `None`.
-fn strip_prefix_ignore_ascii_case<'a>(line: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
-    let (head, rest) = line.split_at_checked(prefix.len())?;
-    head.eq_ignore_ascii_case(prefix).then_some(rest)
 }
 
 #[cfg(test)]

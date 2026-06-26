@@ -1,9 +1,7 @@
 //! DIAL (Discovery and Launch) discovery detection and `LOCATION`-authority parsing — the SSDP-side
 //! inputs the DIAL proxy hook needs.
 
-use std::net::{Ipv4Addr, SocketAddrV4};
-
-use super::strip_prefix_ignore_ascii_case;
+use crate::net::http::{Authority, parse_authority, strip_prefix_ignore_ascii_case};
 
 /// The DIAL service-type URN; the trailing `:1` version is dropped so any version matches.
 const DIAL_SERVICE_TYPE: &[u8] = b"urn:dial-multiscreen-org:service:dial";
@@ -12,52 +10,6 @@ const DIAL_SERVICE_TYPE: &[u8] = b"urn:dial-multiscreen-org:service:dial";
 /// `NT` / `USN`), ASCII-case-insensitively. The SSDP path uses this to gate a `LOCATION` rewrite.
 pub(crate) fn is_dial_service_message(payload: &[u8]) -> bool {
     contains_ignore_ascii_case(payload, DIAL_SERVICE_TYPE)
-}
-
-/// A device HTTP authority parsed from a header value, plus the byte span of its `host[:port]` text
-/// within the payload it came from — so a caller splices a replacement over exactly that span. DIAL
-/// is IPv4-only, so the endpoint is a [`SocketAddrV4`].
-pub(crate) struct Authority {
-    pub(crate) endpoint: SocketAddrV4,
-    pub(crate) offset: usize,
-    pub(crate) len: usize,
-}
-
-/// Parse a device authority from `value`. `bare` (a `Host` header) treats the whole value as the
-/// authority; else `value` must be an `http://host[:port]...` URL (no `https`). The host must be an
-/// IPv4 literal (a hostname or IPv6 is rejected — DIAL is IPv4-only); the port defaults to 80, or an
-/// explicit one must be the whole field and in `1..=65535`. `offset`/`len` are relative to `value`.
-pub(crate) fn parse_authority(value: &[u8], bare: bool) -> Option<Authority> {
-    let (rest, auth_offset) = if bare {
-        (value, 0)
-    } else {
-        let rest = strip_prefix_ignore_ascii_case(value, b"http://")?;
-        (rest, value.len() - rest.len())
-    };
-    let len = rest
-        .iter()
-        .position(|&b| matches!(b, b'/' | b' ' | b'\t' | b'\r'))
-        .unwrap_or(rest.len());
-    let authority = &rest[..len];
-    let (host, port) = match authority.iter().rposition(|&b| b == b':') {
-        Some(colon) => {
-            let port = std::str::from_utf8(&authority[colon + 1..])
-                .ok()?
-                .parse::<u16>()
-                .ok()?;
-            if port == 0 {
-                return None;
-            }
-            (&authority[..colon], port)
-        }
-        None => (authority, 80),
-    };
-    let addr = std::str::from_utf8(host).ok()?.parse::<Ipv4Addr>().ok()?;
-    Some(Authority {
-        endpoint: SocketAddrV4::new(addr, port),
-        offset: auth_offset,
-        len,
-    })
 }
 
 /// Parse the device authority from a DIAL discovery message's `LOCATION:` header, the byte span
@@ -200,12 +152,5 @@ mod tests {
             parse_cache_control_max_age(b"CACHE-CONTROL: max-age=abc\r\n"),
             None // non-numeric
         );
-    }
-
-    #[test]
-    fn parse_authority_handles_a_bare_host_value() {
-        let a = parse_authority(b"192.168.1.5:1900", true).unwrap();
-        assert_eq!(a.endpoint, "192.168.1.5:1900".parse().unwrap());
-        assert_eq!((a.offset, a.len), (0, "192.168.1.5:1900".len()));
     }
 }

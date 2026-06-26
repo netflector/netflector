@@ -3,6 +3,7 @@
 
 mod checksum;
 pub(crate) mod frame;
+pub(crate) mod http;
 pub(crate) mod mac;
 pub(crate) mod mdns;
 pub(crate) mod packet;
