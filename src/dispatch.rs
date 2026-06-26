@@ -32,7 +32,7 @@ use crate::net::LinkType;
 use crate::net::frame::{self, FrameError};
 use crate::net::mac::MacAddr;
 use crate::net::packet::Packet;
-use crate::reactor::{Handler, Reactor, ReadyEvent};
+use crate::reactor::{Arena, Handler, Key, Reactor, ReadyEvent};
 
 /// The most frames drained per readable event before yielding, so a flooded interface
 /// can't starve the others. `AF_PACKET` stops here and the level-triggered wait
@@ -79,6 +79,13 @@ impl CaptureKey {
 /// [`CaptureKey`], but a distinct newtype so the two can't be confused.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct InterfaceKey(u32);
+
+/// A `Copy` handle to a routing registration — the generational arena [`Key`] of its slot, newtyped
+/// so it can't be confused with a reactor key or a [`CaptureKey`]. Returned by
+/// [`register`](PacketDispatcher::register); the SSDP search relay will hold it to
+/// [`unregister`](PacketDispatcher::unregister) a per-searcher capture when its session ends.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct RegistrationKey(Key);
 
 /// An optional-field packet filter: an unset field
 /// matches anything. A `src_mac`/`dst_mac` filter never matches a `DLT_NULL` packet,
@@ -314,7 +321,11 @@ impl InterfaceTable {
 /// egress goes through [`send`](Self::send), keyed.
 pub(crate) struct PacketDispatcher {
     table: InterfaceTable,
-    registrations: Vec<Registration>,
+    registrations: Arena<Registration>,
+    /// Reused scratch for [`route`](Self::route)'s per-packet snapshot of the live registration
+    /// keys — taken once at the start of a route so a mid-route registration isn't fed the
+    /// in-flight frame, and kept allocated across calls so the data path doesn't allocate per packet.
+    route_keys: Vec<RegistrationKey>,
     /// The address-change monitor, opened best-effort in [`new`](Self::new). `None` is a
     /// degraded mode: addresses stay at their startup-resolved values.
     monitor: Option<AddressMonitor>,
@@ -329,7 +340,8 @@ impl PacketDispatcher {
     pub(crate) fn new() -> Self {
         Self {
             table: InterfaceTable::new(),
-            registrations: Vec::new(),
+            registrations: Arena::new(),
+            route_keys: Vec::new(),
             monitor: Self::open_monitor(),
             scratch: vec![0u8; SCRATCH_LEN].into_boxed_slice(),
         }
@@ -377,18 +389,28 @@ impl PacketDispatcher {
         watches
     }
 
-    /// Register `handler`, gated by `filter`, for packets captured on `ingress`.
+    /// Register `handler`, gated by `filter`, for packets captured on `ingress`. The returned
+    /// [`Key`] removes it again via [`unregister`](Self::unregister) — for the per-searcher response
+    /// captures the SSDP search relay creates dynamically; a static reflector ignores it.
     pub(crate) fn register(
         &mut self,
         ingress: CaptureKey,
         filter: Filter,
         handler: Box<dyn PacketHandler>,
-    ) {
-        self.registrations.push(Registration {
+    ) -> RegistrationKey {
+        RegistrationKey(self.registrations.insert(Registration {
             ingress,
             filter,
             handler: Some(handler),
-        });
+        }))
+    }
+
+    /// Remove the registration `key` addresses, freeing its slot; a stale key is a safe no-op.
+    /// Tears down a per-searcher response capture when its session expires.
+    // The SSDP search relay (a later step) is the only caller; until it lands this is unused.
+    #[allow(dead_code)]
+    pub(crate) fn unregister(&mut self, key: RegistrationKey) {
+        self.registrations.remove(key.0);
     }
 
     /// Join `group`'s multicast membership on the interface behind `capture`, so the raw capture
@@ -555,29 +577,41 @@ impl PacketDispatcher {
 
     /// Offer `packet` (captured on `ingress`) to every matching registration, in order.
     fn route(&mut self, ingress: CaptureKey, packet: &Packet, reactor: &mut Reactor) {
-        // Snapshot the length: a reflector registering mid-drain must not feed itself
-        // the in-flight frame, and the bound keeps the index walk valid. Registrations
-        // are append-only — so index `k` stays valid across `on_packet` and the put-back
-        // lands in the right slot; a remove-mid-route API would have to defer the removal.
-        let n = self.registrations.len();
-        for k in 0..n {
-            let applies = {
-                let reg = &self.registrations[k];
-                reg.ingress == ingress && reg.filter.matches(packet)
-            };
-            if applies {
-                // Take the matched reflector out of its slot so `&mut self` is free to
-                // pass into the call, then restore it. `take` never misses here: a
-                // `handler` is `None` only transiently, while it's out mid-call, and
-                // `route` runs only from the re-entrancy-guarded drain — so none is in
-                // flight when we arrive. Clearing a `handler` in place to unregister a
-                // reflector would add a second cause and panic this `expect`.
-                let mut handler = self.registrations[k]
-                    .handler
-                    .take()
-                    .expect("a matching registration has its handler present");
-                handler.on_packet(packet, self, reactor);
-                self.registrations[k].handler = Some(handler);
+        // Snapshot the live registration keys into the reused buffer. Taking them once means a
+        // reflector registering mid-route isn't fed the in-flight frame — its key isn't in the
+        // snapshot whether it appended or reused a freed slot — and a generational key keeps the
+        // put-back safe even if a registration is removed during its own call (the key goes stale
+        // and the restore is a no-op). `route` never nests — a handler sends but never re-drains —
+        // so one shared buffer suffices.
+        self.route_keys.clear();
+        self.route_keys.extend(
+            self.registrations
+                .iter()
+                .map(|(key, _)| RegistrationKey(key)),
+        );
+        for i in 0..self.route_keys.len() {
+            let key = self.route_keys[i];
+            let applies = self
+                .registrations
+                .get(key.0)
+                .is_some_and(|reg| reg.ingress == ingress && reg.filter.matches(packet));
+            if !applies {
+                continue;
+            }
+            // Take the matched reflector out so `&mut self` is free for the call, then restore it
+            // by key. `take` never misses: a `handler` is `None` only transiently while out
+            // mid-call, and `route` doesn't re-enter the same registration in one pass. A `get_mut`
+            // miss on the put-back means the call removed this registration — drop it, don't revive.
+            let mut handler = self
+                .registrations
+                .get_mut(key.0)
+                .expect("a key that just matched is still live")
+                .handler
+                .take()
+                .expect("a matching registration has its handler present");
+            handler.on_packet(packet, self, reactor);
+            if let Some(reg) = self.registrations.get_mut(key.0) {
+                reg.handler = Some(handler);
             }
         }
     }
@@ -1130,6 +1164,106 @@ mod tests {
         assert!(!records.is_empty(), "the reflector never fired");
         assert_eq!(records[0].0, PROBE, "reflector saw the wrong payload");
         assert!(records[0].1, "the keyed egress send failed");
+        Ok(())
+    }
+
+    /// A reflector that records each matched packet's payload — for routing/registration tests
+    /// that need no real egress (no capture, no send).
+    struct Recorder {
+        seen: Rc<RefCell<Vec<Vec<u8>>>>,
+    }
+
+    impl PacketHandler for Recorder {
+        fn on_packet(&mut self, packet: &Packet, _: &mut PacketDispatcher, _: &mut Reactor) {
+            self.seen.borrow_mut().push(packet.payload.to_vec());
+        }
+    }
+
+    /// A synthetic v4 UDP packet for routing tests; the default filter matches it.
+    fn probe_packet(payload: &[u8]) -> Packet<'_> {
+        Packet {
+            source: "10.0.0.1:5".parse().unwrap(),
+            dest: "10.0.0.2:9".parse().unwrap(),
+            ttl: 64,
+            dst_mac: None,
+            src_mac: None,
+            payload,
+        }
+    }
+
+    #[test]
+    fn unregister_stops_routing_to_a_handler() -> io::Result<()> {
+        let mut dispatcher = PacketDispatcher::new();
+        let mut reactor = Reactor::new()?;
+        let ingress = CaptureKey::from_u64(0);
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let key = dispatcher.register(
+            ingress,
+            Filter::default(),
+            Box::new(Recorder { seen: seen.clone() }),
+        );
+        dispatcher.route(ingress, &probe_packet(b"a"), &mut reactor);
+        assert_eq!(seen.borrow().len(), 1, "the registration should route once");
+
+        dispatcher.unregister(key);
+        dispatcher.route(ingress, &probe_packet(b"b"), &mut reactor);
+        assert_eq!(
+            seen.borrow().len(),
+            1,
+            "an unregistered handler is no longer routed to"
+        );
+        dispatcher.unregister(key); // the now-stale key removes nothing
+        Ok(())
+    }
+
+    /// Registers a second recorder once, from inside its own call — the mid-route registration.
+    struct Registrar {
+        ingress: CaptureKey,
+        late: Rc<RefCell<Vec<Vec<u8>>>>,
+        done: bool,
+    }
+
+    impl PacketHandler for Registrar {
+        fn on_packet(&mut self, _: &Packet, dispatcher: &mut PacketDispatcher, _: &mut Reactor) {
+            if !std::mem::replace(&mut self.done, true) {
+                dispatcher.register(
+                    self.ingress,
+                    Filter::default(),
+                    Box::new(Recorder {
+                        seen: self.late.clone(),
+                    }),
+                );
+            }
+        }
+    }
+
+    // route snapshots the live registration keys at the start, so a registration created during the
+    // call isn't in the snapshot and doesn't receive the in-flight frame — true whether it appends
+    // or reuses a freed slot (a key snapshot, unlike the old length bound, doesn't depend on index).
+    #[test]
+    fn a_mid_route_registration_is_not_fed_the_in_flight_frame() -> io::Result<()> {
+        let mut dispatcher = PacketDispatcher::new();
+        let mut reactor = Reactor::new()?;
+        let ingress = CaptureKey::from_u64(0);
+        let late = Rc::new(RefCell::new(Vec::new()));
+        dispatcher.register(
+            ingress,
+            Filter::default(),
+            Box::new(Registrar {
+                ingress,
+                late: late.clone(),
+                done: false,
+            }),
+        );
+
+        dispatcher.route(ingress, &probe_packet(b"x"), &mut reactor);
+        assert!(
+            late.borrow().is_empty(),
+            "a registration born this route must not see the in-flight frame",
+        );
+        // It does receive the next frame.
+        dispatcher.route(ingress, &probe_packet(b"y"), &mut reactor);
+        assert_eq!(late.borrow().as_slice(), [b"y".to_vec()]);
         Ok(())
     }
 
