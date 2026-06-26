@@ -86,6 +86,30 @@ pub(crate) fn parse_dial_location_authority(payload: &[u8]) -> Option<Authority>
     None
 }
 
+/// Parse the advertisement's freshness lifetime from a `CACHE-CONTROL: max-age=<seconds>` header — the
+/// seconds an SSDP cache (and so the proxy's description listener) may treat the device as present. The
+/// `max-age` directive is matched case-insensitively among comma-separated directives; `None` if the
+/// header or a parseable `max-age` is absent, leaving the caller to fall back to its default grace.
+pub(crate) fn parse_cache_control_max_age(payload: &[u8]) -> Option<u32> {
+    for line in payload.split(|&b| b == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if let Some(value) = strip_prefix_ignore_ascii_case(line, b"CACHE-CONTROL:") {
+            return max_age_seconds(value);
+        }
+    }
+    None
+}
+
+/// The `max-age` delta-seconds from a `CACHE-CONTROL` value, scanning its comma-separated directives.
+fn max_age_seconds(value: &[u8]) -> Option<u32> {
+    for directive in value.split(|&b| b == b',') {
+        if let Some(digits) = strip_prefix_ignore_ascii_case(directive.trim_ascii(), b"max-age=") {
+            return std::str::from_utf8(digits).ok()?.parse::<u32>().ok();
+        }
+    }
+    None
+}
+
 /// Whether `haystack` contains `needle` as an ASCII-case-insensitive substring.
 fn contains_ignore_ascii_case(haystack: &[u8], needle: &[u8]) -> bool {
     needle.is_empty()
@@ -140,6 +164,42 @@ mod tests {
         assert!(parse_dial_location_authority(b"LOCATION: http://10.0.0.1:0/x\r\n").is_none());
         assert!(parse_dial_location_authority(b"LOCATION: http://10.0.0.1:80x/x\r\n").is_none());
         assert!(parse_dial_location_authority(b"NOTIFY * HTTP/1.1\r\nNT: foo\r\n\r\n").is_none());
+    }
+
+    #[test]
+    fn parses_cache_control_max_age() {
+        let payload = b"NOTIFY * HTTP/1.1\r\nCACHE-CONTROL: max-age=1800\r\nNT: x\r\n\r\n";
+        assert_eq!(parse_cache_control_max_age(payload), Some(1800));
+    }
+
+    #[test]
+    fn max_age_is_case_insensitive_and_directive_tolerant() {
+        // Header name and directive case-insensitive; no space after the colon; among other directives.
+        assert_eq!(
+            parse_cache_control_max_age(b"Cache-Control:no-cache, Max-Age=600\r\n"),
+            Some(600)
+        );
+        assert_eq!(
+            parse_cache_control_max_age(b"CACHE-CONTROL:max-age=42\r\n"),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn cache_control_without_a_parseable_max_age_is_none() {
+        assert_eq!(parse_cache_control_max_age(b"NT: foo\r\n\r\n"), None); // header absent
+        assert_eq!(
+            parse_cache_control_max_age(b"CACHE-CONTROL: no-cache\r\n"),
+            None // no max-age directive
+        );
+        assert_eq!(
+            parse_cache_control_max_age(b"CACHE-CONTROL: max-age=\r\n"),
+            None
+        ); // empty value
+        assert_eq!(
+            parse_cache_control_max_age(b"CACHE-CONTROL: max-age=abc\r\n"),
+            None // non-numeric
+        );
     }
 
     #[test]
