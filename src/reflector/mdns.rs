@@ -17,12 +17,11 @@ use crate::reactor::Reactor;
 use super::{BuildError, InterfaceMap, IpFamily, egress_sources, missing_required_family};
 
 /// A built mDNS relay for one direction of one family: re-emits each message of its `kind` (query
-/// or response) captured on its ingress onto `egress`, to `group`. The dispatcher's filter pins
-/// the group, so the handler only classifies and re-emits.
+/// or response) captured on its ingress onto `egress`, to the message's own destination. The
+/// dispatcher's filter pins that to the group, so the handler only classifies and re-emits.
 struct MdnsReflector {
     egress: CaptureKey,
     kind: MdnsKind,
-    group: SocketAddr,
 }
 
 impl PacketHandler for MdnsReflector {
@@ -43,12 +42,12 @@ impl PacketHandler for MdnsReflector {
             Some(kind) if kind == self.kind => {
                 // A family the egress can't currently source is a quiet drop (transient address
                 // loss), keeping send_udp_group's error meaning a genuine failure.
-                if !egress_sources(dispatcher, self.egress, self.group) {
+                if !egress_sources(dispatcher, self.egress, packet.dest) {
                     return;
                 }
                 match dispatcher.send_udp_group(
                     self.egress,
-                    self.group,
+                    packet.dest,
                     MDNS_PORT,
                     MDNS_TTL,
                     packet.payload,
@@ -57,12 +56,12 @@ impl PacketHandler for MdnsReflector {
                         "reflected mDNS {:?} from {} to {}",
                         self.kind,
                         packet.source,
-                        self.group
+                        packet.dest
                     ),
                     Err(e) => log::warn!(
                         "mDNS: cannot reflect from {} to {}: {e}",
                         packet.source,
-                        self.group
+                        packet.dest
                     ),
                 }
             }
@@ -139,7 +138,6 @@ pub(crate) fn build(
             Box::new(MdnsReflector {
                 egress: target,
                 kind: MdnsKind::Query,
-                group,
             }),
         );
         // target → source: relay responses, optionally only from the configured device's MAC.
@@ -154,7 +152,6 @@ pub(crate) fn build(
             Box::new(MdnsReflector {
                 egress: source,
                 kind: MdnsKind::Response,
-                group,
             }),
         );
     }
