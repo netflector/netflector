@@ -6,9 +6,6 @@ pub(crate) mod frame;
 pub(crate) mod mac;
 pub(crate) mod mdns;
 pub(crate) mod packet;
-// The SSDP reflector (the next step) is the only consumer; until it lands these constants are
-// unused. Retire this allow with that step.
-#[allow(dead_code)]
 pub(crate) mod ssdp;
 
 /// The link-layer framing of a captured or injected frame. The capture layer reports
