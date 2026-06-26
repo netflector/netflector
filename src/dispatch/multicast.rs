@@ -15,7 +15,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 
 use libc::{c_int, c_void};
 
-use crate::sys::{open_dgram_socket, sockaddr_for, socklen_of};
+use crate::sys::{open_socket, sockaddr_for, socklen_of};
 
 /// `MCAST_JOIN_GROUP` (RFC 3678): protocol-independent, selects the interface strictly by index —
 /// no IPv4 by-address fallback to a wrong NIC. libc defines it only on Linux; the BSDs share the
@@ -96,7 +96,9 @@ impl MulticastJoiner {
         };
         let fd = match slot {
             Some(sock) => sock.as_raw_fd(),
-            None => slot.insert(open_dgram_socket(family)?).as_raw_fd(),
+            None => slot
+                .insert(open_socket(family, libc::SOCK_DGRAM)?)
+                .as_raw_fd(),
         };
         let req = GroupReq {
             gr_interface: self.ifindex,

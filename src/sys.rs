@@ -35,7 +35,7 @@ pub(crate) enum RecvOutcome {
 
 /// Triage a `recv`/`read` return value `n`: a non-negative count is `Ready`, a negative one is
 /// classified by errno into the non-blocking-fd contract (`Interrupted`/`WouldBlock`) or a real
-/// error. Single-sources the would-block errno set — an OS contract, not a per-caller detail.
+/// error.
 ///
 /// # Errors
 /// Returns the last OS error for any errno other than `EINTR`/`EAGAIN`/`EWOULDBLOCK`.
@@ -46,14 +46,21 @@ pub(crate) fn classify_recv(n: isize) -> io::Result<RecvOutcome> {
         ));
     }
     let err = io::Error::last_os_error();
-    let errno = err.raw_os_error();
-    if errno == Some(libc::EINTR) {
+    if err.raw_os_error() == Some(libc::EINTR) {
         return Ok(RecvOutcome::Interrupted);
     }
-    if errno == Some(libc::EAGAIN) || errno == Some(libc::EWOULDBLOCK) {
+    if would_block(&err) {
         return Ok(RecvOutcome::WouldBlock);
     }
     Err(err)
+}
+
+/// Whether `err` is the non-blocking "nothing right now" signal (`EAGAIN`/`EWOULDBLOCK`). The two are
+/// equal on our targets, but matched as a pair — via a guard, not an or-pattern whose second arm would
+/// be unreachable — for portability. Single-sources the would-block errno set across the `recv` triage
+/// and the TCP `send`/`accept` paths, an OS contract rather than a per-caller detail.
+pub(crate) fn would_block(err: &io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(e) if e == libc::EAGAIN || e == libc::EWOULDBLOCK)
 }
 
 /// The size of `T` as a `socklen_t`, for `setsockopt`/`bind` length arguments.
@@ -61,18 +68,17 @@ pub(crate) fn socklen_of<T>() -> socklen_t {
     socklen_t::try_from(size_of::<T>()).expect("option/address size fits socklen_t")
 }
 
-/// Open an unbound `SOCK_DGRAM` socket of `family`, close-on-exec and non-blocking — for the
-/// held-not-read sockets (multicast memberships, port reservations). Never read, so non-blocking
-/// isn't required, but on the single-threaded reactor it keeps a stray read from freezing the loop.
-/// Linux and FreeBSD set both flags in the socket type; macOS lacks them and applies them by `fcntl`.
+/// Open a socket of `family` and `base_type` (e.g. `SOCK_DGRAM`/`SOCK_STREAM`), close-on-exec and
+/// non-blocking — non-blocking keeps a stray read from freezing the single-threaded reactor. Linux and
+/// FreeBSD set both flags in the socket type; macOS lacks them and applies them by `fcntl`.
 ///
 /// # Errors
 /// Returns the OS error if the socket can't be opened (or, on macOS, the flags can't be set).
-pub(crate) fn open_dgram_socket(family: c_int) -> io::Result<OwnedFd> {
+pub(crate) fn open_socket(family: c_int, base_type: c_int) -> io::Result<OwnedFd> {
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-    let sock_type = libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK;
+    let sock_type = base_type | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK;
     #[cfg(target_os = "macos")]
-    let sock_type = libc::SOCK_DGRAM;
+    let sock_type = base_type;
     // SAFETY: `socket` returns a fresh owned fd or -1; `owned_fd_from` takes ownership or errors.
     let fd = owned_fd_from(unsafe { libc::socket(family, sock_type, 0) })?;
     #[cfg(target_os = "macos")]

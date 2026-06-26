@@ -9,7 +9,7 @@ use std::io;
 use std::net::IpAddr;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
-use crate::sys::{open_dgram_socket, sockaddr_for, socklen_of};
+use crate::sys::{open_socket, sockaddr_for, socklen_of};
 
 /// A reservation over one OS-assigned ephemeral UDP port on an interface's source address. Owns the
 /// bound socket; `Drop` frees the port.
@@ -33,7 +33,7 @@ impl PortReservation {
             IpAddr::V4(_) => libc::AF_INET,
             IpAddr::V6(_) => libc::AF_INET6,
         };
-        let fd = open_dgram_socket(family)?;
+        let fd = open_socket(family, libc::SOCK_DGRAM)?;
         #[cfg(target_os = "linux")]
         attach_drop_all_filter(fd.as_raw_fd())?;
         let (storage, len) = sockaddr_for(addr, 0, ifindex);
