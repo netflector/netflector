@@ -6,6 +6,9 @@ pub(crate) mod frame;
 pub(crate) mod mac;
 pub(crate) mod mdns;
 pub(crate) mod packet;
+// The SSDP search relay (a later step) is the only consumer; until it lands this is unused.
+#[allow(dead_code)]
+pub(crate) mod port_reservation;
 pub(crate) mod ssdp;
 
 /// The link-layer framing of a captured or injected frame. The capture layer reports

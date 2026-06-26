@@ -3,9 +3,12 @@
 //! and the `SOCK_*` type flags, so it applies close-on-exec / non-blocking by `fcntl`.
 
 use std::io;
+use std::net::IpAddr;
+#[cfg(target_os = "macos")]
+use std::os::fd::AsRawFd;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 
-use libc::socklen_t;
+use libc::{c_int, socklen_t};
 
 /// Take ownership of a raw fd returned by a fd-returning syscall: a negative value is the
 /// POSIX error sentinel; a non-negative one is a fresh fd we own.
@@ -58,6 +61,79 @@ pub(crate) fn socklen_of<T>() -> socklen_t {
     socklen_t::try_from(size_of::<T>()).expect("option/address size fits socklen_t")
 }
 
+/// Open an unbound `SOCK_DGRAM` socket of `family`, close-on-exec and non-blocking — for the
+/// held-not-read sockets (multicast memberships, port reservations). Never read, so non-blocking
+/// isn't required, but on the single-threaded reactor it keeps a stray read from freezing the loop.
+/// Linux and FreeBSD set both flags in the socket type; macOS lacks them and applies them by `fcntl`.
+///
+/// # Errors
+/// Returns the OS error if the socket can't be opened (or, on macOS, the flags can't be set).
+pub(crate) fn open_dgram_socket(family: c_int) -> io::Result<OwnedFd> {
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    let sock_type = libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK;
+    #[cfg(target_os = "macos")]
+    let sock_type = libc::SOCK_DGRAM;
+    // SAFETY: `socket` returns a fresh owned fd or -1; `owned_fd_from` takes ownership or errors.
+    let fd = owned_fd_from(unsafe { libc::socket(family, sock_type, 0) })?;
+    #[cfg(target_os = "macos")]
+    set_cloexec_nonblock(fd.as_raw_fd())?;
+    Ok(fd)
+}
+
+/// Marshal `addr`:`port` into a zeroed `sockaddr_storage` as a `sockaddr_in`/`sockaddr_in6`,
+/// returning it with the family-specific length for a `bind`/option argument. `scope_id` (an
+/// interface index) goes into `sin6_scope_id` for IPv6 — required to bind a link-local address —
+/// and is ignored for IPv4. On the BSDs the `sin*_len` byte is set, which the kernel requires.
+pub(crate) fn sockaddr_for(
+    addr: IpAddr,
+    port: u16,
+    scope_id: u32,
+) -> (libc::sockaddr_storage, socklen_t) {
+    // SAFETY: an all-zero `sockaddr_storage` is a valid (AF_UNSPEC) value; the family and address
+    // are overwritten below through a correctly-typed pointer into storage large enough for them.
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let len = match addr {
+        IpAddr::V4(v4) => {
+            let sin = (&raw mut storage).cast::<libc::sockaddr_in>();
+            // SAFETY: `storage` outlives `sin` and is larger than `sockaddr_in`.
+            unsafe {
+                (*sin).sin_family =
+                    libc::sa_family_t::try_from(libc::AF_INET).expect("AF_INET fits sa_family_t");
+                (*sin).sin_port = port.to_be();
+                (*sin).sin_addr = libc::in_addr {
+                    s_addr: u32::from_ne_bytes(v4.octets()),
+                };
+                #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+                {
+                    (*sin).sin_len =
+                        u8::try_from(size_of::<libc::sockaddr_in>()).expect("sockaddr_in fits u8");
+                }
+            }
+            socklen_of::<libc::sockaddr_in>()
+        }
+        IpAddr::V6(v6) => {
+            let sin6 = (&raw mut storage).cast::<libc::sockaddr_in6>();
+            // SAFETY: `storage` outlives `sin6` and is larger than `sockaddr_in6`.
+            unsafe {
+                (*sin6).sin6_family =
+                    libc::sa_family_t::try_from(libc::AF_INET6).expect("AF_INET6 fits sa_family_t");
+                (*sin6).sin6_port = port.to_be();
+                (*sin6).sin6_addr = libc::in6_addr {
+                    s6_addr: v6.octets(),
+                };
+                (*sin6).sin6_scope_id = scope_id;
+                #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+                {
+                    (*sin6).sin6_len = u8::try_from(size_of::<libc::sockaddr_in6>())
+                        .expect("sockaddr_in6 fits u8");
+                }
+            }
+            socklen_of::<libc::sockaddr_in6>()
+        }
+    };
+    (storage, len)
+}
+
 /// Set `FD_CLOEXEC` and `O_NONBLOCK` on `fd`, read-modify-write so any other flags survive.
 ///
 /// # Errors
@@ -92,4 +168,40 @@ pub(crate) fn set_nonblock(fd: RawFd) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    use super::*;
+
+    #[test]
+    fn sockaddr_for_v4_marshals_a_sockaddr_in() {
+        let (sa, len) = sockaddr_for(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)), 0, 0);
+        assert_eq!(len, socklen_of::<libc::sockaddr_in>());
+        // SAFETY: `sockaddr_for` wrote a `sockaddr_in` into the storage for a V4 address.
+        let sin = unsafe { &*(&raw const sa).cast::<libc::sockaddr_in>() };
+        assert_eq!(
+            sin.sin_family,
+            libc::sa_family_t::try_from(libc::AF_INET).unwrap()
+        );
+        assert_eq!(sin.sin_addr.s_addr, u32::from_ne_bytes([224, 0, 0, 251]));
+        assert_eq!(sin.sin_port, 0);
+    }
+
+    #[test]
+    fn sockaddr_for_v6_carries_the_scope_id() {
+        let v6 = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+        let (sa, len) = sockaddr_for(IpAddr::V6(v6), 0, 7);
+        assert_eq!(len, socklen_of::<libc::sockaddr_in6>());
+        // SAFETY: `sockaddr_for` wrote a `sockaddr_in6` into the storage for a V6 address.
+        let sin6 = unsafe { &*(&raw const sa).cast::<libc::sockaddr_in6>() };
+        assert_eq!(
+            sin6.sin6_family,
+            libc::sa_family_t::try_from(libc::AF_INET6).unwrap()
+        );
+        assert_eq!(sin6.sin6_addr.s6_addr, v6.octets());
+        assert_eq!(sin6.sin6_scope_id, 7);
+    }
 }

@@ -15,7 +15,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 
 use libc::{c_int, c_void};
 
-use crate::sys::{owned_fd_from, socklen_of};
+use crate::sys::{open_dgram_socket, sockaddr_for, socklen_of};
 
 /// `MCAST_JOIN_GROUP` (RFC 3678): protocol-independent, selects the interface strictly by index —
 /// no IPv4 by-address fallback to a wrong NIC. libc defines it only on Linux; the BSDs share the
@@ -96,11 +96,13 @@ impl MulticastJoiner {
         };
         let fd = match slot {
             Some(sock) => sock.as_raw_fd(),
-            None => slot.insert(open_join_socket(family)?).as_raw_fd(),
+            None => slot.insert(open_dgram_socket(family)?).as_raw_fd(),
         };
         let req = GroupReq {
             gr_interface: self.ifindex,
-            gr_group: group_sockaddr(group),
+            // The membership selects the interface by `gr_interface` (the index), so the group
+            // sockaddr carries no scope id.
+            gr_group: sockaddr_for(group, 0, 0).0,
         };
         // SAFETY: `req` is a fully-initialized `group_req`; we pass its address and own size as the
         // option value and length for the protocol-independent join at the family's IP level.
@@ -131,97 +133,11 @@ fn already_member(err: &io::Error) -> bool {
     matches!(err.raw_os_error(), Some(libc::EADDRINUSE | libc::EINVAL))
 }
 
-/// Open an unbound `SOCK_DGRAM` socket of `family` to hold memberships, close-on-exec.
-fn open_join_socket(family: c_int) -> io::Result<OwnedFd> {
-    // Close-on-exec and non-blocking, like the capture sockets. We never read this one, so
-    // non-blocking isn't required — but on a single-threaded reactor it keeps a stray read from
-    // ever freezing the loop. Linux and FreeBSD set both flags in the socket type; macOS lacks them
-    // and applies them by `fcntl`.
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-    let sock_type = libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK;
-    #[cfg(target_os = "macos")]
-    let sock_type = libc::SOCK_DGRAM;
-    // SAFETY: `socket` returns a fresh owned fd or -1; `owned_fd_from` takes ownership or errors.
-    let fd = owned_fd_from(unsafe { libc::socket(family, sock_type, 0) })?;
-    #[cfg(target_os = "macos")]
-    crate::sys::set_cloexec_nonblock(fd.as_raw_fd())?;
-    Ok(fd)
-}
-
-/// Write `group` into a zeroed `sockaddr_storage` as a `sockaddr_in`/`sockaddr_in6` with port 0.
-/// On the BSDs the `sin*_len` byte is set, which the kernel requires for the embedded address.
-fn group_sockaddr(group: IpAddr) -> libc::sockaddr_storage {
-    // SAFETY: an all-zero `sockaddr_storage` is a valid (AF_UNSPEC) value; the family and address
-    // are overwritten below through a correctly-typed pointer into storage large enough for them.
-    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-    match group {
-        IpAddr::V4(v4) => {
-            let sin = (&raw mut storage).cast::<libc::sockaddr_in>();
-            // SAFETY: `storage` outlives `sin` and is larger than `sockaddr_in`.
-            unsafe {
-                (*sin).sin_family =
-                    libc::sa_family_t::try_from(libc::AF_INET).expect("AF_INET fits sa_family_t");
-                (*sin).sin_addr = libc::in_addr {
-                    s_addr: u32::from_ne_bytes(v4.octets()),
-                };
-                #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-                {
-                    (*sin).sin_len =
-                        u8::try_from(size_of::<libc::sockaddr_in>()).expect("sockaddr_in fits u8");
-                }
-            }
-        }
-        IpAddr::V6(v6) => {
-            let sin6 = (&raw mut storage).cast::<libc::sockaddr_in6>();
-            // SAFETY: `storage` outlives `sin6` and is larger than `sockaddr_in6`.
-            unsafe {
-                (*sin6).sin6_family =
-                    libc::sa_family_t::try_from(libc::AF_INET6).expect("AF_INET6 fits sa_family_t");
-                (*sin6).sin6_addr = libc::in6_addr {
-                    s6_addr: v6.octets(),
-                };
-                #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-                {
-                    (*sin6).sin6_len = u8::try_from(size_of::<libc::sockaddr_in6>())
-                        .expect("sockaddr_in6 fits u8");
-                }
-            }
-        }
-    }
-    storage
-}
-
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     use super::*;
-
-    #[test]
-    fn v4_group_marshals_to_a_sockaddr_in() {
-        let sa = group_sockaddr(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)));
-        // SAFETY: `group_sockaddr` wrote a `sockaddr_in` into the storage for a V4 group.
-        let sin = unsafe { &*(&raw const sa).cast::<libc::sockaddr_in>() };
-        assert_eq!(
-            sin.sin_family,
-            libc::sa_family_t::try_from(libc::AF_INET).unwrap()
-        );
-        assert_eq!(sin.sin_addr.s_addr, u32::from_ne_bytes([224, 0, 0, 251]));
-        assert_eq!(sin.sin_port, 0);
-    }
-
-    #[test]
-    fn v6_group_marshals_to_a_sockaddr_in6() {
-        let group = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb);
-        let sa = group_sockaddr(IpAddr::V6(group));
-        // SAFETY: `group_sockaddr` wrote a `sockaddr_in6` into the storage for a V6 group.
-        let sin6 = unsafe { &*(&raw const sa).cast::<libc::sockaddr_in6>() };
-        assert_eq!(
-            sin6.sin6_family,
-            libc::sa_family_t::try_from(libc::AF_INET6).unwrap()
-        );
-        assert_eq!(sin6.sin6_addr.s6_addr, group.octets());
-    }
 
     #[test]
     fn already_member_only_for_the_duplicate_join_errnos() {
