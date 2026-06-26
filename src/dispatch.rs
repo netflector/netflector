@@ -22,6 +22,7 @@ mod multicast;
 use std::io;
 use std::net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::{AsRawFd, RawFd};
+use std::time::Instant;
 
 use thiserror::Error;
 
@@ -122,6 +123,24 @@ pub(crate) trait PacketHandler {
         dispatcher: &mut PacketDispatcher,
         reactor: &mut Reactor,
     );
+
+    /// The earliest instant this handler wants [`on_deadline`](Self::on_deadline) called, or `None`
+    /// (the default) if it keeps no timer. The dispatcher reports the soonest of these to the reactor,
+    /// which waits within it — so a handler tracking timed state (e.g. expiring sessions) is swept on
+    /// time without polling.
+    fn next_deadline(&self) -> Option<Instant> {
+        None
+    }
+
+    /// `now` has reached this handler's [`next_deadline`](Self::next_deadline). As in `on_packet`, it
+    /// gets `&mut PacketDispatcher` (to send / register / unregister) and `&mut Reactor`.
+    fn on_deadline(
+        &mut self,
+        _now: Instant,
+        _dispatcher: &mut PacketDispatcher,
+        _reactor: &mut Reactor,
+    ) {
+    }
 }
 
 /// One routing registration: the ingress it applies to, its filter, and the reflector
@@ -750,6 +769,50 @@ impl Handler for PacketDispatcher {
             self.drain_and_route(CaptureKey::from_u64(event.user_data), reactor);
         }
     }
+
+    /// The soonest deadline any registered handler keeps — the reactor waits within it.
+    fn next_deadline(&self) -> Option<Instant> {
+        // O(registrations) every run-loop iteration. n stays small — a few base handlers plus the
+        // live SSDP sessions (≤32) — so the scan beats a min-heap, whose O(1) peek isn't worth the
+        // entry invalidation a cancelled or moved deadline would force. Revisit if timers grow.
+        self.registrations
+            .iter()
+            .filter_map(|(_, reg)| reg.handler.as_ref().and_then(|h| h.next_deadline()))
+            .min()
+    }
+
+    /// Fire [`PacketHandler::on_deadline`] on every registration whose deadline has reached `now`,
+    /// taking each handler out for its call (as `route` does) so `&mut self` is free. Reached at most
+    /// about once a second and only while a handler keeps a timer, so the snapshot allocation is off
+    /// the data path. A registration removed during its own call isn't restored.
+    fn on_deadline(&mut self, now: Instant, reactor: &mut Reactor) {
+        let due: Vec<RegistrationKey> = self
+            .registrations
+            .iter()
+            .filter(|(_, reg)| {
+                reg.handler
+                    .as_ref()
+                    .and_then(|h| h.next_deadline())
+                    .is_some_and(|d| d <= now)
+            })
+            .map(|(key, _)| RegistrationKey(key))
+            .collect();
+        for key in due {
+            // Gone if an earlier handler in this sweep unregistered it (a sibling, or itself).
+            let Some(mut handler) = self
+                .registrations
+                .get_mut(key.0)
+                .and_then(|reg| reg.handler.take())
+            else {
+                log::trace!("deadline sweep: handler for {key:?} gone mid-sweep, skipped");
+                continue;
+            };
+            handler.on_deadline(now, self, reactor);
+            if let Some(reg) = self.registrations.get_mut(key.0) {
+                reg.handler = Some(handler);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -758,7 +821,7 @@ mod tests {
     use crate::capture::open_or_skip;
     use crate::interface::LOOPBACK_IFACE;
     use crate::net::frame;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, UdpSocket};
     use std::rc::Rc;
     use std::time::{Duration, Instant};
@@ -1213,6 +1276,58 @@ mod tests {
             "an unregistered handler is no longer routed to"
         );
         dispatcher.unregister(key); // the now-stale key removes nothing
+        Ok(())
+    }
+
+    /// A reflector carrying only a timer: reports `deadline` and counts each `on_deadline` sweep —
+    /// for the dispatcher's deadline aggregation/dispatch, with no packets involved.
+    struct Ticker {
+        deadline: Option<Instant>,
+        fired: Rc<Cell<u32>>,
+    }
+
+    impl PacketHandler for Ticker {
+        fn on_packet(&mut self, _: &Packet, _: &mut PacketDispatcher, _: &mut Reactor) {}
+        fn next_deadline(&self) -> Option<Instant> {
+            self.deadline
+        }
+        fn on_deadline(&mut self, _now: Instant, _: &mut PacketDispatcher, _: &mut Reactor) {
+            self.fired.set(self.fired.get() + 1);
+        }
+    }
+
+    #[test]
+    fn reports_the_soonest_deadline_and_sweeps_only_the_due_one() -> io::Result<()> {
+        let mut dispatcher = PacketDispatcher::new();
+        let mut reactor = Reactor::new()?;
+        let ingress = CaptureKey::from_u64(0);
+        let base = Instant::now();
+        let due = Rc::new(Cell::new(0u32));
+        let future = Rc::new(Cell::new(0u32));
+        dispatcher.register(
+            ingress,
+            Filter::default(),
+            Box::new(Ticker {
+                deadline: Some(base),
+                fired: due.clone(),
+            }),
+        );
+        dispatcher.register(
+            ingress,
+            Filter::default(),
+            Box::new(Ticker {
+                deadline: Some(base + Duration::from_secs(10)),
+                fired: future.clone(),
+            }),
+        );
+
+        // The dispatcher hands the reactor the soonest registration deadline.
+        assert_eq!(dispatcher.next_deadline(), Some(base));
+
+        // A sweep fires only the registration whose deadline has come due.
+        dispatcher.on_deadline(base + Duration::from_secs(1), &mut reactor);
+        assert_eq!(due.get(), 1, "the due handler is swept");
+        assert_eq!(future.get(), 0, "the future handler is not");
         Ok(())
     }
 

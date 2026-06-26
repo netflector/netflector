@@ -32,7 +32,7 @@ pub(crate) use self::arena::{Arena, Key};
 use std::io;
 use std::num::NonZeroUsize;
 use std::os::fd::RawFd;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use self::poll::Poller;
 
@@ -72,6 +72,18 @@ pub(crate) trait Handler {
 
     /// The fd that `event.reg_key` addresses is writable and its write interest is armed.
     fn on_writable(&mut self, _event: ReadyEvent, _reactor: &mut Reactor) {}
+
+    /// The earliest instant this handler wants [`on_deadline`](Self::on_deadline) called, or `None`
+    /// if it has no pending timer. The run loop blocks no longer than the soonest across handlers, so
+    /// a handler with work to do at a future time reports it here and is called back at (or after) it.
+    fn next_deadline(&self) -> Option<Instant> {
+        None
+    }
+
+    /// `now` has reached this handler's [`next_deadline`](Self::next_deadline) — its timer fired.
+    /// `now` is the run loop's single read of the clock, passed in so the sweep is testable without
+    /// a real clock. Like the readiness callbacks, the handler gets `&mut Reactor`.
+    fn on_deadline(&mut self, _now: Instant, _reactor: &mut Reactor) {}
 }
 
 /// What a registration is ready for in a given dispatch — the event a poll loop
@@ -332,13 +344,63 @@ impl Reactor {
         result
     }
 
-    /// Dispatch readiness until [`request_shutdown`](Self::request_shutdown) is
-    /// called. Blocks in each wait, so it idles at zero cost between events.
+    /// Dispatch readiness until [`request_shutdown`](Self::request_shutdown) is called, waking no
+    /// later than the soonest handler deadline to run its timer. With no deadline pending it blocks
+    /// indefinitely, so it still idles at zero cost between events.
     fn run_loop(&mut self) -> io::Result<()> {
         while !self.shutdown {
-            self.poll_once(None)?;
+            let deadline = self.next_deadline();
+            let timeout = deadline.map(|d| d.saturating_duration_since(Instant::now()));
+            self.poll_once(timeout)?;
+            // The wait returns on an fd event or once the timeout elapses; sweep only if a deadline
+            // has actually come due (an fd wakeup before it leaves `now < deadline`, so no scan).
+            let now = Instant::now();
+            if deadline.is_some_and(|d| now >= d) {
+                self.dispatch_deadlines(now);
+            }
         }
         Ok(())
+    }
+
+    /// The soonest deadline any handler is waiting on, or `None` if none has a pending timer.
+    fn next_deadline(&self) -> Option<Instant> {
+        self.handlers
+            .iter()
+            .filter_map(|(_, entry)| entry.handler.as_ref().and_then(|h| h.next_deadline()))
+            .min()
+    }
+
+    /// Fire [`Handler::on_deadline`] on every handler whose deadline has reached `now`. Each handler
+    /// is taken out for its call (as in [`dispatch`](Self::dispatch)) so it can touch the reactor;
+    /// one that removes itself mid-call is simply not restored.
+    fn dispatch_deadlines(&mut self, now: Instant) {
+        let due: Vec<Key> = self
+            .handlers
+            .iter()
+            .filter(|(_, entry)| {
+                entry
+                    .handler
+                    .as_ref()
+                    .and_then(|h| h.next_deadline())
+                    .is_some_and(|d| d <= now)
+            })
+            .map(|(key, _)| key)
+            .collect();
+        for key in due {
+            // Gone if an earlier sweep in this pass removed it (its key went stale) — benign.
+            let Some(mut handler) = self
+                .handlers
+                .get_mut(key)
+                .and_then(|entry| entry.handler.take())
+            else {
+                log::trace!("dispatch_deadlines: handler for {key:?} gone mid-sweep, skipped");
+                continue;
+            };
+            handler.on_deadline(now, self);
+            if let Some(entry) = self.handlers.get_mut(key) {
+                entry.handler = Some(handler);
+            }
+        }
     }
 
     /// Ask the run loop to stop once the current dispatch returns. Handlers call
@@ -445,6 +507,9 @@ mod tests {
     /// it needs. Like any real handler, it owns its fd. Each closure gets the [`ReadyEvent`]
     /// that fired plus the reactor.
     type Action = Box<dyn FnMut(ReadyEvent, &mut Reactor)>;
+
+    /// A [`TimerHandler`]'s fire callback, aliased like [`Action`] to keep the field type simple.
+    type TimerAction = Box<dyn FnMut(Instant, &mut Reactor)>;
 
     struct TestHandler {
         fd: OwnedFd,
@@ -778,5 +843,77 @@ mod tests {
         assert_eq!(event.user_data, 0xdead_beef); // the token round-trips
         assert_eq!(event.fd, raw);
         assert_eq!(event.reg_key, rk);
+    }
+
+    /// A handler with no fd that only carries a timer: it reports `deadline` and runs `on_fire`
+    /// when the reactor sweeps it. Lets the deadline path be tested without a real clock or fds.
+    struct TimerHandler {
+        deadline: Option<Instant>,
+        on_fire: TimerAction,
+    }
+
+    impl Handler for TimerHandler {
+        fn on_readable(&mut self, _event: ReadyEvent, _reactor: &mut Reactor) {}
+        fn next_deadline(&self) -> Option<Instant> {
+            self.deadline
+        }
+        fn on_deadline(&mut self, now: Instant, reactor: &mut Reactor) {
+            (self.on_fire)(now, reactor);
+        }
+    }
+
+    fn timer(
+        deadline: Option<Instant>,
+        on_fire: impl FnMut(Instant, &mut Reactor) + 'static,
+    ) -> Box<dyn Handler> {
+        Box::new(TimerHandler {
+            deadline,
+            on_fire: Box::new(on_fire),
+        })
+    }
+
+    #[test]
+    fn next_deadline_reports_the_soonest_across_handlers() {
+        let mut reactor = Reactor::new().unwrap();
+        let base = Instant::now();
+        reactor.register(timer(Some(base + short() * 2), |_, _| {}));
+        reactor.register(timer(Some(base + short()), |_, _| {}));
+        reactor.register(timer(None, |_, _| {})); // no timer — ignored by the min
+        assert_eq!(reactor.next_deadline(), Some(base + short()));
+    }
+
+    #[test]
+    fn dispatch_deadlines_fires_only_the_handlers_that_are_due() {
+        let mut reactor = Reactor::new().unwrap();
+        let base = Instant::now();
+        let due = Rc::new(Cell::new(false));
+        let early = Rc::new(Cell::new(false));
+        reactor.register(timer(Some(base), {
+            let due = due.clone();
+            move |_, _| due.set(true)
+        }));
+        reactor.register(timer(Some(base + short() * 10), {
+            let early = early.clone();
+            move |_, _| early.set(true)
+        }));
+        reactor.dispatch_deadlines(base + short());
+        assert!(due.get(), "a deadline at or before now fires");
+        assert!(!early.get(), "a deadline in the future does not");
+    }
+
+    #[test]
+    fn run_loop_wakes_at_a_deadline_and_runs_the_timer() {
+        let mut reactor = Reactor::new().unwrap();
+        let fired = Rc::new(Cell::new(false));
+        reactor.register(timer(Some(Instant::now() + short()), {
+            let fired = fired.clone();
+            move |_now, reactor| {
+                fired.set(true);
+                reactor.request_shutdown();
+            }
+        }));
+        // No fds are watched, so nothing but the timer elapsing can end the wait.
+        reactor.run_loop().unwrap();
+        assert!(fired.get());
     }
 }
