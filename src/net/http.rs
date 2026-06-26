@@ -1,7 +1,11 @@
-//! HTTP/1.1 message helpers for the TCP path. For now: the IPv4 authority parser shared by the DIAL
-//! proxy's `Host` / `Application-URL` / `Location` rewrites and the SSDP `LOCATION` rewrite, plus the
+//! HTTP/1.1 message helpers for the TCP path: the IPv4 authority parser shared by the DIAL proxy's
+//! `Host` / `Application-URL` / `Location` rewrites and the SSDP `LOCATION` rewrite, plus the
 //! case-insensitive header-prefix match they — and SSDP, which is HTTP-over-UDP — use to find header
-//! lines. The streaming message framer lands in a later step.
+//! lines. The streaming message framer is in the [`framing`] submodule.
+
+// The DIAL proxy (a later step) is the only consumer of the framer; until it lands, it is inert.
+#[allow(dead_code)]
+pub(crate) mod framing;
 
 use std::net::{Ipv4Addr, SocketAddrV4};
 
