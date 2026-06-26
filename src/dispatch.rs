@@ -68,10 +68,11 @@ impl CaptureKey {
         u64::from(self.0)
     }
 
-    /// Reconstruct a key packed by [`to_u64`](Self::to_u64).
+    /// Reconstruct a key packed by [`to_u64`](Self::to_u64); also how a test mints a synthetic key
+    /// for a capture it never opens (the value is only resolved against the table on a real drain).
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
-    fn from_u64(packed: u64) -> Self {
+    pub(crate) fn from_u64(packed: u64) -> Self {
         CaptureKey(packed as u32)
     }
 }
@@ -238,6 +239,14 @@ impl InterfaceTable {
         self.interfaces
             .get(interface.0 as usize)
             .map(|iface| &iface.addrs)
+    }
+
+    /// The kernel ifindex of the interface `capture` runs on — its stable identity, cached at open.
+    fn ifindex_of(&self, capture: CaptureKey) -> Option<u32> {
+        let interface = self.interface_of(capture)?;
+        self.interfaces
+            .get(interface.0 as usize)
+            .map(|iface| iface.ifindex)
     }
 
     /// The name of the interface `interface` keys, if present.
@@ -426,10 +435,14 @@ impl PacketDispatcher {
 
     /// Remove the registration `key` addresses, freeing its slot; a stale key is a safe no-op.
     /// Tears down a per-searcher response capture when its session expires.
-    // The SSDP search reflector (a later step) is the only caller; until it lands this is unused.
-    #[allow(dead_code)]
     pub(crate) fn unregister(&mut self, key: RegistrationKey) {
         self.registrations.remove(key.0);
+    }
+
+    /// The number of live routing registrations — a test seam for the SSDP session lifecycle.
+    #[cfg(test)]
+    pub(crate) fn registration_count(&self) -> usize {
+        self.registrations.iter().count()
     }
 
     /// Join `group`'s multicast membership on the interface behind `capture`, so the raw capture
@@ -466,6 +479,13 @@ impl PacketDispatcher {
     /// needs.
     pub(crate) fn egress_addrs(&self, egress: CaptureKey) -> Option<&InterfaceAddresses> {
         self.table.egress_addrs(egress)
+    }
+
+    /// The kernel ifindex of the interface behind `capture` — its stable identity (the address
+    /// resolver caches it at open, and the joiners bake it too). The SSDP search reflector bakes the
+    /// target's for its IPv6 link-local reserved-port binds. `None` if the key is unknown.
+    pub(crate) fn capture_ifindex(&self, capture: CaptureKey) -> Option<u32> {
+        self.table.ifindex_of(capture)
     }
 
     /// The link-layer framing of the capture behind `egress`, so [`send_udp_group`](Self::send_udp_group)

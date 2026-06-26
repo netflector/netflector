@@ -41,6 +41,51 @@ pub(crate) fn classify(payload: &[u8]) -> Option<SsdpKind> {
     }
 }
 
+/// The fallback M-SEARCH response window (seconds) the caller applies when [`parse_msearch_mx`]
+/// finds no usable MX. A multicast M-SEARCH MUST carry MX (`UPnP` Device Architecture 2.0), so an
+/// absent or unparseable one is a non-conformant searcher — reflected anyway with this window.
+pub(crate) const MSEARCH_MX_DEFAULT: u8 = 3;
+
+/// MX is clamped to `[1, 5]` seconds (`UPnP` Device Architecture 2.0).
+const MX_MIN: u8 = 1;
+const MX_MAX: u8 = 5;
+
+/// Parse an M-SEARCH's `MX:` header — the searcher's maximum response wait, in seconds — clamped to
+/// `[1, 5]`. Scans the payload's CRLF-delimited lines for the first `MX:` field (case-insensitive
+/// name; an M-SEARCH carries no body, so there is no header/body boundary to stop at) and reads its
+/// leading integer. The first `MX:` line is decisive. Returns `None` when MX is absent or its value
+/// isn't a number; the caller substitutes [`MSEARCH_MX_DEFAULT`] and logs the non-conformance.
+pub(crate) fn parse_msearch_mx(payload: &[u8]) -> Option<u8> {
+    for line in payload.split(|&b| b == b'\n') {
+        // Lines are CRLF-delimited; drop the trailing CR left by splitting on LF.
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(value) = strip_prefix_ignore_ascii_case(line, b"MX:") else {
+            continue;
+        };
+        // Skip leading spaces, then the leading run of digits — a trailing non-digit doesn't void a
+        // valid leading number. Empty or out-of-`u32`-range reads as "present but unparseable".
+        let value = value.trim_ascii_start();
+        let end = value
+            .iter()
+            .position(|b| !b.is_ascii_digit())
+            .unwrap_or(value.len());
+        let mx = std::str::from_utf8(&value[..end])
+            .ok()?
+            .parse::<u32>()
+            .ok()?;
+        return Some(
+            u8::try_from(mx.clamp(u32::from(MX_MIN), u32::from(MX_MAX))).unwrap_or(MX_MAX),
+        );
+    }
+    None
+}
+
+/// `line` with `prefix` removed if it begins with it (ASCII case-insensitive), else `None`.
+fn strip_prefix_ignore_ascii_case<'a>(line: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
+    let (head, rest) = line.split_at_checked(prefix.len())?;
+    head.eq_ignore_ascii_case(prefix).then_some(rest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,5 +108,61 @@ mod tests {
         // The method token must be whole: the prefix without its trailing space is not a match.
         assert_eq!(classify(b"NOTIFYING * HTTP/1.1\r\n"), None);
         assert_eq!(classify(b"M-SEARCHED"), None);
+    }
+
+    /// A well-formed M-SEARCH with the given MX field value.
+    fn msearch(mx: &str) -> Vec<u8> {
+        format!(
+            "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n\
+             MAN: \"ssdp:discover\"\r\nMX: {mx}\r\nST: ssdp:all\r\n\r\n"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn parses_and_clamps_the_mx_window() {
+        assert_eq!(parse_msearch_mx(&msearch("3")), Some(3));
+        assert_eq!(parse_msearch_mx(&msearch("1")), Some(1));
+        assert_eq!(parse_msearch_mx(&msearch("5")), Some(5));
+        // Out of range clamps into [1, 5] (0 -> 1; anything above 5, including a value too big for a
+        // u8, -> 5).
+        assert_eq!(parse_msearch_mx(&msearch("0")), Some(1));
+        assert_eq!(parse_msearch_mx(&msearch("10")), Some(5));
+        assert_eq!(parse_msearch_mx(&msearch("900")), Some(5));
+    }
+
+    #[test]
+    fn mx_field_name_is_case_insensitive_and_space_tolerant() {
+        assert_eq!(
+            parse_msearch_mx(b"M-SEARCH * HTTP/1.1\r\nmx:2\r\n\r\n"),
+            Some(2)
+        );
+        assert_eq!(
+            parse_msearch_mx(b"M-SEARCH * HTTP/1.1\r\nMx:   4\r\n\r\n"),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn absent_or_unparseable_mx_is_none() {
+        // No MX header at all.
+        assert_eq!(
+            parse_msearch_mx(b"M-SEARCH * HTTP/1.1\r\nST: ssdp:all\r\n\r\n"),
+            None
+        );
+        // MX present but not a number, and present but empty.
+        assert_eq!(
+            parse_msearch_mx(b"M-SEARCH * HTTP/1.1\r\nMX: soon\r\n\r\n"),
+            None
+        );
+        assert_eq!(
+            parse_msearch_mx(b"M-SEARCH * HTTP/1.1\r\nMX:\r\n\r\n"),
+            None
+        );
+        // The first MX line is decisive: a bad one isn't rescued by a later valid one.
+        assert_eq!(
+            parse_msearch_mx(b"M-SEARCH * HTTP/1.1\r\nMX: x\r\nMX: 3\r\n\r\n"),
+            None
+        );
     }
 }
