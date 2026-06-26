@@ -8,7 +8,9 @@ pub(crate) mod mdns;
 pub(crate) mod packet;
 pub(crate) mod port_reservation;
 pub(crate) mod ssdp;
-// The DIAL proxy (a later step) is the only consumer; until it lands this is inert.
+// The DIAL proxy (a later step) is the only consumer; until it lands these are inert.
+#[allow(dead_code)]
+pub(crate) mod stream_buffer;
 #[allow(dead_code)]
 pub(crate) mod tcp;
 
