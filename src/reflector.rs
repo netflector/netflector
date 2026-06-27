@@ -11,6 +11,9 @@ use crate::config::AddressFamily;
 use crate::dispatch::{CaptureKey, PacketDispatcher};
 use crate::interface::InterfaceAddresses;
 
+// The DIAL proxy is wired in by the SSDP hook (a later step); until then it is inert.
+#[allow(dead_code)]
+pub(crate) mod dial;
 pub(crate) mod mdns;
 pub(crate) mod ssdp;
 pub(crate) mod wol;
