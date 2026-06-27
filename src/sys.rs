@@ -23,39 +23,42 @@ pub(crate) fn owned_fd_from(raw: RawFd) -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(raw) })
 }
 
-/// The outcome of triaging a `recv`/`read` return value via [`classify_recv`].
-pub(crate) enum RecvOutcome {
-    /// `n` bytes were read — possibly 0; the caller decides what an empty read means.
+/// The status of a non-blocking read/write syscall, from [`from_syscall`](IoStatus::from_syscall).
+pub(crate) enum IoStatus {
+    /// `n` bytes were transferred (read or written) — possibly 0; the caller decides what 0 means.
     Ready(usize),
-    /// `EAGAIN`/`EWOULDBLOCK`: nothing available on a non-blocking fd.
+    /// `EAGAIN`/`EWOULDBLOCK`: nothing transferred on a non-blocking fd.
     WouldBlock,
 }
 
-/// Triage a `recv`/`read` return value `n`: a non-negative count is `Ready`, a negative one is
-/// `WouldBlock` on `EAGAIN`/`EWOULDBLOCK` or else a real error. `EINTR` is not special-cased: the
-/// sockets are non-blocking and the shutdown signals install with `SA_RESTART`, so the restartable
-/// recv/read calls auto-restart rather than surfacing `EINTR` (only the non-restartable reactor wait
-/// can, and it retries itself).
-///
-/// # Errors
-/// Returns the last OS error for any errno other than `EAGAIN`/`EWOULDBLOCK`.
-pub(crate) fn classify_recv(n: isize) -> io::Result<RecvOutcome> {
-    if n >= 0 {
-        return Ok(RecvOutcome::Ready(
-            usize::try_from(n).expect("a non-negative recv count fits usize"),
-        ));
+impl IoStatus {
+    /// Triage a read/write syscall's return value `n`: a non-negative count is `Ready`, a negative one
+    /// is `WouldBlock` on `EAGAIN`/`EWOULDBLOCK` or else a real error. `EINTR` is not special-cased:
+    /// the sockets are non-blocking and the shutdown signals install with `SA_RESTART`, so the
+    /// restartable read/write calls auto-restart rather than surfacing `EINTR` (only the
+    /// non-restartable reactor wait can, and it retries itself).
+    ///
+    /// # Errors
+    /// Returns the last OS error for any errno other than `EAGAIN`/`EWOULDBLOCK`.
+    pub(crate) fn from_syscall(n: isize) -> io::Result<IoStatus> {
+        if n >= 0 {
+            return Ok(IoStatus::Ready(
+                usize::try_from(n).expect("a non-negative transfer count fits usize"),
+            ));
+        }
+        let err = io::Error::last_os_error();
+        if would_block(&err) {
+            return Ok(IoStatus::WouldBlock);
+        }
+        Err(err)
     }
-    let err = io::Error::last_os_error();
-    if would_block(&err) {
-        return Ok(RecvOutcome::WouldBlock);
-    }
-    Err(err)
 }
 
 /// Whether `err` is the non-blocking "nothing right now" signal (`EAGAIN`/`EWOULDBLOCK`). The two are
 /// equal on our targets, but matched as a pair — via a guard, not an or-pattern whose second arm would
-/// be unreachable — for portability. Single-sources the would-block errno set across the `recv` triage
-/// and the TCP `send`/`accept` paths, an OS contract rather than a per-caller detail.
+/// be unreachable — for portability. Single-sources the would-block errno set for
+/// [`from_syscall`](IoStatus::from_syscall) (every read/write) and the TCP `accept` path, an OS
+/// contract rather than a per-caller detail.
 pub(crate) fn would_block(err: &io::Error) -> bool {
     matches!(err.raw_os_error(), Some(e) if e == libc::EAGAIN || e == libc::EWOULDBLOCK)
 }

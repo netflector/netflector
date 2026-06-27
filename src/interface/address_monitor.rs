@@ -9,7 +9,7 @@
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
-use crate::sys::RecvOutcome;
+use crate::sys::IoStatus;
 
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 mod route;
@@ -74,11 +74,11 @@ impl AddressMonitor {
                 on_change(0);
                 continue;
             }
-            match crate::sys::classify_recv(n)? {
+            match IoStatus::from_syscall(n)? {
                 // No more queued notifications (or a defensive empty read — routing sockets
                 // don't EOF).
-                RecvOutcome::WouldBlock | RecvOutcome::Ready(0) => return Ok(()),
-                RecvOutcome::Ready(len) => {
+                IoStatus::WouldBlock | IoStatus::Ready(0) => return Ok(()),
+                IoStatus::Ready(len) => {
                     backend::for_each_change(&self.buf[..len], &mut on_change);
                 }
             }

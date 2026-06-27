@@ -8,7 +8,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use libc::{c_int, c_void};
 
-use crate::sys::{RecvOutcome, classify_recv, open_socket, sockaddr_for, socklen_of, would_block};
+use crate::sys::{IoStatus, open_socket, sockaddr_for, socklen_of, would_block};
 
 /// The listen backlog — a DIAL listener fields a few short-lived client fetches, so this is ample.
 const LISTEN_BACKLOG: c_int = 16;
@@ -105,13 +105,13 @@ impl TcpSocket {
     }
 
     /// Read into `buf` (which must be non-empty: `recv` into a zero-length buffer also returns 0,
-    /// aliasing the [`RecvOutcome::Ready(0)`](RecvOutcome) clean-EOF signal — the `std::io::Read::read`
+    /// aliasing the [`IoStatus::Ready(0)`](IoStatus) clean-EOF signal — the `std::io::Read::read`
     /// caveat). The peer closing its write side is then the only legitimate `Ready(0)`; the splice loop
     /// stops reading under backpressure rather than ever passing an empty slice.
     ///
     /// # Errors
     /// Propagates a real read error (other than `EAGAIN`/`EWOULDBLOCK`).
-    pub(crate) fn recv(&self, buf: &mut [u8]) -> io::Result<RecvOutcome> {
+    pub(crate) fn recv(&self, buf: &mut [u8]) -> io::Result<IoStatus> {
         debug_assert!(
             !buf.is_empty(),
             "recv into an empty buffer returns 0, aliasing EOF"
@@ -125,16 +125,16 @@ impl TcpSocket {
                 0,
             )
         };
-        classify_recv(n)
+        IoStatus::from_syscall(n)
     }
 
-    /// Send as much of `buf` as the socket takes now, returning the byte count (0 if it would block).
-    /// A write to a peer that has reset surfaces as an error, not `SIGPIPE` — Rust ignores `SIGPIPE`
-    /// process-wide, so the `send` returns `EPIPE`.
+    /// Send as much of `buf` as the socket takes now — [`IoStatus::Ready(n)`](IoStatus) for `n` bytes
+    /// taken, or `WouldBlock`. A write to a peer that has reset surfaces as an error, not `SIGPIPE` —
+    /// Rust ignores `SIGPIPE` process-wide, so the `send` returns `EPIPE`.
     ///
     /// # Errors
     /// Propagates a real write error (other than `EAGAIN`/`EWOULDBLOCK`).
-    pub(crate) fn send(&self, buf: &[u8]) -> io::Result<usize> {
+    pub(crate) fn send(&self, buf: &[u8]) -> io::Result<IoStatus> {
         // SAFETY: `buf` is a valid readable region of `buf.len()` bytes.
         let n = unsafe {
             libc::send(
@@ -144,24 +144,17 @@ impl TcpSocket {
                 0,
             )
         };
-        if n >= 0 {
-            return Ok(usize::try_from(n).expect("a non-negative send count fits usize"));
-        }
-        let err = io::Error::last_os_error();
-        if would_block(&err) {
-            return Ok(0);
-        }
-        Err(err)
+        IoStatus::from_syscall(n)
     }
 
-    /// Send from several buffers in one `writev` (scatter-gather), returning the byte count taken now
-    /// (0 if it would block). The proxy forwards a rewritten header and a zero-copy body slice in one
-    /// syscall this way, without coalescing them. Like [`send`](Self::send), a write to a reset peer
-    /// surfaces as `EPIPE`, not a signal.
+    /// Send from several buffers in one `writev` (scatter-gather) — [`IoStatus::Ready(n)`](IoStatus)
+    /// for `n` bytes taken, or `WouldBlock`. The proxy forwards a rewritten header and a zero-copy body
+    /// slice in one syscall this way, without coalescing them. Like [`send`](Self::send), a write to a
+    /// reset peer surfaces as `EPIPE`, not a signal.
     ///
     /// # Errors
     /// Propagates a real write error (other than `EAGAIN`/`EWOULDBLOCK`).
-    pub(crate) fn send_vectored(&self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+    pub(crate) fn send_vectored(&self, bufs: &[io::IoSlice<'_>]) -> io::Result<IoStatus> {
         let iovcnt = c_int::try_from(bufs.len()).unwrap_or(c_int::MAX);
         // SAFETY: `io::IoSlice` is ABI-compatible with `iovec`; `bufs.as_ptr()`/`iovcnt` describe a
         // valid array of that many slices for `writev`.
@@ -172,14 +165,7 @@ impl TcpSocket {
                 iovcnt,
             )
         };
-        if n >= 0 {
-            return Ok(usize::try_from(n).expect("a non-negative writev count fits usize"));
-        }
-        let err = io::Error::last_os_error();
-        if would_block(&err) {
-            return Ok(0);
-        }
-        Err(err)
+        IoStatus::from_syscall(n)
     }
 
     /// Best-effort `shutdown(SHUT_RDWR)` — FIN both directions now rather than waiting for `Drop`, so a
@@ -381,12 +367,15 @@ mod tests {
         client.finish_connect().expect("the connect completed");
         assert!(!client.is_connecting());
 
-        assert_eq!(client.send(b"ping").expect("send"), 4);
+        assert!(matches!(
+            client.send(b"ping").expect("send"),
+            IoStatus::Ready(4)
+        ));
         let mut buf = [0u8; 16];
         let n = spin(|| match server.recv(&mut buf)? {
-            RecvOutcome::Ready(0) => panic!("unexpected EOF before the payload"),
-            RecvOutcome::Ready(n) => Ok(Some(n)),
-            RecvOutcome::WouldBlock => Ok(None),
+            IoStatus::Ready(0) => panic!("unexpected EOF before the payload"),
+            IoStatus::Ready(n) => Ok(Some(n)),
+            IoStatus::WouldBlock => Ok(None),
         });
         assert_eq!(&buf[..n], b"ping");
     }
@@ -403,12 +392,12 @@ mod tests {
         let sent = client
             .send_vectored(&[io::IoSlice::new(b"head"), io::IoSlice::new(b"body")])
             .expect("send_vectored");
-        assert_eq!(sent, 8);
+        assert!(matches!(sent, IoStatus::Ready(8)));
         let mut buf = [0u8; 16];
         let n = spin(|| match server.recv(&mut buf)? {
-            RecvOutcome::Ready(0) => panic!("unexpected EOF before the payload"),
-            RecvOutcome::Ready(n) => Ok(Some(n)),
-            RecvOutcome::WouldBlock => Ok(None),
+            IoStatus::Ready(0) => panic!("unexpected EOF before the payload"),
+            IoStatus::Ready(n) => Ok(Some(n)),
+            IoStatus::WouldBlock => Ok(None),
         });
         assert_eq!(&buf[..n], b"headbody");
     }

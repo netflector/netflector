@@ -18,7 +18,7 @@ use libc::{c_uint, c_ulong, c_void};
 
 use super::filter::{BpfInsn, DLT_NULL_UDP_FILTER, ETHERNET_UDP_FILTER};
 use crate::net::LinkType;
-use crate::sys::RecvOutcome;
+use crate::sys::IoStatus;
 
 // DLT_EN10MB (Ethernet, 1) and DLT_NULL (0) are stable BPF link types,
 // but libc exposes them only on apple — define them locally, anchored to libc's
@@ -236,9 +236,9 @@ impl Capture {
                 self.buf.len(),
             )
         };
-        let bytes = match crate::sys::classify_recv(n)? {
-            RecvOutcome::Ready(len) => len,
-            RecvOutcome::WouldBlock => return Ok(false),
+        let bytes = match IoStatus::from_syscall(n)? {
+            IoStatus::Ready(len) => len,
+            IoStatus::WouldBlock => return Ok(false),
         };
         if bytes == 0 {
             return Ok(false);
