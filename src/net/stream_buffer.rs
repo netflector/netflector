@@ -61,6 +61,26 @@ impl StreamBuffer {
         Ok(())
     }
 
+    /// The free space at the back, to receive into in place. Reclaims the consumed prefix first when
+    /// the tail is exhausted, so the whole spare capacity is offered as one slice; pair with
+    /// [`commit`](Self::commit) to mark how many bytes landed. Empty only when the buffer is full of
+    /// live bytes — the caller then holds an unframable, over-long message and drops-and-closes.
+    pub(crate) fn free_tail_mut(&mut self) -> &mut [u8] {
+        if self.filled == self.storage.len() && self.consumed > 0 {
+            self.compact();
+        }
+        &mut self.storage[self.filled..]
+    }
+
+    /// Mark `n` bytes — received into [`free_tail_mut`](Self::free_tail_mut) — as filled.
+    pub(crate) fn commit(&mut self, n: usize) {
+        debug_assert!(
+            self.filled + n <= self.storage.len(),
+            "commit past the capacity"
+        );
+        self.filled += n;
+    }
+
     /// Drop the first `n` bytes after a send wrote them. Resets both cursors to the front once the
     /// buffer empties, so a fully-drained buffer offers its whole capacity again.
     pub(crate) fn consume(&mut self, n: usize) {
@@ -154,6 +174,36 @@ mod tests {
         // The failed append didn't disturb the live bytes.
         assert_eq!(b.pending(), b"abc");
         assert_eq!(b.len(), 3);
+    }
+
+    #[test]
+    fn free_tail_mut_offers_the_spare_capacity_and_commit_fills_it() {
+        let mut b = StreamBuffer::with_capacity(8);
+        b.append(b"ab").unwrap();
+        let tail = b.free_tail_mut();
+        assert_eq!(tail.len(), 6);
+        tail[..3].copy_from_slice(b"xyz");
+        b.commit(3);
+        assert_eq!(b.pending(), b"abxyz");
+    }
+
+    #[test]
+    fn free_tail_mut_compacts_when_the_tail_is_exhausted() {
+        let mut b = StreamBuffer::with_capacity(4);
+        b.append(b"abcd").unwrap(); // tail full
+        b.consume(2); // live "cd"; tail exhausted but 2 bytes reclaimable
+        let tail = b.free_tail_mut(); // compacts: "cd" slides to the front
+        assert_eq!(tail.len(), 2);
+        tail.copy_from_slice(b"ef");
+        b.commit(2);
+        assert_eq!(b.pending(), b"cdef");
+    }
+
+    #[test]
+    fn free_tail_mut_is_empty_when_full_of_live_bytes() {
+        let mut b = StreamBuffer::with_capacity(4);
+        b.append(b"abcd").unwrap();
+        assert!(b.free_tail_mut().is_empty()); // no consumed prefix to reclaim
     }
 
     #[test]
