@@ -154,6 +154,34 @@ impl TcpSocket {
         Err(err)
     }
 
+    /// Send from several buffers in one `writev` (scatter-gather), returning the byte count taken now
+    /// (0 if it would block). The proxy forwards a rewritten header and a zero-copy body slice in one
+    /// syscall this way, without coalescing them. Like [`send`](Self::send), a write to a reset peer
+    /// surfaces as `EPIPE`, not a signal.
+    ///
+    /// # Errors
+    /// Propagates a real write error (other than `EAGAIN`/`EWOULDBLOCK`).
+    pub(crate) fn send_vectored(&self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        let iovcnt = c_int::try_from(bufs.len()).unwrap_or(c_int::MAX);
+        // SAFETY: `io::IoSlice` is ABI-compatible with `iovec`; `bufs.as_ptr()`/`iovcnt` describe a
+        // valid array of that many slices for `writev`.
+        let n = unsafe {
+            libc::writev(
+                self.fd.as_raw_fd(),
+                bufs.as_ptr().cast::<libc::iovec>(),
+                iovcnt,
+            )
+        };
+        if n >= 0 {
+            return Ok(usize::try_from(n).expect("a non-negative writev count fits usize"));
+        }
+        let err = io::Error::last_os_error();
+        if would_block(&err) {
+            return Ok(0);
+        }
+        Err(err)
+    }
+
     /// Best-effort `shutdown(SHUT_RDWR)` — FIN both directions now rather than waiting for `Drop`, so a
     /// proxied peer isn't left hanging. An error (e.g. already disconnected) is ignored.
     pub(crate) fn shutdown(&self) {
@@ -361,5 +389,27 @@ mod tests {
             RecvOutcome::WouldBlock | RecvOutcome::Interrupted => Ok(None),
         });
         assert_eq!(&buf[..n], b"ping");
+    }
+
+    #[test]
+    fn loopback_send_vectored_concatenates_the_slices() {
+        let listener = TcpSocket::listen(Ipv4Addr::LOCALHOST).expect("listen on loopback");
+        let mut client = TcpSocket::connect(listener.local_addr(), Ipv4Addr::LOCALHOST, 0)
+            .expect("connect to loopback");
+        let server = spin(|| listener.accept());
+        client.finish_connect().expect("the connect completed");
+
+        // A header and a body slice go out in one writev, arriving concatenated.
+        let sent = client
+            .send_vectored(&[io::IoSlice::new(b"head"), io::IoSlice::new(b"body")])
+            .expect("send_vectored");
+        assert_eq!(sent, 8);
+        let mut buf = [0u8; 16];
+        let n = spin(|| match server.recv(&mut buf)? {
+            RecvOutcome::Ready(0) => panic!("unexpected EOF before the payload"),
+            RecvOutcome::Ready(n) => Ok(Some(n)),
+            RecvOutcome::WouldBlock | RecvOutcome::Interrupted => Ok(None),
+        });
+        assert_eq!(&buf[..n], b"headbody");
     }
 }
