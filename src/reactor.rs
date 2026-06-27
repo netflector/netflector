@@ -128,12 +128,13 @@ struct HandlerEntry {
     regs: Vec<RegKey>,
 }
 
-/// One watched fd: the fd, the handler it dispatches to, and whether its write interest
+/// One watched fd: the fd, the handler it dispatches to, and whether its read/write interest
 /// is armed. The poll layer tags the fd with this registration's [`RegKey`], so an event
 /// names the exact fd.
 struct Registration {
     fd: RawFd,
     handler_key: HandlerKey,
+    read_interest: bool,
     write_interest: bool,
     user_data: u64,
 }
@@ -225,6 +226,7 @@ impl Reactor {
         let reg_key = RegKey(self.registrations.insert(Registration {
             fd,
             handler_key,
+            read_interest: true,
             write_interest: false,
             user_data,
         }));
@@ -301,13 +303,45 @@ impl Reactor {
             return Ok(false);
         };
         // Program the kernel first; flip the in-memory flag only on success, so the arena
-        // and the kernel never disagree about write interest. (`self.poll` and
-        // `self.registrations` are disjoint fields, so the `registration` borrow can stay
-        // live across the syscall.)
-        self.poll.set_write(registration.fd, reg_key.0, enabled)?;
+        // and the kernel never disagree about interest. (`self.poll` and `self.registrations`
+        // are disjoint fields, so the `registration` borrow can stay live across the syscall.)
+        self.poll.set_interest(
+            registration.fd,
+            reg_key.0,
+            registration.read_interest,
+            enabled,
+        )?;
         registration.write_interest = enabled;
         log::trace!(
             "fd {}: write interest {}",
+            registration.fd,
+            if enabled { "armed" } else { "disarmed" }
+        );
+        Ok(true)
+    }
+
+    /// Arm or disarm delivery of read readiness for the fd that `reg_key` addresses (armed at
+    /// [`watch`](Self::watch)). Returns whether the registration was live. Disarming stops data and a
+    /// peer's half-close (FIN) from waking the handler; a full hangup/error still surfaces (as readable
+    /// on epoll, via the write filter or the deadline on kqueue), so a closed fd is never silently stuck.
+    ///
+    /// # Errors
+    /// Returns an error if updating the kernel's read interest fails.
+    #[allow(dead_code)] // wired in by the DIAL half-close drain (a later step)
+    pub(crate) fn set_read_interest(&mut self, reg_key: RegKey, enabled: bool) -> io::Result<bool> {
+        let Some(registration) = self.registrations.get_mut(reg_key.0) else {
+            log::trace!("set_read_interest: {reg_key:?} already gone");
+            return Ok(false);
+        };
+        self.poll.set_interest(
+            registration.fd,
+            reg_key.0,
+            enabled,
+            registration.write_interest,
+        )?;
+        registration.read_interest = enabled;
+        log::trace!(
+            "fd {}: read interest {}",
             registration.fd,
             if enabled { "armed" } else { "disarmed" }
         );

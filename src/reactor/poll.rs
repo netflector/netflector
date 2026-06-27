@@ -72,15 +72,41 @@ mod tests {
         assert_eq!(poller.wait(Some(short())).unwrap(), 0);
 
         // Armed: a fresh socket has room to send, so it is writable.
-        poller.set_write(a.as_raw_fd(), key, true).unwrap();
+        poller.set_interest(a.as_raw_fd(), key, true, true).unwrap();
         assert_eq!(poller.wait(Some(short())).unwrap(), 1);
         let event = poller.next_event().unwrap();
         assert_eq!(event.key, key);
         assert!(event.readiness.writable);
 
         // Disarmed again: back to nothing.
-        poller.set_write(a.as_raw_fd(), key, false).unwrap();
+        poller
+            .set_interest(a.as_raw_fd(), key, true, false)
+            .unwrap();
         assert_eq!(poller.wait(Some(short())).unwrap(), 0);
+    }
+
+    #[test]
+    fn read_interest_toggles() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let mut poller = Poller::new(CAPACITY).unwrap();
+        let key = Key::from_u64(9);
+        poller.add(a.as_raw_fd(), key).unwrap();
+        (&b).write_all(b"x").unwrap();
+
+        // Read armed by add(): the byte makes `a` readable.
+        assert_eq!(poller.wait(Some(short())).unwrap(), 1);
+
+        // Disarm read: the still-buffered byte no longer wakes us.
+        poller
+            .set_interest(a.as_raw_fd(), key, false, false)
+            .unwrap();
+        assert_eq!(poller.wait(Some(short())).unwrap(), 0);
+
+        // Re-arm read: the buffered byte fires again (level-triggered).
+        poller
+            .set_interest(a.as_raw_fd(), key, true, false)
+            .unwrap();
+        assert_eq!(poller.wait(Some(short())).unwrap(), 1);
     }
 
     #[test]
@@ -90,7 +116,9 @@ mod tests {
         let key = Key::from_u64(1);
         poller.add(a.as_raw_fd(), key).unwrap();
         // Disarming write interest that was never armed must succeed.
-        poller.set_write(a.as_raw_fd(), key, false).unwrap();
+        poller
+            .set_interest(a.as_raw_fd(), key, true, false)
+            .unwrap();
     }
 
     #[test]

@@ -1,8 +1,8 @@
 //! kqueue readiness backend for macOS (the dev host) and FreeBSD.
 //!
-//! Level-triggered: read interest is added once and stays armed, write interest
-//! is toggled per registration. The reactor [`Key`] travels in each event's
-//! `udata`, so a wakeup carries its own routing — no fd-to-handler side table.
+//! Level-triggered: read and write interest are toggled per registration (independent kqueue
+//! filters). The reactor [`Key`] travels in each event's `udata`, so a wakeup carries its own
+//! routing — no fd-to-handler side table.
 
 use std::io;
 use std::mem;
@@ -46,31 +46,42 @@ impl Poller {
         })
     }
 
-    /// Add level-triggered read interest on `fd`, tagged with `key`. Write
-    /// interest starts off; toggle it with [`set_write`](Self::set_write).
+    /// Register `fd` with level-triggered read interest, tagged with `key`. Write
+    /// interest starts off; change either with [`set_interest`](Self::set_interest).
     pub(crate) fn add(&self, fd: RawFd, key: Key) -> io::Result<()> {
         self.change(fd, libc::EVFILT_READ, libc::EV_ADD | libc::EV_ENABLE, key)?;
         log::trace!("kqueue: armed read on fd {fd}");
         Ok(())
     }
 
-    /// Arm or disarm write interest on `fd` (already [added](Self::add)).
-    pub(crate) fn set_write(&self, fd: RawFd, key: Key, enabled: bool) -> io::Result<()> {
-        let flags = if enabled {
+    /// Set `fd`'s interest (already [added](Self::add)) to `read`/`write`. The read filter from
+    /// [`add`](Self::add) is toggled with `EV_ENABLE`/`EV_DISABLE` (it stays registered); the write
+    /// filter is added/deleted on demand.
+    pub(crate) fn set_interest(
+        &self,
+        fd: RawFd,
+        key: Key,
+        read: bool,
+        write: bool,
+    ) -> io::Result<()> {
+        let read_flag = if read {
+            libc::EV_ENABLE
+        } else {
+            libc::EV_DISABLE
+        };
+        self.change(fd, libc::EVFILT_READ, read_flag, key)?;
+        let write_flags = if write {
             libc::EV_ADD | libc::EV_ENABLE
         } else {
             libc::EV_DELETE
         };
-        match self.change(fd, libc::EVFILT_WRITE, flags, key) {
+        match self.change(fd, libc::EVFILT_WRITE, write_flags, key) {
             Ok(()) => {}
-            // Disarming a write filter that was never armed is a no-op.
-            Err(e) if !enabled && e.raw_os_error() == Some(libc::ENOENT) => {}
+            // Deleting a write filter that was never armed is a no-op.
+            Err(e) if !write && e.raw_os_error() == Some(libc::ENOENT) => {}
             Err(e) => return Err(e),
         }
-        log::trace!(
-            "kqueue: write interest {} on fd {fd}",
-            if enabled { "armed" } else { "disarmed" }
-        );
+        log::trace!("kqueue: interest read={read} write={write} on fd {fd}");
         Ok(())
     }
 

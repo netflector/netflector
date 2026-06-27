@@ -1,9 +1,8 @@
 //! epoll readiness backend for Linux (including the embedded ARM targets).
 //!
-//! Level-triggered: read interest is added once and stays armed, write interest
-//! is toggled per registration via a full-mask `EPOLL_CTL_MOD` (epoll has no
-//! per-direction enable). The reactor [`Key`] travels in each event's `u64`
-//! field, so a wakeup carries its own routing — no fd-to-handler side table.
+//! Level-triggered: read and write interest are toggled per registration via a full-mask
+//! `EPOLL_CTL_MOD` (epoll has no per-direction enable). The reactor [`Key`] travels in each event's
+//! `u64` field, so a wakeup carries its own routing — no fd-to-handler side table.
 
 use std::io;
 use std::mem;
@@ -50,8 +49,8 @@ impl Poller {
         })
     }
 
-    /// Add level-triggered read interest on `fd`, tagged with `key`. Write
-    /// interest starts off; toggle it with [`set_write`](Self::set_write).
+    /// Register `fd` with level-triggered read interest, tagged with `key`. Write
+    /// interest starts off; change either with [`set_interest`](Self::set_interest).
     pub(crate) fn add(&self, fd: RawFd, key: Key) -> io::Result<()> {
         // A re-add (EEXIST) is a caller bug; surface it instead of silently
         // modifying. The reactor enforces add-once uniformly (kqueue's EV_ADD
@@ -61,15 +60,25 @@ impl Poller {
         Ok(())
     }
 
-    /// Arm or disarm write interest on `fd` (already [added](Self::add)). epoll
-    /// has no per-direction toggle, so this rewrites the full interest mask.
-    pub(crate) fn set_write(&self, fd: RawFd, key: Key, enabled: bool) -> io::Result<()> {
-        let mask = if enabled { READ | WRITE } else { READ };
+    /// Set `fd`'s interest (already [added](Self::add)) to `read`/`write`. epoll has no per-direction
+    /// toggle, so this rewrites the full mask from both flags. Errors and hangups are reported
+    /// regardless of the mask, so a read-disarmed fd still wakes (as readable) on a hangup/error.
+    pub(crate) fn set_interest(
+        &self,
+        fd: RawFd,
+        key: Key,
+        read: bool,
+        write: bool,
+    ) -> io::Result<()> {
+        let mut mask = 0;
+        if read {
+            mask |= READ;
+        }
+        if write {
+            mask |= WRITE;
+        }
         self.ctl(libc::EPOLL_CTL_MOD, fd, mask, key)?;
-        log::trace!(
-            "epoll: write interest {} on fd {fd}",
-            if enabled { "armed" } else { "disarmed" }
-        );
+        log::trace!("epoll: interest read={read} write={write} on fd {fd}");
         Ok(())
     }
 
