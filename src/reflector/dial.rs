@@ -7,16 +7,22 @@
 //! connect/idle deadlines, per-direction HTTP framing and forwarding (the request's `Host` rewritten to
 //! the device, the response's `Application-URL`/`Location` to the proxy's REST/description listeners),
 //! drop-and-close backpressure, independent per-direction half-close (one side's EOF flushes its
-//! remaining bytes and FINs the peer while the reverse direction keeps flowing), teardown, and
-//! self-eviction. Constructing and registering one of these per advertised device — the SSDP
-//! `LOCATION` rewrite that mints it — lives in the SSDP reflector and follows in the next step.
+//! remaining bytes and FINs the peer while the reverse direction keeps flowing), and teardown. The
+//! proxy's own lifetime — eviction once the device's advertisement grace lapses — is owned by the
+//! `DialContext` registry (the proxy never sees advertisements). Constructing and registering one per
+//! advertised device — the SSDP `LOCATION` rewrite that mints it — lives in the SSDP reflector next.
 
+use std::fmt;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::{Duration, Instant};
 
+use crate::dispatch::{CaptureKey, DialContext};
 use crate::net::http::framing::{AuthorityHeader, HttpFraming, Kind, RewritePolicy};
+use crate::net::ssdp::dial::{
+    is_dial_service_message, parse_cache_control_max_age, parse_dial_location_authority,
+};
 use crate::net::stream_buffer::StreamBuffer;
 use crate::net::tcp::TcpSocket;
 use crate::reactor::{Arena, Handler, HandlerKey, Key, Reactor, ReadyEvent, RegKey};
@@ -471,6 +477,22 @@ fn split_remainder<'a>(header: &'a [u8], body: &'a [u8], sent: usize) -> (&'a [u
     }
 }
 
+/// Which of a proxy's two source-side listeners — names it in a log message.
+#[derive(Clone, Copy)]
+enum Listener {
+    Description,
+    Rest,
+}
+
+impl fmt::Display for Listener {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Description => "description",
+            Self::Rest => "REST",
+        })
+    }
+}
+
 /// A per-device DIAL proxy — a reactor `Handler` owning a description listener and its connections.
 pub(crate) struct DialDeviceProxy {
     /// This handler's own key, learned via [`adopt_key`](Handler::adopt_key); used to watch fds it
@@ -488,9 +510,6 @@ pub(crate) struct DialDeviceProxy {
     desc: TcpSocket,
     /// The device's description endpoint (`device-ip:desc_port`) — the proxy's identity.
     desc_endpoint: SocketAddrV4,
-    /// The instant the description listener may be reaped after, once idle — the advertisement's
-    /// `max-age`, refreshed on re-advertisement.
-    desc_grace: Instant,
     /// The REST listener (source side); its connections proxy to the device's REST endpoint. Eager-minted
     /// so its address is fixed and available to rewrite a description response's `Application-URL` to.
     rest: TcpSocket,
@@ -502,15 +521,15 @@ pub(crate) struct DialDeviceProxy {
 
 impl DialDeviceProxy {
     /// A proxy fronting `desc_endpoint` via the source-side `desc` listener. Device connections bind the
-    /// target-interface `target` and egress-pin `target_ifindex`; `desc_grace` is when the listener may
-    /// be reaped after once idle.
+    /// target-interface `target` and egress-pin `target_ifindex`. The proxy's lifetime (eviction past the
+    /// advertisement's grace) is owned by the [`DialContext`](crate::dispatch::DialContext) registry, not
+    /// the proxy itself, since the proxy never sees the advertisements that refresh it.
     pub(crate) fn new(
         source: Ipv4Addr,
         target: Ipv4Addr,
         target_ifindex: u32,
         desc: TcpSocket,
         desc_endpoint: SocketAddrV4,
-        desc_grace: Instant,
         rest: TcpSocket,
     ) -> Self {
         Self {
@@ -520,7 +539,6 @@ impl DialDeviceProxy {
             target_ifindex,
             desc,
             desc_endpoint,
-            desc_grace,
             rest,
             rest_endpoint: None,
             conns: Arena::new(),
@@ -538,7 +556,7 @@ impl DialDeviceProxy {
     /// listeners are non-blocking, so a level-triggered wait re-fires while more wait; an accept is
     /// always taken (draining the readiness) even at the shared connection cap, where the client is
     /// dropped. `what` names the listener for the log.
-    fn accept_client(&self, listener: &TcpSocket, what: &str) -> Option<TcpSocket> {
+    fn accept_client(&self, listener: &TcpSocket, what: Listener) -> Option<TcpSocket> {
         let client = match listener.accept() {
             Ok(Some(client)) => client,
             Ok(None) => return None, // spurious / already taken
@@ -556,7 +574,7 @@ impl DialDeviceProxy {
 
     /// Accept a client on the description listener and proxy it to the device's description endpoint.
     fn accept_desc(&mut self, reactor: &mut Reactor) {
-        if let Some(client) = self.accept_client(&self.desc, "description") {
+        if let Some(client) = self.accept_client(&self.desc, Listener::Description) {
             self.start_connection(client, self.desc_endpoint, self.desc.local_addr(), reactor);
         }
     }
@@ -565,7 +583,7 @@ impl DialDeviceProxy {
     /// prior description fetch. A client reaching the REST listener before that fetch (the proxy minted
     /// the listener's address into the description's `Application-URL`, so this is unexpected) is dropped.
     fn accept_rest(&mut self, reactor: &mut Reactor) {
-        let Some(client) = self.accept_client(&self.rest, "REST") else {
+        let Some(client) = self.accept_client(&self.rest, Listener::Rest) else {
             return;
         };
         let Some(device) = self.rest_endpoint else {
@@ -728,8 +746,8 @@ impl DialDeviceProxy {
         log::debug!("dial: closed a connection to {}", conn.device_endpoint);
     }
 
-    /// Close connections past their deadline (connect timeout or idle), then self-unregister once
-    /// idle past the description grace — the device's advertised validity has lapsed with no traffic.
+    /// Close connections past their deadline (connect timeout or idle). The proxy itself is evicted past
+    /// its advertisement grace by the [`DialContext`](crate::dispatch::DialContext) registry, not here.
     fn sweep(&mut self, now: Instant, reactor: &mut Reactor) {
         let expired: Vec<(ConnectionKey, SocketAddrV4)> = self
             .conns
@@ -740,10 +758,6 @@ impl DialDeviceProxy {
         for (conn_key, device_endpoint) in expired {
             log::debug!("dial: connection to {device_endpoint} timed out");
             self.close_conn(conn_key, reactor);
-        }
-        if self.conns.iter().next().is_none() && now >= self.desc_grace {
-            log::debug!("dial: idle past its grace; evicting the proxy");
-            reactor.unregister(self.own_key()).ok();
         }
     }
 }
@@ -773,17 +787,130 @@ impl Handler for DialDeviceProxy {
     }
 
     fn next_deadline(&self) -> Option<Instant> {
-        // While connections are live, wake at the soonest; otherwise wake at the description grace to
-        // self-reap once the device's advertised validity has lapsed.
-        self.conns
-            .iter()
-            .map(|(_, conn)| conn.deadline)
-            .min()
-            .or(Some(self.desc_grace))
+        // Wake at the soonest connection deadline; an idle proxy has no timer of its own (the registry
+        // drives its grace eviction).
+        self.conns.iter().map(|(_, conn)| conn.deadline).min()
     }
 
     fn on_deadline(&mut self, now: Instant, reactor: &mut Reactor) {
         self.sweep(now, reactor);
+    }
+}
+
+/// The description-listener grace when an advertisement carries no `CACHE-CONTROL: max-age` — the
+/// UDA-recommended minimum device validity (DIAL's own example advertises `max-age=1800`).
+#[allow(dead_code)] // the SSDP DIAL hook wires this in (next commit)
+const DEFAULT_DESC_GRACE: Duration = Duration::from_mins(30);
+
+/// Rewrite a DIAL discovery message's `LOCATION` to point at a source-side description proxy, minting and
+/// registering the proxy if one isn't already live for this device and refreshing its grace either way.
+/// On a rewrite the result is written into `out` (cleared first) and `true` returned; `false` leaves
+/// `out` untouched and means forward `payload` unchanged — it isn't a DIAL message, its `LOCATION` isn't
+/// a rewritable IPv4 `http` URL, or the proxy cap was reached / a mint failed (the device stays visible
+/// but unproxied). `out` is the caller's reused scratch; the rewritten datagram is sent immediately, so
+/// it need not outlive the call. `source`/`target` are the source/target interface IPv4 addresses: the
+/// proxy binds its listeners on `source` and egress-pins device connections to `target`/`ifindex`.
+#[allow(dead_code)] // the SSDP DIAL hook wires this in (next commit)
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rewrite_location(
+    ctx: &mut DialContext,
+    reactor: &mut Reactor,
+    payload: &[u8],
+    source_capture: CaptureKey,
+    source: Ipv4Addr,
+    target: Ipv4Addr,
+    ifindex: u32,
+    out: &mut Vec<u8>,
+) -> bool {
+    use std::io::Write;
+    if !is_dial_service_message(payload) {
+        return false;
+    }
+    let Some(location) = parse_dial_location_authority(payload) else {
+        return false;
+    };
+    // The grace is refreshed on every advertisement / search response, so a re-advertised device's
+    // cached LOCATION keeps resolving for another max-age.
+    let max_age = parse_cache_control_max_age(payload).map_or(DEFAULT_DESC_GRACE, |seconds| {
+        Duration::from_secs(u64::from(seconds))
+    });
+    let desc_grace = Instant::now() + max_age;
+    let desc_addr =
+        if let Some(addr) = ctx.lookup(source_capture, location.endpoint, reactor, desc_grace) {
+            // An existing proxy already fronts this device; its grace just refreshed.
+            log::trace!(
+                "dial: reusing the proxy for {}; grace refreshed to {max_age:?}",
+                location.endpoint
+            );
+            addr
+        } else {
+            let Some(addr) = mint_proxy(
+                ctx,
+                reactor,
+                source_capture,
+                location.endpoint,
+                source,
+                target,
+                ifindex,
+                desc_grace,
+            ) else {
+                return false;
+            };
+            addr
+        };
+    // Splice the description-listener address over the `LOCATION` authority span into the reused buffer.
+    out.clear();
+    out.extend_from_slice(&payload[..location.offset]);
+    write!(out, "{desc_addr}").expect("writing to a Vec is infallible");
+    out.extend_from_slice(&payload[location.offset + location.len..]);
+    true
+}
+
+/// Mint a description proxy for `endpoint`, register it on `reactor`, and record it in `ctx`; returns the
+/// source-side description-listener address to rewrite the `LOCATION` to. `None` (logged) at the proxy
+/// cap or on a listen/register failure, leaving the `LOCATION` unrewritten.
+#[allow(dead_code)] // the SSDP DIAL hook wires this in (next commit)
+#[allow(clippy::too_many_arguments)]
+fn mint_proxy(
+    ctx: &mut DialContext,
+    reactor: &mut Reactor,
+    source_capture: CaptureKey,
+    endpoint: SocketAddrV4,
+    source: Ipv4Addr,
+    target: Ipv4Addr,
+    ifindex: u32,
+    desc_grace: Instant,
+) -> Option<SocketAddrV4> {
+    if !ctx.has_capacity(reactor) {
+        log::warn!("dial: proxy cap reached; reflecting {endpoint}'s LOCATION unchanged");
+        return None;
+    }
+    let desc = listen_or_warn(source, Listener::Description)?;
+    let rest = listen_or_warn(source, Listener::Rest)?;
+    let desc_addr = desc.local_addr();
+    let watches = [(desc.as_raw_fd(), 0), (rest.as_raw_fd(), 0)];
+    let proxy = DialDeviceProxy::new(source, target, ifindex, desc, endpoint, rest);
+    let handler = match reactor.register_with_fds(Box::new(proxy), &watches) {
+        Ok(handler) => handler,
+        Err(e) => {
+            log::warn!("dial: registering the proxy for {endpoint} failed: {e}");
+            return None; // the proxy drops, closing both listeners
+        }
+    };
+    ctx.insert(source_capture, endpoint, handler, desc_addr, desc_grace);
+    log::debug!("dial: minted a proxy for {endpoint} via description listener {desc_addr}");
+    Some(desc_addr)
+}
+
+/// Bind a source-side listener, logging and yielding `None` on failure; `what` names it for the log.
+#[allow(dead_code)] // the SSDP DIAL hook wires this in (next commit)
+fn listen_or_warn(source: Ipv4Addr, what: Listener) -> Option<TcpSocket> {
+    match TcpSocket::listen(source) {
+        Ok(listener) => Some(listener),
+        Err(e) => {
+            log::warn!("dial: binding the {what} listener on {source} failed: {e}");
+            None
+        }
     }
 }
 
@@ -1234,7 +1361,6 @@ mod tests {
             0, // no egress pin on loopback
             desc,
             SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 5), 8008),
-            Instant::now() + Duration::from_secs(30), // a grace far past the test's lifetime
             rest,
         );
         proxy.adopt_key(key);
@@ -1298,6 +1424,191 @@ mod tests {
             proxy.conns.iter().count(),
             0,
             "no connection is started before the REST endpoint is known"
+        );
+    }
+
+    /// A DIAL advertisement whose `LOCATION` names the device endpoint `10.0.0.5:8008`.
+    const DIAL_ADVERT: &[u8] =
+        b"NOTIFY * HTTP/1.1\r\nNT: urn:dial-multiscreen-org:service:dial:1\r\n\
+        LOCATION: http://10.0.0.5:8008/dd.xml\r\nCACHE-CONTROL: max-age=1800\r\n\r\n";
+
+    /// The device endpoint `DIAL_ADVERT` resolves to (with [`advert_source`], the `DialContext` key).
+    const ADVERT_ENDPOINT: &str = "10.0.0.5:8008";
+
+    /// The source capture `rewrite_advert` keys its proxy under.
+    fn advert_source() -> CaptureKey {
+        CaptureKey::from_u64(7)
+    }
+
+    fn rewrite_advert(
+        ctx: &mut DialContext,
+        reactor: &mut Reactor,
+        payload: &[u8],
+        out: &mut Vec<u8>,
+    ) -> bool {
+        rewrite_location(
+            ctx,
+            reactor,
+            payload,
+            advert_source(),
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::LOCALHOST,
+            0,
+            out,
+        )
+    }
+
+    #[test]
+    fn rewrite_location_mints_a_proxy_and_rewrites_to_its_desc_listener() {
+        let mut reactor = Reactor::new().expect("reactor");
+        let mut ctx = DialContext::new();
+        let mut buf = Vec::new();
+        assert!(
+            rewrite_advert(&mut ctx, &mut reactor, DIAL_ADVERT, &mut buf),
+            "a DIAL LOCATION is rewritten"
+        );
+        let text = String::from_utf8_lossy(&buf);
+        assert!(
+            text.contains("LOCATION: http://127.0.0.1:"),
+            "LOCATION points at the source-side proxy: {text}"
+        );
+        assert!(
+            !text.contains("10.0.0.5:8008"),
+            "the device address no longer leaks: {text}"
+        );
+        assert_eq!(ctx.proxy_count(), 1, "exactly one proxy minted");
+        assert!(
+            reactor.is_registered(ctx.handler_keys()[0]),
+            "the minted proxy is registered in the reactor"
+        );
+    }
+
+    #[test]
+    fn rewrite_location_reuses_a_live_proxy_for_the_same_device() {
+        let mut reactor = Reactor::new().expect("reactor");
+        let mut ctx = DialContext::new();
+        let mut buf = Vec::new();
+        assert!(rewrite_advert(
+            &mut ctx,
+            &mut reactor,
+            DIAL_ADVERT,
+            &mut buf
+        ));
+        let first = buf.clone();
+        assert!(rewrite_advert(
+            &mut ctx,
+            &mut reactor,
+            DIAL_ADVERT,
+            &mut buf
+        ));
+        assert_eq!(first, buf, "the same proxy (and desc port) is reused");
+        assert_eq!(ctx.proxy_count(), 1, "no second proxy is minted");
+    }
+
+    #[test]
+    fn rewrite_location_refreshes_the_grace_on_every_advertisement() {
+        let mut reactor = Reactor::new().expect("reactor");
+        let mut ctx = DialContext::new();
+        let mut buf = Vec::new();
+        let endpoint = ADVERT_ENDPOINT.parse().unwrap();
+        assert!(rewrite_advert(
+            &mut ctx,
+            &mut reactor,
+            DIAL_ADVERT,
+            &mut buf
+        ));
+        let first_grace = ctx
+            .grace_of(advert_source(), endpoint)
+            .expect("a grace was recorded");
+        sleep(Duration::from_millis(5)); // let the monotonic clock advance
+        // A re-advertisement reuses the proxy but pushes its grace forward.
+        assert!(rewrite_advert(
+            &mut ctx,
+            &mut reactor,
+            DIAL_ADVERT,
+            &mut buf
+        ));
+        let second_grace = ctx
+            .grace_of(advert_source(), endpoint)
+            .expect("grace still recorded");
+        assert!(
+            second_grace > first_grace,
+            "the grace is refreshed on reuse"
+        );
+        assert_eq!(ctx.proxy_count(), 1, "still one proxy");
+    }
+
+    #[test]
+    fn rewrite_location_remints_after_the_proxy_is_evicted() {
+        let mut reactor = Reactor::new().expect("reactor");
+        let mut ctx = DialContext::new();
+        let mut buf = Vec::new();
+        assert!(rewrite_advert(
+            &mut ctx,
+            &mut reactor,
+            DIAL_ADVERT,
+            &mut buf
+        ));
+        let first = buf.clone();
+        // The registry evicts the proxy (unregisters it); its generational key goes stale.
+        reactor
+            .unregister(ctx.handler_keys()[0])
+            .expect("unregister the proxy");
+        assert!(rewrite_advert(
+            &mut ctx,
+            &mut reactor,
+            DIAL_ADVERT,
+            &mut buf
+        ));
+        assert_ne!(
+            first, buf,
+            "a fresh proxy on a new port replaces the evicted one"
+        );
+        assert_eq!(
+            ctx.proxy_count(),
+            1,
+            "the stale entry is replaced, not duplicated"
+        );
+    }
+
+    #[test]
+    fn rewrite_location_forwards_non_dial_and_unrewritable_messages_unchanged() {
+        let mut reactor = Reactor::new().expect("reactor");
+        let mut ctx = DialContext::new();
+        let mut buf = Vec::new();
+        // Not a DIAL service message — left alone despite a rewritable LOCATION.
+        let upnp = b"NOTIFY * HTTP/1.1\r\nNT: urn:schemas-upnp-org:device:MediaServer:1\r\n\
+            LOCATION: http://10.0.0.5:8008/dd.xml\r\n\r\n";
+        assert!(!rewrite_advert(&mut ctx, &mut reactor, upnp, &mut buf));
+        // DIAL, but the LOCATION isn't a rewritable IPv4 http URL.
+        let bad = b"NOTIFY * HTTP/1.1\r\nNT: urn:dial-multiscreen-org:service:dial\r\n\
+            LOCATION: https://tv.local/dd.xml\r\n\r\n";
+        assert!(!rewrite_advert(&mut ctx, &mut reactor, bad, &mut buf));
+        assert_eq!(ctx.proxy_count(), 0, "nothing is minted for either");
+    }
+
+    #[test]
+    fn dial_context_sweep_evicts_a_proxy_past_its_grace() {
+        let mut reactor = Reactor::new().expect("reactor");
+        let mut ctx = DialContext::new();
+        let mut buf = Vec::new();
+        assert!(rewrite_advert(
+            &mut ctx,
+            &mut reactor,
+            DIAL_ADVERT,
+            &mut buf
+        ));
+        let key = ctx.handler_keys()[0];
+        // Within its grace (the advert's max-age is 1800s), the proxy survives the sweep.
+        ctx.sweep(Instant::now(), &mut reactor);
+        assert_eq!(ctx.proxy_count(), 1, "a proxy within its grace survives");
+        assert!(reactor.is_registered(key));
+        // Past the grace, the sweep evicts it and unregisters it from the reactor.
+        ctx.sweep(Instant::now() + Duration::from_secs(2000), &mut reactor);
+        assert_eq!(ctx.proxy_count(), 0, "the past-grace proxy is evicted");
+        assert!(
+            !reactor.is_registered(key),
+            "and torn down from the reactor"
         );
     }
 }
