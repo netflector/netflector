@@ -18,3 +18,5 @@
   host and Linux when touching `cfg(target_os)` code.
 - `cargo run` — no path arg: config from env only; with a path arg: TOML merged
   with `REFLECTOR_*` env.
+- Test-only seams (`cfg(test)` accessor methods, consts) go in an `impl` block
+  inside `mod tests`, never as `#[cfg(test)]` members of a production `impl`.

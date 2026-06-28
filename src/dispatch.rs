@@ -467,27 +467,6 @@ impl DialContext {
             }
         });
     }
-
-    /// The number of recorded proxies — a test seam for the DIAL hook's tests in `reflector::dial`.
-    #[cfg(test)]
-    pub(crate) fn proxy_count(&self) -> usize {
-        self.proxies.len()
-    }
-
-    /// The recorded proxies' handler keys — a test seam to simulate an eviction.
-    #[cfg(test)]
-    pub(crate) fn handler_keys(&self) -> Vec<HandlerKey> {
-        self.proxies.iter().map(|p| p.handler).collect()
-    }
-
-    /// The recorded grace for `(source, endpoint)` — a test seam to assert a re-advertisement refreshed it.
-    #[cfg(test)]
-    pub(crate) fn grace_of(&self, source: CaptureKey, endpoint: SocketAddrV4) -> Option<Instant> {
-        self.proxies
-            .iter()
-            .find(|p| p.source == source && p.endpoint == endpoint)
-            .map(|p| p.desc_grace)
-    }
 }
 
 /// Owns the interface table and the routing registrations. The sole owner of capture fds:
@@ -586,12 +565,6 @@ impl PacketDispatcher {
     /// Tears down a per-searcher response capture when its session expires.
     pub(crate) fn unregister(&mut self, key: RegistrationKey) {
         self.registrations.remove(key.0);
-    }
-
-    /// The number of live routing registrations — a test seam for the SSDP session lifecycle.
-    #[cfg(test)]
-    pub(crate) fn registration_count(&self) -> usize {
-        self.registrations.iter().count()
     }
 
     /// Join `group`'s multicast membership on the interface behind `capture`, so the raw capture
@@ -1002,6 +975,37 @@ mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, UdpSocket};
     use std::rc::Rc;
     use std::time::{Duration, Instant};
+
+    impl PacketDispatcher {
+        /// The number of live routing registrations — a seam for the SSDP session lifecycle tests.
+        pub(crate) fn registration_count(&self) -> usize {
+            self.registrations.iter().count()
+        }
+    }
+
+    impl DialContext {
+        /// The number of recorded proxies — a seam for the DIAL hook's tests in `reflector::dial`.
+        pub(crate) fn proxy_count(&self) -> usize {
+            self.proxies.len()
+        }
+
+        /// The recorded proxies' handler keys — a seam to simulate an eviction.
+        pub(crate) fn handler_keys(&self) -> Vec<HandlerKey> {
+            self.proxies.iter().map(|p| p.handler).collect()
+        }
+
+        /// The recorded grace for `(source, endpoint)` — a seam to assert a re-advertisement refreshed it.
+        pub(crate) fn grace_of(
+            &self,
+            source: CaptureKey,
+            endpoint: SocketAddrV4,
+        ) -> Option<Instant> {
+            self.proxies
+                .iter()
+                .find(|p| p.source == source && p.endpoint == endpoint)
+                .map(|p| p.desc_grace)
+        }
+    }
 
     fn packet(
         source: &str,
