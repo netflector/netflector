@@ -17,8 +17,12 @@ const HEADER_TERMINATOR: &[u8] = b"\r\n\r\n";
 /// there) or the over-cap refusal can't fire before the buffer fills and the reader livelocks.
 pub(crate) const MAX_HEADER: usize = 2 * 1024;
 
-/// The same unterminated-line guard for a single chunk-size or trailer line.
+/// The unterminated-line guard for a single chunk-size line (`1a3\r\n`, plus any chunk extensions).
 const MAX_CHUNK_LINE: usize = 256;
+
+/// The unterminated-line guard for a single trailer field line — looser than a chunk-size line, since
+/// trailers carry header-like field values.
+const MAX_TRAILER_LINE: usize = 1024;
 
 /// Which side of the splice a framer parses: the start line differs (request-line vs status-line),
 /// and only a response can be close-delimited.
@@ -49,8 +53,10 @@ pub(crate) enum FramingError {
     MalformedContentLength,
     /// A chunk-size line that isn't a hex integer.
     MalformedChunkSize,
-    /// A chunk-size or trailer line that never terminated within [`MAX_CHUNK_LINE`] bytes.
+    /// A chunk-size line that never terminated within [`MAX_CHUNK_LINE`] bytes.
     ChunkLineTooLong,
+    /// A trailer field line that never terminated within [`MAX_TRAILER_LINE`] bytes.
+    TrailerLineTooLong,
 }
 
 /// One [`feed`](HttpFraming::feed) call's forwardable output: the rewritten `header` (a view into the
@@ -170,8 +176,8 @@ impl HttpFraming {
                 Phase::BodyChunkedTrailers => {
                     // Consume trailer field lines opaquely until the blank line ends the body.
                     let Some(rel) = find_crlf(&input[pos..]) else {
-                        if input.len() - pos > MAX_CHUNK_LINE {
-                            return Err(FramingError::ChunkLineTooLong);
+                        if input.len() - pos > MAX_TRAILER_LINE {
+                            return Err(FramingError::TrailerLineTooLong);
                         }
                         break; // incomplete trailer line
                     };
@@ -539,6 +545,38 @@ mod tests {
         assert_eq!(msgs.len(), 1);
         // The trailer field and the closing blank line ride out in the body.
         assert_eq!(msgs[0].1, b"0\r\nX-Trailer: v\r\n\r\n");
+    }
+
+    #[test]
+    fn chunk_size_line_over_cap_is_refused() {
+        let mut f = HttpFraming::new(Kind::Response);
+        let mut input = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        input.resize(input.len() + MAX_CHUNK_LINE + 1, b'f'); // a chunk-size line that never terminates
+        assert!(matches!(
+            f.feed(&input, None),
+            Err(FramingError::ChunkLineTooLong)
+        ));
+    }
+
+    #[test]
+    fn trailer_line_over_cap_is_refused() {
+        let mut f = HttpFraming::new(Kind::Response);
+        let mut input = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n".to_vec();
+        input.resize(input.len() + MAX_TRAILER_LINE + 1, b'a'); // a trailer line that never terminates
+        assert!(matches!(
+            f.feed(&input, None),
+            Err(FramingError::TrailerLineTooLong)
+        ));
+    }
+
+    #[test]
+    fn a_trailer_line_past_the_chunk_cap_is_tolerated() {
+        // A trailer line longer than MAX_CHUNK_LINE but within MAX_TRAILER_LINE isn't refused — it's
+        // just incomplete, awaiting its CRLF. A chunk-size line of the same length would be rejected.
+        let mut f = HttpFraming::new(Kind::Response);
+        let mut input = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n".to_vec();
+        input.resize(input.len() + MAX_CHUNK_LINE + 1, b'a');
+        assert!(f.feed(&input, None).is_ok());
     }
 
     #[test]
