@@ -802,14 +802,23 @@ impl Handler for DialDeviceProxy {
 #[allow(dead_code)] // the SSDP DIAL hook wires this in (next commit)
 const DEFAULT_DESC_GRACE: Duration = Duration::from_mins(30);
 
+/// Bytes a reflector reserves on the stack to rewrite one SSDP datagram into. Anchored to the
+/// dispatcher's send frame buffer ([`SCRATCH_LEN`](crate::dispatch::SCRATCH_LEN)): the reflector builds
+/// its outgoing frame there, so a datagram that doesn't fit it can't be forwarded at all — sizing the
+/// rewrite scratch to it holds any rewritten datagram the reflector could send. A `LOCATION` rewrite can
+/// grow the datagram; one that still overruns this falls back to verbatim rather than truncating.
+#[allow(dead_code)] // the SSDP DIAL hook wires this in (next commit)
+pub(crate) const REWRITE_BUF_LEN: usize = crate::dispatch::SCRATCH_LEN;
+
 /// Rewrite a DIAL discovery message's `LOCATION` to point at a source-side description proxy, minting and
 /// registering the proxy if one isn't already live for this device and refreshing its grace either way.
-/// On a rewrite the result is written into `out` (cleared first) and `true` returned; `false` leaves
-/// `out` untouched and means forward `payload` unchanged — it isn't a DIAL message, its `LOCATION` isn't
-/// a rewritable IPv4 `http` URL, or the proxy cap was reached / a mint failed (the device stays visible
-/// but unproxied). `out` is the caller's reused scratch; the rewritten datagram is sent immediately, so
-/// it need not outlive the call. `source`/`target` are the source/target interface IPv4 addresses: the
-/// proxy binds its listeners on `source` and egress-pins device connections to `target`/`ifindex`.
+/// On a rewrite the rewritten datagram is written into `out` and its length returned; `None` means
+/// forward `payload` unchanged — it isn't a DIAL message, its `LOCATION` isn't a rewritable IPv4 `http`
+/// URL, the proxy cap was reached / a mint failed (the device stays visible but unproxied), or the
+/// rewrite wouldn't fit `out`. `out` is the caller's reused scratch (size it [`REWRITE_BUF_LEN`]); the
+/// rewritten datagram is sent immediately, so it need not outlive the call. `source`/`target` are the
+/// source/target interface IPv4 addresses: the proxy binds its listeners on `source` and egress-pins
+/// device connections to `target`/`ifindex`.
 #[allow(dead_code)] // the SSDP DIAL hook wires this in (next commit)
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn rewrite_location(
@@ -820,15 +829,13 @@ pub(crate) fn rewrite_location(
     source: Ipv4Addr,
     target: Ipv4Addr,
     ifindex: u32,
-    out: &mut Vec<u8>,
-) -> bool {
+    out: &mut [u8],
+) -> Option<usize> {
     use std::io::Write;
     if !is_dial_service_message(payload) {
-        return false;
+        return None;
     }
-    let Some(location) = parse_dial_location_authority(payload) else {
-        return false;
-    };
+    let location = parse_dial_location_authority(payload)?;
     // The grace is refreshed on every advertisement / search response, so a re-advertised device's
     // cached LOCATION keeps resolving for another max-age.
     let max_age = parse_cache_control_max_age(payload).map_or(DEFAULT_DESC_GRACE, |seconds| {
@@ -844,7 +851,7 @@ pub(crate) fn rewrite_location(
             );
             addr
         } else {
-            let Some(addr) = mint_proxy(
+            mint_proxy(
                 ctx,
                 reactor,
                 source_capture,
@@ -853,17 +860,25 @@ pub(crate) fn rewrite_location(
                 target,
                 ifindex,
                 desc_grace,
-            ) else {
-                return false;
-            };
-            addr
+            )?
         };
-    // Splice the description-listener address over the `LOCATION` authority span into the reused buffer.
-    out.clear();
-    out.extend_from_slice(&payload[..location.offset]);
-    write!(out, "{desc_addr}").expect("writing to a Vec is infallible");
-    out.extend_from_slice(&payload[location.offset + location.len..]);
-    true
+    // Write the rewritten datagram into `out` — prefix, the proxy authority, suffix. The rewrite can
+    // grow the datagram, so a short buffer errors (the caller forwards verbatim) rather than truncating.
+    let capacity = out.len();
+    let mut cursor: &mut [u8] = out;
+    let fits = cursor.write_all(&payload[..location.offset]).is_ok()
+        && write!(cursor, "{desc_addr}").is_ok()
+        && cursor
+            .write_all(&payload[location.offset + location.len..])
+            .is_ok();
+    if !fits {
+        log::warn!(
+            "dial: rewritten LOCATION for {} exceeds the {capacity} B buffer; forwarding verbatim",
+            location.endpoint
+        );
+        return None;
+    }
+    Some(capacity - cursor.len())
 }
 
 /// Mint a description proxy for `endpoint`, register it on `reactor`, and record it in `ctx`; returns the
@@ -1440,13 +1455,15 @@ mod tests {
         CaptureKey::from_u64(7)
     }
 
+    /// Rewrite `payload` like a reflector would (into a [`REWRITE_BUF_LEN`] stack buffer), returning the
+    /// rewritten datagram, or `None` to forward verbatim.
     fn rewrite_advert(
         ctx: &mut DialContext,
         reactor: &mut Reactor,
         payload: &[u8],
-        out: &mut Vec<u8>,
-    ) -> bool {
-        rewrite_location(
+    ) -> Option<Vec<u8>> {
+        let mut buf = [0u8; REWRITE_BUF_LEN];
+        let n = rewrite_location(
             ctx,
             reactor,
             payload,
@@ -1454,20 +1471,18 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             Ipv4Addr::LOCALHOST,
             0,
-            out,
-        )
+            &mut buf,
+        )?;
+        Some(buf[..n].to_vec())
     }
 
     #[test]
     fn rewrite_location_mints_a_proxy_and_rewrites_to_its_desc_listener() {
         let mut reactor = Reactor::new().expect("reactor");
         let mut ctx = DialContext::new();
-        let mut buf = Vec::new();
-        assert!(
-            rewrite_advert(&mut ctx, &mut reactor, DIAL_ADVERT, &mut buf),
-            "a DIAL LOCATION is rewritten"
-        );
-        let text = String::from_utf8_lossy(&buf);
+        let rewritten = rewrite_advert(&mut ctx, &mut reactor, DIAL_ADVERT)
+            .expect("a DIAL LOCATION is rewritten");
+        let text = String::from_utf8_lossy(&rewritten);
         assert!(
             text.contains("LOCATION: http://127.0.0.1:"),
             "LOCATION points at the source-side proxy: {text}"
@@ -1487,21 +1502,9 @@ mod tests {
     fn rewrite_location_reuses_a_live_proxy_for_the_same_device() {
         let mut reactor = Reactor::new().expect("reactor");
         let mut ctx = DialContext::new();
-        let mut buf = Vec::new();
-        assert!(rewrite_advert(
-            &mut ctx,
-            &mut reactor,
-            DIAL_ADVERT,
-            &mut buf
-        ));
-        let first = buf.clone();
-        assert!(rewrite_advert(
-            &mut ctx,
-            &mut reactor,
-            DIAL_ADVERT,
-            &mut buf
-        ));
-        assert_eq!(first, buf, "the same proxy (and desc port) is reused");
+        let first = rewrite_advert(&mut ctx, &mut reactor, DIAL_ADVERT).expect("first");
+        let second = rewrite_advert(&mut ctx, &mut reactor, DIAL_ADVERT).expect("second");
+        assert_eq!(first, second, "the same proxy (and desc port) is reused");
         assert_eq!(ctx.proxy_count(), 1, "no second proxy is minted");
     }
 
@@ -1509,25 +1512,14 @@ mod tests {
     fn rewrite_location_refreshes_the_grace_on_every_advertisement() {
         let mut reactor = Reactor::new().expect("reactor");
         let mut ctx = DialContext::new();
-        let mut buf = Vec::new();
         let endpoint = ADVERT_ENDPOINT.parse().unwrap();
-        assert!(rewrite_advert(
-            &mut ctx,
-            &mut reactor,
-            DIAL_ADVERT,
-            &mut buf
-        ));
+        assert!(rewrite_advert(&mut ctx, &mut reactor, DIAL_ADVERT).is_some());
         let first_grace = ctx
             .grace_of(advert_source(), endpoint)
             .expect("a grace was recorded");
         sleep(Duration::from_millis(5)); // let the monotonic clock advance
         // A re-advertisement reuses the proxy but pushes its grace forward.
-        assert!(rewrite_advert(
-            &mut ctx,
-            &mut reactor,
-            DIAL_ADVERT,
-            &mut buf
-        ));
+        assert!(rewrite_advert(&mut ctx, &mut reactor, DIAL_ADVERT).is_some());
         let second_grace = ctx
             .grace_of(advert_source(), endpoint)
             .expect("grace still recorded");
@@ -1542,26 +1534,14 @@ mod tests {
     fn rewrite_location_remints_after_the_proxy_is_evicted() {
         let mut reactor = Reactor::new().expect("reactor");
         let mut ctx = DialContext::new();
-        let mut buf = Vec::new();
-        assert!(rewrite_advert(
-            &mut ctx,
-            &mut reactor,
-            DIAL_ADVERT,
-            &mut buf
-        ));
-        let first = buf.clone();
+        let first = rewrite_advert(&mut ctx, &mut reactor, DIAL_ADVERT).expect("first");
         // The registry evicts the proxy (unregisters it); its generational key goes stale.
         reactor
             .unregister(ctx.handler_keys()[0])
             .expect("unregister the proxy");
-        assert!(rewrite_advert(
-            &mut ctx,
-            &mut reactor,
-            DIAL_ADVERT,
-            &mut buf
-        ));
+        let reminted = rewrite_advert(&mut ctx, &mut reactor, DIAL_ADVERT).expect("re-minted");
         assert_ne!(
-            first, buf,
+            first, reminted,
             "a fresh proxy on a new port replaces the evicted one"
         );
         assert_eq!(
@@ -1575,15 +1555,14 @@ mod tests {
     fn rewrite_location_forwards_non_dial_and_unrewritable_messages_unchanged() {
         let mut reactor = Reactor::new().expect("reactor");
         let mut ctx = DialContext::new();
-        let mut buf = Vec::new();
         // Not a DIAL service message — left alone despite a rewritable LOCATION.
         let upnp = b"NOTIFY * HTTP/1.1\r\nNT: urn:schemas-upnp-org:device:MediaServer:1\r\n\
             LOCATION: http://10.0.0.5:8008/dd.xml\r\n\r\n";
-        assert!(!rewrite_advert(&mut ctx, &mut reactor, upnp, &mut buf));
+        assert!(rewrite_advert(&mut ctx, &mut reactor, upnp).is_none());
         // DIAL, but the LOCATION isn't a rewritable IPv4 http URL.
         let bad = b"NOTIFY * HTTP/1.1\r\nNT: urn:dial-multiscreen-org:service:dial\r\n\
             LOCATION: https://tv.local/dd.xml\r\n\r\n";
-        assert!(!rewrite_advert(&mut ctx, &mut reactor, bad, &mut buf));
+        assert!(rewrite_advert(&mut ctx, &mut reactor, bad).is_none());
         assert_eq!(ctx.proxy_count(), 0, "nothing is minted for either");
     }
 
@@ -1591,13 +1570,7 @@ mod tests {
     fn dial_context_sweep_evicts_a_proxy_past_its_grace() {
         let mut reactor = Reactor::new().expect("reactor");
         let mut ctx = DialContext::new();
-        let mut buf = Vec::new();
-        assert!(rewrite_advert(
-            &mut ctx,
-            &mut reactor,
-            DIAL_ADVERT,
-            &mut buf
-        ));
+        assert!(rewrite_advert(&mut ctx, &mut reactor, DIAL_ADVERT).is_some());
         let key = ctx.handler_keys()[0];
         // Within its grace (the advert's max-age is 1800s), the proxy survives the sweep.
         ctx.sweep(Instant::now(), &mut reactor);

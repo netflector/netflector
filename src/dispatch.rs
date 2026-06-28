@@ -47,8 +47,9 @@ const MONITOR_TAG: u64 = u64::MAX;
 
 /// The dispatcher's reused send-buffer size — a standard-MTU datagram fits. One buffer serves
 /// every reflector: the single-threaded loop runs one [`send_udp_group`](PacketDispatcher::send_udp_group)
-/// at a time. An oversized payload is a `BufferTooSmall` error, not a truncation.
-const SCRATCH_LEN: usize = 2048;
+/// at a time. An oversized payload is a `BufferTooSmall` error, not a truncation. It also caps a
+/// forwardable datagram, so the DIAL rewrite scratch ([`REWRITE_BUF_LEN`](crate::reflector::dial::REWRITE_BUF_LEN)) anchors to it.
+pub(crate) const SCRATCH_LEN: usize = 2048;
 
 /// A `Copy` handle to a capture the dispatcher owns: an index into the interface table's
 /// captures. A newtype, not a bare alias — so it can't be passed where an [`InterfaceKey`]
