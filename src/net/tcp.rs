@@ -174,6 +174,14 @@ impl TcpSocket {
         // SAFETY: `fd` is a valid socket; shutdown of an already-closed peer is a harmless error.
         unsafe { libc::shutdown(self.fd.as_raw_fd(), libc::SHUT_RDWR) };
     }
+
+    /// Best-effort `shutdown(SHUT_WR)` — FIN our write half while leaving the read half open. The DIAL
+    /// proxy uses this to signal one direction's end (a half-close) without tearing down the reverse
+    /// direction, which keeps delivering to the half-closing peer. An error is ignored.
+    pub(crate) fn shutdown_write(&self) {
+        // SAFETY: `fd` is a valid socket; shutting an already-closed write half is a harmless error.
+        unsafe { libc::shutdown(self.fd.as_raw_fd(), libc::SHUT_WR) };
+    }
 }
 
 impl AsRawFd for TcpSocket {
@@ -400,5 +408,38 @@ mod tests {
             IoStatus::WouldBlock => Ok(None),
         });
         assert_eq!(&buf[..n], b"headbody");
+    }
+
+    #[test]
+    fn shutdown_write_half_closes_keeping_the_read_half() {
+        let listener = TcpSocket::listen(Ipv4Addr::LOCALHOST).expect("listen on loopback");
+        let mut client =
+            TcpSocket::connect(listener.local_addr(), Ipv4Addr::LOCALHOST, 0).expect("connect");
+        let server = spin(|| listener.accept());
+        client.finish_connect().expect("the connect completed");
+
+        // The client shuts down its write half: the server reads EOF.
+        client.shutdown_write();
+        let mut buf = [0u8; 16];
+        let eof = spin(|| match server.recv(&mut buf)? {
+            IoStatus::Ready(n) => Ok(Some(n)),
+            IoStatus::WouldBlock => Ok(None),
+        });
+        assert_eq!(
+            eof, 0,
+            "the server sees EOF after the client's write shutdown"
+        );
+
+        // The client's read half stays open: the server's reply still arrives.
+        assert!(matches!(
+            server.send(b"pong").expect("send"),
+            IoStatus::Ready(4)
+        ));
+        let n = spin(|| match client.recv(&mut buf)? {
+            IoStatus::Ready(0) => panic!("the client's read half closed unexpectedly"),
+            IoStatus::Ready(n) => Ok(Some(n)),
+            IoStatus::WouldBlock => Ok(None),
+        });
+        assert_eq!(&buf[..n], b"pong");
     }
 }
