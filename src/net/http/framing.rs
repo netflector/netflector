@@ -62,11 +62,15 @@ pub(crate) enum FramingError {
 /// One [`feed`](HttpFraming::feed) call's forwardable output: the rewritten `header` (a view into the
 /// framer's scratch; empty while a body streams across feeds), the `body` (a zero-copy slice of the fed
 /// input; possibly empty), and `consumed` — how many fed bytes to drop. `consumed == 0` means an
-/// incomplete header: read more and feed again.
+/// incomplete header: read more and feed again. `authority` is the authority header this message carried
+/// (with the endpoint it named, *before* the rewrite), reported on the feed that completes the header; the
+/// DIAL proxy acts on `Application-URL` (to learn and re-learn the device's REST target). `None` when the
+/// header carried no rewritable authority.
 pub(crate) struct Framed<'a> {
     pub(crate) header: &'a [u8],
     pub(crate) body: &'a [u8],
     pub(crate) consumed: usize,
+    pub(crate) authority: Option<AuthorityHeader>,
 }
 
 /// Per-direction incremental HTTP/1.1 framing with an authority-header rewrite. It buffers only the
@@ -111,6 +115,7 @@ impl HttpFraming {
     ) -> Result<Framed<'a>, FramingError> {
         let mut pos = 0;
         let mut header_complete = false;
+        let mut authority = None;
         if matches!(self.phase, Phase::Header) {
             let Some(end) = find_header_end(input) else {
                 if input.len() > MAX_HEADER {
@@ -120,9 +125,10 @@ impl HttpFraming {
                     header: &[],
                     body: &[],
                     consumed: 0,
+                    authority: None,
                 }); // incomplete: read more
             };
-            self.scan_and_rewrite_header(&input[..end], rewrite)?;
+            authority = self.scan_and_rewrite_header(&input[..end], rewrite)?;
             pos = end;
             header_complete = true;
         }
@@ -194,6 +200,7 @@ impl HttpFraming {
             header: if header_complete { &self.header } else { &[] },
             body: &input[body_start..pos],
             consumed: pos,
+            authority,
         })
     }
 
@@ -207,10 +214,11 @@ impl HttpFraming {
         &mut self,
         block: &[u8],
         rewrite: Option<SocketAddrV4>,
-    ) -> Result<(), FramingError> {
+    ) -> Result<Option<AuthorityHeader>, FramingError> {
         self.header.clear();
         let mut content_length = None;
         let mut chunked = false;
+        let mut authority = None;
         let mut status = 0;
         let mut pos = 0;
         let mut first = true;
@@ -223,13 +231,15 @@ impl HttpFraming {
                 }
                 self.copy_line(line);
                 first = false;
-            } else {
-                self.inspect_and_emit(line, &mut content_length, &mut chunked, rewrite)?;
+            } else if let Some(found) =
+                self.inspect_and_emit(line, &mut content_length, &mut chunked, rewrite)?
+            {
+                authority = Some(found);
             }
             pos = line_end + CRLF.len();
         }
         self.set_body_phase(status, content_length, chunked);
-        Ok(())
+        Ok(authority)
     }
 
     /// Detect the framing headers (`Content-Length` / `Transfer-Encoding`), rewrite a `Host` /
@@ -240,30 +250,34 @@ impl HttpFraming {
         content_length: &mut Option<usize>,
         chunked: &mut bool,
         rewrite: Option<SocketAddrV4>,
-    ) -> Result<(), FramingError> {
+    ) -> Result<Option<AuthorityHeader>, FramingError> {
         if let Some(value) = strip_prefix_ignore_ascii_case(line, b"Content-Length:") {
             *content_length = Some(parse_content_length(value)?);
             self.copy_line(line);
-            return Ok(());
+            return Ok(None);
         }
         if let Some(value) = strip_prefix_ignore_ascii_case(line, b"Transfer-Encoding:") {
             *chunked |= value_has_chunked(value);
             self.copy_line(line);
-            return Ok(());
+            return Ok(None);
         }
-        if let Some((value_off, found)) = rewritable_authority(line)
-            && let Some(repl) = rewrite
-        {
-            let auth_start = value_off + found.offset;
-            self.header.extend_from_slice(&line[..auth_start]);
-            append_authority(&mut self.header, repl);
-            self.header
-                .extend_from_slice(&line[auth_start + found.len..]);
-            self.header.extend_from_slice(CRLF);
-            return Ok(());
+        if let Some((value_off, found, header)) = rewritable_authority(line) {
+            // Rewrite the authority to `repl` when rewriting, but report it either way so the owner
+            // learns the endpoint it named (it acts on `Application-URL` only).
+            if let Some(repl) = rewrite {
+                let auth_start = value_off + found.offset;
+                self.header.extend_from_slice(&line[..auth_start]);
+                append_authority(&mut self.header, repl);
+                self.header
+                    .extend_from_slice(&line[auth_start + found.len..]);
+                self.header.extend_from_slice(CRLF);
+            } else {
+                self.copy_line(line);
+            }
+            return Ok(Some(header));
         }
         self.copy_line(line);
-        Ok(())
+        Ok(None)
     }
 
     /// Append `line` and its CRLF to the scratch verbatim.
@@ -352,21 +366,34 @@ fn value_has_chunked(value: &[u8]) -> bool {
         .any(|coding| coding.trim_ascii().eq_ignore_ascii_case(b"chunked"))
 }
 
+/// Which authority-bearing header a line is, carrying the endpoint it named — so the framer rewrites it
+/// and reports it, and the owner can act on `ApplicationUrl` alone (the DIAL REST base).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum AuthorityHeader {
+    Host(SocketAddrV4),
+    ApplicationUrl(SocketAddrV4),
+    Location(SocketAddrV4),
+}
+
 /// If `line` is a `Host` / `Application-URL` / `Location` header, parse its authority — returning the
-/// value's offset within `line` and the [`Authority`] (whose own offset is relative to that value).
-fn rewritable_authority(line: &[u8]) -> Option<(usize, Authority)> {
-    let (value, bare) = if let Some(rest) = strip_prefix_ignore_ascii_case(line, b"Host:") {
-        (rest, true)
-    } else if let Some(rest) = strip_prefix_ignore_ascii_case(line, b"Application-URL:") {
-        (rest, false)
-    } else if let Some(rest) = strip_prefix_ignore_ascii_case(line, b"Location:") {
-        (rest, false)
-    } else {
-        return None;
-    };
+/// value's offset within `line`, the [`Authority`] (the span to rewrite, whose own offset is relative to
+/// that value), and the header it was (carrying the endpoint it named).
+fn rewritable_authority(line: &[u8]) -> Option<(usize, Authority, AuthorityHeader)> {
+    let (value, bare, wrap): (&[u8], bool, fn(SocketAddrV4) -> AuthorityHeader) =
+        if let Some(rest) = strip_prefix_ignore_ascii_case(line, b"Host:") {
+            (rest, true, AuthorityHeader::Host)
+        } else if let Some(rest) = strip_prefix_ignore_ascii_case(line, b"Application-URL:") {
+            (rest, false, AuthorityHeader::ApplicationUrl)
+        } else if let Some(rest) = strip_prefix_ignore_ascii_case(line, b"Location:") {
+            (rest, false, AuthorityHeader::Location)
+        } else {
+            return None;
+        };
     let trimmed = value.trim_ascii_start();
     let value_off = line.len() - trimmed.len();
-    Some((value_off, parse_authority(trimmed, bare)?))
+    let found = parse_authority(trimmed, bare)?;
+    let header = wrap(found.endpoint);
+    Some((value_off, found, header))
 }
 
 /// Append `addr` as `host:port` text — the IPv4 [`SocketAddrV4`] `Display` form.
@@ -401,6 +428,42 @@ mod tests {
             f.header,
             b"GET /apps/YouTube HTTP/1.1\r\nHost: 10.1.3.80:36866\r\n\r\n"
         );
+    }
+
+    #[test]
+    fn reports_the_application_url_endpoint_while_rewriting_it() {
+        let repl: SocketAddrV4 = "10.1.1.5:44747".parse().unwrap();
+        let mut f = HttpFraming::new(Kind::Response);
+        let framed = f
+            .feed(
+                b"HTTP/1.1 200 OK\r\nApplication-URL: http://10.0.0.7:8008/apps\r\nContent-Length: 0\r\n\r\n",
+                Some(repl),
+            )
+            .unwrap();
+        // The owner learns the device's REST base (to dial it) even as the header is rewritten to the proxy.
+        assert_eq!(
+            framed.authority,
+            Some(AuthorityHeader::ApplicationUrl(
+                "10.0.0.7:8008".parse().unwrap()
+            ))
+        );
+        assert_eq!(
+            framed.header,
+            &b"HTTP/1.1 200 OK\r\nApplication-URL: http://10.1.1.5:44747/apps\r\nContent-Length: 0\r\n\r\n"[..]
+        );
+        // A Location reports as its own variant (a launched-instance child URL), which the owner —
+        // acting on Application-URL only — ignores.
+        let mut g = HttpFraming::new(Kind::Response);
+        let framed = g
+            .feed(
+                b"HTTP/1.1 201 Created\r\nLocation: http://10.0.0.7:8008/apps/X/run\r\nContent-Length: 0\r\n\r\n",
+                Some(repl),
+            )
+            .unwrap();
+        assert!(matches!(
+            framed.authority,
+            Some(AuthorityHeader::Location(_))
+        ));
     }
 
     #[test]
