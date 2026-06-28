@@ -306,7 +306,7 @@ impl DirectionContext<'_> {
             let framed = match self
                 .flow
                 .framer
-                .feed(self.flow.recv.pending(), self.host_rewrite)
+                .feed(self.flow.recv.pending(), &|_| self.host_rewrite)
             {
                 Ok(framed) => framed,
                 Err(e) => {

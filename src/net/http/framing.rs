@@ -103,15 +103,17 @@ impl HttpFraming {
     /// incomplete header — read more). `header` borrows the framer's scratch and `body` the input, so
     /// the owner forwards both before advancing past `consumed`.
     ///
-    /// `rewrite`, when `Some`, replaces every `Host` (requests) / `Application-URL` / `Location`
-    /// (responses) authority in this message's header with it; `None` leaves them unchanged.
+    /// For each authority header (`Host` on requests, `Application-URL` / `Location` on responses),
+    /// `rewrite` is asked for the address to replace it with — `Some(addr)` rewrites that authority,
+    /// `None` leaves it unchanged. The owner returns a per-header target so one direction can send, say,
+    /// `Application-URL` and `Location` to different listeners.
     ///
     /// # Errors
     /// A malformed or over-cap message: see [`FramingError`].
     pub(crate) fn feed<'a>(
         &'a mut self,
         input: &'a [u8],
-        rewrite: Option<SocketAddrV4>,
+        rewrite: &impl Fn(AuthorityHeader) -> Option<SocketAddrV4>,
     ) -> Result<Framed<'a>, FramingError> {
         let mut pos = 0;
         let mut header_complete = false;
@@ -213,7 +215,7 @@ impl HttpFraming {
     fn scan_and_rewrite_header(
         &mut self,
         block: &[u8],
-        rewrite: Option<SocketAddrV4>,
+        rewrite: &impl Fn(AuthorityHeader) -> Option<SocketAddrV4>,
     ) -> Result<Option<AuthorityHeader>, FramingError> {
         self.header.clear();
         let mut content_length = None;
@@ -249,7 +251,7 @@ impl HttpFraming {
         line: &[u8],
         content_length: &mut Option<usize>,
         chunked: &mut bool,
-        rewrite: Option<SocketAddrV4>,
+        rewrite: &impl Fn(AuthorityHeader) -> Option<SocketAddrV4>,
     ) -> Result<Option<AuthorityHeader>, FramingError> {
         if let Some(value) = strip_prefix_ignore_ascii_case(line, b"Content-Length:") {
             *content_length = Some(parse_content_length(value)?);
@@ -262,9 +264,9 @@ impl HttpFraming {
             return Ok(None);
         }
         if let Some((value_off, found, header)) = rewritable_authority(line) {
-            // Rewrite the authority to `repl` when rewriting, but report it either way so the owner
-            // learns the endpoint it named (it acts on `Application-URL` only).
-            if let Some(repl) = rewrite {
+            // Ask the owner where this header should point; rewrite to that, but report the header either
+            // way so the owner learns the endpoint it named (it acts on `Application-URL` only).
+            if let Some(repl) = rewrite(header) {
                 let auth_start = value_off + found.offset;
                 self.header.extend_from_slice(&line[..auth_start]);
                 append_authority(&mut self.header, repl);
@@ -406,10 +408,20 @@ fn append_authority(buf: &mut Vec<u8>, addr: SocketAddrV4) {
 mod tests {
     use super::*;
 
+    /// A no-op rewrite policy: every authority header is left unchanged.
+    fn no_rewrite(_: AuthorityHeader) -> Option<SocketAddrV4> {
+        None
+    }
+
+    /// A rewrite policy that sends every authority header to `repl`.
+    fn rewrite_all(repl: SocketAddrV4) -> impl Fn(AuthorityHeader) -> Option<SocketAddrV4> {
+        move |_| Some(repl)
+    }
+
     #[test]
     fn copies_a_header_verbatim_when_nothing_rewrites() {
         let mut f = HttpFraming::new(Kind::Request);
-        f.scan_and_rewrite_header(b"GET / HTTP/1.1\r\nHost: 10.0.0.1:80\r\n\r\n", None)
+        f.scan_and_rewrite_header(b"GET / HTTP/1.1\r\nHost: 10.0.0.1:80\r\n\r\n", &no_rewrite)
             .unwrap();
         assert_eq!(f.header, b"GET / HTTP/1.1\r\nHost: 10.0.0.1:80\r\n\r\n");
         assert_eq!(f.phase, Phase::Header); // a GET with no body framing is bodyless
@@ -421,7 +433,7 @@ mod tests {
         let mut f = HttpFraming::new(Kind::Request);
         f.scan_and_rewrite_header(
             b"GET /apps/YouTube HTTP/1.1\r\nHost: 10.0.0.1:8080\r\n\r\n",
-            Some(repl),
+            &rewrite_all(repl),
         )
         .unwrap();
         assert_eq!(
@@ -437,7 +449,7 @@ mod tests {
         let framed = f
             .feed(
                 b"HTTP/1.1 200 OK\r\nApplication-URL: http://10.0.0.7:8008/apps\r\nContent-Length: 0\r\n\r\n",
-                Some(repl),
+                &rewrite_all(repl),
             )
             .unwrap();
         // The owner learns the device's REST base (to dial it) even as the header is rewritten to the proxy.
@@ -457,7 +469,7 @@ mod tests {
         let framed = g
             .feed(
                 b"HTTP/1.1 201 Created\r\nLocation: http://10.0.0.7:8008/apps/X/run\r\nContent-Length: 0\r\n\r\n",
-                Some(repl),
+                &rewrite_all(repl),
             )
             .unwrap();
         assert!(matches!(
@@ -473,7 +485,7 @@ mod tests {
         f.scan_and_rewrite_header(
             b"HTTP/1.1 201 Created\r\nLocation: http://10.1.3.80:36866/apps/YouTube/run\r\n\
               Transfer-Encoding: chunked\r\n\r\n",
-            Some(repl),
+            &rewrite_all(repl),
         )
         .unwrap();
         assert_eq!(
@@ -487,8 +499,11 @@ mod tests {
     #[test]
     fn content_length_sets_the_body_phase() {
         let mut f = HttpFraming::new(Kind::Response);
-        f.scan_and_rewrite_header(b"HTTP/1.1 200 OK\r\nContent-Length: 1069\r\n\r\n", None)
-            .unwrap();
+        f.scan_and_rewrite_header(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 1069\r\n\r\n",
+            &no_rewrite,
+        )
+        .unwrap();
         assert_eq!(f.phase, Phase::BodyContentLength);
         assert_eq!(f.body_remaining, 1069);
     }
@@ -499,7 +514,7 @@ mod tests {
         let mut f = HttpFraming::new(Kind::Response);
         f.scan_and_rewrite_header(
             b"HTTP/1.1 204 No Content\r\nContent-Length: 5\r\n\r\n",
-            None,
+            &no_rewrite,
         )
         .unwrap();
         assert_eq!(f.phase, Phase::Header);
@@ -508,7 +523,7 @@ mod tests {
     #[test]
     fn a_response_without_framing_is_close_delimited() {
         let mut f = HttpFraming::new(Kind::Response);
-        f.scan_and_rewrite_header(b"HTTP/1.1 200 OK\r\nServer: x\r\n\r\n", None)
+        f.scan_and_rewrite_header(b"HTTP/1.1 200 OK\r\nServer: x\r\n\r\n", &no_rewrite)
             .unwrap();
         assert_eq!(f.phase, Phase::BodyCloseDelimited);
     }
@@ -516,7 +531,7 @@ mod tests {
     #[test]
     fn a_request_without_framing_is_bodyless() {
         let mut f = HttpFraming::new(Kind::Request);
-        f.scan_and_rewrite_header(b"GET / HTTP/1.1\r\n\r\n", None)
+        f.scan_and_rewrite_header(b"GET / HTTP/1.1\r\n\r\n", &no_rewrite)
             .unwrap();
         assert_eq!(f.phase, Phase::Header);
     }
@@ -525,7 +540,10 @@ mod tests {
     fn malformed_content_length_is_an_error() {
         let mut f = HttpFraming::new(Kind::Response);
         assert_eq!(
-            f.scan_and_rewrite_header(b"HTTP/1.1 200 OK\r\nContent-Length: 12abc\r\n\r\n", None),
+            f.scan_and_rewrite_header(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 12abc\r\n\r\n",
+                &no_rewrite
+            ),
             Err(FramingError::MalformedContentLength)
         );
     }
@@ -535,7 +553,7 @@ mod tests {
         let mut f = HttpFraming::new(Kind::Response);
         f.scan_and_rewrite_header(
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n",
-            None,
+            &no_rewrite,
         )
         .unwrap();
         assert_eq!(f.phase, Phase::BodyChunked);
@@ -547,7 +565,7 @@ mod tests {
         let mut buf = input.to_vec();
         let mut out = Vec::new();
         loop {
-            let framed = f.feed(&buf, None).unwrap();
+            let framed = f.feed(&buf, &no_rewrite).unwrap();
             if framed.consumed == 0 {
                 break;
             }
@@ -616,7 +634,7 @@ mod tests {
         let mut input = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
         input.resize(input.len() + MAX_CHUNK_LINE + 1, b'f'); // a chunk-size line that never terminates
         assert!(matches!(
-            f.feed(&input, None),
+            f.feed(&input, &no_rewrite),
             Err(FramingError::ChunkLineTooLong)
         ));
     }
@@ -627,7 +645,7 @@ mod tests {
         let mut input = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n".to_vec();
         input.resize(input.len() + MAX_TRAILER_LINE + 1, b'a'); // a trailer line that never terminates
         assert!(matches!(
-            f.feed(&input, None),
+            f.feed(&input, &no_rewrite),
             Err(FramingError::TrailerLineTooLong)
         ));
     }
@@ -639,19 +657,19 @@ mod tests {
         let mut f = HttpFraming::new(Kind::Response);
         let mut input = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n".to_vec();
         input.resize(input.len() + MAX_CHUNK_LINE + 1, b'a');
-        assert!(f.feed(&input, None).is_ok());
+        assert!(f.feed(&input, &no_rewrite).is_ok());
     }
 
     #[test]
     fn close_delimited_streams_the_body_across_feeds() {
         let mut f = HttpFraming::new(Kind::Response);
         let input = b"HTTP/1.1 200 OK\r\nServer: x\r\n\r\nabc";
-        let first = f.feed(input, None).unwrap();
+        let first = f.feed(input, &no_rewrite).unwrap();
         assert_eq!(first.header, b"HTTP/1.1 200 OK\r\nServer: x\r\n\r\n");
         assert_eq!(first.body, b"abc");
         assert_eq!(first.consumed, input.len()); // header + all arrived body
         // The phase stays close-delimited, so a later feed forwards more with no header.
-        let second = f.feed(b"def", None).unwrap();
+        let second = f.feed(b"def", &no_rewrite).unwrap();
         assert_eq!(second.header, b"");
         assert_eq!(second.body, b"def");
     }
@@ -661,7 +679,10 @@ mod tests {
         let mut f = HttpFraming::new(Kind::Response);
         // First feed: header + 3 of the 5 declared body bytes.
         let first = f
-            .feed(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nabc", None)
+            .feed(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nabc",
+                &no_rewrite,
+            )
             .unwrap();
         assert_eq!(
             first.header,
@@ -669,7 +690,7 @@ mod tests {
         );
         assert_eq!(first.body, b"abc");
         // Second feed (after the owner consumed the first): the remaining 2 bytes, no header.
-        let second = f.feed(b"de", None).unwrap();
+        let second = f.feed(b"de", &no_rewrite).unwrap();
         assert_eq!(second.header, b"");
         assert_eq!(second.body, b"de");
         assert_eq!(second.consumed, 2);
@@ -678,7 +699,7 @@ mod tests {
     #[test]
     fn an_incomplete_header_consumes_nothing() {
         let mut f = HttpFraming::new(Kind::Request);
-        let framed = f.feed(b"GET / HTTP/1.1\r\nHost: x", None).unwrap(); // no blank line yet
+        let framed = f.feed(b"GET / HTTP/1.1\r\nHost: x", &no_rewrite).unwrap(); // no blank line yet
         assert_eq!(framed.consumed, 0);
         assert_eq!(framed.header, b"");
         assert_eq!(framed.body, b"");
@@ -689,7 +710,7 @@ mod tests {
         let mut f = HttpFraming::new(Kind::Request);
         let huge = vec![b'x'; MAX_HEADER + 1]; // no blank line, over the cap
         assert!(matches!(
-            f.feed(&huge, None),
+            f.feed(&huge, &no_rewrite),
             Err(FramingError::HeaderTooLong)
         ));
     }
@@ -700,7 +721,7 @@ mod tests {
         assert!(matches!(
             f.feed(
                 b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nZZ\r\n",
-                None
+                &no_rewrite
             ),
             Err(FramingError::MalformedChunkSize)
         ));
