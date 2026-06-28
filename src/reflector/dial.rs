@@ -4,18 +4,18 @@
 //! authorities so the device's address never leaks to the client.
 //!
 //! Lifecycle, dispatch, and the bidirectional byte splice: accept, egress-pinned connect, the
-//! connect/idle deadlines, per-direction HTTP framing and forwarding (the request's `Host` rewritten
-//! to the device), drop-and-close backpressure, independent per-direction half-close (one side's EOF
-//! flushes its remaining bytes and FINs the peer while the reverse direction keeps flowing), teardown,
-//! and self-eviction. The response's `Application-URL`/`Location` rewrite through a lazily-minted REST
-//! listener follows in the next step.
+//! connect/idle deadlines, per-direction HTTP framing and forwarding (the request's `Host` rewritten to
+//! the device, the response's `Application-URL`/`Location` to the proxy's REST/description listeners),
+//! drop-and-close backpressure, independent per-direction half-close (one side's EOF flushes its
+//! remaining bytes and FINs the peer while the reverse direction keeps flowing), teardown, and
+//! self-eviction. Accepting on the REST listener (its own connections) follows in the next step.
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::{Duration, Instant};
 
-use crate::net::http::framing::{HttpFraming, Kind};
+use crate::net::http::framing::{AuthorityHeader, HttpFraming, Kind, RewritePolicy};
 use crate::net::stream_buffer::StreamBuffer;
 use crate::net::tcp::TcpSocket;
 use crate::reactor::{Arena, Handler, HandlerKey, Key, Reactor, ReadyEvent, RegKey};
@@ -58,9 +58,10 @@ struct Flow {
 }
 
 impl Flow {
-    fn new(kind: Kind) -> Self {
+    /// A flow framing `kind` messages, rewriting their authority headers per `rewrite`.
+    fn new(kind: Kind, rewrite: RewritePolicy) -> Self {
         Self {
-            framer: HttpFraming::new(kind),
+            framer: HttpFraming::new(kind, rewrite),
             recv: StreamBuffer::with_capacity(MAX_RECV),
             send: StreamBuffer::with_capacity(MAX_SEND),
             state: FlowState::Open,
@@ -98,12 +99,16 @@ struct Connection {
     device_endpoint: SocketAddrV4,
     c2u: Flow, // client -> device
     u2c: Flow, // device -> client
+    /// The device REST endpoint just learned from a response's `Application-URL`, lifted into the proxy's
+    /// `rest_endpoint` after each readable edge (`None` between).
+    learned_rest: Option<SocketAddrV4>,
     deadline: Instant,
 }
 
 /// Which way bytes flow on one edge of the splice. `ClientToDevice` is the `c2u` flow — a request read
-/// from the client and forwarded to the device (its `Host` rewritten); `DeviceToClient` is `u2c` — a
-/// response read from the device and forwarded to the client (verbatim).
+/// from the client and forwarded to the device (its `Host` rewritten to the device); `DeviceToClient`
+/// is `u2c` — a response read from the device and forwarded to the client (its `Application-URL` /
+/// `Location` rewritten to the proxy's listeners, so the device's address never leaks).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Direction {
     ClientToDevice,
@@ -128,21 +133,21 @@ enum Forwarded {
 
 /// One `Direction` resolved against a connection: the socket to read from (and its registration, to
 /// disarm on half-close), the socket to forward to (and its registration), that direction's framing and
-/// buffers, and the rewrite to apply. Built once per event by [`Connection::context`] so the
-/// forward/drain paths never re-pick a side.
+/// buffers (the framer carries its own rewrite policy), and a slot for any REST endpoint learned from a
+/// response. Built once per event by [`Connection::context`] so the forward/drain paths never re-pick a side.
 struct DirectionContext<'a> {
     from: &'a TcpSocket,
     from_reg: Option<RegKey>,
     to: &'a TcpSocket,
     to_reg: Option<RegKey>,
     flow: &'a mut Flow,
-    host_rewrite: Option<SocketAddrV4>,
+    learned_rest: &'a mut Option<SocketAddrV4>,
     deadline: &'a mut Instant,
 }
 
 impl Connection {
-    /// The resolved view for `direction` — the sockets, registration, flow, rewrite, and deadline it
-    /// touches — so the forward/drain paths operate without re-picking a side.
+    /// The resolved view for `direction` — the sockets, registration, flow, and deadline it touches — so
+    /// the forward/drain paths operate without re-picking a side.
     fn context(&mut self, direction: Direction) -> DirectionContext<'_> {
         match direction {
             Direction::ClientToDevice => DirectionContext {
@@ -151,7 +156,7 @@ impl Connection {
                 to: &self.device,
                 to_reg: self.device_reg,
                 flow: &mut self.c2u,
-                host_rewrite: Some(self.device_endpoint),
+                learned_rest: &mut self.learned_rest,
                 deadline: &mut self.deadline,
             },
             Direction::DeviceToClient => DirectionContext {
@@ -160,7 +165,7 @@ impl Connection {
                 to: &self.client,
                 to_reg: self.client_reg,
                 flow: &mut self.u2c,
-                host_rewrite: None,
+                learned_rest: &mut self.learned_rest,
                 deadline: &mut self.deadline,
             },
         }
@@ -281,11 +286,12 @@ impl Connection {
 
 impl DirectionContext<'_> {
     /// Read one chunk from the source, frame whole messages out of this direction's buffer, and forward
-    /// each — rewriting `Host` when set — to the destination, buffering any unsent tail in the send
-    /// buffer for the writable edge to drain. The deadline is refreshed (by the senders) only when bytes
-    /// actually reach the destination, so a wedged one still ages out via the idle sweep. Returns `true`
-    /// to close: a framing/recv/send error or a backpressure overflow (`Failed`); the source half-closed
-    /// (`SourceEof`); otherwise `Open`. Reactor-free, so the splice is unit-testable without a reactor.
+    /// each — rewriting its authority headers per this direction's policy — to the destination, buffering
+    /// any unsent tail in the send buffer for the writable edge to drain. The deadline is refreshed (by
+    /// the senders) only when bytes actually reach the destination, so a wedged one still ages out via
+    /// the idle sweep. Returns the [`Forwarded`] outcome: a framing/recv/send error or a backpressure
+    /// overflow is `Failed`; the source half-closed is `SourceEof`; otherwise `Open`. Reactor-free, so
+    /// the splice is unit-testable without a reactor.
     fn forward(&mut self) -> Forwarded {
         let tail = self.flow.recv.free_tail_mut();
         if tail.is_empty() {
@@ -303,17 +309,18 @@ impl DirectionContext<'_> {
         };
         self.flow.recv.commit(n);
         loop {
-            let framed = match self
-                .flow
-                .framer
-                .feed(self.flow.recv.pending(), &|_| self.host_rewrite)
-            {
+            let framed = match self.flow.framer.feed(self.flow.recv.pending()) {
                 Ok(framed) => framed,
                 Err(e) => {
                     log::debug!("dial: framing error: {e:?}");
                     return Forwarded::Failed;
                 }
             };
+            // Learn the device REST base from a response's Application-URL (the proxy lifts it into
+            // rest_endpoint); a later description fetch can move it, so the latest wins.
+            if let Some(AuthorityHeader::ApplicationUrl(ep)) = framed.authority {
+                *self.learned_rest = Some(ep);
+            }
             if framed.consumed == 0 {
                 break; // an incomplete message: wait for more bytes
             }
@@ -476,18 +483,24 @@ pub(crate) struct DialDeviceProxy {
     target: Ipv4Addr,
     /// The target interface index, egress-pinning device connections to that segment.
     target_ifindex: u32,
-    /// The description listener (source side); its connections proxy to `desc_device`.
+    /// The description listener (source side); its connections proxy to `desc_endpoint`.
     desc: TcpSocket,
     /// The device's description endpoint (`device-ip:desc_port`) — the proxy's identity.
-    desc_device: SocketAddrV4,
+    desc_endpoint: SocketAddrV4,
     /// The instant the description listener may be reaped after, once idle — the advertisement's
     /// `max-age`, refreshed on re-advertisement.
     desc_grace: Instant,
+    /// The REST listener (source side); its connections proxy to the device's REST endpoint. Eager-minted
+    /// so its address is fixed and available to rewrite a description response's `Application-URL` to.
+    rest: TcpSocket,
+    /// The device's REST endpoint, learned (and re-learned) from a description response's `Application-URL`;
+    /// `None` until the first description fetch reveals it. REST connections proxy here.
+    rest_endpoint: Option<SocketAddrV4>,
     conns: Arena<Connection>,
 }
 
 impl DialDeviceProxy {
-    /// A proxy fronting `desc_device` via the source-side `desc` listener. Device connections bind the
+    /// A proxy fronting `desc_endpoint` via the source-side `desc` listener. Device connections bind the
     /// target-interface `target` and egress-pin `target_ifindex`; `desc_grace` is when the listener may
     /// be reaped after once idle.
     pub(crate) fn new(
@@ -495,8 +508,9 @@ impl DialDeviceProxy {
         target: Ipv4Addr,
         target_ifindex: u32,
         desc: TcpSocket,
-        desc_device: SocketAddrV4,
+        desc_endpoint: SocketAddrV4,
         desc_grace: Instant,
+        rest: TcpSocket,
     ) -> Self {
         Self {
             key: None,
@@ -504,8 +518,10 @@ impl DialDeviceProxy {
             target,
             target_ifindex,
             desc,
-            desc_device,
+            desc_endpoint,
             desc_grace,
+            rest,
+            rest_endpoint: None,
             conns: Arena::new(),
         }
     }
@@ -533,8 +549,9 @@ impl DialDeviceProxy {
             log::warn!("dial: connection cap ({MAX_CONNECTIONS}) reached; dropping a new client");
             return; // `client` drops here, closing it
         }
-        let device = self.desc_device;
-        self.start_connection(client, device, reactor);
+        let device = self.desc_endpoint;
+        let own_listener = self.desc.local_addr();
+        self.start_connection(client, device, own_listener, reactor);
     }
 
     /// Open an egress-pinned connection to `device_endpoint`, register both fds, and record the
@@ -543,9 +560,11 @@ impl DialDeviceProxy {
         &mut self,
         client: TcpSocket,
         device_endpoint: SocketAddrV4,
+        own_listener: SocketAddrV4,
         reactor: &mut Reactor,
     ) {
         let key = self.own_key();
+        let rest_listener = self.rest.local_addr();
         let device = match TcpSocket::connect(device_endpoint, self.target, self.target_ifindex) {
             Ok(device) => device,
             Err(e) => {
@@ -555,6 +574,18 @@ impl DialDeviceProxy {
         };
         let client_fd = client.as_raw_fd();
         let device_fd = device.as_raw_fd();
+        // The request rewrites its `Host` to the device; the response rewrites `Application-URL` to the
+        // REST listener and `Location` to this connection's own listener, so the device never leaks.
+        let c2u_rewrite = RewritePolicy {
+            host: Some(device_endpoint),
+            application_url: None,
+            location: None,
+        };
+        let u2c_rewrite = RewritePolicy {
+            host: None,
+            application_url: Some(rest_listener),
+            location: Some(own_listener),
+        };
         // Insert first so the connection's arena key can tag both fds' `user_data`; the regs are
         // patched in once watching succeeds.
         let conn_key = ConnectionKey(self.conns.insert(Connection {
@@ -563,8 +594,9 @@ impl DialDeviceProxy {
             device,
             device_reg: None,
             device_endpoint,
-            c2u: Flow::new(Kind::Request),
-            u2c: Flow::new(Kind::Response),
+            c2u: Flow::new(Kind::Request, c2u_rewrite),
+            u2c: Flow::new(Kind::Response, u2c_rewrite),
+            learned_rest: None,
             deadline: Instant::now() + CONNECT_TIMEOUT,
         }));
         let user_data = conn_key.to_u64();
@@ -604,7 +636,7 @@ impl DialDeviceProxy {
         fd: RawFd,
         reactor: &mut Reactor,
     ) {
-        let outcome = {
+        let (outcome, learned) = {
             let Some(conn) = self.conns.get_mut(conn_key.0) else {
                 log::trace!("dial: readable event for an unknown connection; ignoring");
                 return;
@@ -615,8 +647,13 @@ impl DialDeviceProxy {
             } else {
                 Direction::DeviceToClient
             };
-            conn.forward(direction, reactor)
+            let outcome = conn.forward(direction, reactor);
+            (outcome, conn.learned_rest.take())
         };
+        // A description response just revealed (or moved) the device's REST endpoint.
+        if let Some(endpoint) = learned {
+            self.rest_endpoint = Some(endpoint);
+        }
         if outcome == Outcome::Close {
             self.close_conn(conn_key, reactor);
         }
@@ -752,33 +789,36 @@ mod tests {
         (initiator, accepted)
     }
 
-    /// Drive `forward_dir` until the message it forwards arrives at `peer_out`, and return those bytes.
+    /// Drive `forward_dir` until the message it forwards arrives at `peer_out`. Returns those bytes
+    /// alongside the REST endpoint learned from an `Application-URL`, if any.
     fn drive_forward(
         from: &TcpSocket,
         to: &TcpSocket,
         flow: &mut Flow,
-        rewrite: Option<SocketAddrV4>,
         peer_out: &TcpSocket,
-    ) -> Vec<u8> {
+    ) -> (Vec<u8>, Option<SocketAddrV4>) {
         let mut deadline = Instant::now();
+        let mut learned_rest = None;
         let mut buf = [0u8; 1024];
         for _ in 0..2000 {
-            let mut ctx = DirectionContext {
-                from,
-                from_reg: None,
-                to,
-                to_reg: None,
-                flow: &mut *flow,
-                host_rewrite: rewrite,
-                deadline: &mut deadline,
-            };
-            assert!(
-                matches!(ctx.forward(), Forwarded::Open),
-                "forward should stay open on a clean message"
-            );
+            {
+                let mut ctx = DirectionContext {
+                    from,
+                    from_reg: None,
+                    to,
+                    to_reg: None,
+                    flow: &mut *flow,
+                    learned_rest: &mut learned_rest,
+                    deadline: &mut deadline,
+                };
+                assert!(
+                    matches!(ctx.forward(), Forwarded::Open),
+                    "forward should stay open on a clean message"
+                );
+            }
             match peer_out.recv(&mut buf).expect("recv on the peer") {
                 IoStatus::Ready(0) => panic!("unexpected EOF before the forwarded bytes"),
-                IoStatus::Ready(n) => return buf[..n].to_vec(),
+                IoStatus::Ready(n) => return (buf[..n].to_vec(), learned_rest),
                 IoStatus::WouldBlock => sleep(Duration::from_millis(1)),
             }
         }
@@ -821,8 +861,13 @@ mod tests {
                 .expect("send the request"),
             IoStatus::Ready(_)
         ));
-        let mut flow = Flow::new(Kind::Request);
-        let got = drive_forward(&from, &to, &mut flow, Some(device), &peer_out);
+        let rewrite = RewritePolicy {
+            host: Some(device),
+            application_url: None,
+            location: None,
+        };
+        let mut flow = Flow::new(Kind::Request, rewrite);
+        let (got, _) = drive_forward(&from, &to, &mut flow, &peer_out);
         assert!(
             got.starts_with(b"GET /apps HTTP/1.1\r\n"),
             "request line preserved: {:?}",
@@ -836,9 +881,17 @@ mod tests {
     }
 
     #[test]
-    fn forward_dir_forwards_a_response_verbatim() {
+    fn forward_dir_rewrites_application_url_to_the_rest_listener_and_learns_it() {
         let (peer_in, from) = connected_pair();
         let (to, peer_out) = connected_pair();
+        // The DD-connection u2c policy points Application-URL at the proxy's REST listener so the
+        // device's REST endpoint never reaches the client; the proxy learns that endpoint instead.
+        let rest_listener = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 1), 9000);
+        let rewrite = RewritePolicy {
+            host: None,
+            application_url: Some(rest_listener),
+            location: None,
+        };
         let response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\
              Application-URL: http://192.168.1.2:8008/apps\r\n\r\nhello";
         assert!(matches!(
@@ -847,15 +900,49 @@ mod tests {
                 .expect("send the response"),
             IoStatus::Ready(_)
         ));
-        let mut flow = Flow::new(Kind::Response);
-        let got = drive_forward(&from, &to, &mut flow, None, &peer_out);
-        // u2c is verbatim for now: the device's Application-URL passes through untouched.
+        let mut flow = Flow::new(Kind::Response, rewrite);
+        let (got, learned) = drive_forward(&from, &to, &mut flow, &peer_out);
         assert!(
-            contains(&got, b"Application-URL: http://192.168.1.2:8008/apps\r\n"),
-            "response forwarded verbatim: {:?}",
+            contains(&got, b"Application-URL: http://192.168.1.1:9000/apps\r\n"),
+            "Application-URL rewritten to the REST listener: {:?}",
             String::from_utf8_lossy(&got)
         );
+        assert_eq!(
+            learned,
+            Some(SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 2), 8008)),
+            "the device's Application-URL endpoint is learned for the REST connection"
+        );
         assert!(got.ends_with(b"hello"), "body forwarded: {got:?}");
+    }
+
+    #[test]
+    fn forward_dir_rewrites_a_location_redirect_to_the_desc_listener() {
+        let (peer_in, from) = connected_pair();
+        let (to, peer_out) = connected_pair();
+        // A rare dd redirect: Location points the client back at the proxy's own desc listener, not
+        // the device. It is not a REST endpoint, so nothing is learned.
+        let own_listener = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 1), 1901);
+        let rewrite = RewritePolicy {
+            host: None,
+            application_url: None,
+            location: Some(own_listener),
+        };
+        let response = "HTTP/1.1 302 Found\r\nContent-Length: 0\r\n\
+             Location: http://192.168.1.2:8008/dd.xml\r\n\r\n";
+        assert!(matches!(
+            peer_in
+                .send(response.as_bytes())
+                .expect("send the response"),
+            IoStatus::Ready(_)
+        ));
+        let mut flow = Flow::new(Kind::Response, rewrite);
+        let (got, learned) = drive_forward(&from, &to, &mut flow, &peer_out);
+        assert!(
+            contains(&got, b"Location: http://192.168.1.1:1901/dd.xml\r\n"),
+            "Location rewritten to the desc listener: {:?}",
+            String::from_utf8_lossy(&got)
+        );
+        assert_eq!(learned, None, "a Location redirect is not a REST endpoint");
     }
 
     #[test]
@@ -863,8 +950,9 @@ mod tests {
         let (peer_in, from) = connected_pair();
         let (to, _peer_out) = connected_pair();
         drop(peer_in); // the source's peer closes → `from` observes EOF
-        let mut flow = Flow::new(Kind::Request);
+        let mut flow = Flow::new(Kind::Request, RewritePolicy::NONE);
         let mut deadline = Instant::now();
+        let mut learned_rest = None;
         let outcome = loop {
             let mut ctx = DirectionContext {
                 from: &from,
@@ -872,7 +960,7 @@ mod tests {
                 to: &to,
                 to_reg: None,
                 flow: &mut flow,
-                host_rewrite: None,
+                learned_rest: &mut learned_rest,
                 deadline: &mut deadline,
             };
             match ctx.forward() {
@@ -904,14 +992,23 @@ mod tests {
         let device_reg = reactor
             .watch(key, device.as_raw_fd(), 0)
             .expect("watch device");
+        let device_endpoint = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 5), 8008);
+        // The c2u framer rewrites the request's Host to the device, as `start_connection` wires it; the
+        // state-machine tests don't drive a u2c response through the rewrite, so its policy stays empty.
+        let c2u_rewrite = RewritePolicy {
+            host: Some(device_endpoint),
+            application_url: None,
+            location: None,
+        };
         let conn = Connection {
             client,
             client_reg: Some(client_reg),
             device,
             device_reg: Some(device_reg),
-            device_endpoint: SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 5), 8008),
-            c2u: Flow::new(Kind::Request),
-            u2c: Flow::new(Kind::Response),
+            device_endpoint,
+            learned_rest: None,
+            c2u: Flow::new(Kind::Request, c2u_rewrite),
+            u2c: Flow::new(Kind::Response, RewritePolicy::NONE),
             deadline: Instant::now(),
         };
         (reactor, conn, client_peer, device_peer)

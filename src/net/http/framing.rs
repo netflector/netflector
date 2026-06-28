@@ -75,10 +75,11 @@ pub(crate) struct Framed<'a> {
 
 /// Per-direction incremental HTTP/1.1 framing with an authority-header rewrite. It buffers only the
 /// header — copied into a scratch so it can be rewritten — and forwards the body as a zero-copy slice
-/// of the fed input. The rewrite is supplied per [`feed`](Self::feed) call rather than stored, so the
-/// owner can recompute it between messages (e.g. after minting a listener for a freshly-seen device).
+/// of the fed input. The [`RewritePolicy`] is fixed for the framer's lifetime (the owner's per-direction
+/// targets don't change over a connection), so it is stored at construction rather than passed per feed.
 pub(crate) struct HttpFraming {
     kind: Kind,
+    rewrite: RewritePolicy,
     phase: Phase,
     header: Vec<u8>,
     body_remaining: usize,
@@ -86,10 +87,11 @@ pub(crate) struct HttpFraming {
 }
 
 impl HttpFraming {
-    /// A framer for one direction.
-    pub(crate) fn new(kind: Kind) -> Self {
+    /// A framer for one direction, rewriting authority headers per `rewrite`.
+    pub(crate) fn new(kind: Kind, rewrite: RewritePolicy) -> Self {
         Self {
             kind,
+            rewrite,
             phase: Phase::Header,
             header: Vec::new(),
             body_remaining: 0,
@@ -103,18 +105,13 @@ impl HttpFraming {
     /// incomplete header — read more). `header` borrows the framer's scratch and `body` the input, so
     /// the owner forwards both before advancing past `consumed`.
     ///
-    /// For each authority header (`Host` on requests, `Application-URL` / `Location` on responses),
-    /// `rewrite` is asked for the address to replace it with — `Some(addr)` rewrites that authority,
-    /// `None` leaves it unchanged. The owner returns a per-header target so one direction can send, say,
-    /// `Application-URL` and `Location` to different listeners.
+    /// Each authority header (`Host` on requests, `Application-URL` / `Location` on responses) is
+    /// rewritten per the framer's [`RewritePolicy`] — a per-header target, so one direction can send,
+    /// say, `Application-URL` and `Location` to different listeners.
     ///
     /// # Errors
     /// A malformed or over-cap message: see [`FramingError`].
-    pub(crate) fn feed<'a>(
-        &'a mut self,
-        input: &'a [u8],
-        rewrite: &impl Fn(AuthorityHeader) -> Option<SocketAddrV4>,
-    ) -> Result<Framed<'a>, FramingError> {
+    pub(crate) fn feed<'a>(&'a mut self, input: &'a [u8]) -> Result<Framed<'a>, FramingError> {
         let mut pos = 0;
         let mut header_complete = false;
         let mut authority = None;
@@ -130,7 +127,7 @@ impl HttpFraming {
                     authority: None,
                 }); // incomplete: read more
             };
-            authority = self.scan_and_rewrite_header(&input[..end], rewrite)?;
+            authority = self.scan_and_rewrite_header(&input[..end])?;
             pos = end;
             header_complete = true;
         }
@@ -215,7 +212,6 @@ impl HttpFraming {
     fn scan_and_rewrite_header(
         &mut self,
         block: &[u8],
-        rewrite: &impl Fn(AuthorityHeader) -> Option<SocketAddrV4>,
     ) -> Result<Option<AuthorityHeader>, FramingError> {
         self.header.clear();
         let mut content_length = None;
@@ -234,7 +230,7 @@ impl HttpFraming {
                 self.copy_line(line);
                 first = false;
             } else if let Some(found) =
-                self.inspect_and_emit(line, &mut content_length, &mut chunked, rewrite)?
+                self.inspect_and_emit(line, &mut content_length, &mut chunked)?
             {
                 authority = Some(found);
             }
@@ -251,7 +247,6 @@ impl HttpFraming {
         line: &[u8],
         content_length: &mut Option<usize>,
         chunked: &mut bool,
-        rewrite: &impl Fn(AuthorityHeader) -> Option<SocketAddrV4>,
     ) -> Result<Option<AuthorityHeader>, FramingError> {
         if let Some(value) = strip_prefix_ignore_ascii_case(line, b"Content-Length:") {
             *content_length = Some(parse_content_length(value)?);
@@ -264,9 +259,9 @@ impl HttpFraming {
             return Ok(None);
         }
         if let Some((value_off, found, header)) = rewritable_authority(line) {
-            // Ask the owner where this header should point; rewrite to that, but report the header either
-            // way so the owner learns the endpoint it named (it acts on `Application-URL` only).
-            if let Some(repl) = rewrite(header) {
+            // Rewrite to wherever the policy points this header, but report the header either way so the
+            // owner learns the endpoint it named (it acts on `Application-URL` only).
+            if let Some(repl) = self.rewrite.target(header) {
                 let auth_start = value_off + found.offset;
                 self.header.extend_from_slice(&line[..auth_start]);
                 append_authority(&mut self.header, repl);
@@ -377,6 +372,34 @@ pub(crate) enum AuthorityHeader {
     Location(SocketAddrV4),
 }
 
+/// Where a framer rewrites each authority header to — one optional target per [`AuthorityHeader`] kind,
+/// `None` leaving that kind unchanged. The owner picks the targets (the DIAL proxy points `Host` at the
+/// device, `Application-URL` at its REST listener, `Location` at the connection's own listener).
+#[derive(Clone, Copy)]
+pub(crate) struct RewritePolicy {
+    pub(crate) host: Option<SocketAddrV4>,
+    pub(crate) application_url: Option<SocketAddrV4>,
+    pub(crate) location: Option<SocketAddrV4>,
+}
+
+impl RewritePolicy {
+    /// A policy that rewrites nothing — every authority header passes through unchanged.
+    pub(crate) const NONE: Self = Self {
+        host: None,
+        application_url: None,
+        location: None,
+    };
+
+    /// The address `header` should be rewritten to under this policy, or `None` to leave it unchanged.
+    fn target(&self, header: AuthorityHeader) -> Option<SocketAddrV4> {
+        match header {
+            AuthorityHeader::Host(_) => self.host,
+            AuthorityHeader::ApplicationUrl(_) => self.application_url,
+            AuthorityHeader::Location(_) => self.location,
+        }
+    }
+}
+
 /// If `line` is a `Host` / `Application-URL` / `Location` header, parse its authority — returning the
 /// value's offset within `line`, the [`Authority`] (the span to rewrite, whose own offset is relative to
 /// that value), and the header it was (carrying the endpoint it named).
@@ -408,20 +431,19 @@ fn append_authority(buf: &mut Vec<u8>, addr: SocketAddrV4) {
 mod tests {
     use super::*;
 
-    /// A no-op rewrite policy: every authority header is left unchanged.
-    fn no_rewrite(_: AuthorityHeader) -> Option<SocketAddrV4> {
-        None
-    }
-
     /// A rewrite policy that sends every authority header to `repl`.
-    fn rewrite_all(repl: SocketAddrV4) -> impl Fn(AuthorityHeader) -> Option<SocketAddrV4> {
-        move |_| Some(repl)
+    fn rewrite_all(repl: SocketAddrV4) -> RewritePolicy {
+        RewritePolicy {
+            host: Some(repl),
+            application_url: Some(repl),
+            location: Some(repl),
+        }
     }
 
     #[test]
     fn copies_a_header_verbatim_when_nothing_rewrites() {
-        let mut f = HttpFraming::new(Kind::Request);
-        f.scan_and_rewrite_header(b"GET / HTTP/1.1\r\nHost: 10.0.0.1:80\r\n\r\n", &no_rewrite)
+        let mut f = HttpFraming::new(Kind::Request, RewritePolicy::NONE);
+        f.scan_and_rewrite_header(b"GET / HTTP/1.1\r\nHost: 10.0.0.1:80\r\n\r\n")
             .unwrap();
         assert_eq!(f.header, b"GET / HTTP/1.1\r\nHost: 10.0.0.1:80\r\n\r\n");
         assert_eq!(f.phase, Phase::Header); // a GET with no body framing is bodyless
@@ -430,12 +452,9 @@ mod tests {
     #[test]
     fn rewrites_the_host_authority_on_a_request() {
         let repl: SocketAddrV4 = "10.1.3.80:36866".parse().unwrap();
-        let mut f = HttpFraming::new(Kind::Request);
-        f.scan_and_rewrite_header(
-            b"GET /apps/YouTube HTTP/1.1\r\nHost: 10.0.0.1:8080\r\n\r\n",
-            &rewrite_all(repl),
-        )
-        .unwrap();
+        let mut f = HttpFraming::new(Kind::Request, rewrite_all(repl));
+        f.scan_and_rewrite_header(b"GET /apps/YouTube HTTP/1.1\r\nHost: 10.0.0.1:8080\r\n\r\n")
+            .unwrap();
         assert_eq!(
             f.header,
             b"GET /apps/YouTube HTTP/1.1\r\nHost: 10.1.3.80:36866\r\n\r\n"
@@ -445,11 +464,10 @@ mod tests {
     #[test]
     fn reports_the_application_url_endpoint_while_rewriting_it() {
         let repl: SocketAddrV4 = "10.1.1.5:44747".parse().unwrap();
-        let mut f = HttpFraming::new(Kind::Response);
+        let mut f = HttpFraming::new(Kind::Response, rewrite_all(repl));
         let framed = f
             .feed(
                 b"HTTP/1.1 200 OK\r\nApplication-URL: http://10.0.0.7:8008/apps\r\nContent-Length: 0\r\n\r\n",
-                &rewrite_all(repl),
             )
             .unwrap();
         // The owner learns the device's REST base (to dial it) even as the header is rewritten to the proxy.
@@ -465,11 +483,10 @@ mod tests {
         );
         // A Location reports as its own variant (a launched-instance child URL), which the owner —
         // acting on Application-URL only — ignores.
-        let mut g = HttpFraming::new(Kind::Response);
+        let mut g = HttpFraming::new(Kind::Response, rewrite_all(repl));
         let framed = g
             .feed(
                 b"HTTP/1.1 201 Created\r\nLocation: http://10.0.0.7:8008/apps/X/run\r\nContent-Length: 0\r\n\r\n",
-                &rewrite_all(repl),
             )
             .unwrap();
         assert!(matches!(
@@ -481,11 +498,10 @@ mod tests {
     #[test]
     fn rewrites_location_in_a_chunked_201() {
         let repl: SocketAddrV4 = "10.1.1.5:44747".parse().unwrap();
-        let mut f = HttpFraming::new(Kind::Response);
+        let mut f = HttpFraming::new(Kind::Response, rewrite_all(repl));
         f.scan_and_rewrite_header(
             b"HTTP/1.1 201 Created\r\nLocation: http://10.1.3.80:36866/apps/YouTube/run\r\n\
               Transfer-Encoding: chunked\r\n\r\n",
-            &rewrite_all(repl),
         )
         .unwrap();
         assert_eq!(
@@ -498,12 +514,9 @@ mod tests {
 
     #[test]
     fn content_length_sets_the_body_phase() {
-        let mut f = HttpFraming::new(Kind::Response);
-        f.scan_and_rewrite_header(
-            b"HTTP/1.1 200 OK\r\nContent-Length: 1069\r\n\r\n",
-            &no_rewrite,
-        )
-        .unwrap();
+        let mut f = HttpFraming::new(Kind::Response, RewritePolicy::NONE);
+        f.scan_and_rewrite_header(b"HTTP/1.1 200 OK\r\nContent-Length: 1069\r\n\r\n")
+            .unwrap();
         assert_eq!(f.phase, Phase::BodyContentLength);
         assert_eq!(f.body_remaining, 1069);
     }
@@ -511,51 +524,42 @@ mod tests {
     #[test]
     fn a_bodyless_status_has_no_body_despite_a_content_length() {
         // 204 is bodyless regardless of headers (RFC 7230 §3.3.3 rule 1).
-        let mut f = HttpFraming::new(Kind::Response);
-        f.scan_and_rewrite_header(
-            b"HTTP/1.1 204 No Content\r\nContent-Length: 5\r\n\r\n",
-            &no_rewrite,
-        )
-        .unwrap();
+        let mut f = HttpFraming::new(Kind::Response, RewritePolicy::NONE);
+        f.scan_and_rewrite_header(b"HTTP/1.1 204 No Content\r\nContent-Length: 5\r\n\r\n")
+            .unwrap();
         assert_eq!(f.phase, Phase::Header);
     }
 
     #[test]
     fn a_response_without_framing_is_close_delimited() {
-        let mut f = HttpFraming::new(Kind::Response);
-        f.scan_and_rewrite_header(b"HTTP/1.1 200 OK\r\nServer: x\r\n\r\n", &no_rewrite)
+        let mut f = HttpFraming::new(Kind::Response, RewritePolicy::NONE);
+        f.scan_and_rewrite_header(b"HTTP/1.1 200 OK\r\nServer: x\r\n\r\n")
             .unwrap();
         assert_eq!(f.phase, Phase::BodyCloseDelimited);
     }
 
     #[test]
     fn a_request_without_framing_is_bodyless() {
-        let mut f = HttpFraming::new(Kind::Request);
-        f.scan_and_rewrite_header(b"GET / HTTP/1.1\r\n\r\n", &no_rewrite)
+        let mut f = HttpFraming::new(Kind::Request, RewritePolicy::NONE);
+        f.scan_and_rewrite_header(b"GET / HTTP/1.1\r\n\r\n")
             .unwrap();
         assert_eq!(f.phase, Phase::Header);
     }
 
     #[test]
     fn malformed_content_length_is_an_error() {
-        let mut f = HttpFraming::new(Kind::Response);
+        let mut f = HttpFraming::new(Kind::Response, RewritePolicy::NONE);
         assert_eq!(
-            f.scan_and_rewrite_header(
-                b"HTTP/1.1 200 OK\r\nContent-Length: 12abc\r\n\r\n",
-                &no_rewrite
-            ),
+            f.scan_and_rewrite_header(b"HTTP/1.1 200 OK\r\nContent-Length: 12abc\r\n\r\n"),
             Err(FramingError::MalformedContentLength)
         );
     }
 
     #[test]
     fn chunked_in_a_coding_list_is_detected() {
-        let mut f = HttpFraming::new(Kind::Response);
-        f.scan_and_rewrite_header(
-            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n",
-            &no_rewrite,
-        )
-        .unwrap();
+        let mut f = HttpFraming::new(Kind::Response, RewritePolicy::NONE);
+        f.scan_and_rewrite_header(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n")
+            .unwrap();
         assert_eq!(f.phase, Phase::BodyChunked);
     }
 
@@ -565,7 +569,7 @@ mod tests {
         let mut buf = input.to_vec();
         let mut out = Vec::new();
         loop {
-            let framed = f.feed(&buf, &no_rewrite).unwrap();
+            let framed = f.feed(&buf).unwrap();
             if framed.consumed == 0 {
                 break;
             }
@@ -579,7 +583,7 @@ mod tests {
 
     #[test]
     fn frames_a_content_length_message() {
-        let mut f = HttpFraming::new(Kind::Response);
+        let mut f = HttpFraming::new(Kind::Response, RewritePolicy::NONE);
         let msgs = drain(&mut f, b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].0, b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n");
@@ -588,7 +592,7 @@ mod tests {
 
     #[test]
     fn frames_a_chunked_message_forwarding_the_body_opaquely() {
-        let mut f = HttpFraming::new(Kind::Response);
+        let mut f = HttpFraming::new(Kind::Response, RewritePolicy::NONE);
         let msgs = drain(
             &mut f,
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n3\r\nbar\r\n0\r\n\r\n",
@@ -604,7 +608,7 @@ mod tests {
 
     #[test]
     fn frames_multiple_keep_alive_messages() {
-        let mut f = HttpFraming::new(Kind::Response);
+        let mut f = HttpFraming::new(Kind::Response, RewritePolicy::NONE);
         // A Content-Length response immediately followed by a chunked one on the same connection.
         let msgs = drain(
             &mut f,
@@ -618,7 +622,7 @@ mod tests {
 
     #[test]
     fn forwards_chunked_trailers_opaquely() {
-        let mut f = HttpFraming::new(Kind::Response);
+        let mut f = HttpFraming::new(Kind::Response, RewritePolicy::NONE);
         let msgs = drain(
             &mut f,
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX-Trailer: v\r\n\r\n",
@@ -630,22 +634,22 @@ mod tests {
 
     #[test]
     fn chunk_size_line_over_cap_is_refused() {
-        let mut f = HttpFraming::new(Kind::Response);
+        let mut f = HttpFraming::new(Kind::Response, RewritePolicy::NONE);
         let mut input = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
         input.resize(input.len() + MAX_CHUNK_LINE + 1, b'f'); // a chunk-size line that never terminates
         assert!(matches!(
-            f.feed(&input, &no_rewrite),
+            f.feed(&input),
             Err(FramingError::ChunkLineTooLong)
         ));
     }
 
     #[test]
     fn trailer_line_over_cap_is_refused() {
-        let mut f = HttpFraming::new(Kind::Response);
+        let mut f = HttpFraming::new(Kind::Response, RewritePolicy::NONE);
         let mut input = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n".to_vec();
         input.resize(input.len() + MAX_TRAILER_LINE + 1, b'a'); // a trailer line that never terminates
         assert!(matches!(
-            f.feed(&input, &no_rewrite),
+            f.feed(&input),
             Err(FramingError::TrailerLineTooLong)
         ));
     }
@@ -654,35 +658,32 @@ mod tests {
     fn a_trailer_line_past_the_chunk_cap_is_tolerated() {
         // A trailer line longer than MAX_CHUNK_LINE but within MAX_TRAILER_LINE isn't refused — it's
         // just incomplete, awaiting its CRLF. A chunk-size line of the same length would be rejected.
-        let mut f = HttpFraming::new(Kind::Response);
+        let mut f = HttpFraming::new(Kind::Response, RewritePolicy::NONE);
         let mut input = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n".to_vec();
         input.resize(input.len() + MAX_CHUNK_LINE + 1, b'a');
-        assert!(f.feed(&input, &no_rewrite).is_ok());
+        assert!(f.feed(&input).is_ok());
     }
 
     #[test]
     fn close_delimited_streams_the_body_across_feeds() {
-        let mut f = HttpFraming::new(Kind::Response);
+        let mut f = HttpFraming::new(Kind::Response, RewritePolicy::NONE);
         let input = b"HTTP/1.1 200 OK\r\nServer: x\r\n\r\nabc";
-        let first = f.feed(input, &no_rewrite).unwrap();
+        let first = f.feed(input).unwrap();
         assert_eq!(first.header, b"HTTP/1.1 200 OK\r\nServer: x\r\n\r\n");
         assert_eq!(first.body, b"abc");
         assert_eq!(first.consumed, input.len()); // header + all arrived body
         // The phase stays close-delimited, so a later feed forwards more with no header.
-        let second = f.feed(b"def", &no_rewrite).unwrap();
+        let second = f.feed(b"def").unwrap();
         assert_eq!(second.header, b"");
         assert_eq!(second.body, b"def");
     }
 
     #[test]
     fn streams_a_content_length_body_across_feeds() {
-        let mut f = HttpFraming::new(Kind::Response);
+        let mut f = HttpFraming::new(Kind::Response, RewritePolicy::NONE);
         // First feed: header + 3 of the 5 declared body bytes.
         let first = f
-            .feed(
-                b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nabc",
-                &no_rewrite,
-            )
+            .feed(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nabc")
             .unwrap();
         assert_eq!(
             first.header,
@@ -690,7 +691,7 @@ mod tests {
         );
         assert_eq!(first.body, b"abc");
         // Second feed (after the owner consumed the first): the remaining 2 bytes, no header.
-        let second = f.feed(b"de", &no_rewrite).unwrap();
+        let second = f.feed(b"de").unwrap();
         assert_eq!(second.header, b"");
         assert_eq!(second.body, b"de");
         assert_eq!(second.consumed, 2);
@@ -698,8 +699,8 @@ mod tests {
 
     #[test]
     fn an_incomplete_header_consumes_nothing() {
-        let mut f = HttpFraming::new(Kind::Request);
-        let framed = f.feed(b"GET / HTTP/1.1\r\nHost: x", &no_rewrite).unwrap(); // no blank line yet
+        let mut f = HttpFraming::new(Kind::Request, RewritePolicy::NONE);
+        let framed = f.feed(b"GET / HTTP/1.1\r\nHost: x").unwrap(); // no blank line yet
         assert_eq!(framed.consumed, 0);
         assert_eq!(framed.header, b"");
         assert_eq!(framed.body, b"");
@@ -707,22 +708,16 @@ mod tests {
 
     #[test]
     fn an_unterminated_oversize_header_errors() {
-        let mut f = HttpFraming::new(Kind::Request);
+        let mut f = HttpFraming::new(Kind::Request, RewritePolicy::NONE);
         let huge = vec![b'x'; MAX_HEADER + 1]; // no blank line, over the cap
-        assert!(matches!(
-            f.feed(&huge, &no_rewrite),
-            Err(FramingError::HeaderTooLong)
-        ));
+        assert!(matches!(f.feed(&huge), Err(FramingError::HeaderTooLong)));
     }
 
     #[test]
     fn a_malformed_chunk_size_errors() {
-        let mut f = HttpFraming::new(Kind::Response);
+        let mut f = HttpFraming::new(Kind::Response, RewritePolicy::NONE);
         assert!(matches!(
-            f.feed(
-                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nZZ\r\n",
-                &no_rewrite
-            ),
+            f.feed(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nZZ\r\n"),
             Err(FramingError::MalformedChunkSize)
         ));
     }
