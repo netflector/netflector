@@ -349,7 +349,6 @@ impl InterfaceTable {
 /// Cap on concurrent minted DIAL proxies — a burst of advertised devices can't exhaust source-side
 /// listeners or reactor slots. At the cap a new device's `LOCATION` is reflected unchanged (the device
 /// stays visible but unproxied) rather than evicting a live proxy.
-#[allow(dead_code)] // the SSDP DIAL hook wires this in (next commit)
 const MAX_DIAL_PROXIES: usize = 32;
 
 /// One minted DIAL description proxy: keyed by the `source` capture it fronts on plus the device's
@@ -358,7 +357,6 @@ const MAX_DIAL_PROXIES: usize = 32;
 /// `desc_addr` spliced into the device's `LOCATION`, and `desc_grace` — the instant past which the
 /// dispatcher evicts the proxy, refreshed to each advertisement's `max-age` so a cached `LOCATION`
 /// keeps resolving while the device is advertised.
-#[allow(dead_code)] // the SSDP DIAL hook wires this in (next commit)
 struct DialEntry {
     source: CaptureKey,
     endpoint: SocketAddrV4,
@@ -371,12 +369,10 @@ struct DialEntry {
 /// search-response paths — separate handlers — share one proxy per device. The DIAL hook
 /// (`reflector::dial::rewrite_location`) reuses (and refreshes the grace of) a live proxy found here, or
 /// records a freshly-minted one; an evicted proxy's entry is pruned on the next lookup or capacity check.
-#[allow(dead_code)] // the SSDP DIAL hook wires this in (next commit)
 pub(crate) struct DialContext {
     proxies: Vec<DialEntry>,
 }
 
-#[allow(dead_code)] // the SSDP DIAL hook wires this in (next commit)
 impl DialContext {
     /// An empty registry.
     pub(crate) fn new() -> Self {
@@ -632,6 +628,12 @@ impl PacketDispatcher {
     /// needs.
     pub(crate) fn egress_addrs(&self, egress: CaptureKey) -> Option<&InterfaceAddresses> {
         self.table.egress_addrs(egress)
+    }
+
+    /// The DIAL proxy registry, shared by the SSDP advertisement/response reflectors so a device gets
+    /// one proxy across both paths (see [`rewrite_location`](crate::reflector::dial::rewrite_location)).
+    pub(crate) fn dial_context(&mut self) -> &mut DialContext {
+        &mut self.dial
     }
 
     /// The kernel ifindex of the interface behind `capture` — its stable identity (the address

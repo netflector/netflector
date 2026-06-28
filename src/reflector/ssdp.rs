@@ -20,7 +20,52 @@ use crate::net::ssdp::{
 };
 use crate::reactor::Reactor;
 
+use super::dial::{REWRITE_BUF_LEN, rewrite_location};
 use super::{BuildError, InterfaceMap, IpFamily, egress_sources, missing_required_family};
+
+/// What a DIAL-enabled SSDP reflector needs to rewrite a device's `LOCATION` to a source-side proxy: the
+/// target capture the device sits behind (for its address) and that interface's egress-pin ifindex. The
+/// source side is the reflector's own egress. `None` on a reflector without `dial`.
+#[derive(Clone, Copy)]
+struct DialRewrite {
+    target: CaptureKey,
+    target_ifindex: u32,
+}
+
+/// Rewrite a target→source SSDP datagram's DIAL `LOCATION` to point at a source-side description proxy,
+/// into `buf`. Returns the rewritten slice when `dial` is set and the rewrite succeeds, else `payload`
+/// (forward verbatim). `egress` is the source capture the datagram reflects onto.
+fn dial_rewrite<'a>(
+    payload: &'a [u8],
+    buf: &'a mut [u8],
+    egress: CaptureKey,
+    dial: Option<DialRewrite>,
+    dispatcher: &mut PacketDispatcher,
+    reactor: &mut Reactor,
+) -> &'a [u8] {
+    let Some(dial) = dial else {
+        return payload;
+    };
+    let (Some(source), Some(target)) = (
+        dispatcher.egress_addrs(egress).and_then(|a| a.v4),
+        dispatcher.egress_addrs(dial.target).and_then(|a| a.v4),
+    ) else {
+        return payload; // a family the proxy can't bridge yet — forward unchanged
+    };
+    match rewrite_location(
+        dispatcher.dial_context(),
+        reactor,
+        payload,
+        egress,
+        source,
+        target,
+        dial.target_ifindex,
+        buf,
+    ) {
+        Some(n) => &buf[..n],
+        None => payload,
+    }
+}
 
 /// Reflects SSDP advertisements (`NOTIFY`) captured on the target onto `egress` (the source), to the
 /// message's own destination — the dispatcher's filter pins that to the group. Searches (`M-SEARCH`)
@@ -28,6 +73,8 @@ use super::{BuildError, InterfaceMap, IpFamily, egress_sources, missing_required
 /// advertisements.
 struct SsdpAdvertisementReflector {
     egress: CaptureKey,
+    /// DIAL `LOCATION` rewriting, when the reflector has `dial` set; `None` leaves advertisements verbatim.
+    dial: Option<DialRewrite>,
 }
 
 impl PacketHandler for SsdpAdvertisementReflector {
@@ -35,7 +82,7 @@ impl PacketHandler for SsdpAdvertisementReflector {
         &mut self,
         packet: &Packet,
         dispatcher: &mut PacketDispatcher,
-        _reactor: &mut Reactor,
+        reactor: &mut Reactor,
     ) {
         match classify(packet.payload) {
             Some(SsdpKind::Advertisement) => {
@@ -44,12 +91,21 @@ impl PacketHandler for SsdpAdvertisementReflector {
                 if !egress_sources(dispatcher, self.egress, packet.dest) {
                     return;
                 }
+                let mut buf = [0u8; REWRITE_BUF_LEN];
+                let payload = dial_rewrite(
+                    packet.payload,
+                    &mut buf,
+                    self.egress,
+                    self.dial,
+                    dispatcher,
+                    reactor,
+                );
                 match dispatcher.send_udp_group(
                     self.egress,
                     packet.dest,
                     SSDP_PORT,
                     SSDP_TTL,
-                    packet.payload,
+                    payload,
                 ) {
                     Ok(()) => log::debug!(
                         "reflected SSDP advertisement from {} to {}",
@@ -87,6 +143,8 @@ struct SsdpResponseReflector {
     searcher: SocketAddr,
     searcher_mac: MacAddr,
     egress: CaptureKey,
+    /// DIAL `LOCATION` rewriting, inherited from the search reflector that opened this session.
+    dial: Option<DialRewrite>,
 }
 
 impl PacketHandler for SsdpResponseReflector {
@@ -94,7 +152,7 @@ impl PacketHandler for SsdpResponseReflector {
         &mut self,
         packet: &Packet,
         dispatcher: &mut PacketDispatcher,
-        _reactor: &mut Reactor,
+        reactor: &mut Reactor,
     ) {
         // The dispatcher's filter already pinned this capture to the reserved port, so every packet
         // here is a unicast reply for this searcher — nothing to classify. A family the source can't
@@ -102,13 +160,22 @@ impl PacketHandler for SsdpResponseReflector {
         if !egress_sources(dispatcher, self.egress, self.searcher) {
             return;
         }
+        let mut buf = [0u8; REWRITE_BUF_LEN];
+        let payload = dial_rewrite(
+            packet.payload,
+            &mut buf,
+            self.egress,
+            self.dial,
+            dispatcher,
+            reactor,
+        );
         match dispatcher.send_udp(
             self.egress,
             self.searcher,
             self.searcher_mac,
             packet.source.port(),
             SSDP_TTL,
-            packet.payload,
+            payload,
         ) {
             Ok(()) => log::debug!(
                 "reflected SSDP response from {} to searcher {}",
@@ -157,6 +224,8 @@ struct SsdpSearchReflector {
     target_ifindex: u32,
     /// The configured device MAC, scoping the response capture as the advertisement direction is.
     device_mac: Option<MacAddr>,
+    /// DIAL `LOCATION` rewriting, stamped into each session's [`SsdpResponseReflector`].
+    dial: Option<DialRewrite>,
     sessions: Vec<Session>,
 }
 
@@ -166,12 +235,14 @@ impl SsdpSearchReflector {
         target: CaptureKey,
         target_ifindex: u32,
         device_mac: Option<MacAddr>,
+        dial: Option<DialRewrite>,
     ) -> Self {
         Self {
             source,
             target,
             target_ifindex,
             device_mac,
+            dial,
             sessions: Vec::new(),
         }
     }
@@ -242,6 +313,7 @@ impl SsdpSearchReflector {
                 searcher: packet.source,
                 searcher_mac,
                 egress: self.source,
+                dial: self.dial,
             }),
         );
         Some(Session {
@@ -383,12 +455,6 @@ pub(crate) fn build(
     let Some(ssdp) = &reflector.ssdp else {
         return Ok(());
     };
-    if ssdp.dial {
-        log::warn!(
-            "SSDP reflector \"{}\": DIAL is not yet implemented; reflecting without LOCATION rewrite",
-            reflector.name.as_str()
-        );
-    }
     let source = interfaces
         .key_for(reflector.source_if.as_str())
         .ok_or_else(|| BuildError::UnknownInterface(reflector.source_if.as_str().to_owned()))?;
@@ -422,6 +488,13 @@ pub(crate) fn build(
     // the ifindex the capture already cached (the single source of truth the joiners bake too).
     let target_ifindex = dispatcher.capture_ifindex(target).unwrap_or(0);
 
+    // With `dial`, the target→source reflectors rewrite a device's DIAL `LOCATION` to a source-side
+    // proxy (IPv4 only; a non-rewritable LOCATION passes through). The device sits behind `target`.
+    let dial = ssdp.dial.then_some(DialRewrite {
+        target,
+        target_ifindex,
+    });
+
     for group in used_groups(reflector.address_family) {
         let group_ip = group.ip();
         // Advertisements are captured on the target and searches on the source, so join the group on
@@ -441,7 +514,10 @@ pub(crate) fn build(
                 src_mac: reflector.mac,
                 ..Filter::default()
             },
-            Box::new(SsdpAdvertisementReflector { egress: source }),
+            Box::new(SsdpAdvertisementReflector {
+                egress: source,
+                dial,
+            }),
         );
         // source -> target: reflect searches (unfiltered — any source client may search) and route
         // each searcher's unicast 200-OK replies back through a per-searcher session.
@@ -457,14 +533,16 @@ pub(crate) fn build(
                 target,
                 target_ifindex,
                 reflector.mac,
+                dial,
             )),
         );
     }
     log::info!(
-        "SSDP reflector \"{}\": {} <-> {} (advertisements + searches)",
+        "SSDP reflector \"{}\": {} <-> {} (advertisements + searches{})",
         reflector.name.as_str(),
         reflector.source_if.as_str(),
-        reflector.target_if.as_str()
+        reflector.target_if.as_str(),
+        if dial.is_some() { " + DIAL" } else { "" }
     );
     Ok(())
 }
@@ -530,6 +608,7 @@ mod tests {
                 searcher,
                 searcher_mac: MacAddr::from([0; 6]),
                 egress: source,
+                dial: None,
             }),
         );
         reflector.sessions.push(Session {
@@ -543,8 +622,13 @@ mod tests {
     #[test]
     fn next_deadline_is_the_soonest_session_expiry() {
         let mut dispatcher = PacketDispatcher::new();
-        let mut reflector =
-            SsdpSearchReflector::new(CaptureKey::from_u64(1), CaptureKey::from_u64(0), 0, None);
+        let mut reflector = SsdpSearchReflector::new(
+            CaptureKey::from_u64(1),
+            CaptureKey::from_u64(0),
+            0,
+            None,
+            None,
+        );
         assert_eq!(
             reflector.next_deadline(),
             None,
@@ -573,8 +657,13 @@ mod tests {
     fn on_deadline_evicts_expired_sessions_and_unregisters_their_captures() {
         let mut dispatcher = PacketDispatcher::new();
         let mut reactor = Reactor::new().unwrap();
-        let mut reflector =
-            SsdpSearchReflector::new(CaptureKey::from_u64(1), CaptureKey::from_u64(0), 0, None);
+        let mut reflector = SsdpSearchReflector::new(
+            CaptureKey::from_u64(1),
+            CaptureKey::from_u64(0),
+            0,
+            None,
+            None,
+        );
         let base = Instant::now();
         push_session(&mut reflector, &mut dispatcher, "10.0.0.1:5", base); // already due
         push_session(
@@ -613,8 +702,13 @@ mod tests {
         let mut reactor = Reactor::new().unwrap();
         // A synthetic target: send_udp_group on an unknown egress drops the datagram and returns Ok,
         // so the re-reflect "succeeds" with no real capture — this exercises only the bookkeeping.
-        let mut reflector =
-            SsdpSearchReflector::new(CaptureKey::from_u64(1), CaptureKey::from_u64(0), 0, None);
+        let mut reflector = SsdpSearchReflector::new(
+            CaptureKey::from_u64(1),
+            CaptureKey::from_u64(0),
+            0,
+            None,
+            None,
+        );
         let base = Instant::now();
         push_session(&mut reflector, &mut dispatcher, "10.0.0.7:50000", base);
         assert_eq!(dispatcher.registration_count(), 1);
