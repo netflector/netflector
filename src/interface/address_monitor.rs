@@ -21,6 +21,11 @@ use self::route as backend;
 #[cfg(target_os = "linux")]
 use self::rtnetlink as backend;
 
+/// Bound on consecutive `ENOBUFS` overflows in a single drain. The kernel clears the overflow flag
+/// on the next recv, so a long unbroken run of them means the socket is wedged — stop rather than
+/// spin the single-threaded loop forever (a level-triggered wait re-fires to try again later).
+const MAX_CONSECUTIVE_OVERFLOWS: u32 = 16;
+
 /// A routing-socket monitor for interface address and link changes. The dispatcher watches
 /// its fd and calls [`drain`](Self::drain) on readiness.
 pub(crate) struct AddressMonitor {
@@ -56,8 +61,9 @@ impl AddressMonitor {
     ///
     /// # Errors
     /// The first non-recoverable recv failure. Recoverable: `EAGAIN`/`EWOULDBLOCK` end the
-    /// drain, `ENOBUFS` reports the overflow signal and continues.
+    /// drain, `ENOBUFS` reports the overflow signal and continues (bailing if it never clears).
     pub(crate) fn drain(&mut self, mut on_change: impl FnMut(u32)) -> io::Result<()> {
+        let mut overflows = 0u32;
         loop {
             // SAFETY: `recv` fills up to `buf.len()` bytes of the owned buffer.
             let n = unsafe {
@@ -71,9 +77,25 @@ impl AddressMonitor {
             // ENOBUFS is the drain's own signal (a dropped-notification overflow → re-resolve
             // everything), so handle it before the generic classifier.
             if n < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ENOBUFS) {
-                on_change(0);
+                overflows += 1;
+                if overflows == 1 {
+                    // A dropped-notification overflow is genuinely abnormal (kernel buffer pressure
+                    // or an event storm); surface it at warn, not just the dispatcher's debug. Signal
+                    // re-resolve-all once per burst — repeating it for each consecutive ENOBUFS is
+                    // redundant (the dispatcher coalesces the 0 anyway).
+                    log::warn!(
+                        "address monitor overflowed; notifications were dropped, re-resolving every interface"
+                    );
+                    on_change(0);
+                } else if overflows >= MAX_CONSECUTIVE_OVERFLOWS {
+                    log::warn!(
+                        "address monitor overflow did not clear after {overflows} reads; ending the drain"
+                    );
+                    return Ok(());
+                }
                 continue;
             }
+            overflows = 0; // a successful recv breaks the overflow streak
             match IoStatus::from_syscall(n)? {
                 // No more queued notifications (or a defensive empty read — routing sockets
                 // don't EOF).
