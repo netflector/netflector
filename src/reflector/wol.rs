@@ -136,12 +136,8 @@ pub(crate) fn build(
     let Some(wol) = &reflector.wol else {
         return Ok(());
     };
-    let ingress = interfaces
-        .key_for(reflector.source_if.as_str())
-        .ok_or_else(|| BuildError::UnknownInterface(reflector.source_if.as_str().to_owned()))?;
-    let egress = interfaces
-        .key_for(reflector.target_if.as_str())
-        .ok_or_else(|| BuildError::UnknownInterface(reflector.target_if.as_str().to_owned()))?;
+    let ingress = interfaces.require(reflector.source_if.as_str())?;
+    let egress = interfaces.require(reflector.target_if.as_str())?;
 
     let addrs = dispatcher.egress_addrs(egress).copied().unwrap_or_default();
     if let Some(family) = missing_required_family(reflector.address_family, &addrs) {

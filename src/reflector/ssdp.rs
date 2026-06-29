@@ -465,12 +465,8 @@ pub(crate) fn build(
     let Some(ssdp) = &reflector.ssdp else {
         return Ok(());
     };
-    let source = interfaces
-        .key_for(reflector.source_if.as_str())
-        .ok_or_else(|| BuildError::UnknownInterface(reflector.source_if.as_str().to_owned()))?;
-    let target = interfaces
-        .key_for(reflector.target_if.as_str())
-        .ok_or_else(|| BuildError::UnknownInterface(reflector.target_if.as_str().to_owned()))?;
+    let source = interfaces.require(reflector.source_if.as_str())?;
+    let target = interfaces.require(reflector.target_if.as_str())?;
 
     // The full reflector re-emits on both interfaces (advertisements on source, searches and their
     // unicast responses on target), so a required family must be sendable on BOTH.

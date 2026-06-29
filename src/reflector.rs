@@ -50,6 +50,13 @@ impl InterfaceMap {
     pub(crate) fn key_for(&self, name: &str) -> Option<CaptureKey> {
         self.0.iter().find(|(n, _)| n == name).map(|&(_, key)| key)
     }
+
+    /// The capture key recorded for `name`, or a [`BuildError::UnknownInterface`] naming it — the
+    /// build functions' standard step for resolving a configured interface name to its capture.
+    pub(crate) fn require(&self, name: &str) -> Result<CaptureKey, BuildError> {
+        self.key_for(name)
+            .ok_or_else(|| BuildError::UnknownInterface(name.to_owned()))
+    }
 }
 
 /// Why a reflector could not be built from its config.
