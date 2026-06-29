@@ -53,6 +53,10 @@ pub(crate) enum FramingError {
     MalformedContentLength,
     /// A chunk-size line that isn't a hex integer.
     MalformedChunkSize,
+    /// A chunk size so large that adding its terminating CRLF would overflow `usize` — no legitimate
+    /// device emits a near-`2^64` chunk, and the unchecked add would otherwise panic (debug) or wrap
+    /// (release) and misframe the stream.
+    ChunkSizeTooLarge,
     /// A chunk-size line that never terminated within [`MAX_CHUNK_LINE`] bytes.
     ChunkLineTooLong,
     /// A trailer field line that never terminated within [`MAX_TRAILER_LINE`] bytes.
@@ -175,7 +179,11 @@ impl HttpFraming {
                     if size == 0 {
                         self.phase = Phase::BodyChunkedTrailers;
                     } else {
-                        self.chunk_remaining = size + CRLF.len(); // chunk DATA + its terminating CRLF
+                        // chunk DATA + its terminating CRLF; a near-usize::MAX size (hostile/buggy
+                        // device) would overflow the add, so refuse it rather than panic/wrap-and-misframe.
+                        self.chunk_remaining = size
+                            .checked_add(CRLF.len())
+                            .ok_or(FramingError::ChunkSizeTooLarge)?;
                     }
                 }
                 Phase::BodyChunkedTrailers => {
@@ -643,6 +651,19 @@ mod tests {
         assert!(matches!(
             f.feed(&input),
             Err(FramingError::ChunkLineTooLong)
+        ));
+    }
+
+    #[test]
+    fn a_near_max_chunk_size_is_refused_not_overflowed() {
+        // A hostile/buggy device sends a 16-hex-digit chunk size (usize::MAX on a 64-bit target). It is
+        // under MAX_CHUNK_LINE so it passes the line-length guard; adding the terminating CRLF would
+        // overflow, so the framer must refuse it cleanly rather than panic (debug) or wrap (release).
+        let mut f = HttpFraming::new(Kind::Response, RewritePolicy::NONE);
+        let input = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nffffffffffffffff\r\n";
+        assert!(matches!(
+            f.feed(input),
+            Err(FramingError::ChunkSizeTooLarge)
         ));
     }
 
