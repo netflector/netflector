@@ -841,7 +841,16 @@ impl PacketDispatcher {
                 match result {
                     Ok(change) if change.v4 => v4_moved.push(ifindex),
                     Ok(_) => {}
-                    Err(e) => log::warn!("re-resolving ifindex {ifindex} failed: {e}"),
+                    Err(e) => {
+                        // The overflow already means notifications were dropped, so this is the one
+                        // chance to catch a move whose event was lost — and we can't confirm the v4
+                        // survived. Treat it as moved so any DIAL proxy on it re-mints rather than
+                        // keeping listeners bound to (and advertising) a possibly-vanished address.
+                        log::warn!(
+                            "re-resolving ifindex {ifindex} failed: {e}; evicting its proxies"
+                        );
+                        v4_moved.push(ifindex);
+                    }
                 }
             }
         } else {
@@ -854,7 +863,15 @@ impl PacketDispatcher {
                         }
                     }
                     Ok(None) => {} // a change on an interface we don't watch
-                    Err(e) => log::warn!("re-resolving ifindex {ifindex} failed: {e}"),
+                    Err(e) => {
+                        // Same conservative stance as the overflow branch: a failed re-resolve can't
+                        // confirm the bound v4 survived (a notification arrived, so something changed),
+                        // so evict any proxy on it rather than risk a stale, silently-dead listener.
+                        log::warn!(
+                            "re-resolving ifindex {ifindex} failed: {e}; evicting its proxies"
+                        );
+                        v4_moved.push(*ifindex);
+                    }
                 }
             }
         }
