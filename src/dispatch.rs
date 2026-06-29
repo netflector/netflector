@@ -78,7 +78,7 @@ impl CaptureKey {
     }
 }
 
-/// A `Copy` handle into the interface table's interfaces — an insert-only index, like
+/// A `Copy` handle into the interface table's interface entries — an insert-only index, like
 /// [`CaptureKey`], but a distinct newtype so the two can't be confused.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct InterfaceKey(u32);
@@ -162,22 +162,27 @@ struct CaptureEntry {
     interface: InterfaceKey,
 }
 
+/// One interface paired with its multicast joiner. Bundling them makes the two impossible to
+/// desync (one push adds both) and bakes the relationship the joiner relies on: it carries the
+/// interface's ifindex, stable for the interface's lifetime, and a refresh re-attempts its joins.
+struct InterfaceEntry {
+    interface: Interface,
+    joiner: MulticastJoiner,
+}
+
 /// Owns every interface and every capture, linking each capture to its interface. Plain
 /// `Vec`s (not generational arenas): both are insert-only, so an index is a stable identity
 /// and the inner `Option<Capture>` alone marks the take-out.
 struct InterfaceTable {
-    interfaces: Vec<Interface>,
-    /// One multicast joiner per interface, index-aligned with `interfaces` (an [`InterfaceKey`]
-    /// keys both). The interface's ifindex is stable for its lifetime, so each joiner bakes it.
-    joiners: Vec<MulticastJoiner>,
+    /// One entry per interface, indexed by [`InterfaceKey`].
+    entries: Vec<InterfaceEntry>,
     captures: Vec<CaptureEntry>,
 }
 
 impl InterfaceTable {
     fn new() -> Self {
         Self {
-            interfaces: Vec::new(),
-            joiners: Vec::new(),
+            entries: Vec::new(),
             captures: Vec::new(),
         }
     }
@@ -185,9 +190,9 @@ impl InterfaceTable {
     /// Add an interface, returning its key. Startup-only.
     fn add_interface(&mut self, interface: Interface) -> InterfaceKey {
         let key =
-            InterfaceKey(u32::try_from(self.interfaces.len()).expect("interface count fits a u32"));
-        self.joiners.push(MulticastJoiner::new(interface.ifindex));
-        self.interfaces.push(interface);
+            InterfaceKey(u32::try_from(self.entries.len()).expect("interface count fits a u32"));
+        let joiner = MulticastJoiner::new(interface.ifindex);
+        self.entries.push(InterfaceEntry { interface, joiner });
         key
     }
 
@@ -195,12 +200,8 @@ impl InterfaceTable {
     /// address change. # Errors: propagates the joiner's OS error (an unavailable family is
     /// deferred to [`rejoin`](MulticastJoiner::rejoin), not an error).
     fn join_on(&mut self, interface: InterfaceKey, group: IpAddr) -> io::Result<()> {
-        // `joiners` is index-aligned with `interfaces` (pushed together, insert-only), so an
-        // `InterfaceKey` always indexes a joiner; a miss would be a desync bug, not a runtime case.
-        self.joiners
-            .get_mut(interface.0 as usize)
-            .expect("an InterfaceKey always indexes a joiner")
-            .join(group)
+        // Startup-only with a freshly-minted key, so the index is always in range.
+        self.entries[interface.0 as usize].joiner.join(group)
     }
 
     /// The key of the interface named `name`, opening and resolving it if absent — so
@@ -209,7 +210,11 @@ impl InterfaceTable {
     /// # Errors
     /// Propagates a resolution syscall failure when first opening the interface.
     fn find_or_add_interface(&mut self, name: &str) -> io::Result<InterfaceKey> {
-        if let Some(index) = self.interfaces.iter().position(|iface| iface.name == name) {
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.interface.name == name)
+        {
             return Ok(InterfaceKey(
                 u32::try_from(index).expect("interface count fits a u32"),
             ));
@@ -237,24 +242,24 @@ impl InterfaceTable {
 
     /// An interface's current source addresses, by key.
     fn addrs(&self, interface: InterfaceKey) -> Option<&InterfaceAddresses> {
-        self.interfaces
+        self.entries
             .get(interface.0 as usize)
-            .map(|iface| &iface.addrs)
+            .map(|entry| &entry.interface.addrs)
     }
 
     /// The kernel ifindex of the interface `capture` runs on — its stable identity, cached at open.
     fn ifindex_of(&self, capture: CaptureKey) -> Option<u32> {
         let interface = self.interface_of(capture)?;
-        self.interfaces
+        self.entries
             .get(interface.0 as usize)
-            .map(|iface| iface.ifindex)
+            .map(|entry| entry.interface.ifindex)
     }
 
     /// The name of the interface `interface` keys, if present.
     fn interface_name(&self, interface: InterfaceKey) -> Option<&str> {
-        self.interfaces
+        self.entries
             .get(interface.0 as usize)
-            .map(|iface| iface.name.as_str())
+            .map(|entry| entry.interface.name.as_str())
     }
 
     /// The current source addresses behind a capture, in one hop.
@@ -304,13 +309,17 @@ impl InterfaceTable {
     /// # Errors
     /// Propagates a resolution syscall failure.
     fn refresh_by_ifindex(&mut self, ifindex: u32) -> io::Result<Option<AddressChange>> {
-        let Some(idx) = self.interfaces.iter().position(|i| i.ifindex == ifindex) else {
+        let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.interface.ifindex == ifindex)
+        else {
             return Ok(None);
         };
-        let change = self.interfaces[idx].refresh()?;
+        let change = entry.interface.refresh()?;
         // Re-resolved addresses may have made a deferred join (a v4 group that had no address)
         // viable; re-attempt this interface's memberships.
-        self.joiners[idx].rejoin();
+        entry.joiner.rejoin();
         Ok(Some(change))
     }
 
@@ -321,12 +330,12 @@ impl InterfaceTable {
     /// [`refresh_by_ifindex`](Self::refresh_by_ifindex).
     fn refresh_all(&mut self) -> Vec<(u32, io::Result<AddressChange>)> {
         let results: Vec<(u32, io::Result<AddressChange>)> = self
-            .interfaces
+            .entries
             .iter_mut()
-            .map(|iface| (iface.ifindex, iface.refresh()))
+            .map(|entry| (entry.interface.ifindex, entry.interface.refresh()))
             .collect();
-        for joiner in &mut self.joiners {
-            joiner.rejoin();
+        for entry in &mut self.entries {
+            entry.joiner.rejoin();
         }
         results
     }
