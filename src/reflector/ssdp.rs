@@ -90,6 +90,11 @@ impl PacketHandler for SsdpAdvertisementReflector {
                 // A family the egress can't currently source is a quiet drop (transient address
                 // loss), keeping send_udp_group's error meaning a genuine failure.
                 if !egress_sources(dispatcher, self.egress, packet.dest) {
+                    log::debug!(
+                        "SSDP: egress has no source for {} yet; dropping advertisement from {}",
+                        packet.dest,
+                        packet.source
+                    );
                     return;
                 }
                 let mut buf = [0u8; REWRITE_BUF_LEN];
@@ -159,6 +164,11 @@ impl PacketHandler for SsdpResponseReflector {
         // here is a unicast reply for this searcher — nothing to classify. A family the source can't
         // currently send is a quiet drop (transient address loss), as in the advertisement direction.
         if !egress_sources(dispatcher, self.egress, self.searcher) {
+            log::debug!(
+                "SSDP: egress has no source for searcher {} yet; dropping response from {}",
+                self.searcher,
+                packet.source
+            );
             return;
         }
         let mut buf = [0u8; REWRITE_BUF_LEN];

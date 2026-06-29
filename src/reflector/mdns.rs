@@ -43,6 +43,11 @@ impl PacketHandler for MdnsReflector {
                 // A family the egress can't currently source is a quiet drop (transient address
                 // loss), keeping send_udp_group's error meaning a genuine failure.
                 if !egress_sources(dispatcher, self.egress, packet.dest) {
+                    log::debug!(
+                        "mDNS: egress has no source for {} yet; dropping reflection from {}",
+                        packet.dest,
+                        packet.source
+                    );
                     return;
                 }
                 match dispatcher.send_udp_group(
