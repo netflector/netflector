@@ -812,7 +812,8 @@ pub(crate) const REWRITE_BUF_LEN: usize = crate::dispatch::SCRATCH_LEN;
 /// rewrite wouldn't fit `out`. `out` is the caller's reused scratch (size it [`REWRITE_BUF_LEN`]); the
 /// rewritten datagram is sent immediately, so it need not outlive the call. `source`/`target` are the
 /// source/target interface IPv4 addresses: the proxy binds its listeners on `source` and egress-pins
-/// device connections to `target`/`ifindex`.
+/// device connections to `target`/`ifindex`. `source_capture`/`target_capture` identify those interfaces
+/// so an address change on either evicts the proxy.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn rewrite_location(
     ctx: &mut DialContext,
@@ -820,6 +821,7 @@ pub(crate) fn rewrite_location(
     payload: &[u8],
     source_capture: CaptureKey,
     source: Ipv4Addr,
+    target_capture: CaptureKey,
     target: Ipv4Addr,
     ifindex: u32,
     out: &mut [u8],
@@ -850,6 +852,7 @@ pub(crate) fn rewrite_location(
                 source_capture,
                 location.endpoint,
                 source,
+                target_capture,
                 target,
                 ifindex,
                 desc_grace,
@@ -884,6 +887,7 @@ fn mint_proxy(
     source_capture: CaptureKey,
     endpoint: SocketAddrV4,
     source: Ipv4Addr,
+    target_capture: CaptureKey,
     target: Ipv4Addr,
     ifindex: u32,
     desc_grace: Instant,
@@ -904,7 +908,14 @@ fn mint_proxy(
             return None; // the proxy drops, closing both listeners
         }
     };
-    ctx.insert(source_capture, endpoint, handler, desc_addr, desc_grace);
+    ctx.insert(
+        source_capture,
+        target_capture,
+        endpoint,
+        handler,
+        desc_addr,
+        desc_grace,
+    );
     log::debug!("dial: minted a proxy for {endpoint} via description listener {desc_addr}");
     Some(desc_addr)
 }
@@ -1445,6 +1456,11 @@ mod tests {
         CaptureKey::from_u64(7)
     }
 
+    /// The target capture `rewrite_advert`'s proxy egresses device connections on.
+    fn advert_target() -> CaptureKey {
+        CaptureKey::from_u64(8)
+    }
+
     /// Rewrite `payload` like a reflector would (into a [`REWRITE_BUF_LEN`] stack buffer), returning the
     /// rewritten datagram, or `None` to forward verbatim.
     fn rewrite_advert(
@@ -1459,6 +1475,7 @@ mod tests {
             payload,
             advert_source(),
             Ipv4Addr::LOCALHOST,
+            advert_target(),
             Ipv4Addr::LOCALHOST,
             0,
             &mut buf,
@@ -1539,6 +1556,53 @@ mod tests {
             1,
             "the stale entry is replaced, not duplicated"
         );
+    }
+
+    #[test]
+    fn an_interface_change_evicts_a_proxy_by_source_or_target() {
+        let mut reactor = Reactor::new().expect("reactor");
+        let mut ctx = DialContext::new();
+        rewrite_advert(&mut ctx, &mut reactor, DIAL_ADVERT).expect("minted");
+        let handler = ctx.handler_keys()[0];
+
+        // A change on an unrelated interface leaves the proxy alone.
+        ctx.evict_on_interface_change(&mut reactor, |c| c == CaptureKey::from_u64(99));
+        assert_eq!(
+            ctx.proxy_count(),
+            1,
+            "an unrelated interface change spares it"
+        );
+        assert!(reactor.is_registered(handler));
+
+        // A change on its source interface evicts and unregisters it.
+        ctx.evict_on_interface_change(&mut reactor, |c| c == advert_source());
+        assert_eq!(ctx.proxy_count(), 0, "a source interface change evicts it");
+        assert!(!reactor.is_registered(handler), "and unregisters it");
+
+        // A re-mint is evicted just the same by a change on its target interface.
+        rewrite_advert(&mut ctx, &mut reactor, DIAL_ADVERT).expect("re-minted");
+        let handler = ctx.handler_keys()[0];
+        ctx.evict_on_interface_change(&mut reactor, |c| c == advert_target());
+        assert_eq!(
+            ctx.proxy_count(),
+            0,
+            "a target interface change evicts it too"
+        );
+        assert!(!reactor.is_registered(handler));
+    }
+
+    #[test]
+    fn evict_on_interface_change_prunes_an_already_evicted_entry() {
+        let mut reactor = Reactor::new().expect("reactor");
+        let mut ctx = DialContext::new();
+        rewrite_advert(&mut ctx, &mut reactor, DIAL_ADVERT).expect("minted");
+        // The proxy is torn down out from under the registry (e.g. by the grace sweep on a prior tick).
+        reactor
+            .unregister(ctx.handler_keys()[0])
+            .expect("unregister the proxy");
+        // An interface change matching no live proxy still prunes the now-stale entry.
+        ctx.evict_on_interface_change(&mut reactor, |_| false);
+        assert_eq!(ctx.proxy_count(), 0, "the already-evicted entry is pruned");
     }
 
     #[test]

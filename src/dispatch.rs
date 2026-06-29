@@ -28,7 +28,7 @@ use thiserror::Error;
 
 use self::multicast::MulticastJoiner;
 use crate::capture::Capture;
-use crate::interface::{AddressMonitor, Interface, InterfaceAddresses};
+use crate::interface::{AddressChange, AddressMonitor, Interface, InterfaceAddresses};
 use crate::net::LinkType;
 use crate::net::frame::{self, FrameError};
 use crate::net::mac::MacAddr;
@@ -294,39 +294,41 @@ impl InterfaceTable {
 
     /// Re-resolve the interface with kernel index `ifindex`, in place. A real index matches at
     /// most one interface — they dedup by name, and the kernel gives each a distinct index —
-    /// so this finds rather than scans. Returns whether one matched; a change on an interface
-    /// we don't watch is `Ok(false)`. Log-free, like [`take`](Self::take); the dispatcher
-    /// reports the outcome. (The caller routes the `0` overflow-signal to [`refresh_all`], so
-    /// `ifindex` is always a real index here.)
+    /// so this finds rather than scans. Returns the fields that changed if one matched, or `None`
+    /// for a change on an interface we don't watch. Log-free, like [`take`](Self::take); the
+    /// dispatcher reports the outcome. (The caller routes the `0` overflow-signal to
+    /// [`refresh_all`], so `ifindex` is always a real index here.)
     ///
     /// [`refresh_all`]: Self::refresh_all
     ///
     /// # Errors
     /// Propagates a resolution syscall failure.
-    fn refresh_by_ifindex(&mut self, ifindex: u32) -> io::Result<bool> {
+    fn refresh_by_ifindex(&mut self, ifindex: u32) -> io::Result<Option<AddressChange>> {
         let Some(idx) = self.interfaces.iter().position(|i| i.ifindex == ifindex) else {
-            return Ok(false);
+            return Ok(None);
         };
-        self.interfaces[idx].refresh()?;
+        let change = self.interfaces[idx].refresh()?;
         // Re-resolved addresses may have made a deferred join (a v4 group that had no address)
         // viable; re-attempt this interface's memberships.
         self.joiners[idx].rejoin();
-        Ok(true)
+        Ok(Some(change))
     }
 
-    /// Re-resolve every interface in place — the response to an overflow signal, where
-    /// dropped notifications mean any address could be stale.
-    ///
-    /// # Errors
-    /// Propagates the first resolution syscall failure.
-    fn refresh_all(&mut self) -> io::Result<()> {
-        for iface in &mut self.interfaces {
-            iface.refresh()?;
-        }
+    /// Re-resolve every interface in place — the response to an overflow signal, where dropped
+    /// notifications mean any address could be stale. Returns each interface's ifindex paired with its
+    /// refresh outcome (best-effort: a per-interface failure is reported, not fatal), so the caller logs
+    /// failures and reacts to exactly the interfaces whose addresses moved. Log-free, like
+    /// [`refresh_by_ifindex`](Self::refresh_by_ifindex).
+    fn refresh_all(&mut self) -> Vec<(u32, io::Result<AddressChange>)> {
+        let results: Vec<(u32, io::Result<AddressChange>)> = self
+            .interfaces
+            .iter_mut()
+            .map(|iface| (iface.ifindex, iface.refresh()))
+            .collect();
         for joiner in &mut self.joiners {
             joiner.rejoin();
         }
-        Ok(())
+        results
     }
 
     /// Each present capture's `(fd, user_data = CaptureKey)` for
@@ -352,13 +354,15 @@ impl InterfaceTable {
 const MAX_DIAL_PROXIES: usize = 32;
 
 /// One minted DIAL description proxy: keyed by the `source` capture it fronts on plus the device's
-/// description `endpoint` (its `LOCATION` authority), recording the proxy's reactor `handler` (whose
-/// generational key goes stale once the proxy is evicted), the source-side description-listener
-/// `desc_addr` spliced into the device's `LOCATION`, and `desc_grace` — the instant past which the
-/// dispatcher evicts the proxy, refreshed to each advertisement's `max-age` so a cached `LOCATION`
-/// keeps resolving while the device is advertised.
+/// description `endpoint` (its `LOCATION` authority), recording the `target` capture its device
+/// connections egress on (so an address change on either interface evicts it), the proxy's reactor
+/// `handler` (whose generational key goes stale once the proxy is evicted), the source-side
+/// description-listener `desc_addr` spliced into the device's `LOCATION`, and `desc_grace` — the instant
+/// past which the dispatcher evicts the proxy, refreshed to each advertisement's `max-age` so a cached
+/// `LOCATION` keeps resolving while the device is advertised.
 struct DialEntry {
     source: CaptureKey,
+    target: CaptureKey,
     endpoint: SocketAddrV4,
     handler: HandlerKey,
     desc_addr: SocketAddrV4,
@@ -417,6 +421,7 @@ impl DialContext {
     pub(crate) fn insert(
         &mut self,
         source: CaptureKey,
+        target: CaptureKey,
         endpoint: SocketAddrV4,
         handler: HandlerKey,
         desc_addr: SocketAddrV4,
@@ -427,12 +432,14 @@ impl DialContext {
             .iter_mut()
             .find(|p| p.source == source && p.endpoint == endpoint)
         {
+            entry.target = target;
             entry.handler = handler;
             entry.desc_addr = desc_addr;
             entry.desc_grace = desc_grace;
         } else {
             self.proxies.push(DialEntry {
                 source,
+                target,
                 endpoint,
                 handler,
                 desc_addr,
@@ -447,24 +454,48 @@ impl DialContext {
         self.proxies.iter().map(|p| p.desc_grace).min()
     }
 
-    /// Evict every proxy whose grace has lapsed (`now` past its `desc_grace`): unregister it from the
-    /// reactor — tearing down its listeners and connections — and drop its entry. An entry whose proxy
-    /// is already gone is pruned too.
-    pub(crate) fn sweep(&mut self, now: Instant, reactor: &mut Reactor) {
+    /// Evict every proxy `evict` selects: unregister it from the reactor — tearing down its listeners and
+    /// connections — and drop its entry. `reason` names why, for the log. A surviving entry whose proxy is
+    /// already gone is pruned too, so a stale [`HandlerKey`] never lingers.
+    fn evict_where(
+        &mut self,
+        reactor: &mut Reactor,
+        reason: &str,
+        evict: impl Fn(&DialEntry) -> bool,
+    ) {
         self.proxies.retain(|p| {
-            if now >= p.desc_grace {
+            if evict(p) {
                 match reactor.unregister(p.handler) {
-                    Ok(_) => {
-                        log::debug!("dial: evicted the proxy for {} past its grace", p.endpoint);
-                    }
+                    Ok(_) => log::debug!("dial: evicted the proxy for {} {reason}", p.endpoint),
                     Err(e) => {
-                        log::warn!("dial: evicting the proxy for {} failed: {e}", p.endpoint);
+                        log::warn!(
+                            "dial: evicting the proxy for {} {reason} failed: {e}",
+                            p.endpoint
+                        );
                     }
                 }
                 false // drop the entry whether or not the teardown cleanly succeeded
             } else {
                 reactor.is_registered(p.handler) // drop an already-evicted entry
             }
+        });
+    }
+
+    /// Evict every proxy whose grace has lapsed (`now` past its `desc_grace`).
+    pub(crate) fn sweep(&mut self, now: Instant, reactor: &mut Reactor) {
+        self.evict_where(reactor, "past its grace", |p| now >= p.desc_grace);
+    }
+
+    /// Evict every proxy whose source or target capture is on a changed interface (`on_changed`): an
+    /// address move there stranded the proxy's listeners or its device-connect egress, so it must re-mint
+    /// against the current addresses on the next advertisement rather than be reused.
+    pub(crate) fn evict_on_interface_change(
+        &mut self,
+        reactor: &mut Reactor,
+        on_changed: impl Fn(CaptureKey) -> bool,
+    ) {
+        self.evict_where(reactor, "after its interface's address changed", |p| {
+            on_changed(p.source) || on_changed(p.target)
         });
     }
 }
@@ -787,7 +818,7 @@ impl PacketDispatcher {
     /// coalescing duplicates so one interface re-resolves at most once per wakeup. A `0`
     /// (the overflow signal) re-resolves every interface. Best-effort: a read or resolution
     /// failure logs and is dropped — the daemon keeps its last-known addresses.
-    fn refresh_changed_interfaces(&mut self) {
+    fn refresh_changed_interfaces(&mut self, reactor: &mut Reactor) {
         let Some(monitor) = self.monitor.as_mut() else {
             return;
         };
@@ -800,21 +831,40 @@ impl PacketDispatcher {
             log::warn!("address monitor read failed; skipping refresh: {e}");
             return;
         }
-        // 0 is the overflow signal: notifications were dropped, so re-resolve everything.
+        // The DIAL proxies bind IPv4 only, so collect the interfaces whose v4 address actually moved — a
+        // routine v6 or MAC change must not churn a proxy whose v4 (and cached LOCATION) is unchanged.
+        let mut v4_moved: Vec<u32> = Vec::new();
         if changed.contains(&0) {
+            // 0 is the overflow signal: notifications were dropped, so re-resolve every interface.
             log::debug!("address monitor overflow; re-resolving all interfaces");
-            if let Err(e) = self.table.refresh_all() {
-                log::warn!("re-resolving all interfaces failed: {e}");
+            for (ifindex, result) in self.table.refresh_all() {
+                match result {
+                    Ok(change) if change.v4 => v4_moved.push(ifindex),
+                    Ok(_) => {}
+                    Err(e) => log::warn!("re-resolving ifindex {ifindex} failed: {e}"),
+                }
             }
-            return;
-        }
-        for ifindex in changed {
-            match self.table.refresh_by_ifindex(ifindex) {
-                Ok(true) => log::debug!("re-resolved interface (ifindex {ifindex}) after a change"),
-                Ok(false) => {} // a change on an interface we don't watch
-                Err(e) => log::warn!("re-resolving ifindex {ifindex} failed: {e}"),
+        } else {
+            for ifindex in &changed {
+                match self.table.refresh_by_ifindex(*ifindex) {
+                    Ok(Some(change)) => {
+                        log::debug!("re-resolved interface (ifindex {ifindex}) after a change");
+                        if change.v4 {
+                            v4_moved.push(*ifindex);
+                        }
+                    }
+                    Ok(None) => {} // a change on an interface we don't watch
+                    Err(e) => log::warn!("re-resolving ifindex {ifindex} failed: {e}"),
+                }
             }
         }
+        // Evict proxies whose source or target interface lost the v4 address they bound: their listeners
+        // sit on a vanished address and their cached LOCATION is stale, so they must re-mint, not be reused.
+        self.dial.evict_on_interface_change(reactor, |cap| {
+            self.table
+                .ifindex_of(cap)
+                .is_some_and(|ix| v4_moved.contains(&ix))
+        });
     }
 }
 
@@ -912,7 +962,7 @@ impl Handler for PacketDispatcher {
     /// drop in [`drain_and_route`](Self::drain_and_route).
     fn on_readable(&mut self, event: ReadyEvent, reactor: &mut Reactor) {
         if event.user_data == MONITOR_TAG {
-            self.refresh_changed_interfaces();
+            self.refresh_changed_interfaces(reactor);
         } else {
             self.drain_and_route(CaptureKey::from_u64(event.user_data), reactor);
         }
@@ -1800,20 +1850,24 @@ mod tests {
         );
     }
 
-    // refresh_by_ifindex re-resolves only the interface(s) with the matching kernel index.
-    // Resolution is unprivileged (no capture needed), so this exercises the monitor's refresh
-    // path without CAP_NET_RAW.
+    // refresh_by_ifindex re-resolves only the interface(s) with the matching kernel index, reporting
+    // the changed fields (`None` for an unwatched index). Resolution is unprivileged (no capture
+    // needed), so this exercises the monitor's refresh path without CAP_NET_RAW.
     #[test]
     fn refresh_by_ifindex_targets_the_matching_interface() -> io::Result<()> {
         let mut dispatcher = PacketDispatcher::new();
         dispatcher.table.find_or_add_interface(LOOPBACK_IFACE)?;
         let ifindex = crate::interface::if_index(LOOPBACK_IFACE).expect("loopback has an ifindex");
+        let change = dispatcher
+            .table
+            .refresh_by_ifindex(ifindex)?
+            .expect("the loopback interface matches its ifindex and re-resolves");
         assert!(
-            dispatcher.table.refresh_by_ifindex(ifindex)?,
-            "the loopback interface should match its ifindex and re-resolve",
+            !change.v4,
+            "re-resolving the unchanged loopback reports no v4 move — the bit the DIAL eviction gates on",
         );
         assert!(
-            !dispatcher.table.refresh_by_ifindex(u32::MAX)?,
+            dispatcher.table.refresh_by_ifindex(u32::MAX)?.is_none(),
             "an ifindex we don't watch should refresh nothing",
         );
         Ok(())
@@ -1833,8 +1887,13 @@ mod tests {
             iface,
             IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb)),
         )?;
-        // The recorded memberships survive a refresh, re-attempted idempotently (no error).
-        dispatcher.table.refresh_all()?;
+        // The recorded memberships survive a refresh, re-attempted idempotently (each interface
+        // resolves cleanly).
+        let results = dispatcher.table.refresh_all();
+        assert!(
+            results.iter().all(|(_, r)| r.is_ok()),
+            "re-resolving every interface succeeds",
+        );
         Ok(())
     }
 

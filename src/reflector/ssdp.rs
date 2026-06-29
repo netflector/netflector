@@ -58,6 +58,7 @@ fn dial_rewrite<'a>(
         payload,
         egress,
         source,
+        dial.target,
         target,
         dial.target_ifindex,
         buf,

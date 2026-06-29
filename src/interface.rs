@@ -31,6 +31,16 @@ pub(crate) struct InterfaceAddresses {
     pub(crate) v6: Option<Ipv6Addr>,
 }
 
+/// Which source fields a [`refresh`](Interface::refresh) found changed — one flag per
+/// [`InterfaceAddresses`] field, so a caller reacts only to the family it depends on (the DIAL proxies
+/// bind IPv4, so they re-mint only when `v4` moves, not on a routine v6 or MAC change).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct AddressChange {
+    pub(crate) mac: bool,
+    pub(crate) v4: bool,
+    pub(crate) v6: bool,
+}
+
 impl fmt::Display for InterfaceAddresses {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("mac ")?;
@@ -62,21 +72,23 @@ pub(crate) fn if_index(name: &str) -> Option<u32> {
 }
 
 /// Log a single source field's transition at `info` — the address churn an operator (and the
-/// address-change e2e) wants visible. Nothing is logged when the field is unchanged.
+/// address-change e2e) wants visible — returning whether it changed at all, so the caller acts on
+/// exactly the families that moved. Nothing is logged when the field is unchanged.
 fn log_field_change<A: PartialEq + fmt::Display>(
     iface: &str,
     family: &str,
     old: Option<A>,
     new: Option<A>,
-) {
+) -> bool {
     match (old, new) {
         (None, Some(now)) => log::info!("interface {iface}: gained {family} {now}"),
         (Some(was), None) => log::info!("interface {iface}: lost {family} (was {was})"),
         (Some(was), Some(now)) if was != now => {
             log::info!("interface {iface}: {family} changed {was} -> {now}");
         }
-        _ => {}
+        _ => return false,
     }
+    true
 }
 
 /// One configured interface: its name (kept for re-resolution), kernel ifindex (the address
@@ -107,21 +119,25 @@ impl Interface {
     /// Re-resolve this interface's addresses in place (at open, and after an address-change
     /// notification) via the platform backend. The cached `ifindex` — a stable identity for
     /// the interface's lifetime — keys the Linux dump; the BSD `getifaddrs` walk matches by
-    /// name. The backend logs each address (and every v6's flag status) at `trace`.
+    /// name. The backend logs each address (and every v6's flag status) at `trace`. Returns which
+    /// source fields changed from the previous resolution, so a caller can react to exactly the
+    /// family it depends on.
     ///
     /// # Errors
     /// Propagates a resolution syscall failure.
-    pub(crate) fn refresh(&mut self) -> io::Result<()> {
+    pub(crate) fn refresh(&mut self) -> io::Result<AddressChange> {
         #[cfg(any(target_os = "macos", target_os = "freebsd"))]
         let addrs = self::getifaddrs::resolve(&self.name)?;
         #[cfg(target_os = "linux")]
         let addrs = self::rtnetlink::resolve(&self.name, self.ifindex)?;
         log::debug!("{}: resolved {addrs}", self.name);
-        log_field_change(&self.name, "MAC", self.addrs.mac, addrs.mac);
-        log_field_change(&self.name, "IPv4", self.addrs.v4, addrs.v4);
-        log_field_change(&self.name, "IPv6", self.addrs.v6, addrs.v6);
+        let change = AddressChange {
+            mac: log_field_change(&self.name, "MAC", self.addrs.mac, addrs.mac),
+            v4: log_field_change(&self.name, "IPv4", self.addrs.v4, addrs.v4),
+            v6: log_field_change(&self.name, "IPv6", self.addrs.v6, addrs.v6),
+        };
         self.addrs = addrs;
-        Ok(())
+        Ok(change)
     }
 }
 
@@ -158,6 +174,29 @@ mod tests {
         // exercises the full backend (the v4 path, and on Linux the rtnetlink round-trip).
         let addrs = Interface::open(LOOPBACK_IFACE).unwrap().addrs;
         assert_eq!(addrs.v4, Some(Ipv4Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn refresh_reports_which_source_fields_changed() {
+        let mut iface = Interface::open(LOOPBACK_IFACE).unwrap();
+        // Re-resolving an interface whose addresses are already current reports nothing moved.
+        assert_eq!(iface.refresh().unwrap(), AddressChange::default());
+        // With a stale v4 cached, the next resolve (back to the real 127.0.0.1) reports a v4 move — and
+        // only v4. This is the flag the DIAL eviction gates on.
+        iface.addrs.v4 = Some(Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(
+            iface.refresh().unwrap(),
+            AddressChange {
+                v4: true,
+                ..AddressChange::default()
+            },
+        );
+        // A stale v6 is reported independently of v4 — so a routine v6 rotation can't masquerade as the
+        // v4 change that would evict a DIAL proxy.
+        iface.addrs.v6 = Some("2001:db8::1".parse().unwrap());
+        let change = iface.refresh().unwrap();
+        assert!(change.v6, "the differing v6 is reported");
+        assert!(!change.v4, "but it does not look like a v4 change");
     }
 
     #[test]
