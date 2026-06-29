@@ -38,6 +38,17 @@ pub(crate) fn parse_dial_location_authority(payload: &[u8]) -> Option<Authority>
     None
 }
 
+/// The raw, trimmed `LOCATION:` header value (the URL), or `None` if the message carries none — for a
+/// debug log when [`parse_dial_location_authority`] rejects the URL as non-rewritable and the operator
+/// wants to see what the device actually advertised.
+pub(crate) fn dial_location_value(payload: &[u8]) -> Option<&[u8]> {
+    payload.split(|&b| b == b'\n').find_map(|line| {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let url = strip_prefix_ignore_ascii_case(line, b"LOCATION:")?.trim_ascii_start();
+        (!url.is_empty()).then_some(url)
+    })
+}
+
 /// Parse the advertisement's freshness lifetime from a `CACHE-CONTROL: max-age=<seconds>` header — the
 /// seconds an SSDP cache (and so the proxy's description listener) may treat the device as present. The
 /// `max-age` directive is matched case-insensitively among comma-separated directives; `None` if the
@@ -116,6 +127,16 @@ mod tests {
         assert!(parse_dial_location_authority(b"LOCATION: http://10.0.0.1:0/x\r\n").is_none());
         assert!(parse_dial_location_authority(b"LOCATION: http://10.0.0.1:80x/x\r\n").is_none());
         assert!(parse_dial_location_authority(b"NOTIFY * HTTP/1.1\r\nNT: foo\r\n\r\n").is_none());
+    }
+
+    #[test]
+    fn dial_location_value_returns_the_raw_url() {
+        // Even a non-rewritable LOCATION yields its raw value, so the rewrite hook can log it.
+        assert_eq!(
+            dial_location_value(b"NOTIFY * HTTP/1.1\r\nLOCATION: https://tv.local/x\r\n\r\n"),
+            Some(&b"https://tv.local/x"[..])
+        );
+        assert!(dial_location_value(b"NOTIFY * HTTP/1.1\r\nNT: foo\r\n\r\n").is_none());
     }
 
     #[test]

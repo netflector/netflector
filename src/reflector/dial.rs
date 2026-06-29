@@ -21,7 +21,8 @@ use std::time::{Duration, Instant};
 use crate::dispatch::{CaptureKey, DialContext};
 use crate::net::http::framing::{AuthorityHeader, HttpFraming, Kind, RewritePolicy};
 use crate::net::ssdp::dial::{
-    is_dial_service_message, parse_cache_control_max_age, parse_dial_location_authority,
+    dial_location_value, is_dial_service_message, parse_cache_control_max_age,
+    parse_dial_location_authority,
 };
 use crate::net::stream_buffer::StreamBuffer;
 use crate::net::tcp::TcpSocket;
@@ -830,7 +831,16 @@ pub(crate) fn rewrite_location(
     if !is_dial_service_message(payload) {
         return None;
     }
-    let location = parse_dial_location_authority(payload)?;
+    let Some(location) = parse_dial_location_authority(payload) else {
+        // The message is DIAL but its LOCATION isn't a rewritable IPv4 http URL (https, a hostname,
+        // an IPv6 literal, a bad port). It's forwarded verbatim with no proxy minted — exactly the
+        // "device discovered but never proxied" case, so name the offending URL for a debug session.
+        log::debug!(
+            "dial: LOCATION {} is not a rewritable IPv4 http URL; forwarding the message unproxied",
+            dial_location_value(payload).map_or_else(|| "(absent)".into(), String::from_utf8_lossy)
+        );
+        return None;
+    };
     // The grace is refreshed on every advertisement / search response, so a re-advertised device's
     // cached LOCATION keeps resolving for another max-age.
     let max_age = parse_cache_control_max_age(payload).map_or(DEFAULT_DESC_GRACE, |seconds| {
