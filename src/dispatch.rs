@@ -708,11 +708,11 @@ impl PacketDispatcher {
     /// Inject a broadcast/multicast UDP datagram on `egress`, deriving the L2 destination MAC from
     /// `dst`'s address class (all-ones for the IPv4 limited broadcast, the RFC-derived group MAC
     /// for multicast) — a thin wrapper over [`send_udp`](Self::send_udp). A unicast `dst` has no
-    /// derivable group MAC, so it is a [`BuildError::UnicastDestination`]; use `send_udp` with an
+    /// derivable group MAC, so it is a [`DatagramError::UnicastDestination`]; use `send_udp` with an
     /// explicit MAC for unicast.
     ///
     /// # Errors
-    /// As [`send_udp`](Self::send_udp), plus [`BuildError::UnicastDestination`] for a unicast `dst`.
+    /// As [`send_udp`](Self::send_udp), plus [`DatagramError::UnicastDestination`] for a unicast `dst`.
     pub(crate) fn send_udp_group(
         &mut self,
         egress: CaptureKey,
@@ -899,7 +899,7 @@ impl PacketDispatcher {
 /// reflector's family/MAC gating makes unreachable in practice, but they stay typed so the
 /// builder is unit-testable and a stray one logs precisely.
 #[derive(Debug, Error, PartialEq, Eq)]
-enum BuildError {
+enum DatagramError {
     /// The egress has no source address for the datagram's family.
     #[error("egress has no source address for the datagram's family")]
     NoSourceAddress,
@@ -917,12 +917,12 @@ enum BuildError {
 /// The Ethernet destination MAC for an injected datagram to `dst`: the all-ones broadcast
 /// for the IPv4 limited broadcast, the RFC-derived group MAC for any multicast destination.
 /// Only broadcast/multicast destinations are injected here, so a unicast `dst` — whose MAC
-/// we would have to resolve — is a [`BuildError::UnicastDestination`].
-fn ethernet_dst(dst: IpAddr) -> Result<MacAddr, BuildError> {
+/// we would have to resolve — is a [`DatagramError::UnicastDestination`].
+fn ethernet_dst(dst: IpAddr) -> Result<MacAddr, DatagramError> {
     match dst {
         IpAddr::V4(v4) if v4.is_broadcast() => Ok(MacAddr::broadcast()),
         _ if dst.is_multicast() => Ok(MacAddr::multicast_for(dst)),
-        _ => Err(BuildError::UnicastDestination),
+        _ => Err(DatagramError::UnicastDestination),
     }
 }
 
@@ -943,14 +943,14 @@ fn build_udp(
     ttl: u8,
     payload: &[u8],
     scratch: &mut [u8],
-) -> Result<usize, BuildError> {
+) -> Result<usize, DatagramError> {
     match dst {
         SocketAddr::V4(dst) => {
-            let src = SocketAddrV4::new(addrs.v4.ok_or(BuildError::NoSourceAddress)?, src_port);
+            let src = SocketAddrV4::new(addrs.v4.ok_or(DatagramError::NoSourceAddress)?, src_port);
             match link {
                 LinkType::Ethernet => Ok(frame::ethernet_ipv4_udp(
                     dst_mac,
-                    addrs.mac.ok_or(BuildError::NoSourceMac)?,
+                    addrs.mac.ok_or(DatagramError::NoSourceMac)?,
                     src,
                     dst,
                     ttl,
@@ -962,12 +962,16 @@ fn build_udp(
             }
         }
         SocketAddr::V6(dst) => {
-            let src =
-                SocketAddrV6::new(addrs.v6.ok_or(BuildError::NoSourceAddress)?, src_port, 0, 0);
+            let src = SocketAddrV6::new(
+                addrs.v6.ok_or(DatagramError::NoSourceAddress)?,
+                src_port,
+                0,
+                0,
+            );
             match link {
                 LinkType::Ethernet => Ok(frame::ethernet_ipv6_udp(
                     dst_mac,
-                    addrs.mac.ok_or(BuildError::NoSourceMac)?,
+                    addrs.mac.ok_or(DatagramError::NoSourceMac)?,
                     src,
                     dst,
                     ttl,
@@ -1218,11 +1222,11 @@ mod tests {
         // A unicast destination (either family) has no injectable L2 address.
         assert_eq!(
             ethernet_dst("192.168.0.1".parse().unwrap()),
-            Err(BuildError::UnicastDestination)
+            Err(DatagramError::UnicastDestination)
         );
         assert_eq!(
             ethernet_dst("fe80::1".parse().unwrap()),
-            Err(BuildError::UnicastDestination)
+            Err(DatagramError::UnicastDestination)
         );
     }
 
@@ -1315,7 +1319,7 @@ mod tests {
                 b"x",
                 &mut scratch
             ),
-            Err(BuildError::NoSourceAddress)
+            Err(DatagramError::NoSourceAddress)
         );
     }
 
@@ -1338,13 +1342,13 @@ mod tests {
                 b"x",
                 &mut scratch
             ),
-            Err(BuildError::NoSourceMac)
+            Err(DatagramError::NoSourceMac)
         );
     }
 
     #[test]
     fn build_udp_surfaces_a_frame_error() {
-        // A scratch too small for the frame is a typed BuildError::Frame, not a panic — the
+        // A scratch too small for the frame is a typed DatagramError::Frame, not a panic — the
         // `#[from] FrameError` conversion that send_udp then maps onto io::Error.
         let dst = SocketAddr::from((Ipv4Addr::BROADCAST, 9));
         let mut tiny = [0u8; 16];
@@ -1359,7 +1363,7 @@ mod tests {
                 b"x",
                 &mut tiny
             ),
-            Err(BuildError::Frame(FrameError::BufferTooSmall { .. }))
+            Err(DatagramError::Frame(FrameError::BufferTooSmall { .. }))
         ));
     }
 
