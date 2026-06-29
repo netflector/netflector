@@ -17,6 +17,10 @@ pub(crate) const SSDP_GROUP_V4: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
 pub(crate) const SSDP_GROUP_V6_LINK_LOCAL: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0x0c);
 /// The IPv6 site-local SSDP multicast group (`ff05::c`); SSDP joins both v6 scopes.
 pub(crate) const SSDP_GROUP_V6_SITE_LOCAL: Ipv6Addr = Ipv6Addr::new(0xff05, 0, 0, 0, 0, 0, 0, 0x0c);
+/// The fallback M-SEARCH response window (seconds) the caller applies when [`parse_msearch_mx`]
+/// finds no usable MX. A multicast M-SEARCH MUST carry MX (`UPnP` Device Architecture 2.0), so an
+/// absent or unparseable one is a non-conformant searcher — reflected anyway with this window.
+pub(crate) const MSEARCH_MX_DEFAULT: u8 = 3;
 
 /// An SSDP message is a search or an advertisement, per its HTTPU request line. This split is the
 /// reflector's directional gate: searches (`M-SEARCH`) reflect source → target, advertisements
@@ -44,11 +48,6 @@ pub(crate) fn classify(payload: &[u8]) -> Option<SsdpKind> {
         None
     }
 }
-
-/// The fallback M-SEARCH response window (seconds) the caller applies when [`parse_msearch_mx`]
-/// finds no usable MX. A multicast M-SEARCH MUST carry MX (`UPnP` Device Architecture 2.0), so an
-/// absent or unparseable one is a non-conformant searcher — reflected anyway with this window.
-pub(crate) const MSEARCH_MX_DEFAULT: u8 = 3;
 
 /// MX is clamped to `[1, 5]` seconds (`UPnP` Device Architecture 2.0).
 const MX_MIN: u8 = 1;
