@@ -59,8 +59,15 @@ pub(super) fn resolve(if_name: &str) -> io::Result<InterfaceAddresses> {
         match family {
             libc::AF_INET => {
                 let v4 = read_v4(ifa.ifa_addr);
-                log::trace!("{if_name}: v4 {v4}");
-                addrs.v4 = Some(v4);
+                // First address wins, matching the rtnetlink backend. Taking the last would let a
+                // secondary alias and the kernel's enumeration order flip the chosen v4 on unrelated
+                // alias churn, producing a spurious v4 delta that needlessly evicts DIAL proxies.
+                if addrs.v4.is_none() {
+                    log::trace!("{if_name}: v4 {v4}");
+                    addrs.v4 = Some(v4);
+                } else {
+                    log::trace!("{if_name}: v4 {v4} (ignored; already have one)");
+                }
             }
             libc::AF_LINK => {
                 let mac = read_mac(ifa.ifa_addr);
