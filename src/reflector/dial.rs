@@ -805,26 +805,33 @@ const DEFAULT_DESC_GRACE: Duration = Duration::from_mins(30);
 /// grow the datagram; one that still overruns this falls back to verbatim rather than truncating.
 pub(crate) const REWRITE_BUF_LEN: usize = crate::dispatch::SCRATCH_LEN;
 
+/// Where a minted DIAL description proxy sits across the two interfaces, resolved per datagram: it
+/// binds its source-side listeners on `source`, egress-pins device connections to
+/// `target`/`target_ifindex`, and is evicted if either `source_capture`'s or `target_capture`'s
+/// IPv4 address later changes. Bundling the two same-typed capture/address pairs keeps them from
+/// being transposed at the call.
+#[derive(Clone, Copy)]
+pub(crate) struct ProxyPlacement {
+    pub(crate) source_capture: CaptureKey,
+    pub(crate) source: Ipv4Addr,
+    pub(crate) target_capture: CaptureKey,
+    pub(crate) target: Ipv4Addr,
+    pub(crate) target_ifindex: u32,
+}
+
 /// Rewrite a DIAL discovery message's `LOCATION` to point at a source-side description proxy, minting and
 /// registering the proxy if one isn't already live for this device and refreshing its grace either way.
 /// On a rewrite the rewritten datagram is written into `out` and its length returned; `None` means
 /// forward `payload` unchanged — it isn't a DIAL message, its `LOCATION` isn't a rewritable IPv4 `http`
 /// URL, the proxy cap was reached / a mint failed (the device stays visible but unproxied), or the
 /// rewrite wouldn't fit `out`. `out` is the caller's reused scratch (size it [`REWRITE_BUF_LEN`]); the
-/// rewritten datagram is sent immediately, so it need not outlive the call. `source`/`target` are the
-/// source/target interface IPv4 addresses: the proxy binds its listeners on `source` and egress-pins
-/// device connections to `target`/`ifindex`. `source_capture`/`target_capture` identify those interfaces
-/// so an address change on either evicts the proxy.
-#[allow(clippy::too_many_arguments)]
+/// rewritten datagram is sent immediately, so it need not outlive the call. `placement` says where the
+/// proxy lives across the two interfaces (see [`ProxyPlacement`]).
 pub(crate) fn rewrite_location(
     ctx: &mut DialContext,
     reactor: &mut Reactor,
     payload: &[u8],
-    source_capture: CaptureKey,
-    source: Ipv4Addr,
-    target_capture: CaptureKey,
-    target: Ipv4Addr,
-    ifindex: u32,
+    placement: ProxyPlacement,
     out: &mut [u8],
 ) -> Option<usize> {
     use std::io::Write;
@@ -847,27 +854,21 @@ pub(crate) fn rewrite_location(
         Duration::from_secs(u64::from(seconds))
     });
     let desc_grace = Instant::now() + max_age;
-    let desc_addr =
-        if let Some(addr) = ctx.lookup(source_capture, location.endpoint, reactor, desc_grace) {
-            // An existing proxy already fronts this device; its grace just refreshed.
-            log::trace!(
-                "dial: reusing the proxy for {}; grace refreshed to {max_age:?}",
-                location.endpoint
-            );
-            addr
-        } else {
-            mint_proxy(
-                ctx,
-                reactor,
-                source_capture,
-                location.endpoint,
-                source,
-                target_capture,
-                target,
-                ifindex,
-                desc_grace,
-            )?
-        };
+    let desc_addr = if let Some(addr) = ctx.lookup(
+        placement.source_capture,
+        location.endpoint,
+        reactor,
+        desc_grace,
+    ) {
+        // An existing proxy already fronts this device; its grace just refreshed.
+        log::trace!(
+            "dial: reusing the proxy for {}; grace refreshed to {max_age:?}",
+            location.endpoint
+        );
+        addr
+    } else {
+        mint_proxy(ctx, reactor, placement, location.endpoint, desc_grace)?
+    };
     // Write the rewritten datagram into `out` — prefix, the proxy authority, suffix. The rewrite can
     // grow the datagram, so a short buffer errors (the caller forwards verbatim) rather than truncating.
     let capacity = out.len();
@@ -890,27 +891,28 @@ pub(crate) fn rewrite_location(
 /// Mint a description proxy for `endpoint`, register it on `reactor`, and record it in `ctx`; returns the
 /// source-side description-listener address to rewrite the `LOCATION` to. `None` (logged) at the proxy
 /// cap or on a listen/register failure, leaving the `LOCATION` unrewritten.
-#[allow(clippy::too_many_arguments)]
 fn mint_proxy(
     ctx: &mut DialContext,
     reactor: &mut Reactor,
-    source_capture: CaptureKey,
+    placement: ProxyPlacement,
     endpoint: SocketAddrV4,
-    source: Ipv4Addr,
-    target_capture: CaptureKey,
-    target: Ipv4Addr,
-    ifindex: u32,
     desc_grace: Instant,
 ) -> Option<SocketAddrV4> {
     if !ctx.has_capacity(reactor) {
         log::warn!("dial: proxy cap reached; reflecting {endpoint}'s LOCATION unchanged");
         return None;
     }
-    let desc = listen_or_warn(source, Listener::Description)?;
-    let rest = listen_or_warn(source, Listener::Rest)?;
+    let desc = listen_or_warn(placement.source, Listener::Description)?;
+    let rest = listen_or_warn(placement.source, Listener::Rest)?;
     let desc_addr = desc.local_addr();
     let watches = [(desc.as_raw_fd(), 0), (rest.as_raw_fd(), 0)];
-    let proxy = DialDeviceProxy::new(target, ifindex, desc, endpoint, rest);
+    let proxy = DialDeviceProxy::new(
+        placement.target,
+        placement.target_ifindex,
+        desc,
+        endpoint,
+        rest,
+    );
     let handler = match reactor.register_with_fds(Box::new(proxy), &watches) {
         Ok(handler) => handler,
         Err(e) => {
@@ -919,8 +921,8 @@ fn mint_proxy(
         }
     };
     ctx.insert(
-        source_capture,
-        target_capture,
+        placement.source_capture,
+        placement.target_capture,
         endpoint,
         handler,
         desc_addr,
@@ -1479,17 +1481,14 @@ mod tests {
         payload: &[u8],
     ) -> Option<Vec<u8>> {
         let mut buf = [0u8; REWRITE_BUF_LEN];
-        let n = rewrite_location(
-            ctx,
-            reactor,
-            payload,
-            advert_source(),
-            Ipv4Addr::LOCALHOST,
-            advert_target(),
-            Ipv4Addr::LOCALHOST,
-            0,
-            &mut buf,
-        )?;
+        let placement = ProxyPlacement {
+            source_capture: advert_source(),
+            source: Ipv4Addr::LOCALHOST,
+            target_capture: advert_target(),
+            target: Ipv4Addr::LOCALHOST,
+            target_ifindex: 0,
+        };
+        let n = rewrite_location(ctx, reactor, payload, placement, &mut buf)?;
         Some(buf[..n].to_vec())
     }
 

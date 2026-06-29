@@ -19,7 +19,7 @@ use crate::net::ssdp::{
 };
 use crate::reactor::Reactor;
 
-use super::dial::{REWRITE_BUF_LEN, rewrite_location};
+use super::dial::{ProxyPlacement, REWRITE_BUF_LEN, rewrite_location};
 use super::{BuildError, InterfaceMap, egress_sources, require_bidirectional_families};
 
 /// What a DIAL-enabled SSDP reflector needs to rewrite a device's `LOCATION` to a source-side proxy: the
@@ -51,17 +51,14 @@ fn dial_rewrite<'a>(
     ) else {
         return payload; // a family the proxy can't bridge yet — forward unchanged
     };
-    match rewrite_location(
-        dispatcher.dial_context(),
-        reactor,
-        payload,
-        egress,
+    let placement = ProxyPlacement {
+        source_capture: egress,
         source,
-        dial.target,
+        target_capture: dial.target,
         target,
-        dial.target_ifindex,
-        buf,
-    ) {
+        target_ifindex: dial.target_ifindex,
+    };
+    match rewrite_location(dispatcher.dial_context(), reactor, payload, placement, buf) {
         Some(n) => &buf[..n],
         None => payload,
     }
