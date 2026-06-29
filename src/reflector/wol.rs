@@ -97,7 +97,7 @@ impl PacketHandler for WolReflector {
             packet.ttl,
             packet.payload,
         ) {
-            Ok(()) => log::info!("reflected WoL packet from {} to {dst}", packet.source),
+            Ok(()) => log::debug!("reflected WoL packet from {} to {dst}", packet.source),
             Err(e) => log::warn!(
                 "WoL: cannot reflect packet from {} to {dst}: {e}",
                 packet.source
