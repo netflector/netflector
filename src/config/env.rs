@@ -331,6 +331,28 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_reflector_across_sources_rejected_case_insensitively() {
+        // A verbatim file key "TV" and the lowercased env tag "tv" name the same reflector; the
+        // duplicate guard must fold case (and whitespace) rather than miss the collision.
+        let toml = r#"
+            [reflectors.TV]
+            source_if = "a"
+            target_if = "b"
+            mdns = true
+        "#;
+        let e = Config::from_sources(
+            Some(toml),
+            env(&[
+                ("REFLECTOR_TV_SOURCE_IF", "c"),
+                ("REFLECTOR_TV_TARGET_IF", "d"),
+                ("REFLECTOR_TV_MDNS", "true"),
+            ]),
+        )
+        .unwrap_err();
+        assert!(matches!(e, ConfigError::DuplicateReflector { name } if name == "tv"));
+    }
+
+    #[test]
     fn env_malformed_var_rejected() {
         // No underscore to split into <tag>_<param>.
         assert!(matches!(

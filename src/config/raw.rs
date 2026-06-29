@@ -56,7 +56,14 @@ impl RawConfig {
         self.log_level = env.log_level.or(self.log_level);
         self.debug_memory = env.debug_memory.or(self.debug_memory);
         for (name, reflector) in env.reflectors {
-            if self.reflectors.contains_key(&name) {
+            // Compare folded: an env tag is already lowercase and unpadded, but a TOML table key is
+            // stored verbatim, so `[reflectors.TV]` (or `"  tv  "`) and env `REFLECTOR_TV_*` name the
+            // same reflector and must collide rather than silently produce two.
+            if self
+                .reflectors
+                .keys()
+                .any(|k| k.trim().eq_ignore_ascii_case(&name))
+            {
                 return Err(ConfigError::DuplicateReflector { name });
             }
             self.reflectors.insert(name, reflector);
