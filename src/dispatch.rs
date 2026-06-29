@@ -17,23 +17,27 @@
 //! [`drain_and_route`]: PacketDispatcher::drain_and_route
 //! [`send`]: PacketDispatcher::send
 
+mod datagram;
+mod dial_context;
+mod interface_table;
 mod multicast;
 
+pub(crate) use self::dial_context::DialContext;
+
 use std::io;
-use std::net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::{IpAddr, SocketAddr};
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::Instant;
 
-use thiserror::Error;
-
-use self::multicast::MulticastJoiner;
 use crate::capture::Capture;
-use crate::interface::{AddressChange, AddressMonitor, Interface, InterfaceAddresses};
+use crate::interface::{AddressMonitor, InterfaceAddresses};
 use crate::net::LinkType;
-use crate::net::frame::{self, FrameError};
 use crate::net::mac::MacAddr;
 use crate::net::packet::Packet;
-use crate::reactor::{Arena, Handler, HandlerKey, Key, Reactor, ReadyEvent};
+use crate::reactor::{Arena, Handler, Key, Reactor, ReadyEvent};
+
+use self::datagram::{build_udp, ethernet_dst};
+use self::interface_table::InterfaceTable;
 
 /// The most frames drained per readable event before yielding, so a flooded interface
 /// can't starve the others. `AF_PACKET` stops here and the level-triggered wait
@@ -77,11 +81,6 @@ impl CaptureKey {
         CaptureKey(packed as u32)
     }
 }
-
-/// A `Copy` handle into the interface table's interface entries — an insert-only index, like
-/// [`CaptureKey`], but a distinct newtype so the two can't be confused.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) struct InterfaceKey(u32);
 
 /// A `Copy` handle to a routing registration — the generational arena [`Key`] of its slot, newtyped
 /// so it can't be confused with a reactor key or a [`CaptureKey`]. Returned by
@@ -152,361 +151,6 @@ struct Registration {
     ingress: CaptureKey,
     filter: Filter,
     handler: Option<Box<dyn PacketHandler>>,
-}
-
-/// One capture plus the interface it runs on. The `capture` is `Option` so the drain can
-/// take it OUT (leaving the `interface` link resident, so a capture's addresses resolve
-/// even mid-drain) and restore it; `None` marks "currently draining". Never removed.
-struct CaptureEntry {
-    capture: Option<Capture>,
-    interface: InterfaceKey,
-}
-
-/// One interface paired with its multicast joiner. Bundling them makes the two impossible to
-/// desync (one push adds both) and bakes the relationship the joiner relies on: it carries the
-/// interface's ifindex, stable for the interface's lifetime, and a refresh re-attempts its joins.
-struct InterfaceEntry {
-    interface: Interface,
-    joiner: MulticastJoiner,
-}
-
-/// Owns every interface and every capture, linking each capture to its interface. Plain
-/// `Vec`s (not generational arenas): both are insert-only, so an index is a stable identity
-/// and the inner `Option<Capture>` alone marks the take-out.
-struct InterfaceTable {
-    /// One entry per interface, indexed by [`InterfaceKey`].
-    entries: Vec<InterfaceEntry>,
-    captures: Vec<CaptureEntry>,
-}
-
-impl InterfaceTable {
-    fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-            captures: Vec::new(),
-        }
-    }
-
-    /// Add an interface, returning its key. Startup-only.
-    fn add_interface(&mut self, interface: Interface) -> InterfaceKey {
-        let key =
-            InterfaceKey(u32::try_from(self.entries.len()).expect("interface count fits a u32"));
-        let joiner = MulticastJoiner::new(interface.ifindex);
-        self.entries.push(InterfaceEntry { interface, joiner });
-        key
-    }
-
-    /// Join `group`'s multicast membership on `interface`, recording it for re-attempt on a later
-    /// address change. # Errors: propagates the joiner's OS error (an unavailable family is
-    /// deferred to [`rejoin`](MulticastJoiner::rejoin), not an error).
-    fn join_on(&mut self, interface: InterfaceKey, group: IpAddr) -> io::Result<()> {
-        // Startup-only with a freshly-minted key, so the index is always in range.
-        self.entries[interface.0 as usize].joiner.join(group)
-    }
-
-    /// The key of the interface named `name`, opening and resolving it if absent — so
-    /// captures on the same interface share one record (and one monitor refresh later).
-    ///
-    /// # Errors
-    /// Propagates a resolution syscall failure when first opening the interface.
-    fn find_or_add_interface(&mut self, name: &str) -> io::Result<InterfaceKey> {
-        if let Some(index) = self
-            .entries
-            .iter()
-            .position(|entry| entry.interface.name == name)
-        {
-            return Ok(InterfaceKey(
-                u32::try_from(index).expect("interface count fits a u32"),
-            ));
-        }
-        Ok(self.add_interface(Interface::open(name)?))
-    }
-
-    /// Add a capture bound to `interface`, returning its key. Startup-only.
-    fn add_capture(&mut self, capture: Capture, interface: InterfaceKey) -> CaptureKey {
-        let key = CaptureKey(u32::try_from(self.captures.len()).expect("capture count fits a u32"));
-        self.captures.push(CaptureEntry {
-            capture: Some(capture),
-            interface,
-        });
-        key
-    }
-
-    /// The interface a capture runs on — resolves even while the capture is taken out (the
-    /// link is a sibling field of the take-out `Option`).
-    fn interface_of(&self, capture: CaptureKey) -> Option<InterfaceKey> {
-        self.captures
-            .get(capture.0 as usize)
-            .map(|entry| entry.interface)
-    }
-
-    /// An interface's current source addresses, by key.
-    fn addrs(&self, interface: InterfaceKey) -> Option<&InterfaceAddresses> {
-        self.entries
-            .get(interface.0 as usize)
-            .map(|entry| &entry.interface.addrs)
-    }
-
-    /// The kernel ifindex of the interface `capture` runs on — its stable identity, cached at open.
-    fn ifindex_of(&self, capture: CaptureKey) -> Option<u32> {
-        let interface = self.interface_of(capture)?;
-        self.entries
-            .get(interface.0 as usize)
-            .map(|entry| entry.interface.ifindex)
-    }
-
-    /// The name of the interface `interface` keys, if present.
-    fn interface_name(&self, interface: InterfaceKey) -> Option<&str> {
-        self.entries
-            .get(interface.0 as usize)
-            .map(|entry| entry.interface.name.as_str())
-    }
-
-    /// The current source addresses behind a capture, in one hop.
-    fn egress_addrs(&self, capture: CaptureKey) -> Option<&InterfaceAddresses> {
-        self.addrs(self.interface_of(capture)?)
-    }
-
-    /// A shared borrow of a present capture, for [`send`](PacketDispatcher::send).
-    fn capture(&self, capture: CaptureKey) -> Option<&Capture> {
-        self.captures.get(capture.0 as usize)?.capture.as_ref()
-    }
-
-    /// Whether `capture` names a known (in-range) capture — distinguishes a forged key from
-    /// one that is merely taken out, for the drain's guard.
-    fn contains(&self, capture: CaptureKey) -> bool {
-        (capture.0 as usize) < self.captures.len()
-    }
-
-    /// Take a capture OUT for its drain; restore with [`restore`](Self::restore). `None`
-    /// means out of range, or already taken out (currently draining).
-    fn take(&mut self, capture: CaptureKey) -> Option<Capture> {
-        self.captures.get_mut(capture.0 as usize)?.capture.take()
-    }
-
-    /// Restore a drained capture, reporting whether its slot was present — keeping logging
-    /// out of the table, like [`take`](Self::take). The miss can't actually happen (restore
-    /// follows a successful `take` on a Vec that never shrinks); on one, the capture drops.
-    #[must_use]
-    fn restore(&mut self, capture: CaptureKey, value: Capture) -> bool {
-        if let Some(entry) = self.captures.get_mut(capture.0 as usize) {
-            entry.capture = Some(value);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Re-resolve the interface with kernel index `ifindex`, in place. A real index matches at
-    /// most one interface — they dedup by name, and the kernel gives each a distinct index —
-    /// so this finds rather than scans. Returns the fields that changed if one matched, or `None`
-    /// for a change on an interface we don't watch. Log-free, like [`take`](Self::take); the
-    /// dispatcher reports the outcome. (The caller routes the `0` overflow-signal to
-    /// [`refresh_all`], so `ifindex` is always a real index here.)
-    ///
-    /// [`refresh_all`]: Self::refresh_all
-    ///
-    /// # Errors
-    /// Propagates a resolution syscall failure.
-    fn refresh_by_ifindex(&mut self, ifindex: u32) -> io::Result<Option<AddressChange>> {
-        let Some(entry) = self
-            .entries
-            .iter_mut()
-            .find(|entry| entry.interface.ifindex == ifindex)
-        else {
-            return Ok(None);
-        };
-        let change = entry.interface.refresh()?;
-        // Re-resolved addresses may have made a deferred join (a v4 group that had no address)
-        // viable; re-attempt this interface's memberships.
-        entry.joiner.rejoin();
-        Ok(Some(change))
-    }
-
-    /// Re-resolve every interface in place — the response to an overflow signal, where dropped
-    /// notifications mean any address could be stale. Returns each interface's ifindex paired with its
-    /// refresh outcome (best-effort: a per-interface failure is reported, not fatal), so the caller logs
-    /// failures and reacts to exactly the interfaces whose addresses moved. Log-free, like
-    /// [`refresh_by_ifindex`](Self::refresh_by_ifindex).
-    fn refresh_all(&mut self) -> Vec<(u32, io::Result<AddressChange>)> {
-        let results: Vec<(u32, io::Result<AddressChange>)> = self
-            .entries
-            .iter_mut()
-            .map(|entry| (entry.interface.ifindex, entry.interface.refresh()))
-            .collect();
-        for entry in &mut self.entries {
-            entry.joiner.rejoin();
-        }
-        results
-    }
-
-    /// Each present capture's `(fd, user_data = CaptureKey)` for
-    /// [`Reactor::register_with_fds`].
-    fn capture_watches(&self) -> Vec<(RawFd, u64)> {
-        self.captures
-            .iter()
-            .enumerate()
-            .filter_map(|(index, entry)| {
-                let key = CaptureKey(u32::try_from(index).expect("capture count fits a u32"));
-                entry
-                    .capture
-                    .as_ref()
-                    .map(|capture| (capture.as_raw_fd(), key.to_u64()))
-            })
-            .collect()
-    }
-}
-
-/// Cap on concurrent minted DIAL proxies — a burst of advertised devices can't exhaust source-side
-/// listeners or reactor slots. At the cap a new device's `LOCATION` is reflected unchanged (the device
-/// stays visible but unproxied) rather than evicting a live proxy.
-const MAX_DIAL_PROXIES: usize = 32;
-
-/// One minted DIAL description proxy: keyed by the `source` capture it fronts on plus the device's
-/// description `endpoint` (its `LOCATION` authority), recording the `target` capture its device
-/// connections egress on (so an address change on either interface evicts it), the proxy's reactor
-/// `handler` (whose generational key goes stale once the proxy is evicted), the source-side
-/// description-listener `desc_addr` spliced into the device's `LOCATION`, and `desc_grace` — the instant
-/// past which the dispatcher evicts the proxy, refreshed to each advertisement's `max-age` so a cached
-/// `LOCATION` keeps resolving while the device is advertised.
-struct DialEntry {
-    source: CaptureKey,
-    target: CaptureKey,
-    endpoint: SocketAddrV4,
-    handler: HandlerKey,
-    desc_addr: SocketAddrV4,
-    desc_grace: Instant,
-}
-
-/// The registry of minted DIAL proxies, owned by the [`PacketDispatcher`] so the SSDP advertisement and
-/// search-response paths — separate handlers — share one proxy per device. The DIAL hook
-/// (`reflector::dial::rewrite_location`) reuses (and refreshes the grace of) a live proxy found here, or
-/// records a freshly-minted one; an evicted proxy's entry is pruned on the next lookup or capacity check.
-pub(crate) struct DialContext {
-    proxies: Vec<DialEntry>,
-}
-
-impl DialContext {
-    /// An empty registry.
-    pub(crate) fn new() -> Self {
-        Self {
-            proxies: Vec::new(),
-        }
-    }
-
-    /// The live proxy's description-listener address for `(source, endpoint)`, refreshing its grace to
-    /// `desc_grace` (a re-advertisement extends the device's validity). `None` if none is registered; a
-    /// stale entry — its proxy evicted, so its [`HandlerKey`] no longer resolves — is pruned and treated
-    /// as absent.
-    pub(crate) fn lookup(
-        &mut self,
-        source: CaptureKey,
-        endpoint: SocketAddrV4,
-        reactor: &Reactor,
-        desc_grace: Instant,
-    ) -> Option<SocketAddrV4> {
-        let pos = self
-            .proxies
-            .iter()
-            .position(|p| p.source == source && p.endpoint == endpoint)?;
-        if reactor.is_registered(self.proxies[pos].handler) {
-            self.proxies[pos].desc_grace = desc_grace;
-            Some(self.proxies[pos].desc_addr)
-        } else {
-            log::trace!("dial: pruning the stale proxy entry for {endpoint}");
-            self.proxies.swap_remove(pos);
-            None
-        }
-    }
-
-    /// Whether another proxy may be minted: prune every evicted entry, then check the cap.
-    pub(crate) fn has_capacity(&mut self, reactor: &Reactor) -> bool {
-        self.proxies.retain(|p| reactor.is_registered(p.handler));
-        self.proxies.len() < MAX_DIAL_PROXIES
-    }
-
-    /// Record a freshly-minted proxy and its grace, replacing any prior entry for `(source, endpoint)`
-    /// — a re-mint after the old proxy was evicted.
-    pub(crate) fn insert(
-        &mut self,
-        source: CaptureKey,
-        target: CaptureKey,
-        endpoint: SocketAddrV4,
-        handler: HandlerKey,
-        desc_addr: SocketAddrV4,
-        desc_grace: Instant,
-    ) {
-        if let Some(entry) = self
-            .proxies
-            .iter_mut()
-            .find(|p| p.source == source && p.endpoint == endpoint)
-        {
-            entry.target = target;
-            entry.handler = handler;
-            entry.desc_addr = desc_addr;
-            entry.desc_grace = desc_grace;
-        } else {
-            self.proxies.push(DialEntry {
-                source,
-                target,
-                endpoint,
-                handler,
-                desc_addr,
-                desc_grace,
-            });
-        }
-    }
-
-    /// The soonest grace deadline across recorded proxies — when [`sweep`](Self::sweep) next has work,
-    /// folded into the dispatcher's [`next_deadline`](Handler::next_deadline). `None` when empty.
-    pub(crate) fn next_grace(&self) -> Option<Instant> {
-        self.proxies.iter().map(|p| p.desc_grace).min()
-    }
-
-    /// Evict every proxy `evict` selects: unregister it from the reactor — tearing down its listeners and
-    /// connections — and drop its entry. `reason` names why, for the log. A surviving entry whose proxy is
-    /// already gone is pruned too, so a stale [`HandlerKey`] never lingers.
-    fn evict_where(
-        &mut self,
-        reactor: &mut Reactor,
-        reason: &str,
-        evict: impl Fn(&DialEntry) -> bool,
-    ) {
-        self.proxies.retain(|p| {
-            if evict(p) {
-                match reactor.unregister(p.handler) {
-                    Ok(_) => log::debug!("dial: evicted the proxy for {} {reason}", p.endpoint),
-                    Err(e) => {
-                        log::warn!(
-                            "dial: evicting the proxy for {} {reason} failed: {e}",
-                            p.endpoint
-                        );
-                    }
-                }
-                false // drop the entry whether or not the teardown cleanly succeeded
-            } else {
-                reactor.is_registered(p.handler) // drop an already-evicted entry
-            }
-        });
-    }
-
-    /// Evict every proxy whose grace has lapsed (`now` past its `desc_grace`).
-    pub(crate) fn sweep(&mut self, now: Instant, reactor: &mut Reactor) {
-        self.evict_where(reactor, "past its grace", |p| now >= p.desc_grace);
-    }
-
-    /// Evict every proxy whose source or target capture is on a changed interface (`on_changed`): an
-    /// address move there stranded the proxy's listeners or its device-connect egress, so it must re-mint
-    /// against the current addresses on the next advertisement rather than be reused.
-    pub(crate) fn evict_on_interface_change(
-        &mut self,
-        reactor: &mut Reactor,
-        on_changed: impl Fn(CaptureKey) -> bool,
-    ) {
-        self.evict_where(reactor, "after its interface's address changed", |p| {
-            on_changed(p.source) || on_changed(p.target)
-        });
-    }
 }
 
 /// Owns the interface table and the routing registrations. The sole owner of capture fds:
@@ -708,11 +352,11 @@ impl PacketDispatcher {
     /// Inject a broadcast/multicast UDP datagram on `egress`, deriving the L2 destination MAC from
     /// `dst`'s address class (all-ones for the IPv4 limited broadcast, the RFC-derived group MAC
     /// for multicast) — a thin wrapper over [`send_udp`](Self::send_udp). A unicast `dst` has no
-    /// derivable group MAC, so it is a [`DatagramError::UnicastDestination`]; use `send_udp` with an
+    /// derivable group MAC, so it is a [`DatagramError::UnicastDestination`](datagram::DatagramError::UnicastDestination); use `send_udp` with an
     /// explicit MAC for unicast.
     ///
     /// # Errors
-    /// As [`send_udp`](Self::send_udp), plus [`DatagramError::UnicastDestination`] for a unicast `dst`.
+    /// As [`send_udp`](Self::send_udp), plus [`DatagramError::UnicastDestination`](datagram::DatagramError::UnicastDestination) for a unicast `dst`.
     pub(crate) fn send_udp_group(
         &mut self,
         egress: CaptureKey,
@@ -894,97 +538,6 @@ impl PacketDispatcher {
     }
 }
 
-/// Why a datagram could not be assembled for an egress: from [`build_udp`] (no source address or
-/// MAC, or a frame overflow) or [`ethernet_dst`] (a unicast destination). Each is a case the
-/// reflector's family/MAC gating makes unreachable in practice, but they stay typed so the
-/// builder is unit-testable and a stray one logs precisely.
-#[derive(Debug, Error, PartialEq, Eq)]
-enum DatagramError {
-    /// The egress has no source address for the datagram's family.
-    #[error("egress has no source address for the datagram's family")]
-    NoSourceAddress,
-    /// An Ethernet egress has no source MAC.
-    #[error("egress has no source MAC for an Ethernet frame")]
-    NoSourceMac,
-    /// The destination is unicast; this layer injects only to a broadcast/multicast group.
-    #[error("destination is unicast; only broadcast/multicast is injected")]
-    UnicastDestination,
-    /// The frame builder rejected the datagram (buffer too small, or payload too large).
-    #[error(transparent)]
-    Frame(#[from] FrameError),
-}
-
-/// The Ethernet destination MAC for an injected datagram to `dst`: the all-ones broadcast
-/// for the IPv4 limited broadcast, the RFC-derived group MAC for any multicast destination.
-/// Only broadcast/multicast destinations are injected here, so a unicast `dst` — whose MAC
-/// we would have to resolve — is a [`DatagramError::UnicastDestination`].
-fn ethernet_dst(dst: IpAddr) -> Result<MacAddr, DatagramError> {
-    match dst {
-        IpAddr::V4(v4) if v4.is_broadcast() => Ok(MacAddr::broadcast()),
-        _ if dst.is_multicast() => Ok(MacAddr::multicast_for(dst)),
-        _ => Err(DatagramError::UnicastDestination),
-    }
-}
-
-/// Assemble a UDP datagram for an egress with addresses `addrs` and link framing `link` into
-/// `scratch`, returning its byte length. The L2 source is the egress's own IP and MAC; the L2
-/// destination is the caller-supplied `dst_mac` (so this serves unicast, multicast, and broadcast
-/// alike). BSD `DLT_NULL` (loopback/tunnel) carries no L2 addresses, so it ignores `dst_mac` and
-/// needs no source MAC.
-// A frame builder takes the full wire spec (egress addrs + link, dst addr + MAC, port, ttl,
-// payload, buffer); bundling any of these would obscure more than the arg count costs.
-#[allow(clippy::too_many_arguments)]
-fn build_udp(
-    addrs: &InterfaceAddresses,
-    link: LinkType,
-    dst: SocketAddr,
-    dst_mac: MacAddr,
-    src_port: u16,
-    ttl: u8,
-    payload: &[u8],
-    scratch: &mut [u8],
-) -> Result<usize, DatagramError> {
-    match dst {
-        SocketAddr::V4(dst) => {
-            let src = SocketAddrV4::new(addrs.v4.ok_or(DatagramError::NoSourceAddress)?, src_port);
-            match link {
-                LinkType::Ethernet => Ok(frame::ethernet_ipv4_udp(
-                    dst_mac,
-                    addrs.mac.ok_or(DatagramError::NoSourceMac)?,
-                    src,
-                    dst,
-                    ttl,
-                    payload,
-                    scratch,
-                )?),
-                #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-                LinkType::DltNull => Ok(frame::dlt_null_ipv4_udp(src, dst, ttl, payload, scratch)?),
-            }
-        }
-        SocketAddr::V6(dst) => {
-            let src = SocketAddrV6::new(
-                addrs.v6.ok_or(DatagramError::NoSourceAddress)?,
-                src_port,
-                0,
-                0,
-            );
-            match link {
-                LinkType::Ethernet => Ok(frame::ethernet_ipv6_udp(
-                    dst_mac,
-                    addrs.mac.ok_or(DatagramError::NoSourceMac)?,
-                    src,
-                    dst,
-                    ttl,
-                    payload,
-                    scratch,
-                )?),
-                #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-                LinkType::DltNull => Ok(frame::dlt_null_ipv6_udp(src, dst, ttl, payload, scratch)?),
-            }
-        }
-    }
-}
-
 impl Handler for PacketDispatcher {
     /// [`MONITOR_TAG`] routes to an address-monitor drain; otherwise `event.user_data` is the
     /// ready capture's [`CaptureKey`] (tagged at registration), so drain that capture
@@ -1052,7 +605,7 @@ mod tests {
     use crate::interface::LOOPBACK_IFACE;
     use crate::net::frame;
     use std::cell::{Cell, RefCell};
-    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, UdpSocket};
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
     use std::rc::Rc;
     use std::time::{Duration, Instant};
 
@@ -1060,30 +613,6 @@ mod tests {
         /// The number of live routing registrations — a seam for the SSDP session lifecycle tests.
         pub(crate) fn registration_count(&self) -> usize {
             self.registrations.iter().count()
-        }
-    }
-
-    impl DialContext {
-        /// The number of recorded proxies — a seam for the DIAL hook's tests in `reflector::dial`.
-        pub(crate) fn proxy_count(&self) -> usize {
-            self.proxies.len()
-        }
-
-        /// The recorded proxies' handler keys — a seam to simulate an eviction.
-        pub(crate) fn handler_keys(&self) -> Vec<HandlerKey> {
-            self.proxies.iter().map(|p| p.handler).collect()
-        }
-
-        /// The recorded grace for `(source, endpoint)` — a seam to assert a re-advertisement refreshed it.
-        pub(crate) fn grace_of(
-            &self,
-            source: CaptureKey,
-            endpoint: SocketAddrV4,
-        ) -> Option<Instant> {
-            self.proxies
-                .iter()
-                .find(|p| p.source == source && p.endpoint == endpoint)
-                .map(|p| p.desc_grace)
         }
     }
 
@@ -1195,205 +724,6 @@ mod tests {
             ..Filter::default()
         };
         assert!(!v6.matches(&packet("10.0.0.1:5353", "224.0.0.251:5353", None, None)));
-    }
-
-    // --- send_udp frame assembly (build_udp / ethernet_dst) — privilege-free ---
-
-    /// A fully-populated egress: a MAC and both families, for the builder tests.
-    fn full_addrs() -> InterfaceAddresses {
-        InterfaceAddresses {
-            mac: Some(MacAddr::from([0x02, 0, 0, 0, 0, 0x01])),
-            v4: Some(Ipv4Addr::new(192, 168, 0, 2)),
-            v6: Some("fe80::2".parse().unwrap()),
-        }
-    }
-
-    #[test]
-    fn ethernet_dst_maps_address_classes() {
-        // v4 limited broadcast -> all-ones; v4/v6 multicast -> the derived group MAC.
-        assert_eq!(
-            ethernet_dst(IpAddr::V4(Ipv4Addr::BROADCAST)),
-            Ok(MacAddr::broadcast())
-        );
-        let v4_group: IpAddr = "224.0.0.251".parse().unwrap();
-        assert_eq!(ethernet_dst(v4_group), Ok(MacAddr::multicast_for(v4_group)));
-        let v6_group: IpAddr = "ff02::1".parse().unwrap();
-        assert_eq!(ethernet_dst(v6_group), Ok(MacAddr::multicast_for(v6_group)));
-        // A unicast destination (either family) has no injectable L2 address.
-        assert_eq!(
-            ethernet_dst("192.168.0.1".parse().unwrap()),
-            Err(DatagramError::UnicastDestination)
-        );
-        assert_eq!(
-            ethernet_dst("fe80::1".parse().unwrap()),
-            Err(DatagramError::UnicastDestination)
-        );
-    }
-
-    #[test]
-    fn build_udp_v4_broadcast_sources_from_the_egress() {
-        let addrs = full_addrs();
-        let dst = SocketAddr::from((Ipv4Addr::BROADCAST, 9));
-        let mut scratch = [0u8; 2048];
-        let n = build_udp(
-            &addrs,
-            LinkType::Ethernet,
-            dst,
-            MacAddr::broadcast(),
-            4000,
-            64,
-            b"wol",
-            &mut scratch,
-        )
-        .unwrap();
-        // L2 header: the supplied destination MAC, the egress's own MAC as source.
-        assert_eq!(&scratch[0..6], MacAddr::broadcast().octets().as_slice());
-        assert_eq!(&scratch[6..12], addrs.mac.unwrap().octets().as_slice());
-        assert!(n > 12, "frame must extend past the L2 header");
-    }
-
-    #[test]
-    fn build_udp_v6_writes_the_supplied_mac() {
-        let addrs = full_addrs();
-        let group = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
-        let dst = SocketAddr::from((group, 9));
-        let mut scratch = [0u8; 2048];
-        build_udp(
-            &addrs,
-            LinkType::Ethernet,
-            dst,
-            MacAddr::multicast_for(IpAddr::V6(group)),
-            4000,
-            64,
-            b"wol",
-            &mut scratch,
-        )
-        .unwrap();
-        // 33:33 + the low 32 bits of ff02::1 (the supplied MAC), then the egress's own MAC.
-        assert_eq!(&scratch[0..6], [0x33, 0x33, 0, 0, 0, 0x01].as_slice());
-        assert_eq!(&scratch[6..12], addrs.mac.unwrap().octets().as_slice());
-    }
-
-    #[test]
-    fn build_udp_assembles_a_unicast_frame() {
-        // The unicast path the M-SEARCH 200-OK reply will use: an explicit dst MAC, a unicast dst
-        // (build_udp doesn't derive the MAC, so unicast is fine — unlike send_udp_group).
-        let addrs = full_addrs();
-        let searcher_mac = MacAddr::from([0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f]);
-        let dst = SocketAddr::from((Ipv4Addr::new(192, 168, 0, 5), 9));
-        let mut scratch = [0u8; 2048];
-        let n = build_udp(
-            &addrs,
-            LinkType::Ethernet,
-            dst,
-            searcher_mac,
-            4000,
-            64,
-            b"ok",
-            &mut scratch,
-        )
-        .unwrap();
-        // The supplied unicast MAC is the L2 destination; the egress's own MAC is the source.
-        assert_eq!(&scratch[0..6], searcher_mac.octets().as_slice());
-        assert_eq!(&scratch[6..12], addrs.mac.unwrap().octets().as_slice());
-        assert!(n > 12);
-    }
-
-    #[test]
-    fn build_udp_needs_a_source_address_for_the_family() {
-        // A v6-less egress cannot source a v6 datagram.
-        let v4_only = InterfaceAddresses {
-            v6: None,
-            ..full_addrs()
-        };
-        let dst = SocketAddr::from((Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1), 9));
-        let mut scratch = [0u8; 2048];
-        assert_eq!(
-            build_udp(
-                &v4_only,
-                LinkType::Ethernet,
-                dst,
-                MacAddr::broadcast(),
-                4000,
-                64,
-                b"x",
-                &mut scratch
-            ),
-            Err(DatagramError::NoSourceAddress)
-        );
-    }
-
-    #[test]
-    fn build_udp_ethernet_needs_a_source_mac() {
-        let no_mac = InterfaceAddresses {
-            mac: None,
-            ..full_addrs()
-        };
-        let dst = SocketAddr::from((Ipv4Addr::BROADCAST, 9));
-        let mut scratch = [0u8; 2048];
-        assert_eq!(
-            build_udp(
-                &no_mac,
-                LinkType::Ethernet,
-                dst,
-                MacAddr::broadcast(),
-                4000,
-                64,
-                b"x",
-                &mut scratch
-            ),
-            Err(DatagramError::NoSourceMac)
-        );
-    }
-
-    #[test]
-    fn build_udp_surfaces_a_frame_error() {
-        // A scratch too small for the frame is a typed DatagramError::Frame, not a panic — the
-        // `#[from] FrameError` conversion that send_udp then maps onto io::Error.
-        let dst = SocketAddr::from((Ipv4Addr::BROADCAST, 9));
-        let mut tiny = [0u8; 16];
-        assert!(matches!(
-            build_udp(
-                &full_addrs(),
-                LinkType::Ethernet,
-                dst,
-                MacAddr::broadcast(),
-                4000,
-                64,
-                b"x",
-                &mut tiny
-            ),
-            Err(DatagramError::Frame(FrameError::BufferTooSmall { .. }))
-        ));
-    }
-
-    // DLT_NULL (BSD loopback) carries no L2 header, so a MAC-less egress still builds — the frame
-    // opens with the 4-byte host-order address family, not a MAC, and the supplied dst MAC is
-    // ignored (there is no L2 header to place it in).
-    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-    #[test]
-    fn build_udp_dlt_null_needs_no_mac() {
-        let no_mac = InterfaceAddresses {
-            mac: None,
-            ..full_addrs()
-        };
-        let dst = SocketAddr::from((Ipv4Addr::BROADCAST, 9));
-        let mut scratch = [0u8; 2048];
-        build_udp(
-            &no_mac,
-            LinkType::DltNull,
-            dst,
-            MacAddr::broadcast(),
-            4000,
-            64,
-            b"wol",
-            &mut scratch,
-        )
-        .unwrap();
-        assert_eq!(
-            u32::from_ne_bytes(scratch[0..4].try_into().unwrap()),
-            libc::AF_INET.cast_unsigned()
-        );
     }
 
     const PROBE: &[u8] = b"reflector-dispatch-probe";
@@ -1878,53 +1208,6 @@ mod tests {
             watches[0].1, MONITOR_TAG,
             "the monitor fd must carry MONITOR_TAG"
         );
-    }
-
-    // refresh_by_ifindex re-resolves only the interface(s) with the matching kernel index, reporting
-    // the changed fields (`None` for an unwatched index). Resolution is unprivileged (no capture
-    // needed), so this exercises the monitor's refresh path without CAP_NET_RAW.
-    #[test]
-    fn refresh_by_ifindex_targets_the_matching_interface() -> io::Result<()> {
-        let mut dispatcher = PacketDispatcher::new();
-        dispatcher.table.find_or_add_interface(LOOPBACK_IFACE)?;
-        let ifindex = crate::interface::if_index(LOOPBACK_IFACE).expect("loopback has an ifindex");
-        let change = dispatcher
-            .table
-            .refresh_by_ifindex(ifindex)?
-            .expect("the loopback interface matches its ifindex and re-resolves");
-        assert!(
-            !change.v4,
-            "re-resolving the unchanged loopback reports no v4 move — the bit the DIAL eviction gates on",
-        );
-        assert!(
-            dispatcher.table.refresh_by_ifindex(u32::MAX)?.is_none(),
-            "an ifindex we don't watch should refresh nothing",
-        );
-        Ok(())
-    }
-
-    // join_on records a group on the interface's joiner and joins it; a later refresh re-attempts
-    // the recorded memberships idempotently. Unprivileged: loopback accepts the join and resolving
-    // the interface needs no CAP_NET_RAW.
-    #[test]
-    fn join_on_records_a_membership_and_refresh_re_attempts_it() -> io::Result<()> {
-        let mut dispatcher = PacketDispatcher::new();
-        let iface = dispatcher.table.find_or_add_interface(LOOPBACK_IFACE)?;
-        dispatcher
-            .table
-            .join_on(iface, IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)))?;
-        dispatcher.table.join_on(
-            iface,
-            IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb)),
-        )?;
-        // The recorded memberships survive a refresh, re-attempted idempotently (each interface
-        // resolves cleanly).
-        let results = dispatcher.table.refresh_all();
-        assert!(
-            results.iter().all(|(_, r)| r.is_ok()),
-            "re-resolving every interface succeeds",
-        );
-        Ok(())
     }
 
     // A join_group on an unknown capture is logged and skipped — not an error or a panic.
