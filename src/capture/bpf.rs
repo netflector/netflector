@@ -193,7 +193,10 @@ impl Capture {
             self.offset = start + advance;
             match record {
                 Record::Frame(frame) => break (start + frame.start)..(start + frame.end),
-                Record::Oversized { datalen } => log::warn!(
+                // trace, not warn: this runs in the per-frame drain loop, and a remote peer can flood
+                // oversized frames — a per-frame warn would both break data-path-quiet and let it spam
+                // the operator's log. The frame is still correctly dropped.
+                Record::Oversized { datalen } => log::trace!(
                     "dropping oversized frame: {datalen} bytes exceeds the {}-byte capture buffer",
                     self.buf.len()
                 ),

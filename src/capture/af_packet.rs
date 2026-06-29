@@ -107,7 +107,10 @@ impl Capture {
             // MSG_TRUNC reports the frame's real length even past the buffer, so an
             // oversized frame is detectable (and dropped) instead of silently cut.
             if bytes > self.buf.len() {
-                log::warn!(
+                // trace, not warn: this runs in the per-frame drain loop, and a remote peer can flood
+                // oversized frames — a per-frame warn would both break data-path-quiet and let it spam
+                // the operator's log. The frame is still correctly dropped.
+                log::trace!(
                     "dropping oversized frame: {bytes} bytes exceeds the {}-byte receive buffer",
                     self.buf.len()
                 );
