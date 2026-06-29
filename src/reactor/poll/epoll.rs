@@ -112,7 +112,13 @@ impl Poller {
         let max_events = libc::c_int::try_from(self.events.len()).unwrap_or(libc::c_int::MAX);
         let timeout_ms = match timeout {
             None => -1,
-            Some(d) => libc::c_int::try_from(d.as_millis()).unwrap_or(libc::c_int::MAX),
+            // Round up to whole milliseconds: a sub-millisecond (but non-zero) deadline must not
+            // truncate to a 0 ms epoll_wait, which would return immediately with nothing ready and
+            // busy-spin until the deadline. An exactly-due (zero) deadline stays 0 for an immediate
+            // sweep. kqueue keeps sub-ms precision via tv_nsec, so this also aligns the two backends.
+            Some(d) => {
+                libc::c_int::try_from(d.as_nanos().div_ceil(1_000_000)).unwrap_or(libc::c_int::MAX)
+            }
         };
         // SAFETY: the eventlist is our owned buffer, sized by `max_events`.
         let count = unsafe {
