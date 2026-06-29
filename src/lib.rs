@@ -10,6 +10,7 @@ mod dispatch;
 mod error;
 mod interface;
 mod logging;
+mod memory_report;
 mod net;
 mod reactor;
 mod reflector;
@@ -70,8 +71,21 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut reactor = Reactor::new()?;
     let watches = dispatcher.capture_watches();
     reactor.register_with_fds(Box::new(dispatcher), &watches)?;
+    if config.debug_memory {
+        log::info!(
+            "memory diagnostics enabled; reporting every {}s",
+            memory_report::INTERVAL.as_secs()
+        );
+        memory_report::log_report(); // a baseline before the loop starts
+        reactor.register(Box::new(memory_report::MemoryReporter::new(
+            std::time::Instant::now(),
+        )));
+    }
     log::info!("running; press Ctrl-C or send SIGTERM to stop");
     reactor.run()?;
+    if config.debug_memory {
+        memory_report::log_report(); // a final report at shutdown
+    }
     log::info!("stopped");
     Ok(())
 }
