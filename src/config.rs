@@ -70,113 +70,31 @@ pub(crate) struct Reflector {
     pub(crate) ssdp: Option<Ssdp>,
 }
 
-/// A fully-validated configuration.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Config {
-    /// Minimum severity to log.
-    pub(crate) log_level: LogLevel,
-    /// Whether to periodically log memory-footprint diagnostics.
-    pub(crate) debug_memory: bool,
-    /// The configured reflectors.
-    pub(crate) reflectors: Vec<Reflector>,
-}
-
-impl Config {
-    /// Build a configuration from optional TOML text plus environment variables.
-    ///
-    /// Environment variables take precedence over the file for the global
-    /// settings; reflectors from the two sources are combined, and a name defined
-    /// by both is rejected. Kept free of I/O so it can be exercised directly.
-    ///
-    /// # Errors
-    /// Returns [`ConfigError::Parse`] for malformed TOML, an `Env*` variant for a
-    /// malformed or invalid environment variable, [`ConfigError::DuplicateReflector`]
-    /// when a name is defined by both sources, or any cross-field [`ConfigError`].
-    pub(crate) fn from_sources(
-        toml_text: Option<&str>,
-        env: impl IntoIterator<Item = (String, String)>,
-    ) -> Result<Self, ConfigError> {
-        let mut raw: RawConfig = match toml_text {
-            Some(text) => toml::from_str(text)?,
-            None => RawConfig::default(),
-        };
-        raw.merge_env(env::parse_env(env)?)?;
-        Config::try_from(raw)
-    }
-}
-
-/// Read a configuration file, mapping I/O failure to [`ConfigError::ReadFile`].
-pub(crate) fn read_config_file(path: &str) -> Result<String, ConfigError> {
-    std::fs::read_to_string(path).map_err(|source| ConfigError::ReadFile {
-        path: path.to_owned(),
-        source,
-    })
-}
-
-/// Resolve just the log level from the environment and TOML text, before the full
-/// configuration is parsed — so the logger can be raised to the configured
-/// verbosity and the rest of loading logged at that level. Environment overrides
-/// the file, which overrides the default.
-///
-/// Deliberately lightweight: it reads only `REFLECTOR_LOG_LEVEL` and the file's
-/// top-level `log_level`, never touching the reflector tables, so it can't fail
-/// on a reflector error that should instead surface (logged) from the full parse.
-///
-/// # Errors
-/// Returns [`ConfigError::Parse`] for malformed TOML, or [`ConfigError::EnvBadValue`]
-/// if `REFLECTOR_LOG_LEVEL` is not a valid level.
-pub(crate) fn resolve_log_level(
-    toml_text: Option<&str>,
-    env: &[(String, String)],
-) -> Result<LogLevel, ConfigError> {
-    if let Some(level) = env::log_level_from_env(env)? {
-        return Ok(level);
-    }
-    if let Some(text) = toml_text {
-        let probe: LogLevelProbe = toml::from_str(text)?;
-        if let Some(level) = probe.log_level {
-            return Ok(level);
+impl Reflector {
+    /// The protocol on which `self` and `other` would reflect the same packet
+    /// twice, if any: same direction, overlapping MAC selection and address
+    /// family, and a shared enabled protocol (for `WoL`, also a shared port).
+    fn conflicts_with(&self, other: &Reflector) -> Option<Protocol> {
+        if self.source_if != other.source_if || self.target_if != other.target_if {
+            return None;
         }
-    }
-    Ok(LogLevel::default())
-}
-
-/// A view over the TOML file that reads only the top-level `log_level` and ignores
-/// everything else (note: no `deny_unknown_fields`), so [`resolve_log_level`] can
-/// extract the level without parsing or validating the reflector tables.
-#[derive(Deserialize)]
-struct LogLevelProbe {
-    #[serde(default)]
-    log_level: Option<LogLevel>,
-}
-
-impl TryFrom<RawConfig> for Config {
-    type Error = ConfigError;
-
-    fn try_from(raw: RawConfig) -> Result<Self, ConfigError> {
-        let mut reflectors = Vec::with_capacity(raw.reflectors.len());
-        for (name, raw_reflector) in raw.reflectors {
-            let reflector = Reflector::try_from((name, raw_reflector))?;
-            log::debug!(
-                "reflector {}: {} -> {} [{}] family={:?}",
-                reflector.name,
-                reflector.source_if,
-                reflector.target_if,
-                protocol_list(&reflector),
-                reflector.address_family,
-            );
-            reflectors.push(reflector);
+        if !macs_overlap(self.mac, other.mac)
+            || !families_overlap(self.address_family, other.address_family)
+        {
+            return None;
         }
-        if reflectors.is_empty() {
-            return Err(ConfigError::NoReflectors);
+        if let (Some(a), Some(b)) = (&self.wol, &other.wol)
+            && a.ports.iter().any(|port| b.ports.contains(port))
+        {
+            return Some(Protocol::Wol);
         }
-        check_conflicts(&reflectors)?;
-
-        Ok(Config {
-            log_level: raw.log_level.unwrap_or_default(),
-            debug_memory: raw.debug_memory.unwrap_or_default(),
-            reflectors,
-        })
+        if self.mdns && other.mdns {
+            return Some(Protocol::Mdns);
+        }
+        if self.ssdp.is_some() && other.ssdp.is_some() {
+            return Some(Protocol::Ssdp);
+        }
+        None
     }
 }
 
@@ -239,32 +157,114 @@ impl TryFrom<(String, RawReflector)> for Reflector {
     }
 }
 
-impl Reflector {
-    /// The protocol on which `self` and `other` would reflect the same packet
-    /// twice, if any: same direction, overlapping MAC selection and address
-    /// family, and a shared enabled protocol (for `WoL`, also a shared port).
-    fn conflicts_with(&self, other: &Reflector) -> Option<Protocol> {
-        if self.source_if != other.source_if || self.target_if != other.target_if {
-            return None;
-        }
-        if !macs_overlap(self.mac, other.mac)
-            || !families_overlap(self.address_family, other.address_family)
-        {
-            return None;
-        }
-        if let (Some(a), Some(b)) = (&self.wol, &other.wol)
-            && a.ports.iter().any(|port| b.ports.contains(port))
-        {
-            return Some(Protocol::Wol);
-        }
-        if self.mdns && other.mdns {
-            return Some(Protocol::Mdns);
-        }
-        if self.ssdp.is_some() && other.ssdp.is_some() {
-            return Some(Protocol::Ssdp);
-        }
-        None
+/// A fully-validated configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Config {
+    /// Minimum severity to log.
+    pub(crate) log_level: LogLevel,
+    /// Whether to periodically log memory-footprint diagnostics.
+    pub(crate) debug_memory: bool,
+    /// The configured reflectors.
+    pub(crate) reflectors: Vec<Reflector>,
+}
+
+impl Config {
+    /// Build a configuration from optional TOML text plus environment variables.
+    ///
+    /// Environment variables take precedence over the file for the global
+    /// settings; reflectors from the two sources are combined, and a name defined
+    /// by both is rejected. Kept free of I/O so it can be exercised directly.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::Parse`] for malformed TOML, an `Env*` variant for a
+    /// malformed or invalid environment variable, [`ConfigError::DuplicateReflector`]
+    /// when a name is defined by both sources, or any cross-field [`ConfigError`].
+    pub(crate) fn from_sources(
+        toml_text: Option<&str>,
+        env: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<Self, ConfigError> {
+        let mut raw: RawConfig = match toml_text {
+            Some(text) => toml::from_str(text)?,
+            None => RawConfig::default(),
+        };
+        raw.merge_env(env::parse_env(env)?)?;
+        Config::try_from(raw)
     }
+}
+
+impl TryFrom<RawConfig> for Config {
+    type Error = ConfigError;
+
+    fn try_from(raw: RawConfig) -> Result<Self, ConfigError> {
+        let mut reflectors = Vec::with_capacity(raw.reflectors.len());
+        for (name, raw_reflector) in raw.reflectors {
+            let reflector = Reflector::try_from((name, raw_reflector))?;
+            log::debug!(
+                "reflector {}: {} -> {} [{}] family={:?}",
+                reflector.name,
+                reflector.source_if,
+                reflector.target_if,
+                protocol_list(&reflector),
+                reflector.address_family,
+            );
+            reflectors.push(reflector);
+        }
+        if reflectors.is_empty() {
+            return Err(ConfigError::NoReflectors);
+        }
+        check_conflicts(&reflectors)?;
+
+        Ok(Config {
+            log_level: raw.log_level.unwrap_or_default(),
+            debug_memory: raw.debug_memory.unwrap_or_default(),
+            reflectors,
+        })
+    }
+}
+
+/// A view over the TOML file that reads only the top-level `log_level` and ignores
+/// everything else (note: no `deny_unknown_fields`), so [`resolve_log_level`] can
+/// extract the level without parsing or validating the reflector tables.
+#[derive(Deserialize)]
+struct LogLevelProbe {
+    #[serde(default)]
+    log_level: Option<LogLevel>,
+}
+
+/// Read a configuration file, mapping I/O failure to [`ConfigError::ReadFile`].
+pub(crate) fn read_config_file(path: &str) -> Result<String, ConfigError> {
+    std::fs::read_to_string(path).map_err(|source| ConfigError::ReadFile {
+        path: path.to_owned(),
+        source,
+    })
+}
+
+/// Resolve just the log level from the environment and TOML text, before the full
+/// configuration is parsed — so the logger can be raised to the configured
+/// verbosity and the rest of loading logged at that level. Environment overrides
+/// the file, which overrides the default.
+///
+/// Deliberately lightweight: it reads only `REFLECTOR_LOG_LEVEL` and the file's
+/// top-level `log_level`, never touching the reflector tables, so it can't fail
+/// on a reflector error that should instead surface (logged) from the full parse.
+///
+/// # Errors
+/// Returns [`ConfigError::Parse`] for malformed TOML, or [`ConfigError::EnvBadValue`]
+/// if `REFLECTOR_LOG_LEVEL` is not a valid level.
+pub(crate) fn resolve_log_level(
+    toml_text: Option<&str>,
+    env: &[(String, String)],
+) -> Result<LogLevel, ConfigError> {
+    if let Some(level) = env::log_level_from_env(env)? {
+        return Ok(level);
+    }
+    if let Some(text) = toml_text {
+        let probe: LogLevelProbe = toml::from_str(text)?;
+        if let Some(level) = probe.log_level {
+            return Ok(level);
+        }
+    }
+    Ok(LogLevel::default())
 }
 
 /// The enabled protocols of `reflector` as a comma-separated summary — with
