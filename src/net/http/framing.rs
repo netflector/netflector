@@ -319,6 +319,36 @@ impl HttpFraming {
     }
 }
 
+/// Which authority-bearing header a line is, carrying the endpoint it named — so the framer rewrites it
+/// and reports it, and the owner can act on `ApplicationUrl` alone (the DIAL REST base).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum AuthorityHeader {
+    Host(SocketAddrV4),
+    ApplicationUrl(SocketAddrV4),
+    Location(SocketAddrV4),
+}
+
+/// Where a framer rewrites each authority header to — one optional target per [`AuthorityHeader`] kind,
+/// `None` leaving that kind unchanged. The owner picks the targets (the DIAL proxy points `Host` at the
+/// device, `Application-URL` at its REST listener, `Location` at the connection's own listener).
+#[derive(Clone, Copy)]
+pub(crate) struct RewritePolicy {
+    pub(crate) host: Option<SocketAddrV4>,
+    pub(crate) application_url: Option<SocketAddrV4>,
+    pub(crate) location: Option<SocketAddrV4>,
+}
+
+impl RewritePolicy {
+    /// The address `header` should be rewritten to under this policy, or `None` to leave it unchanged.
+    fn target(&self, header: AuthorityHeader) -> Option<SocketAddrV4> {
+        match header {
+            AuthorityHeader::Host(_) => self.host,
+            AuthorityHeader::ApplicationUrl(_) => self.application_url,
+            AuthorityHeader::Location(_) => self.location,
+        }
+    }
+}
+
 /// The length of the header block in `input` (up to and including the terminating blank line), or
 /// `None` if the blank line has not arrived yet.
 fn find_header_end(input: &[u8]) -> Option<usize> {
@@ -369,36 +399,6 @@ fn value_has_chunked(value: &[u8]) -> bool {
     value
         .split(|&b| b == b',')
         .any(|coding| coding.trim_ascii().eq_ignore_ascii_case(b"chunked"))
-}
-
-/// Which authority-bearing header a line is, carrying the endpoint it named — so the framer rewrites it
-/// and reports it, and the owner can act on `ApplicationUrl` alone (the DIAL REST base).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum AuthorityHeader {
-    Host(SocketAddrV4),
-    ApplicationUrl(SocketAddrV4),
-    Location(SocketAddrV4),
-}
-
-/// Where a framer rewrites each authority header to — one optional target per [`AuthorityHeader`] kind,
-/// `None` leaving that kind unchanged. The owner picks the targets (the DIAL proxy points `Host` at the
-/// device, `Application-URL` at its REST listener, `Location` at the connection's own listener).
-#[derive(Clone, Copy)]
-pub(crate) struct RewritePolicy {
-    pub(crate) host: Option<SocketAddrV4>,
-    pub(crate) application_url: Option<SocketAddrV4>,
-    pub(crate) location: Option<SocketAddrV4>,
-}
-
-impl RewritePolicy {
-    /// The address `header` should be rewritten to under this policy, or `None` to leave it unchanged.
-    fn target(&self, header: AuthorityHeader) -> Option<SocketAddrV4> {
-        match header {
-            AuthorityHeader::Host(_) => self.host,
-            AuthorityHeader::ApplicationUrl(_) => self.application_url,
-            AuthorityHeader::Location(_) => self.location,
-        }
-    }
 }
 
 /// If `line` is a `Host` / `Application-URL` / `Location` header, parse its authority — returning the
