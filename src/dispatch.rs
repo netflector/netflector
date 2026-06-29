@@ -56,7 +56,7 @@ const MONITOR_TAG: u64 = u64::MAX;
 pub(crate) const SCRATCH_LEN: usize = 2048;
 
 /// A `Copy` handle to a capture the dispatcher owns: an index into the interface table's
-/// captures. A newtype, not a bare alias — so it can't be passed where an [`InterfaceKey`]
+/// captures. A newtype, not a bare alias — so it can't be passed where an [`InterfaceKey`](interface_table::InterfaceKey)
 /// or a reactor key is expected, where it would silently miss instead of failing to
 /// compile. Captures are insert-only, so the index is a stable identity (no generation).
 /// Reflectors hold these for the interface(s) they egress on and send by key, never
@@ -204,7 +204,7 @@ impl PacketDispatcher {
 
     /// Hand a capture to the dispatcher; the returned key is how reflectors send on it. The
     /// capture's interface is found-or-created from its [`if_name`](Capture::if_name), so
-    /// captures on the same interface share one [`Interface`] record.
+    /// captures on the same interface share one [`Interface`](crate::interface::Interface) record.
     ///
     /// # Errors
     /// Propagates a resolution syscall failure when first opening the capture's interface.

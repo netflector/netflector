@@ -3,7 +3,7 @@
 //! [`rewrite_location`] is what the SSDP reflector calls on every advertisement / search response: it
 //! detects a DIAL discovery message, parses its `LOCATION` authority, and rewrites that `LOCATION` to a
 //! source-side description proxy — minting and registering one (via the
-//! [`DialContext`](crate::dispatch::DialContext) registry) if none is live for the device, and refreshing
+//! [`DialContext`] registry) if none is live for the device, and refreshing
 //! its grace either way. Minting is the means; the rewrite is the purpose.
 
 use std::net::{Ipv4Addr, SocketAddrV4};
