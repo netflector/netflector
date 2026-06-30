@@ -137,8 +137,8 @@ jobs:
         # Both profiles: the shipped binary is release (overflow checks off, debug_assert! compiled
         # out, LTO) while debug keeps them on, so a test can pass under one and not the other.
         profile:
-          - { name: debug, flag: '' }
-          - { name: release, flag: '--release' }
+          - { name: debug, flags: '' }
+          - { name: release, flags: '--release' }
         target:
           - { name: linux-amd64, runner: ubuntu-24.04 }
           - { name: linux-arm64, runner: ubuntu-24.04-arm }
@@ -159,7 +159,7 @@ jobs:
       - name: Show toolchain
         run: rustc -V && cargo -V
       - name: cargo test
-        run: cargo test --locked ${{ matrix.profile.flag }}
+        run: cargo test --locked ${{ matrix.profile.flags }}
 
   # armv7/armv5 have no native runner, but 32-bit ARM is a deployment target (MikroTik), so run the suite
   # under QEMU rather than only cross-building it -- this catches pointer-width / alignment / cast bugs the
@@ -176,8 +176,8 @@ jobs:
       fail-fast: false
       matrix:
         profile:
-          - { name: debug, flag: '' }
-          - { name: release, flag: '--release' }
+          - { name: debug, flags: '' }
+          - { name: release, flags: '--release' }
         target:
           - { name: linux-armv7, triple: armv7-unknown-linux-musleabihf }
           - { name: linux-armv5, triple: arm-unknown-linux-musleabi }
@@ -220,7 +220,7 @@ jobs:
       - name: Show toolchain
         run: rustc -V && cargo -V
       - name: cargo test (under QEMU)
-        run: cargo test --locked --target ${{ matrix.target.triple }} ${{ matrix.profile.flag }}
+        run: cargo test --locked --target ${{ matrix.target.triple }} ${{ matrix.profile.flags }}
 
   # FreeBSD shares its BSD platform path (kqueue, BPF, route sockets, getifaddrs) with macOS but needs a real
   # FreeBSD kernel to build and run -- Docker can't provide one. vmactions boots a FreeBSD VM (KVM on the
@@ -239,8 +239,8 @@ jobs:
       fail-fast: false
       matrix:
         profile:
-          - { name: debug, flag: '' }
-          - { name: release, flag: '--release' }
+          - { name: debug, flags: '', rustflags: '' }
+          - { name: release, flags: '--release --target x86_64-unknown-freebsd', rustflags: '-C target-feature=+crt-static' }
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
@@ -254,7 +254,12 @@ jobs:
           run: |
             rustc --version
             cargo --version
-            cargo test --locked ${{ matrix.profile.flag }}
+            # The release lane builds and tests static via the matrix (+crt-static rustflags, and the
+            # explicit --target flags so the flag stays off the host proc-macros), so a +crt-static build
+            # failure surfaces here. Like the Linux musl build, the binary's static linking itself is
+            # verified at release time (release.yml), not in CI. Debug ships nothing -> default-dynamic.
+            export RUSTFLAGS="${{ matrix.profile.rustflags }}"
+            cargo test --locked ${{ matrix.profile.flags }}
 
   # Build the scratch image and drive the Docker-bridge e2e suite (the data path: capture -> reflect across
   # two bridges, multi-protocol). --skip-build reuses the image built here with the gha cache.
