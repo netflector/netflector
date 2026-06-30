@@ -1,0 +1,250 @@
+name: Release
+
+# Cutting a release is just pushing a v* tag (see release.sh): this gates on CI, builds the per-arch
+# binaries, publishes the multi-arch image to GHCR, and creates the GitHub release with assets attached.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  # Fail fast on a version mismatch before the (possibly long) CI wait: check the tag matches the project
+  # version first, then gate the release on ci.yml being green for this commit (poll it, waiting if the tag
+  # was pushed before CI finished).
+  verify-ci:
+    name: Verify CI + tag check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      actions: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      # A version tag must match the [package] version in Cargo.toml, so the git tag, the published image,
+      # and the GitHub release name can never disagree.
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          version="$(./version.sh)"
+          expected="v${version}"
+          if [ "${GITHUB_REF_NAME}" != "${expected}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match Cargo.toml version (expected ${expected}). Bump Cargo.toml or retag."
+            exit 1
+          fi
+          echo "Tag ${GITHUB_REF_NAME} matches Cargo.toml version ${version}."
+
+      - name: Wait for CI to pass on this commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sha='${{ github.sha }}'
+          wf=ci.yml
+          ok=
+          for _ in $(seq 1 90); do  # job timeout-minutes is the real ceiling
+            run=$(gh api "repos/${{ github.repository }}/actions/workflows/$wf/runs?head_sha=$sha&per_page=1" \
+              --jq '.workflow_runs[0] | "\(.status)|\(.conclusion // "")"')
+            case "${run%%|*}" in
+              completed)
+                if [ "${run##*|}" = success ]; then ok=1; break; fi
+                echo "::error::$wf concluded '${run##*|}' on $sha"; exit 1 ;;
+              "") echo "No $wf run for $sha yet; waiting..." ;;
+              *)  echo "$wf is '${run%%|*}'; waiting..." ;;
+            esac
+            sleep 20
+          done
+          [ -n "$ok" ] || { echo "::error::Timed out waiting for $wf on $sha"; exit 1; }
+          echo "$wf passed on $sha."
+
+  # Downloadable binaries. The Linux targets are static musl, cross-compiled on the amd64 runner with lld
+  # (no QEMU, no per-arch gcc -- the same path the Dockerfile uses); macOS builds natively and ships dynamic
+  # (no static libSystem). FreeBSD is separate (no native runner; see binaries-freebsd).
+  binaries:
+    name: Binary (${{ matrix.variant }})
+    needs: verify-ci
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: linux-amd64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - variant: linux-arm64
+            runner: ubuntu-24.04
+            target: aarch64-unknown-linux-musl
+          - variant: linux-armv7
+            runner: ubuntu-24.04
+            target: armv7-unknown-linux-musleabihf
+          - variant: linux-armv5
+            runner: ubuntu-24.04
+            target: arm-unknown-linux-musleabi
+          - variant: macos-arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install lld (musl cross-link)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends lld
+
+      - name: Add the Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      # Link the musl targets with lld (cross-capable, unlike the host gcc) -- the same config the Dockerfile
+      # writes. cfg(target_env = "musl") leaves host build-scripts/proc-macros on the default linker.
+      - name: Configure the musl cross-linker
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p .cargo
+          cat > .cargo/config.toml <<'EOF'
+          [target.'cfg(target_env = "musl")']
+          linker = "ld.lld"
+          rustflags = ["-C", "linker-flavor=ld.lld"]
+          EOF
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Stage binary
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/reflector" "dist/reflector-${{ github.ref_name }}-${{ matrix.variant }}"
+
+      - name: Verify static linking (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          file "dist/reflector-${{ github.ref_name }}-${{ matrix.variant }}"
+          file "dist/reflector-${{ github.ref_name }}-${{ matrix.variant }}" | grep -q 'statically linked' \
+            || { echo "::error::binary is not statically linked"; exit 1; }
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: reflector-${{ matrix.variant }}
+          path: dist/reflector-${{ github.ref_name }}-${{ matrix.variant }}
+          if-no-files-found: error
+
+  # FreeBSD has no native runner and Docker can't run a FreeBSD kernel, so build in a VM (vmactions). amd64
+  # is KVM-accelerated; arm64 has no KVM on any GitHub-hosted runner, so it builds emulated on the (faster)
+  # amd64 host. Static (+crt-static) so one binary per arch runs across FreeBSD majors, like the embedded
+  # deployment needs.
+  binaries-freebsd:
+    name: Binary (freebsd-${{ matrix.arch }})
+    needs: verify-ci
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            vm_arch: x86_64
+          - arch: arm64
+            vm_arch: aarch64
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Build the static release binary in a FreeBSD VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: '14.2'
+          arch: ${{ matrix.vm_arch }}
+          usesh: true
+          prepare: |
+            pkg install -y rust
+          run: |
+            RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --locked
+            file target/release/reflector
+            file target/release/reflector | grep -q 'statically linked' \
+              || { echo "::error::freebsd binary is not statically linked"; exit 1; }
+            mkdir -p dist
+            cp target/release/reflector "dist/reflector-${{ github.ref_name }}-freebsd-${{ matrix.arch }}"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: reflector-freebsd-${{ matrix.arch }}
+          path: dist/reflector-${{ github.ref_name }}-freebsd-${{ matrix.arch }}
+          if-no-files-found: error
+
+  # One buildx multi-platform build on the amd64 runner: the Dockerfile cross-compiles every arch with lld
+  # (no QEMU), so a native arm64 runner buys nothing, and buildx assembles the manifest itself -- no
+  # per-arch digests to stitch. Pushes the multi-arch image to GHCR, tagged from the git tag.
+  image:
+    name: Image -> GHCR
+    needs: verify-ci
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/reflector
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      - name: Build and push the multi-arch image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64,linux/arm/v7,linux/arm/v5
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  release:
+    name: GitHub release
+    needs: [binaries, binaries-freebsd, image]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download binary artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: reflector-*
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum reflector-* | tee SHA256SUMS
+
+      - name: Create release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            dist/reflector-*
+            dist/SHA256SUMS
+          generate_release_notes: true
+          fail_on_unmatched_files: true

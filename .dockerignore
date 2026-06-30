@@ -1,0 +1,7 @@
+# The Dockerfile copies only Cargo.toml, Cargo.lock, and src/, so send nothing else to the daemon -- a
+# smaller build context is faster, and target/ alone can be gigabytes. Allowlist: ignore everything, then
+# re-include exactly what the build needs.
+*
+!Cargo.toml
+!Cargo.lock
+!src
