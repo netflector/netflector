@@ -41,6 +41,36 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --locked --target "${triple}"; \
     install -D "target/${triple}/release/reflector" /out/reflector
 
+# The reflector under Valgrind memcheck, for `e2e/run.py --valgrind`. A glibc release binary with debug
+# symbols (unstripped): the same -O3/LTO codegen the scratch image ships, just with -g for readable traces
+# and dynamic glibc -- Valgrind supports that well, unlike the static musl target. amd64-only (the Valgrind
+# e2e job is); built and run on the one rust:slim base so the glibc versions match. run.py SIGTERMs the
+# daemon so Valgrind reports leaks at a clean exit; --track-fds catches a leaked socket in the live daemon;
+# --error-exitcode=1 fails on any leak, leaked fd, or memcheck error. "reachable" is allowed (the logger and
+# other process-lifetime statics live to exit by design).
+FROM docker.io/library/rust:slim AS runtime-valgrind
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends valgrind \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY src/ ./src/
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    CARGO_PROFILE_RELEASE_DEBUG=true CARGO_PROFILE_RELEASE_STRIP=false \
+    cargo build --release --locked \
+    && install -D target/release/reflector /usr/local/bin/reflector
+ENTRYPOINT ["valgrind", \
+    "--leak-check=full", \
+    "--show-leak-kinds=all", \
+    "--errors-for-leak-kinds=definite,indirect,possible", \
+    "--track-fds=yes", \
+    "--num-callers=30", \
+    "--error-exitcode=1", \
+    "/usr/local/bin/reflector"]
+CMD ["/etc/reflector/config.toml"]
+
+# Production image: one fully static binary on scratch -- nothing else to ship or grow CVEs. Keep this LAST
+# so a bare `docker build .` (no --target, as releases and the non-valgrind e2e use) defaults to it.
 FROM scratch AS runtime
 COPY --from=builder /out/reflector /usr/local/bin/reflector
 ENTRYPOINT ["/usr/local/bin/reflector"]

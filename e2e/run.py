@@ -33,6 +33,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 E2E_DIR = Path(__file__).resolve().parent
 
 DEFAULT_REFLECTOR_IMAGE = "reflector:e2e"
+VALGRIND_REFLECTOR_IMAGE = "reflector:e2e-valgrind"
 DEFAULT_HELPER_IMAGE = "python:3.13-alpine"
 CONFIGURED_MAC = "02:42:ac:11:00:09"
 WRONG_MAC = "02:42:ac:11:00:0a"
@@ -113,6 +114,9 @@ ADDR_CHANGE_POLL_DEADLINE = 60.0
 REFLECTOR_READY_LOG = "running; press Ctrl-C or send SIGTERM to stop"
 RECEIVER_READY_LOG = "receiver ready: UDP socket bound"
 CONTAINER_READY_TIMEOUT_SECONDS = 15.0
+# A clean SIGTERM exit triggers valgrind's leak analysis; give `docker stop` this much grace before it
+# SIGKILLs, so the analysis (which can take tens of seconds) finishes and its exit code is read.
+VALGRIND_STOP_GRACE_SECONDS = 60
 REFLECTOR_SOURCE_IFNAME = "wol_src"
 REFLECTOR_TARGET_IFNAME = "wol_dst"
 RECEIVER_IFNAME = "probe0"
@@ -626,6 +630,20 @@ class DockerE2E:
             docker(["rm", "-f", container], check=False)
         for network in self.networks:
             docker(["network", "rm", network], check=False)
+
+    def check_reflector_valgrind(self) -> None:
+        # SIGTERM the reflector so it shuts down cleanly and valgrind runs its leak analysis, then read its
+        # exit code: the image's --error-exitcode=1 fires on any leak, leaked fd, or memcheck error.
+        docker(["stop", "-t", str(VALGRIND_STOP_GRACE_SECONDS), self.reflector_container])
+        exit_code = docker(["wait", self.reflector_container]).stdout.strip()
+        if exit_code != "0":
+            print(f"\n--- valgrind report: {self.case.name} ---", file=sys.stderr, flush=True)
+            report = docker(["logs", self.reflector_container], check=False)
+            if report.stderr:
+                print(report.stderr, end="", file=sys.stderr, flush=True)
+            raise RuntimeError(
+                f"valgrind reported errors in case {self.case.name} (reflector exited {exit_code})"
+            )
 
     def setup_networks(self) -> None:
         # Both networks are dual-stack: IPv4 cases are unaffected, and IPv6 cases need the bridges to
@@ -1294,8 +1312,9 @@ def make_runner(args: argparse.Namespace,
     return DockerE2E(args, case)
 
 
-def build_reflector_image(image: str) -> None:
-    docker(["build", "-t", image, "."], capture=False)
+def build_reflector_image(image: str, target: str | None = None) -> None:
+    target_args = ["--target", target] if target is not None else []
+    docker(["build", *target_args, "-t", image, "."], capture=False)
 
 
 def select_cases(case_names: list[str]) -> list[TestCase | RoundTripCase | DialCase | DialAddressChangeCase | AddressChangeCase]:
@@ -1316,6 +1335,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image", default=DEFAULT_REFLECTOR_IMAGE,
         help="reflector image tag to run (default: reflector:e2e)")
     parser.add_argument("--skip-build", action="store_true", help="use --image without building it first")
+    parser.add_argument("--valgrind", action="store_true",
+        help="run the reflector under Valgrind memcheck (the runtime-valgrind image; fails on any leak, fd leak, or memcheck error)")
     parser.add_argument("--helper-image", default=DEFAULT_HELPER_IMAGE, help="Python image used for UDP probes")
     parser.add_argument("--keep-on-failure", action="store_true", help="leave Docker resources behind after a failure")
     parser.add_argument("--show-reflector-logs", action="store_true", help="print reflector container logs after each passing case")
@@ -1333,17 +1354,24 @@ def main() -> int:
     args = parse_args()
     require_command("docker")
 
+    # --valgrind selects the valgrind image unless one was passed explicitly.
+    if args.valgrind and args.image == DEFAULT_REFLECTOR_IMAGE:
+        args.image = VALGRIND_REFLECTOR_IMAGE
+
     cases = select_cases(args.case)
     print(f"expected magic payload: {magic_packet_hex(CONFIGURED_MAC)}", flush=True)
 
     if not args.skip_build:
-        build_reflector_image(args.image)
+        build_reflector_image(args.image, "runtime-valgrind" if args.valgrind else None)
 
     for case in cases:
         with make_runner(args, case) as runner:
             runner.run()
+            if args.valgrind:
+                runner.check_reflector_valgrind()
 
-    print(f"\nPASS {len(cases)} e2e case(s)", flush=True)
+    suffix = " under valgrind" if args.valgrind else ""
+    print(f"\nPASS {len(cases)} e2e case(s){suffix}", flush=True)
     return 0
 
 

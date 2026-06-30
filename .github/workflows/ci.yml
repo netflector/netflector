@@ -279,3 +279,30 @@ jobs:
           cache-to: type=gha,mode=max
       - name: Run e2e
         run: python3 e2e/run.py --skip-build --image reflector:e2e
+
+  # The e2e suite with the reflector under Valgrind memcheck (the runtime-valgrind image: a glibc release
+  # binary with debug symbols). run.py --valgrind SIGTERMs the daemon per case so Valgrind runs its leak
+  # analysis at a clean exit; --error-exitcode=1 fails on any leak, leaked fd, or memcheck error.
+  # --skip-build reuses the image built here.
+  valgrind-e2e:
+    name: Valgrind e2e
+    needs: gate
+    if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+      - name: Build runtime-valgrind image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: runtime-valgrind
+          tags: reflector:e2e-valgrind
+          load: true
+          cache-from: type=gha,scope=valgrind
+          cache-to: type=gha,mode=max,scope=valgrind
+      - name: Run e2e under Valgrind memcheck
+        run: python3 e2e/run.py --valgrind --skip-build
