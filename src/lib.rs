@@ -42,6 +42,7 @@ pub fn run(args: &[String]) -> Result<()> {
     // Resolve the log level first, from a minimal read of env + file, so the full
     // parse below is logged at the configured verbosity (see resolve_log_level).
     logging::set_level(config::resolve_log_level(toml_text.as_deref(), &env)?);
+    log::info!("reflector {} starting", env!("CARGO_PKG_VERSION"));
     if let Some(path) = path {
         log::debug!("loading configuration from {path} with REFLECTOR_* overrides");
     } else {
