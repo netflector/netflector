@@ -55,8 +55,7 @@ const fn bpf_wordalign(x: usize) -> usize {
     (x + (BPF_ALIGN - 1)) & !(BPF_ALIGN - 1)
 }
 
-/// A raw-capture handle on one interface: an owned BPF fd, a reused read buffer, a cursor
-/// over the current batch, the link type, and the interface name it is bound to.
+/// A raw-capture handle on one interface.
 pub(crate) struct Capture {
     fd: OwnedFd,
     buf: Box<[u8]>,

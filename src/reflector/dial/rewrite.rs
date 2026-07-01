@@ -1,10 +1,9 @@
 //! The SSDP-side entry to the DIAL proxy: rewrite a discovery message's `LOCATION` to a minted proxy.
 //!
-//! [`rewrite_location`] is what the SSDP reflector calls on every advertisement / search response: it
-//! detects a DIAL discovery message, parses its `LOCATION` authority, and rewrites that `LOCATION` to a
-//! source-side description proxy — minting and registering one (via the
-//! [`DialContext`] registry) if none is live for the device, and refreshing
-//! its grace either way. Minting is the means; the rewrite is the purpose.
+//! [`rewrite_location`] runs on every advertisement / search response: it rewrites a DIAL message's
+//! `LOCATION` to a source-side description proxy — minting and registering one (via the [`DialContext`]
+//! registry) if none is live for the device, and refreshing its grace either way. Minting is the means;
+//! the rewrite is the purpose.
 
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::os::fd::AsRawFd;
@@ -20,22 +19,20 @@ use crate::reactor::Reactor;
 
 use super::proxy::{DialDeviceProxy, Listener};
 
-/// The description-listener grace when an advertisement carries no `CACHE-CONTROL: max-age` — the
+/// Description-listener grace when an advertisement carries no `CACHE-CONTROL: max-age` — the
 /// UDA-recommended minimum device validity (DIAL's own example advertises `max-age=1800`).
 const DEFAULT_DESC_GRACE: Duration = Duration::from_mins(30);
 
-/// Bytes a reflector reserves on the stack to rewrite one SSDP datagram into. Anchored to the
-/// dispatcher's send frame buffer ([`SCRATCH_LEN`](crate::dispatch::SCRATCH_LEN)): the reflector builds
-/// its outgoing frame there, so a datagram that doesn't fit it can't be forwarded at all — sizing the
-/// rewrite scratch to it holds any rewritten datagram the reflector could send. A `LOCATION` rewrite can
-/// grow the datagram; one that still overruns this falls back to verbatim rather than truncating.
+/// Stack scratch to rewrite one SSDP datagram into. Anchored to the dispatcher's send frame buffer
+/// ([`SCRATCH_LEN`](crate::dispatch::SCRATCH_LEN)): the reflector builds its outgoing frame there, so
+/// anything that doesn't fit it can't be forwarded anyway. A `LOCATION` rewrite can grow the datagram;
+/// one that still overruns this falls back to verbatim rather than truncating.
 pub(crate) const REWRITE_BUF_LEN: usize = crate::dispatch::SCRATCH_LEN;
 
-/// Where a minted DIAL description proxy sits across the two interfaces, resolved per datagram: it
-/// binds its source-side listeners on `source`, egress-pins device connections to
-/// `target`/`target_ifindex`, and is evicted if either `source_capture`'s or `target_capture`'s
-/// IPv4 address later changes. Bundling the two same-typed capture/address pairs keeps them from
-/// being transposed at the call.
+/// Where a minted DIAL description proxy sits across the two interfaces: it binds its source-side
+/// listeners on `source`, egress-pins device connections to `target`/`target_ifindex`, and is evicted if
+/// either `source_capture`'s or `target_capture`'s IPv4 address later changes. Bundling the two
+/// same-typed capture/address pairs keeps them from being transposed at the call.
 #[derive(Clone, Copy)]
 pub(crate) struct ProxyPlacement {
     pub(crate) source_capture: CaptureKey,
@@ -45,14 +42,12 @@ pub(crate) struct ProxyPlacement {
     pub(crate) target_ifindex: u32,
 }
 
-/// Rewrite a DIAL discovery message's `LOCATION` to point at a source-side description proxy, minting and
+/// Rewrite a DIAL discovery message's `LOCATION` to a source-side description proxy, minting and
 /// registering the proxy if one isn't already live for this device and refreshing its grace either way.
-/// On a rewrite the rewritten datagram is written into `out` and its length returned; `None` means
-/// forward `payload` unchanged — it isn't a DIAL message, its `LOCATION` isn't a rewritable IPv4 `http`
-/// URL, the proxy cap was reached / a mint failed (the device stays visible but unproxied), or the
-/// rewrite wouldn't fit `out`. `out` is the caller's reused scratch (size it [`REWRITE_BUF_LEN`]); the
-/// rewritten datagram is sent immediately, so it need not outlive the call. `placement` says where the
-/// proxy lives across the two interfaces (see [`ProxyPlacement`]).
+/// On a rewrite the datagram is written into `out` and its length returned; `None` means forward
+/// `payload` unchanged — it isn't a DIAL message, its `LOCATION` isn't a rewritable IPv4 `http` URL, the
+/// proxy cap was reached / a mint failed (device stays visible but unproxied), or the rewrite wouldn't
+/// fit `out`. `out` is the caller's reused scratch (size it [`REWRITE_BUF_LEN`]).
 pub(crate) fn rewrite_location(
     ctx: &mut DialContext,
     reactor: &mut Reactor,
@@ -65,9 +60,8 @@ pub(crate) fn rewrite_location(
         return None;
     }
     let Some(location) = parse_dial_location_authority(payload) else {
-        // The message is DIAL but its LOCATION isn't a rewritable IPv4 http URL (https, a hostname,
-        // an IPv6 literal, a bad port). It's forwarded verbatim with no proxy minted — exactly the
-        // "device discovered but never proxied" case, so name the offending URL for a debug session.
+        // DIAL, but LOCATION isn't a rewritable IPv4 http URL (https, a hostname, an IPv6 literal, a
+        // bad port) — the "discovered but never proxied" case; name the offending URL for debugging.
         log::debug!(
             "dial: LOCATION {} is not a rewritable IPv4 http URL; forwarding the message unproxied",
             dial_location_value(payload).map_or_else(|| "(absent)".into(), String::from_utf8_lossy)
@@ -95,8 +89,8 @@ pub(crate) fn rewrite_location(
     } else {
         mint_proxy(ctx, reactor, placement, location.endpoint, desc_grace)?
     };
-    // Write the rewritten datagram into `out` — prefix, the proxy authority, suffix. The rewrite can
-    // grow the datagram, so a short buffer errors (the caller forwards verbatim) rather than truncating.
+    // The rewrite can grow the datagram, so a short buffer errors (caller forwards verbatim) rather
+    // than truncating.
     let capacity = out.len();
     let mut cursor: &mut [u8] = out;
     let fits = cursor.write_all(&payload[..location.offset]).is_ok()
@@ -115,8 +109,8 @@ pub(crate) fn rewrite_location(
 }
 
 /// Mint a description proxy for `endpoint`, register it on `reactor`, and record it in `ctx`; returns the
-/// source-side description-listener address to rewrite the `LOCATION` to. `None` (logged) at the proxy
-/// cap or on a listen/register failure, leaving the `LOCATION` unrewritten.
+/// source-side description-listener address to rewrite `LOCATION` to. `None` (logged) at the proxy cap or
+/// on a listen/register failure, leaving `LOCATION` unrewritten.
 fn mint_proxy(
     ctx: &mut DialContext,
     reactor: &mut Reactor,
@@ -175,7 +169,7 @@ mod tests {
 
     use super::*;
 
-    /// A DIAL advertisement whose `LOCATION` names the device endpoint `10.0.0.5:8008`.
+    /// A DIAL advertisement whose `LOCATION` names device endpoint `10.0.0.5:8008`, `max-age=1800`.
     const DIAL_ADVERT: &[u8] =
         b"NOTIFY * HTTP/1.1\r\nNT: urn:dial-multiscreen-org:service:dial:1\r\n\
         LOCATION: http://10.0.0.5:8008/dd.xml\r\nCACHE-CONTROL: max-age=1800\r\n\r\n";

@@ -9,13 +9,12 @@ use crate::reflector::egress_sources;
 
 use super::{DialRewrite, dial_rewrite};
 
-/// Reflects SSDP advertisements (`NOTIFY`) captured on the target onto `egress` (the source), to the
-/// message's own destination — the dispatcher's filter pins that to the group. Searches (`M-SEARCH`)
-/// flow the other way through the [`SsdpSearchReflector`](super::search::SsdpSearchReflector), so this
-/// handler only ever reflects advertisements.
+/// Reflects SSDP advertisements (`NOTIFY`) target → source, onto `egress`, to the message's own
+/// destination — the dispatcher's filter pins that to the group. Searches (`M-SEARCH`) flow the other
+/// way through `SsdpSearchReflector`, so this handler only ever reflects advertisements.
 pub(super) struct SsdpAdvertisementReflector {
     egress: CaptureKey,
-    /// DIAL `LOCATION` rewriting, when the reflector has `dial` set; `None` leaves advertisements verbatim.
+    /// DIAL `LOCATION` rewriting; `None` leaves advertisements verbatim.
     dial: Option<DialRewrite>,
 }
 
@@ -36,7 +35,7 @@ impl PacketHandler for SsdpAdvertisementReflector {
         match classify(packet.payload) {
             Some(SsdpKind::Advertisement) => {
                 // A family the egress can't currently source is a quiet drop (transient address
-                // loss), keeping send_udp_group's error meaning a genuine failure.
+                // loss), so send_udp_group's error stays a genuine failure.
                 if !egress_sources(dispatcher, self.egress, packet.dest) {
                     log::debug!(
                         "SSDP: egress has no source for {} yet; dropping advertisement from {}",
@@ -73,10 +72,9 @@ impl PacketHandler for SsdpAdvertisementReflector {
                     ),
                 }
             }
-            // A search (M-SEARCH) on this direction isn't reflected: searches flow source → target
-            // through the SsdpSearchReflector.
+            // Searches flow source → target through SsdpSearchReflector, not this direction.
             Some(SsdpKind::Search) => {}
-            // A non-SSDP payload on the group is anomalous but harmless; drop it quietly.
+            // Non-SSDP payload on the group: anomalous but harmless, drop quietly.
             None => log::debug!(
                 "SSDP: dropping non-SSDP payload ({} B) to {} from {}",
                 packet.payload.len(),

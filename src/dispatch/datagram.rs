@@ -1,6 +1,6 @@
 //! Assembling a UDP datagram for an egress: pick the L2 destination MAC and the frame builder for the
-//! egress's link type, sourcing from the egress's own address. The adapter over [`net::frame`](crate::net::frame)
-//! the dispatcher's send path uses.
+//! egress's link type, sourcing from the egress's own address. The dispatcher send path's adapter over
+//! [`net::frame`](crate::net::frame).
 
 use std::net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
@@ -17,13 +17,10 @@ use crate::net::mac::MacAddr;
 /// builder is unit-testable and a stray one logs precisely.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub(super) enum DatagramError {
-    /// The egress has no source address for the datagram's family.
     #[error("egress has no source address for the datagram's family")]
     NoSourceAddress,
-    /// An Ethernet egress has no source MAC.
     #[error("egress has no source MAC for an Ethernet frame")]
     NoSourceMac,
-    /// The destination is unicast; this layer injects only to a broadcast/multicast group.
     #[error("destination is unicast; only broadcast/multicast is injected")]
     UnicastDestination,
     /// The frame builder rejected the datagram (buffer too small, or payload too large).
@@ -109,7 +106,7 @@ mod tests {
 
     use super::*;
 
-    /// A fully-populated egress: a MAC, v4, a link-local v6, and a routable v6, for the builder tests.
+    /// A fully-populated egress: a MAC, v4, a link-local v6, and a routable v6.
     fn full_addrs() -> InterfaceAddresses {
         InterfaceAddresses::new(
             Some(MacAddr::from([0x02, 0, 0, 0, 0, 0x01])),
@@ -121,8 +118,7 @@ mod tests {
 
     #[test]
     fn build_udp_sources_a_site_local_group_from_the_routable_address() {
-        // A site-local SSDP group (ff05::c) must be sourced from the routable address, not the
-        // link-local one — the per-scope selection.
+        // A site-local SSDP group (ff05::c) must source from the routable address, not the link-local.
         let addrs = full_addrs();
         let dst = SocketAddr::from((Ipv6Addr::new(0xff05, 0, 0, 0, 0, 0, 0, 0x0c), 1900));
         let mut scratch = [0u8; 2048];
@@ -296,7 +292,7 @@ mod tests {
     #[test]
     fn build_udp_surfaces_a_frame_error() {
         // A scratch too small for the frame is a typed DatagramError::Frame, not a panic — the
-        // `#[from] FrameError` conversion that send_udp then maps onto io::Error.
+        // `#[from] FrameError` conversion send_udp then maps onto io::Error.
         let dst = SocketAddr::from((Ipv4Addr::BROADCAST, 9));
         let mut tiny = [0u8; 16];
         assert!(matches!(

@@ -13,8 +13,7 @@ use thiserror::Error;
 use crate::config::ConfigError;
 use crate::reflector::BuildError;
 
-/// Crate-wide result alias, so signatures read `Result<T>` instead of
-/// `Result<T, crate::Error>`.
+/// Crate-wide result alias, so signatures read `Result<T>`.
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Anything that can go wrong while configuring or running the reflector.
@@ -25,8 +24,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug)]
 pub struct Error(ErrorKind);
 
-/// The private cause behind an [`struct@Error`]: one variant per subsystem, each
-/// wrapping that subsystem's error with `#[from]`.
+/// The private cause behind an [`struct@Error`]: one variant per subsystem.
 #[derive(Debug, Error)]
 enum ErrorKind {
     /// Configuration could not be loaded or failed validation.
@@ -56,7 +54,6 @@ impl Error {
         })
     }
 
-    /// The reflector named `name` could not be built.
     pub(crate) fn reflector(name: &str, source: BuildError) -> Self {
         Self(ErrorKind::Reflector {
             name: name.to_owned(),

@@ -2,10 +2,7 @@
 //!
 //! One backend per platform behind a uniform `Capture` — BPF on macOS/FreeBSD,
 //! `AF_PACKET` on Linux. The handle owns a pollable fd, reads link-layer frames
-//! into a reused buffer (no per-frame allocation), and injects built frames. Each
-//! backend exposes the same surface (`open` / `next_frame` / `has_buffered` /
-//! `send` / `link_type` / `AsRawFd`); the facade re-exports the platform `Capture`
-//! under one name for the dispatch layer (and the tests).
+//! into a reused buffer (no per-frame allocation), and injects built frames.
 
 mod filter;
 
@@ -14,17 +11,15 @@ mod af_packet;
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 mod bpf;
 
-/// The platform `Capture` under one name, so consumers (the dispatch layer) and the
-/// tests need not name the backend.
+/// The platform `Capture` under one name, so consumers and tests need not name the backend.
 #[cfg(target_os = "linux")]
 pub(crate) use self::af_packet::Capture;
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub(crate) use self::bpf::Capture;
 
 /// Open a capture on `if_name`, returning `Ok(None)` (and noting why) when the host
-/// can't — no BPF access / `CAP_NET_RAW`, or the interface is absent. A real error
-/// is returned for the caller to propagate with `?`. Shared by the backend tests, the
-/// live test below, and the dispatch-layer tests.
+/// can't — no BPF access / `CAP_NET_RAW`, or the interface is absent. Other errors
+/// propagate for the caller to `?`.
 #[cfg(test)]
 pub(crate) fn open_or_skip(if_name: &str, what: &str) -> std::io::Result<Option<Capture>> {
     match Capture::open(if_name) {
@@ -50,9 +45,7 @@ mod tests {
 
     // Live capture against a real interface (`REFLECTOR_TEST_IFACE`) — backend-neutral
     // because a real interface is Ethernet-framed on both backends (BPF reports
-    // DLT_EN10MB, AF_PACKET delivers the Ethernet header). Validates the open/filter/
-    // recv path and the frame layout; skips when the env var is unset or capture isn't
-    // permitted.
+    // DLT_EN10MB, AF_PACKET delivers the Ethernet header).
     #[test]
     fn live_capture_decodes_real_frames() -> std::io::Result<()> {
         let Some(iface) = std::env::var_os("REFLECTOR_TEST_IFACE") else {
@@ -65,8 +58,7 @@ mod tests {
         };
         assert_eq!(capture.link_type(), LinkType::Ethernet);
 
-        // Poll briefly for ambient UDP traffic and validate each frame's layout: every
-        // frame the kernel filter passed must be an IPv4/IPv6 Ethernet frame, so a
+        // Every frame the kernel filter passed must be an IPv4/IPv6 Ethernet frame, so a
         // mis-sliced header would corrupt these.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let mut validated = 0u32;

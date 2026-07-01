@@ -79,10 +79,9 @@ impl AddressMonitor {
             if n < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ENOBUFS) {
                 overflows += 1;
                 if overflows == 1 {
-                    // A dropped-notification overflow is genuinely abnormal (kernel buffer pressure
-                    // or an event storm); surface it at warn, not just the dispatcher's debug. Signal
-                    // re-resolve-all once per burst — repeating it for each consecutive ENOBUFS is
-                    // redundant (the dispatcher coalesces the 0 anyway).
+                    // A dropped-notification overflow is abnormal (kernel buffer pressure or an event
+                    // storm) — warn, not just the dispatcher's debug. Signal re-resolve-all once per
+                    // burst; the dispatcher coalesces the 0, so repeating it per ENOBUFS is redundant.
                     log::warn!(
                         "address monitor overflowed; notifications were dropped, re-resolving every interface"
                     );

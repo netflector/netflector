@@ -1,8 +1,8 @@
 //! Environment-variable configuration (`REFLECTOR_*`).
 //!
-//! [`parse_env`] turns the variables into the same [`RawConfig`] the TOML path
-//! produces, so the validation downstream is shared. Each value is parsed through
-//! its [`FromStr`] type, with failures tagged by the originating variable name.
+//! [`parse_env`] produces the same [`RawConfig`] as the TOML path, so downstream
+//! validation is shared. Values parse through their [`FromStr`] type, with failures
+//! tagged by the originating variable name.
 
 use std::collections::BTreeMap;
 use std::str::FromStr;
@@ -12,8 +12,8 @@ use super::raw::{RawConfig, RawReflector};
 use super::value::{AddressFamily, InterfaceName, LogLevel, ReflectorName, WolPorts};
 use crate::net::mac::MacAddr;
 
-/// Accumulates a reflector's fields as its `REFLECTOR_<tag>_<param>` variables
-/// are seen, then converts to a [`RawReflector`] once all are consumed.
+/// Accumulates a reflector's fields across its `REFLECTOR_<tag>_<param>` variables,
+/// then converts to a [`RawReflector`] once all are seen.
 #[derive(Debug, Default)]
 struct PartialReflector {
     name: Option<ReflectorName>,
@@ -29,8 +29,7 @@ struct PartialReflector {
 }
 
 impl PartialReflector {
-    /// Route one lowercased `param` to its field, parsing `value`. `var` is the
-    /// full variable name, used only to label errors.
+    /// `var` is the full variable name, used only to label errors.
     fn set(&mut self, param: &str, value: &str, var: &str) -> Result<(), ConfigError> {
         match param {
             "name" => self.name = Some(env_value(value, var)?),
@@ -53,7 +52,7 @@ impl PartialReflector {
         Ok(())
     }
 
-    /// Finalize into a [`RawReflector`], requiring the two interface fields.
+    /// The two interface fields are required; the rest default.
     fn into_raw(self, name: &str) -> Result<RawReflector, ConfigError> {
         Ok(RawReflector {
             name: self.name,
@@ -80,7 +79,7 @@ impl PartialReflector {
 ///
 /// `REFLECTOR_LOG_LEVEL` and `REFLECTOR_DEBUG_MEMORY` set the globals; every other
 /// `REFLECTOR_<tag>_<param>` contributes to the reflector keyed by the lowercased
-/// `tag`. Variables without the prefix are ignored.
+/// `tag`. Unprefixed variables are ignored.
 pub(super) fn parse_env(
     vars: impl IntoIterator<Item = (String, String)>,
 ) -> Result<RawConfig, ConfigError> {
@@ -138,8 +137,8 @@ pub(super) fn parse_env(
 
 /// Resolve `REFLECTOR_LOG_LEVEL` alone, ignoring the rest of the environment.
 ///
-/// Used to raise the logger to the configured verbosity *before* the full parse
-/// runs, so that parse (env merge, reflector build) can be logged at that level.
+/// Raises the logger to the configured verbosity *before* the full parse runs, so
+/// the parse itself (env merge, reflector build) logs at that level.
 pub(super) fn log_level_from_env(
     vars: &[(String, String)],
 ) -> Result<Option<LogLevel>, ConfigError> {
@@ -149,8 +148,7 @@ pub(super) fn log_level_from_env(
         .transpose()
 }
 
-/// Parse an environment value through its `FromStr` type, tagging a failure with
-/// the originating variable name.
+/// Parse through `FromStr`, tagging a failure with the originating variable name.
 fn env_value<T>(value: &str, var: &str) -> Result<T, ConfigError>
 where
     T: FromStr,

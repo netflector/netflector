@@ -145,7 +145,6 @@ pub(super) fn resolve(if_name: &str, ifindex: u32) -> io::Result<InterfaceAddres
     Ok(addrs)
 }
 
-/// A `NETLINK_ROUTE` socket.
 fn netlink_socket() -> io::Result<OwnedFd> {
     // SAFETY: `socket` returns a fresh fd or -1.
     crate::sys::owned_fd_from(unsafe {

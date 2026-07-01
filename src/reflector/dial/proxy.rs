@@ -1,10 +1,10 @@
 //! The per-device DIAL proxy: a reactor [`Handler`] fronting one device's HTTP endpoints.
 //!
 //! [`DialDeviceProxy`] owns a source-side description listener and a REST listener plus a pool of live
-//! [`Connection`]s. It accepts a client on either listener, opens an egress-pinned connection to the
-//! device on the target subnet, and dispatches each readable/writable edge to the matching connection.
-//! The proxy's own lifetime — eviction once the device's advertisement grace lapses — is owned by the
-//! [`DialContext`](crate::dispatch::DialContext) registry (the proxy never sees advertisements); it only
+//! [`Connection`]s. It accepts on either listener, opens an egress-pinned connection to the device on
+//! the target subnet, and dispatches each readable/writable edge to the matching connection. The proxy's
+//! own eviction (once the device's advertisement grace lapses) is owned by the
+//! [`DialContext`](crate::dispatch::DialContext) registry — the proxy never sees advertisements; it only
 //! sweeps its own connections past their connect/idle deadlines.
 
 use std::fmt;
@@ -21,8 +21,8 @@ use super::connection::{Connection, Outcome};
 const MAX_CONNECTIONS: usize = 64;
 
 /// A `Copy` handle into the proxy's connection [`Arena`] — a newtype over the arena [`Key`] so it
-/// can't be confused with the reactor's keys. It is the unit that round-trips through a watched fd's
-/// `user_data`: the reactor echoes it back on every event, and dispatch decodes it to find the flow.
+/// can't be confused with the reactor's keys. Round-trips through a watched fd's `user_data`: the
+/// reactor echoes it back on every event, and dispatch decodes it to find the flow.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct ConnectionKey(Key);
 
@@ -57,7 +57,7 @@ impl fmt::Display for Listener {
 /// A per-device DIAL proxy — a reactor `Handler` owning a description listener and its connections.
 pub(super) struct DialDeviceProxy {
     /// This handler's own key, learned via [`adopt_key`](Handler::adopt_key); used to watch fds it
-    /// opens and to self-unregister.
+    /// opens.
     key: Option<HandlerKey>,
     /// The target-interface address device connections bind, so the device sees a same-segment peer
     /// and replies via the target interface (on the BSDs the bind is the only egress steer).
@@ -79,10 +79,7 @@ pub(super) struct DialDeviceProxy {
 
 impl DialDeviceProxy {
     /// A proxy fronting `desc_endpoint` via the source-side `desc` listener (already bound by the caller).
-    /// Device connections bind the target-interface `target` and egress-pin `target_ifindex`. The proxy's
-    /// lifetime (eviction past the advertisement's grace) is owned by the
-    /// [`DialContext`](crate::dispatch::DialContext) registry, not the proxy itself, since the proxy never
-    /// sees the advertisements that refresh it.
+    /// Device connections bind the target-interface `target` and egress-pin `target_ifindex`.
     pub(super) fn new(
         target: Ipv4Addr,
         target_ifindex: u32,
@@ -102,17 +99,16 @@ impl DialDeviceProxy {
         }
     }
 
-    /// This handler's own key. `adopt_key` sets it at registration — before the reactor dispatches any
-    /// event — so every method that runs has it; its absence would be a reactor-contract violation.
+    /// This handler's own key. `adopt_key` sets it at registration, before any dispatch — its absence
+    /// would be a reactor-contract violation.
     fn own_key(&self) -> HandlerKey {
         self.key
             .expect("adopt_key sets the proxy's key before any dispatch")
     }
 
-    /// Accept one pending client on `listener` if there is connection capacity, else `None`. The
-    /// listeners are non-blocking, so a level-triggered wait re-fires while more wait; an accept is
-    /// always taken (draining the readiness) even at the shared connection cap, where the client is
-    /// dropped. `what` names the listener for the log.
+    /// Accept one pending client on `listener` if there is connection capacity, else `None`. An accept
+    /// is always taken — draining the readiness — even at the shared connection cap, where the client
+    /// is then dropped.
     fn accept_client(&self, listener: &TcpSocket, what: Listener) -> Option<TcpSocket> {
         let client = match listener.accept() {
             Ok(Some(client)) => client,
@@ -136,9 +132,9 @@ impl DialDeviceProxy {
         }
     }
 
-    /// Accept a client on the REST listener and proxy it to the device's REST endpoint — learned from a
-    /// prior description fetch. A client reaching the REST listener before that fetch (the proxy minted
-    /// the listener's address into the description's `Application-URL`, so this is unexpected) is dropped.
+    /// Accept a client on the REST listener and proxy it to the REST endpoint learned from a prior
+    /// description fetch. A client reaching here before that fetch is dropped (the proxy minted the
+    /// listener's address into the description's `Application-URL`, so this is unexpected).
     fn accept_rest(&mut self, reactor: &mut Reactor) {
         let Some(client) = self.accept_client(&self.rest, Listener::Rest) else {
             return;
@@ -336,8 +332,8 @@ mod tests {
 
     /// A proxy with bound loopback desc/rest listeners, its key borrowed from a placeholder handler so
     /// `start_connection`'s watches resolve without dispatching through the reactor. Returns the proxy and
-    /// its REST listener address (a client connects there to reach `accept_rest`). `rest_endpoint` starts
-    /// unlearned (`None`).
+    /// its REST listener address (a client connects there to reach `accept_rest`); `rest_endpoint` starts
+    /// unlearned.
     fn watched_proxy(reactor: &mut Reactor) -> (DialDeviceProxy, SocketAddrV4) {
         let key = reactor.register(Box::new(NoopHandler));
         let desc = TcpSocket::listen(Ipv4Addr::LOCALHOST).expect("desc listen");

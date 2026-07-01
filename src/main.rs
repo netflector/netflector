@@ -13,9 +13,9 @@ fn main() -> ExitCode {
     match reflector::run(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            // Through the log facade, not eprintln, so a fatal error reads like every other line
-            // (timestamp + level) and is visible in the structured log — at the cost of
-            // `log_level = "off"` silencing it, which is that setting's stated intent.
+            // Log facade, not eprintln, so a fatal error reads like every other line
+            // (timestamp + level) — at the cost of `log_level = "off"` silencing it,
+            // which is that setting's stated intent.
             log::error!("{err}");
             ExitCode::FAILURE
         }

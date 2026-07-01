@@ -26,7 +26,6 @@ pub(crate) enum LogLevel {
     Trace,
 }
 
-/// Error returned when a string is not a valid [`LogLevel`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[error("expected one of: off, error, warning, info, debug, trace")]
 pub(crate) struct ParseLogLevelError;
@@ -66,36 +65,32 @@ pub(crate) enum AddressFamily {
 }
 
 impl AddressFamily {
-    /// Whether this family handles IPv4 traffic.
     #[must_use]
     pub(crate) fn uses_ipv4(self) -> bool {
         matches!(self, Self::Default | Self::Dual | Self::Ipv4)
     }
 
-    /// Whether this family handles IPv6 traffic.
     #[must_use]
     pub(crate) fn uses_ipv6(self) -> bool {
         matches!(self, Self::Default | Self::Dual | Self::Ipv6)
     }
 
-    /// Whether a v4 source must be present at startup, else the reflector fails to build. The
-    /// same set as [`uses_ipv4`](Self::uses_ipv4) — v4 is the baseline — but a distinct concept:
-    /// `Default` requires v4 even while treating v6 as best-effort.
+    /// A v4 source must be present at startup, else the reflector fails to build. Same set as
+    /// `uses_ipv4` — v4 is the baseline — but distinct: `Default` requires v4 while treating v6
+    /// as best-effort.
     #[must_use]
     pub(crate) fn requires_ipv4(self) -> bool {
         matches!(self, Self::Default | Self::Dual | Self::Ipv4)
     }
 
-    /// Whether a v6 source must be present at startup, else the reflector fails to build — only
-    /// `Dual` and `Ipv6`. Unlike [`uses_ipv6`](Self::uses_ipv6), `Default` does not require v6:
-    /// it reflects v6 when available but starts without it.
+    /// A v6 source must be present at startup, else the reflector fails to build — only `Dual`
+    /// and `Ipv6`. Unlike `uses_ipv6`, `Default` reflects v6 when available but starts without it.
     #[must_use]
     pub(crate) fn requires_ipv6(self) -> bool {
         matches!(self, Self::Dual | Self::Ipv6)
     }
 }
 
-/// Error returned when a string is not a valid [`AddressFamily`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[error("expected one of: default, dual, ipv4, ipv6")]
 pub(crate) struct ParseAddressFamilyError;
@@ -127,7 +122,6 @@ impl<'de> Deserialize<'de> for AddressFamily {
 pub(crate) struct InterfaceName(String);
 
 impl InterfaceName {
-    /// The interface name as a string slice.
     #[must_use]
     pub(crate) fn as_str(&self) -> &str {
         &self.0
@@ -140,7 +134,6 @@ impl fmt::Display for InterfaceName {
     }
 }
 
-/// Error returned when a string is not a valid [`InterfaceName`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[error("interface name must not be empty")]
 pub(crate) struct ParseInterfaceNameError;
@@ -169,7 +162,6 @@ impl<'de> Deserialize<'de> for InterfaceName {
 pub(crate) struct ReflectorName(String);
 
 impl ReflectorName {
-    /// The name as a string slice.
     #[must_use]
     pub(crate) fn as_str(&self) -> &str {
         &self.0
@@ -182,7 +174,6 @@ impl fmt::Display for ReflectorName {
     }
 }
 
-/// Error returned when a string is not a valid [`ReflectorName`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[error("reflector name must not be empty or whitespace-only")]
 pub(crate) struct ParseReflectorNameError;
@@ -218,13 +209,10 @@ impl Deref for WolPorts {
     }
 }
 
-/// Error returned when a string or list is not a valid [`WolPorts`].
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub(crate) enum WolPortsError {
-    /// The list was empty.
     #[error("wol_ports must not be empty")]
     Empty,
-    /// The same port appeared more than once.
     #[error("wol_ports contains duplicate port {0}")]
     Duplicate(u16),
     /// A comma-separated token was not a port in 1..=65535.

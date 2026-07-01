@@ -45,7 +45,7 @@ extern "C" fn on_signal(_signum: c_int) {
 /// restores those dispositions, unpublishes the fd, and closes the write end — in
 /// that order, so no signal can reach a handler that points at a closed fd.
 pub(crate) struct ShutdownPipe {
-    /// The self-pipe's write end, held only so its `OwnedFd` `Drop` closes it when the guard drops.
+    /// Held only so its `OwnedFd` `Drop` closes the write end when the guard drops.
     _write_fd: OwnedFd,
     saved_actions: [libc::sigaction; SHUTDOWN_SIGNALS.len()],
 }
@@ -117,8 +117,8 @@ impl Handler for SignalPipe {
         // SAFETY: `self.read` is the registered, non-blocking read end; draining
         // stops at EOF (0) or EAGAIN (-1).
         while unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
-        // A once-per-process control event, so it earns an info line: it tells the operator the
-        // daemon is stopping because a signal arrived, not because it crashed or self-terminated.
+        // Once-per-process control event: tells the operator the daemon stopped on
+        // a signal, not a crash or self-termination.
         log::info!("received shutdown signal; stopping");
         reactor.request_shutdown();
     }
@@ -182,7 +182,7 @@ fn install_handlers() -> io::Result<[libc::sigaction; SHUTDOWN_SIGNALS.len()]> {
     Ok(saved)
 }
 
-/// Restore previously-saved signal dispositions (best effort).
+/// Restore previously-saved signal dispositions (best effort — errors ignored).
 fn restore_handlers(saved: &[libc::sigaction]) {
     for (&signum, action) in SHUTDOWN_SIGNALS.iter().zip(saved) {
         // SAFETY: `action` is a disposition a prior `sigaction` produced.

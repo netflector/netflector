@@ -1,5 +1,5 @@
-//! The registry of minted DIAL proxies, owned by the [`PacketDispatcher`](super::PacketDispatcher) so a
-//! device gets one proxy across the SSDP advertisement and search-response paths.
+//! The registry of minted DIAL proxies — one proxy per device, shared across the SSDP advertisement
+//! and search-response paths.
 
 use std::net::SocketAddrV4;
 use std::time::Instant;
@@ -9,17 +9,16 @@ use crate::reactor::{HandlerKey, Reactor};
 use super::CaptureKey;
 
 /// Cap on concurrent minted DIAL proxies — a burst of advertised devices can't exhaust source-side
-/// listeners or reactor slots. At the cap a new device's `LOCATION` is reflected unchanged (the device
-/// stays visible but unproxied) rather than evicting a live proxy.
+/// listeners or reactor slots. At the cap a new device's `LOCATION` is reflected unchanged (visible but
+/// unproxied) rather than evicting a live proxy.
 const MAX_DIAL_PROXIES: usize = 32;
 
-/// One minted DIAL description proxy: keyed by the `source` capture it fronts on plus the device's
-/// description `endpoint` (its `LOCATION` authority), recording the `target` capture its device
-/// connections egress on (so an address change on either interface evicts it), the proxy's reactor
-/// `handler` (whose generational key goes stale once the proxy is evicted), the source-side
-/// description-listener `desc_addr` spliced into the device's `LOCATION`, and `desc_grace` — the instant
-/// past which the dispatcher evicts the proxy, refreshed to each advertisement's `max-age` so a cached
-/// `LOCATION` keeps resolving while the device is advertised.
+/// One minted DIAL description proxy, keyed by `(source, endpoint)`:
+/// - `target` — capture the device connections egress on; a change on either interface evicts the proxy.
+/// - `handler` — the proxy's reactor key; goes stale once the proxy is evicted.
+/// - `desc_addr` — source-side description-listener spliced into the device's `LOCATION`.
+/// - `desc_grace` — eviction deadline, refreshed to each advertisement's `max-age` so a cached
+///   `LOCATION` keeps resolving while the device is advertised.
 struct DialEntry {
     source: CaptureKey,
     target: CaptureKey,
@@ -31,15 +30,13 @@ struct DialEntry {
 
 /// The registry of minted DIAL proxies, owned by the [`PacketDispatcher`](super::PacketDispatcher) so the
 /// SSDP advertisement and search-response paths — separate handlers — share one proxy per device. The
-/// DIAL hook (`reflector::dial::rewrite_location`) reuses (and refreshes the grace of) a live proxy found
-/// here, or records a freshly-minted one; an evicted proxy's entry is pruned on the next lookup or
-/// capacity check.
+/// DIAL hook (`reflector::dial::rewrite_location`) reuses a live proxy found here (refreshing its grace)
+/// or records a freshly-minted one; an evicted proxy's entry is pruned on the next lookup or capacity check.
 pub(crate) struct DialContext {
     proxies: Vec<DialEntry>,
 }
 
 impl DialContext {
-    /// An empty registry.
     pub(crate) fn new() -> Self {
         Self {
             proxies: Vec::new(),

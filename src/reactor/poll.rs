@@ -1,7 +1,7 @@
 //! Readiness backend: an OS-uniform [`Poller`] over the platform's readiness
 //! syscalls. A wait reports which registered fds are ready, each tagged with the
 //! reactor [`Key`] handed to the kernel, so dispatch needs no fd-to-handler side
-//! table. The kqueue backend (macOS/FreeBSD) is implemented; epoll (Linux) follows.
+//! table. kqueue backend (macOS/FreeBSD) implemented; epoll (Linux) follows.
 
 use super::{Key, Readiness};
 
@@ -161,8 +161,8 @@ mod tests {
 
     #[test]
     fn level_triggered_refires_until_drained() {
-        // Level-triggered (no edge/one-shot mode): a readable fd re-fires every wait
-        // until drained, so a handler may read once and trust the next wait for the rest.
+        // Level-triggered (no edge/one-shot mode): a readable fd re-fires every wait until drained, so a
+        // handler may read once and trust the next wait for the rest.
         let (mut a, b) = UnixStream::pair().unwrap();
         let mut poller = Poller::new(CAPACITY).unwrap();
         poller.add(a.as_raw_fd(), Key::from_u64(1)).unwrap();

@@ -1,27 +1,22 @@
 //! Single-threaded reactor: a registration arena dispatched against I/O readiness.
 //!
-//! Built on a generational-index [`arena`]. Registrations are addressed by a
-//! `Copy` [`Key`], never a pointer or reference — which is what lets a handler
-//! reach back into the reactor (to register or unregister others, or arm write
-//! interest) without aliasing the storage it lives in. A freed slot bumps its
-//! generation, so a stale key fails safe (resolves to nothing) instead of
-//! dangling.
+//! Registrations are addressed by a `Copy` [`Key`] into a generational-index
+//! [`arena`], never a pointer — which lets a handler reach back into the reactor
+//! (register/unregister others, arm write interest) without aliasing the storage
+//! it lives in. A freed slot bumps its generation, so a stale key fails safe
+//! (resolves to nothing) instead of dangling.
 //!
-//! The reactor owns a [`poll::Poller`] and drives the kernel (epoll/kqueue) as handlers
-//! and their watched fds come and go; [`Reactor::poll_once`] waits for readiness and
-//! dispatches it. A [`Handler`] is registered once and **owns** the fds it
-//! [`watch`](Reactor::watch)es; each fd is watched under its own [`RegKey`], so an event
-//! names the exact fd and the reactor dispatches the owning handler for the fd that fired.
-//! Unwatching (or unregistering) removes the kernel interest *first*, then
-//! the handler drops and closes the fds — so interest is always gone before a fd closes:
-//! no stale-interest window, and no fd the reactor double-owns (a capture socket the
-//! handler also needs for I/O stays owned by the handler).
+//! A [`Handler`] is registered once and **owns** the fds it [`watch`](Reactor::watch)es;
+//! each fd is watched under its own [`RegKey`], so an event names the exact fd and
+//! dispatches the owning handler. Unwatching (or unregistering) removes the kernel
+//! interest *first*, then the handler drops and closes the fds — interest is always
+//! gone before a fd closes: no stale-interest window, and no fd the reactor
+//! double-owns (a capture socket the handler also needs for I/O stays the handler's).
 //!
-//! Dispatch **takes the handler out of its slot** for the duration of its call, so
-//! `&mut Reactor` is free to hand to the handler. The handler can therefore mutate the
-//! reactor freely — watch/unwatch fds, register or unregister others — which a loop
-//! holding an iterator into the storage would risk invalidating mid-iteration; here
-//! nothing borrows the arenas during the call, so it just works.
+//! Dispatch **takes the handler out of its slot** for its call, so `&mut Reactor` is
+//! free to hand to it — it can watch/unwatch fds and register/unregister others, which
+//! a loop holding an iterator into the storage would risk invalidating mid-iteration;
+//! nothing borrows the arenas during the call.
 
 mod arena;
 mod poll;
@@ -36,9 +31,9 @@ use std::time::{Duration, Instant};
 
 use self::poll::Poller;
 
-/// How many ready fds one [`wait`](poll::Poller::wait) reports. The reflector
-/// watches only a handful of fds, so this is ample headroom; level-triggering
-/// re-reports any overflow on the next wait, so a small buffer never loses events.
+/// How many ready fds one [`wait`](poll::Poller::wait) reports. The reflector watches
+/// only a handful of fds; level-triggering re-reports any overflow on the next wait,
+/// so a small buffer never loses events.
 const EVENT_CAPACITY: NonZeroUsize = NonZeroUsize::new(64).unwrap();
 
 /// A `Copy` handle to a registered handler — what [`register`](Reactor::register)
@@ -49,8 +44,7 @@ pub(crate) struct HandlerKey(Key);
 
 /// A `Copy` handle to one watched fd of a handler — what [`watch`](Reactor::watch)
 /// returns. It names a single fd, so it is the handle for [`set_write_interest`] and
-/// [`unwatch`], and the reactor hands it back to dispatch so a handler learns *which* of
-/// its fds fired.
+/// [`unwatch`], and is handed back to dispatch so a handler learns *which* of its fds fired.
 ///
 /// [`set_write_interest`]: Reactor::set_write_interest
 /// [`unwatch`]: Reactor::unwatch
@@ -63,31 +57,29 @@ pub(crate) struct RegKey(Key);
 ///
 /// `on_readable` is required; `on_writable` defaults to a no-op and only fires while
 /// write interest is armed for that fd (see [`Reactor::set_write_interest`]). Each is
-/// handed `&mut Reactor`, so a handler can watch/unwatch fds, register or unregister
-/// others, arm/disarm its own write interest, etc.
+/// handed `&mut Reactor`, so a handler can watch/unwatch fds, register/unregister others,
+/// arm/disarm its own write interest.
 pub(crate) trait Handler {
-    /// The fd `event.fd` is readable.
     fn on_readable(&mut self, event: ReadyEvent, reactor: &mut Reactor);
 
     /// The fd `event.fd` is writable and its write interest is armed.
     fn on_writable(&mut self, _event: ReadyEvent, _reactor: &mut Reactor) {}
 
     /// The earliest instant this handler wants [`on_deadline`](Self::on_deadline) called, or `None`
-    /// if it has no pending timer. The run loop blocks no longer than the soonest across handlers, so
-    /// a handler with work to do at a future time reports it here and is called back at (or after) it.
+    /// if it has no pending timer. The run loop blocks no longer than the soonest across handlers,
+    /// so a handler is called back at (or after) the instant it reports here.
     fn next_deadline(&self) -> Option<Instant> {
         None
     }
 
     /// `now` has reached this handler's [`next_deadline`](Self::next_deadline) — its timer fired.
     /// `now` is the run loop's single read of the clock, passed in so the sweep is testable without
-    /// a real clock. Like the readiness callbacks, the handler gets `&mut Reactor`.
+    /// a real clock.
     fn on_deadline(&mut self, _now: Instant, _reactor: &mut Reactor) {}
 
     /// Called once, right after [`register`](Reactor::register) inserts this handler, handing it its
     /// own [`HandlerKey`]. A handler that later watches fds it opens — or unregisters itself — records
-    /// the key here. Defaulted to a no-op: most handlers act only through the `event` they are handed
-    /// and never need it.
+    /// the key here. Defaulted to a no-op: most handlers act only through the `event` they are handed.
     fn adopt_key(&mut self, _key: HandlerKey) {}
 }
 
@@ -95,9 +87,7 @@ pub(crate) trait Handler {
 /// (or a test) feeds the reactor.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Readiness {
-    /// The fd is readable.
     pub(crate) readable: bool,
-    /// The fd is writable.
     pub(crate) writable: bool,
 }
 
@@ -106,15 +96,14 @@ pub(crate) struct Readiness {
 /// `user_data` — a handler can pack a key, an index, or anything into it.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ReadyEvent {
-    /// The fd that is ready.
     pub(crate) fd: RawFd,
     /// The opaque value the handler passed to [`watch`](Reactor::watch).
     pub(crate) user_data: u64,
 }
 
 /// A registered handler plus the keys of the fd-registrations that dispatch to it (so
-/// [`unregister`](Reactor::unregister) can tear them all down). The handler is taken out
-/// of `handler` only transiently, while it is mid-dispatch.
+/// [`unregister`](Reactor::unregister) can tear them all down). `handler` is `None` only
+/// transiently, while it is mid-dispatch.
 struct HandlerEntry {
     handler: Option<Box<dyn Handler>>,
     regs: Vec<RegKey>,
@@ -206,9 +195,9 @@ impl Reactor {
         fd: RawFd,
         user_data: u64,
     ) -> io::Result<RegKey> {
-        // Borrow the handler once, up front — its `regs` get the new reg key at the end.
-        // `handlers`, `registrations`, and `poll` are disjoint fields, so this borrow
-        // stays live across the insert and the poll syscall.
+        // Borrow the handler up front — its `regs` get the new reg key at the end. `handlers`,
+        // `registrations`, and `poll` are disjoint fields, so this borrow stays live across the
+        // insert and the poll syscall.
         let Some(handler_entry) = self.handlers.get_mut(handler_key.0) else {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -263,8 +252,8 @@ impl Reactor {
             log::trace!("unregister: {handler_key:?} already gone");
             return Ok(false);
         };
-        // `handler_entry` keeps the handler (and its fds) alive until this returns. Tear
-        // down each fd registration — kernel interest then arena slot — before it drops.
+        // `handler_entry` keeps the handler (and its fds) alive until this returns, so each fd's
+        // kernel interest is removed before the fd drops and closes.
         let mut first_err = None;
         for reg_key in handler_entry.regs {
             if let Some(registration) = self.registrations.remove(reg_key.0)
@@ -294,9 +283,9 @@ impl Reactor {
             log::trace!("set_write_interest: {reg_key:?} already gone");
             return Ok(false);
         };
-        // Program the kernel first; flip the in-memory flag only on success, so the arena
-        // and the kernel never disagree about interest. (`self.poll` and `self.registrations`
-        // are disjoint fields, so the `registration` borrow can stay live across the syscall.)
+        // Program the kernel first; flip the in-memory flag only on success, so the arena and
+        // kernel never disagree about interest. (`self.poll` and `self.registrations` are disjoint
+        // fields, so the `registration` borrow stays live across the syscall.)
         self.poll.set_interest(
             registration.fd,
             reg_key.0,
@@ -353,8 +342,8 @@ impl Reactor {
     /// no events rather than erroring.
     pub(crate) fn poll_once(&mut self, timeout: Option<Duration>) -> io::Result<()> {
         self.poll.wait(timeout)?;
-        // `next_event` returns an owned (`Copy`) event, so the `self.poll` borrow
-        // ends before `dispatch` needs `&mut self`.
+        // `next_event` returns an owned (`Copy`) event, so the `self.poll` borrow ends before
+        // `dispatch` needs `&mut self`.
         while let Some(event) = self.poll.next_event() {
             self.dispatch(RegKey(event.key), event.readiness);
         }
@@ -389,8 +378,8 @@ impl Reactor {
             let deadline = self.next_deadline();
             let timeout = deadline.map(|d| d.saturating_duration_since(Instant::now()));
             self.poll_once(timeout)?;
-            // The wait returns on an fd event or once the timeout elapses; sweep only if a deadline
-            // has actually come due (an fd wakeup before it leaves `now < deadline`, so no scan).
+            // Sweep only if a deadline has actually come due — an fd wakeup before it leaves
+            // `now < deadline`, so no scan.
             let now = Instant::now();
             if deadline.is_some_and(|d| now >= d) {
                 self.dispatch_deadlines(now);
@@ -462,7 +451,7 @@ impl Reactor {
             fd: registration.fd,
             user_data: registration.user_data,
         };
-        // Take the handler out so `self` is free to pass to it. The slot stays put, so
+        // Take the handler out so `self` is free to pass to it; the slot stays put, so
         // `handler_key` stays valid and the handler is returned after the call.
         let Some(handler_entry) = self.handlers.get_mut(handler_key.0) else {
             log::trace!("dispatch: {reg_key:?} -> {handler_key:?} gone, ignored");
@@ -498,8 +487,8 @@ impl Reactor {
             }
         }
 
-        // Return the handler — unless it was removed during the call, in which case the
-        // handler_entry is gone and the handler is dropped.
+        // Return the handler — unless it was removed during the call, in which case its
+        // entry is gone and the handler is dropped.
         if let Some(handler_entry) = self.handlers.get_mut(handler_key.0) {
             handler_entry.handler = Some(handler);
         }
@@ -539,9 +528,8 @@ mod tests {
         (OwnedFd::from(a), b)
     }
 
-    /// A handler whose behavior is supplied as closures, so each test wires up only what
-    /// it needs. Like any real handler, it owns its fd. Each closure gets the [`ReadyEvent`]
-    /// that fired plus the reactor.
+    /// A [`TestHandler`] callback: each test supplies behavior as a closure over the
+    /// [`ReadyEvent`] that fired plus the reactor.
     type Action = Box<dyn FnMut(ReadyEvent, &mut Reactor)>;
 
     /// A [`TimerHandler`]'s fire callback, aliased like [`Action`] to keep the field type simple.

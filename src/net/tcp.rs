@@ -17,8 +17,8 @@ const LISTEN_BACKLOG: c_int = 16;
 /// may still be completing its non-blocking `connect`. Owns its fd; `Drop` closes it.
 pub(crate) struct TcpSocket {
     fd: OwnedFd,
-    /// The bound local address, captured once at construction (the `bind` fixes it) so
-    /// [`local_addr`](Self::local_addr) is a field read rather than a per-call `getsockname`.
+    /// Captured once at construction (the `bind` fixes it) so [`local_addr`](Self::local_addr) is a
+    /// field read rather than a per-call `getsockname`.
     local_addr: SocketAddrV4,
     connecting: bool,
 }
@@ -44,7 +44,7 @@ impl TcpSocket {
         })
     }
 
-    /// The IPv4 address the socket is bound to — for a listener, the ephemeral port to advertise. A
+    /// The bound IPv4 address — for a listener, the ephemeral port to advertise. A
     /// field read of the address captured at construction, not a `getsockname`.
     pub(crate) fn local_addr(&self) -> SocketAddrV4 {
         self.local_addr
@@ -59,8 +59,7 @@ impl TcpSocket {
     pub(crate) fn accept(&self) -> io::Result<Option<Self>> {
         Ok(accept_fd(self.fd.as_raw_fd())?.map(|fd| Self {
             fd,
-            // An accepted socket shares the listener's local address, so inherit it rather than
-            // re-querying the kernel.
+            // shares the listener's local address — inherit rather than re-query
             local_addr: self.local_addr,
             connecting: false,
         }))
@@ -194,7 +193,6 @@ impl AsRawFd for TcpSocket {
     }
 }
 
-/// Bind `fd` to `addr:port`.
 fn bind_v4(fd: RawFd, addr: Ipv4Addr, port: u16) -> io::Result<()> {
     let (storage, len) = sockaddr_for(IpAddr::V4(addr), port, 0);
     // SAFETY: `storage` is a valid `sockaddr_in` of length `len` for `fd`'s family.

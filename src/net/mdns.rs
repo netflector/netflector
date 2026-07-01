@@ -2,15 +2,14 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-/// The mDNS UDP port (RFC 6762).
+/// RFC 6762.
 pub(crate) const MDNS_PORT: u16 = 5353;
 /// mDNS messages carry IP TTL 255 so a receiver can verify the message originated on the local
 /// link — a lower TTL means it was routed, and is rejected (RFC 6762 §11). The reflector re-emits a
 /// fresh link-local message, so it sets 255 rather than preserving the captured TTL.
 pub(crate) const MDNS_TTL: u8 = 255;
-/// The IPv4 mDNS multicast group.
 pub(crate) const MDNS_GROUP_V4: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
-/// The IPv6 link-local mDNS multicast group.
+/// Link-local scope (`ff02::`), not site-local.
 pub(crate) const MDNS_GROUP_V6: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb);
 
 /// An mDNS message is a query or a response, per the QR bit of its DNS header. Unsolicited
@@ -46,7 +45,7 @@ pub(crate) fn classify(payload: &[u8]) -> Option<MdnsKind> {
 mod tests {
     use super::*;
 
-    /// A minimal DNS message: a 12-byte header with `flags_high` at offset 2, plus a `tail`.
+    /// 12-byte header with `flags_high` at offset 2, plus `tail`.
     fn message(flags_high: u8, tail: &[u8]) -> Vec<u8> {
         let mut m = vec![0u8; DNS_HEADER_LEN];
         m[FLAGS_HIGH] = flags_high;

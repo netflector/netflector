@@ -1,23 +1,20 @@
 //! Configuration loading and validation.
 //!
 //! TOML is deserialized into a raw form (`RawConfig`/`RawReflector`) and then
-//! validated into the strongly-typed [`Config`] the rest of the program uses. The
-//! typed values make illegal states unrepresentable (for example, [`Wol::ports`]
-//! exists only when `WoL` is enabled, and [`InterfaceName`]/[`WolPorts`] can't be
-//! empty).
+//! validated into the strongly-typed [`Config`]. Typed values make illegal states
+//! unrepresentable ([`Wol::ports`] exists only when `WoL` is enabled;
+//! [`InterfaceName`]/[`WolPorts`] can't be empty).
 //!
-//! The pieces live in submodules: value types in `value`, errors in `error`, the
-//! serde layer in `raw`, and the environment parser in `env`. Each value type is
-//! a `FromStr` type with a matching `Deserialize`, so the same validation serves
-//! both the TOML path (via serde, with located errors) and the environment path
-//! (via `FromStr`, with variable-named errors). Cross-field and cross-reflector
-//! rules live in the `TryFrom` conversions here, and file and environment settings
-//! are combined in [`Config::from_sources`].
+//! Submodules: value types in `value`, errors in `error`, the serde layer in
+//! `raw`, the environment parser in `env`. Each value type pairs `FromStr` with a
+//! matching `Deserialize`, so one validation serves both the TOML path (serde,
+//! located errors) and the environment path (`FromStr`, variable-named errors).
+//! Cross-field and cross-reflector rules live in the `TryFrom` conversions here;
+//! sources are combined in [`Config::from_sources`].
 //!
-//! Reflectors are nested under a `reflectors` table (`[reflectors.<name>]`)
-//! rather than top-level tables: this keeps the deserializer off
-//! `#[serde(flatten)]`, which would otherwise discard the line/column of every
-//! value error.
+//! Reflectors nest under `[reflectors.<name>]` rather than top-level tables to keep
+//! the deserializer off `#[serde(flatten)]`, which would discard the line/column of
+//! every value error.
 
 mod env;
 mod error;
@@ -51,8 +48,8 @@ pub(crate) struct Ssdp {
 /// One reflector: bridges `source_if` → `target_if` for the enabled protocols.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Reflector {
-    /// Display name (from the `[reflectors.<name>]` key or `REFLECTOR_<tag>_NAME`),
-    /// used in logs; trimmed and never empty.
+    /// Display name for logs, from the `[reflectors.<name>]` key or
+    /// `REFLECTOR_<tag>_NAME`.
     pub(crate) name: ReflectorName,
     /// Interface to listen on.
     pub(crate) source_if: InterfaceName,
@@ -64,7 +61,6 @@ pub(crate) struct Reflector {
     pub(crate) address_family: AddressFamily,
     /// Wake-on-LAN settings, or `None` when `WoL` is disabled.
     pub(crate) wol: Option<Wol>,
-    /// Whether mDNS reflection is enabled.
     pub(crate) mdns: bool,
     /// SSDP settings, or `None` when SSDP is disabled.
     pub(crate) ssdp: Option<Ssdp>,
@@ -102,8 +98,8 @@ impl TryFrom<(String, RawReflector)> for Reflector {
     type Error = ConfigError;
 
     fn try_from((key, raw): (String, RawReflector)) -> Result<Self, ConfigError> {
-        // Display name: the env `NAME` override (already validated) or the
-        // identity key (file table key / env tag), validated here.
+        // Env `NAME` override is already validated; the identity key (file table
+        // key / env tag) is validated here.
         let name = match raw.name {
             Some(name) => name,
             None => ReflectorName::from_str(&key)
@@ -164,7 +160,6 @@ pub(crate) struct Config {
     pub(crate) log_level: LogLevel,
     /// Whether to periodically log memory-footprint diagnostics.
     pub(crate) debug_memory: bool,
-    /// The configured reflectors.
     pub(crate) reflectors: Vec<Reflector>,
 }
 
@@ -222,9 +217,9 @@ impl TryFrom<RawConfig> for Config {
     }
 }
 
-/// A view over the TOML file that reads only the top-level `log_level` and ignores
-/// everything else (note: no `deny_unknown_fields`), so [`resolve_log_level`] can
-/// extract the level without parsing or validating the reflector tables.
+/// Reads only the top-level `log_level`, ignoring everything else (no
+/// `deny_unknown_fields`), so [`resolve_log_level`] can extract the level without
+/// validating the reflector tables.
 #[derive(Deserialize)]
 struct LogLevelProbe {
     #[serde(default)]

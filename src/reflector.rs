@@ -1,6 +1,6 @@
 //! The reflectors: per-protocol packet handlers that re-emit matched traffic on the opposite
 //! interface. Each implements the dispatcher's `PacketHandler` and is registered by `run()`
-//! from config. Wake-on-LAN is the first; mDNS and SSDP follow.
+//! from config.
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -51,8 +51,8 @@ impl InterfaceMap {
         self.0.iter().find(|(n, _)| n == name).map(|&(_, key)| key)
     }
 
-    /// The capture key recorded for `name`, or a [`BuildError::UnknownInterface`] naming it — the
-    /// build functions' standard step for resolving a configured interface name to its capture.
+    /// The capture key for `name`, or [`BuildError::UnknownInterface`] — the build functions'
+    /// standard step for resolving a configured interface name to its capture.
     pub(crate) fn require(&self, name: &str) -> Result<CaptureKey, BuildError> {
         self.key_for(name)
             .ok_or_else(|| BuildError::UnknownInterface(name.to_owned()))

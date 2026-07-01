@@ -1,4 +1,4 @@
-//! The per-direction streaming HTTP/1.1 framer: it buffers and rewrites the header, then forwards the
+//! The per-direction streaming HTTP/1.1 framer: buffers and rewrites the header, then forwards the
 //! body as a zero-copy slice of the fed input via [`feed`](HttpFraming::feed). Built on the parent
 //! module's authority parser.
 
@@ -158,7 +158,7 @@ impl HttpFraming {
                     break;
                 }
                 Phase::BodyChunked if self.chunk_remaining > 0 => {
-                    // Forwarding the current chunk's DATA(+CRLF), opaquely.
+                    // forward the current chunk's DATA(+CRLF) opaquely
                     let take = self.chunk_remaining.min(input.len() - pos);
                     pos += take;
                     self.chunk_remaining -= take;
@@ -167,7 +167,7 @@ impl HttpFraming {
                     }
                 }
                 Phase::BodyChunked => {
-                    // At a chunk boundary: parse the next chunk-size line.
+                    // at a chunk boundary: parse the next chunk-size line
                     let Some(rel) = find_crlf(&input[pos..]) else {
                         if input.len() - pos > MAX_CHUNK_LINE {
                             return Err(FramingError::ChunkLineTooLong);
@@ -187,7 +187,7 @@ impl HttpFraming {
                     }
                 }
                 Phase::BodyChunkedTrailers => {
-                    // Consume trailer field lines opaquely until the blank line ends the body.
+                    // consume trailer field lines opaquely until the blank line ends the body
                     let Some(rel) = find_crlf(&input[pos..]) else {
                         if input.len() - pos > MAX_TRAILER_LINE {
                             return Err(FramingError::TrailerLineTooLong);
@@ -202,7 +202,7 @@ impl HttpFraming {
                 }
             }
         }
-        // Take the scratch borrow only now, after the loop is done mutating `self`.
+        // borrow the scratch only now, after the loop is done mutating `self`
         Ok(Framed {
             header: if header_complete { &self.header } else { &[] },
             body: &input[body_start..pos],

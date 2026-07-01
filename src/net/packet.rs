@@ -201,9 +201,8 @@ fn parse_udp(l4: &[u8]) -> Result<(u16, u16, &[u8]), ParseError> {
     Ok((src_port, dst_port, &l4[UDP_HEADER_SIZE..udp_len]))
 }
 
-/// Read a 4-byte IPv4 address field. `bytes` is a fixed-size slice of a length-checked
-/// header, so the conversion never fails; mapping a mismatch to `Truncated` keeps it
-/// panic-free regardless.
+/// `bytes` is a length-checked header slice, so the conversion never fails; mapping a
+/// mismatch to `Truncated` keeps it panic-free regardless.
 fn ipv4_addr(bytes: &[u8]) -> Result<Ipv4Addr, ParseError> {
     <[u8; 4]>::try_from(bytes)
         .map(Ipv4Addr::from)

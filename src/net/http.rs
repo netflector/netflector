@@ -1,25 +1,24 @@
-//! HTTP/1.1 message helpers for the TCP path: the IPv4 authority parser shared by the DIAL proxy's
-//! `Host` / `Application-URL` / `Location` rewrites and the SSDP `LOCATION` rewrite, plus the
-//! case-insensitive header-prefix match they — and SSDP, which is HTTP-over-UDP — use to find header
-//! lines. The streaming message framer is in the [`framing`] submodule.
+//! HTTP/1.1 message helpers: the IPv4 authority parser shared by the DIAL proxy's
+//! `Host` / `Application-URL` / `Location` rewrites and the SSDP `LOCATION` rewrite (SSDP is
+//! HTTP-over-UDP), plus the case-insensitive header-prefix match. Streaming framer in [`framing`].
 
 pub(crate) mod framing;
 
 use std::net::{Ipv4Addr, SocketAddrV4};
 
-/// A device HTTP authority parsed from a header value, plus the byte span of its `host[:port]` text
-/// within the value it came from — so a caller splices a replacement over exactly that span. The
-/// reflector's HTTP/DIAL rewrites are IPv4-only, so the endpoint is a [`SocketAddrV4`].
+/// A parsed HTTP authority plus the byte span (`offset`/`len`) of its `host[:port]` text within the
+/// source value, so a caller splices a replacement over exactly that span. HTTP/DIAL rewrites are
+/// IPv4-only, hence [`SocketAddrV4`].
 pub(crate) struct Authority {
     pub(crate) endpoint: SocketAddrV4,
     pub(crate) offset: usize,
     pub(crate) len: usize,
 }
 
-/// Parse a device authority from `value`. `bare` (a `Host` header) treats the whole value as the
-/// authority; else `value` must be an `http://host[:port]...` URL (no `https`). The host must be an
-/// IPv4 literal (a hostname or IPv6 is rejected — DIAL is IPv4-only); the port defaults to 80, or an
-/// explicit one must be the whole field and in `1..=65535`. `offset`/`len` are relative to `value`.
+/// Parse an authority from `value`. `bare` (a `Host` header) treats the whole value as the authority;
+/// else `value` must be an `http://host[:port]...` URL (no `https`). Host must be an IPv4 literal
+/// (hostname/IPv6 rejected — DIAL is IPv4-only); port defaults to 80, else must parse in `1..=65535`.
+/// `offset`/`len` are relative to `value`.
 pub(crate) fn parse_authority(value: &[u8], bare: bool) -> Option<Authority> {
     let (rest, auth_offset) = if bare {
         (value, 0)

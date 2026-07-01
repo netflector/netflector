@@ -15,9 +15,8 @@ use crate::reactor::Reactor;
 
 use super::{BuildError, InterfaceMap, egress_sources, require_bidirectional_families};
 
-/// A built mDNS reflector for one direction of one family: re-emits each message of its `kind` (query
-/// or response) captured on its ingress onto `egress`, to the message's own destination. The
-/// dispatcher's filter pins that to the group, so the handler only classifies and re-emits.
+/// One direction of one family: re-emits each message of its `kind` (query or response) captured on
+/// its ingress onto `egress`, to the message's own destination.
 struct MdnsReflector {
     egress: CaptureKey,
     kind: MdnsKind,
@@ -154,7 +153,7 @@ pub(crate) fn build(
     Ok(())
 }
 
-/// The mDNS group address (at port 5353) each family `family` uses re-emits to.
+/// The mDNS group socket addresses `family` reflects to.
 fn used_groups(family: AddressFamily) -> Vec<SocketAddr> {
     let mut groups = Vec::with_capacity(2);
     if family.uses_ipv4() {

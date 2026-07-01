@@ -1,11 +1,10 @@
 //! Build the link-layer frames we inject on the egress path.
 //!
 //! The public builders write a full frame into a caller-provided buffer (no
-//! allocation on the data path) and return the byte count, filling the IPv4-header
-//! and UDP checksums via [`super::checksum`]. The Ethernet builders prefix
-//! destination/source MACs and an ethertype; the BSD `DLT_NULL` builders
-//! (macOS/FreeBSD) prefix a 4-byte host-order address family instead, matching the
-//! capture-side framing.
+//! data-path allocation) and return the byte count, filling checksums via
+//! [`super::checksum`]. Ethernet builders prefix destination/source MACs and an
+//! ethertype; the BSD `DLT_NULL` builders (macOS/FreeBSD) prefix a 4-byte
+//! host-order address family instead, matching the capture-side framing.
 
 use std::net::{SocketAddrV4, SocketAddrV6};
 
@@ -35,9 +34,9 @@ pub(crate) enum FrameError {
     PayloadTooLarge { payload: usize },
 }
 
-/// Build an Ethernet frame carrying an IPv4 UDP datagram into `out`, returning
-/// the frame length: the destination/source MAC header and ethertype, then the
-/// IPv4 + UDP datagram with checksums filled.
+/// Ethernet frame carrying an IPv4 UDP datagram into `out`, returning the frame
+/// length: dst/src MAC header and ethertype, then the IPv4 + UDP datagram with
+/// checksums filled.
 ///
 /// # Errors
 /// [`FrameError::PayloadTooLarge`] if the datagram overflows the 16-bit length
@@ -58,9 +57,9 @@ pub(crate) fn ethernet_ipv4_udp(
     Ok(ETHERNET_HEADER_SIZE + datagram)
 }
 
-/// Build an Ethernet frame carrying an IPv6 UDP datagram into `out`, returning
-/// the frame length: the destination/source MAC header and ethertype, then the
-/// IPv6 + UDP datagram with the UDP checksum filled.
+/// Ethernet frame carrying an IPv6 UDP datagram into `out`, returning the frame
+/// length: dst/src MAC header and ethertype, then the IPv6 + UDP datagram with
+/// the UDP checksum filled.
 ///
 /// # Errors
 /// [`FrameError::PayloadTooLarge`] if the datagram overflows the 16-bit length
@@ -81,8 +80,8 @@ pub(crate) fn ethernet_ipv6_udp(
     Ok(ETHERNET_HEADER_SIZE + datagram)
 }
 
-/// Build a `DLT_NULL` frame carrying an IPv4 UDP datagram into `out` (BSD
-/// `lo0` framing): a 4-byte host-order address family, then the IPv4 + UDP datagram
+/// `DLT_NULL` frame carrying an IPv4 UDP datagram into `out` (BSD `lo0`
+/// framing): a 4-byte host-order address family, then the IPv4 + UDP datagram
 /// with checksums filled. Returns the frame length.
 ///
 /// # Errors
@@ -103,8 +102,8 @@ pub(crate) fn dlt_null_ipv4_udp(
     Ok(DLT_NULL_HEADER_SIZE + datagram)
 }
 
-/// Build a `DLT_NULL` frame carrying an IPv6 UDP datagram into `out` (BSD
-/// `lo0` framing): a 4-byte host-order address family, then the IPv6 + UDP datagram
+/// `DLT_NULL` frame carrying an IPv6 UDP datagram into `out` (BSD `lo0`
+/// framing): a 4-byte host-order address family, then the IPv6 + UDP datagram
 /// with the UDP checksum filled. Returns the frame length.
 ///
 /// # Errors

@@ -1,9 +1,9 @@
-//! An ephemeral-UDP-port reservation: a held, never-read socket whose only job is to keep the
-//! kernel's UDP demux satisfied. The SSDP search reflector re-emits an M-SEARCH from this port so
-//! devices unicast their `200 OK` back to it; the port must stay claimed for the session's lifetime
-//! so the kernel finds a socket for the reply and does NOT answer it with an ICMP port-unreachable.
-//! The bound socket is never read — the raw capture reads the actual datagram; on Linux a drop-all
-//! BPF filter makes the socket enqueue nothing. Dropping it frees the port.
+//! An ephemeral-UDP-port reservation: a held, never-read socket that keeps the kernel's UDP demux
+//! satisfied. The SSDP search reflector re-emits an M-SEARCH from this port so devices unicast their
+//! `200 OK` back to it; the port must stay claimed for the session's lifetime so the kernel finds a
+//! socket for the reply and does NOT answer with an ICMP port-unreachable. The raw capture reads the
+//! actual datagram, not this socket; on Linux a drop-all BPF filter makes it enqueue nothing.
+//! Dropping it frees the port.
 
 use std::io;
 use std::net::IpAddr;
@@ -14,17 +14,15 @@ use crate::sys::{open_socket, sockaddr_for, socklen_of};
 /// A reservation over one OS-assigned ephemeral UDP port on an interface's source address. Owns the
 /// bound socket; `Drop` frees the port.
 pub(crate) struct PortReservation {
-    /// Held for its lifetime to keep the port claimed; never read — the raw capture reads the reply.
+    /// Held to keep the port claimed; never read.
     _fd: OwnedFd,
     port: u16,
 }
 
 impl PortReservation {
-    /// Reserve an ephemeral port on `addr` (the egress interface's own address — the reflector sends
-    /// from it and devices reply to it): open a `SOCK_DGRAM` socket, bind it to `addr:0`, and read
-    /// the assigned port back. `ifindex` is the interface index, required to bind an IPv6 link-local
-    /// `addr` (ignored for IPv4). On Linux a drop-all filter makes the socket enqueue nothing — the
-    /// real datagram is read by the capture.
+    /// Reserve an ephemeral port on `addr` — the egress interface's own address, which the reflector
+    /// sends from and devices reply to. `ifindex` is required to bind an IPv6 link-local `addr`
+    /// (ignored for IPv4).
     ///
     /// # Errors
     /// Propagates the socket / filter / bind / `getsockname` syscall failure.
@@ -58,9 +56,9 @@ impl PortReservation {
     }
 }
 
-/// Read back the port `fd` was bound to via `getsockname`. The port field sits at the same offset
-/// (right after the family) in `sockaddr_in` and `sockaddr_in6`, so one read serves both; it is in
-/// network byte order.
+/// The port `fd` was bound to, via `getsockname`. The port field sits at the same offset (right
+/// after the family) in `sockaddr_in` and `sockaddr_in6`, so one read serves both; it is in network
+/// byte order.
 fn bound_port(fd: RawFd) -> io::Result<u16> {
     // SAFETY: an all-zero `sockaddr_storage` is a valid buffer; `getsockname` fills it and updates
     // `len` to the bytes written.
@@ -84,7 +82,7 @@ fn bound_port(fd: RawFd) -> io::Result<u16> {
 }
 
 /// Attach a drop-all classic-BPF filter so the bound socket enqueues nothing: the bind already
-/// suppresses the ICMP port-unreachable, and the real datagram is read by the raw capture.
+/// suppresses the ICMP port-unreachable, and the raw capture reads the real datagram.
 #[cfg(target_os = "linux")]
 fn attach_drop_all_filter(fd: RawFd) -> io::Result<()> {
     // A single `BPF_RET | BPF_K` returning 0 — accept zero bytes, i.e. drop every packet.

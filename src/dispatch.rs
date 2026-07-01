@@ -103,7 +103,7 @@ pub(crate) struct Filter {
 }
 
 impl Filter {
-    /// Whether `p` satisfies every set field.
+    /// Whether `p` satisfies every set field (an unset field matches anything).
     fn matches(&self, p: &Packet) -> bool {
         self.src_ip.is_none_or(|ip| p.source.ip() == ip)
             && self.dst_ip.is_none_or(|ip| p.dest.ip() == ip)

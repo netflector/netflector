@@ -7,7 +7,7 @@ use crate::net::http::{Authority, parse_authority, strip_prefix_ignore_ascii_cas
 const DIAL_SERVICE_TYPE: &[u8] = b"urn:dial-multiscreen-org:service:dial";
 
 /// Whether `payload` is a DIAL discovery message — the service-type URN appears anywhere (`ST` /
-/// `NT` / `USN`), ASCII-case-insensitively. The SSDP path uses this to gate a `LOCATION` rewrite.
+/// `NT` / `USN`), ASCII-case-insensitively. Gates a `LOCATION` rewrite.
 pub(crate) fn is_dial_service_message(payload: &[u8]) -> bool {
     contains_ignore_ascii_case(payload, DIAL_SERVICE_TYPE)
 }
@@ -38,9 +38,8 @@ pub(crate) fn parse_dial_location_authority(payload: &[u8]) -> Option<Authority>
     None
 }
 
-/// The raw, trimmed `LOCATION:` header value (the URL), or `None` if the message carries none — for a
-/// debug log when [`parse_dial_location_authority`] rejects the URL as non-rewritable and the operator
-/// wants to see what the device actually advertised.
+/// The raw, trimmed `LOCATION:` header value (the URL), or `None` if the message carries none — for the
+/// debug log when [`parse_dial_location_authority`] rejects the URL as non-rewritable.
 pub(crate) fn dial_location_value(payload: &[u8]) -> Option<&[u8]> {
     payload.split(|&b| b == b'\n').find_map(|line| {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
@@ -49,10 +48,10 @@ pub(crate) fn dial_location_value(payload: &[u8]) -> Option<&[u8]> {
     })
 }
 
-/// Parse the advertisement's freshness lifetime from a `CACHE-CONTROL: max-age=<seconds>` header — the
-/// seconds an SSDP cache (and so the proxy's description listener) may treat the device as present. The
-/// `max-age` directive is matched case-insensitively among comma-separated directives; `None` if the
-/// header or a parseable `max-age` is absent, leaving the caller to fall back to its default grace.
+/// The advertisement's freshness lifetime from a `CACHE-CONTROL: max-age=<seconds>` header — the
+/// seconds the proxy's description listener may treat the device as present. `max-age` is matched
+/// case-insensitively among comma-separated directives; `None` (caller falls back to its default grace)
+/// if the header or a parseable `max-age` is absent.
 pub(crate) fn parse_cache_control_max_age(payload: &[u8]) -> Option<u32> {
     for line in payload.split(|&b| b == b'\n') {
         let line = line.strip_suffix(b"\r").unwrap_or(line);

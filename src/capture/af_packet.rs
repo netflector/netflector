@@ -1,8 +1,6 @@
 //! `AF_PACKET` packet capture (Linux).
 //!
-//! Opens a raw `AF_PACKET` socket, attaches a UDP-only classic-BPF filter, and
-//! binds it to an interface. Unlike the BSD BPF backend, one `recv` returns exactly
-//! one frame, so there is no batch to walk.
+//! Unlike the BSD BPF backend, one `recv` returns exactly one frame — no batch to walk.
 //!
 //! Init order matters: the socket opens with protocol 0, capturing nothing, so the
 //! filter and the loop-prevention option install *before* `bind` sets the real
@@ -26,8 +24,7 @@ const RECV_BUFFER_SIZE: usize = 4096;
 /// The fallback filter length: the egress-drop prologue plus the UDP classifier.
 const DROP_OUTGOING_FILTER_LEN: usize = DROP_OUTGOING_PROLOGUE.len() + ETHERNET_UDP_FILTER.len();
 
-/// A raw-capture handle on one interface: an owned `AF_PACKET` fd, a reused read
-/// buffer, the prebuilt `sockaddr_ll` it injects to, and the interface name it is on.
+/// A raw-capture handle on one interface.
 pub(crate) struct Capture {
     fd: OwnedFd,
     buf: Box<[u8]>,
@@ -67,8 +64,8 @@ impl Capture {
             attach_filter(&fd, &drop_outgoing_filter())?;
         }
 
-        // Start capturing: bind to the interface with ETH_P_ALL. The filter is already
-        // installed, so there is no unfiltered-capture window.
+        // Bind with ETH_P_ALL to start capturing. The filter is already installed, so
+        // there is no unfiltered-capture window.
         bind_interface(&fd, send_addr)?;
 
         log::debug!(
@@ -89,7 +86,6 @@ impl Capture {
         LinkType::Ethernet
     }
 
-    /// The interface this capture is bound to.
     pub(crate) fn if_name(&self) -> &str {
         &self.name
     }
@@ -107,9 +103,8 @@ impl Capture {
             // MSG_TRUNC reports the frame's real length even past the buffer, so an
             // oversized frame is detectable (and dropped) instead of silently cut.
             if bytes > self.buf.len() {
-                // trace, not warn: this runs in the per-frame drain loop, and a remote peer can flood
-                // oversized frames — a per-frame warn would both break data-path-quiet and let it spam
-                // the operator's log. The frame is still correctly dropped.
+                // trace, not warn: per-frame drain loop, and a remote peer can flood oversized
+                // frames — a per-frame warn would break data-path-quiet and spam the log.
                 log::trace!(
                     "dropping oversized frame: {bytes} bytes exceeds the {}-byte receive buffer",
                     self.buf.len()

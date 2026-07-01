@@ -1,14 +1,11 @@
 //! A generational-index arena.
 //!
-//! [`insert`](Arena::insert) stores a value and returns a `Copy` [`Key`]. The key
-//! carries the slot's `index` and its `generation`; [`remove`](Arena::remove)
-//! bumps that generation, so any key referring to the old occupant no longer
-//! matches and resolves to `None`. Reusing a slot for a new value therefore can't
-//! be mistaken for the old one — a stale key is detected, not dangling.
+//! [`insert`](Arena::insert) returns a `Copy` [`Key`] carrying the slot's `index`
+//! and `generation`; [`remove`](Arena::remove) bumps the generation, so a key to
+//! the old occupant resolves to `None` — a stale key is detected, not dangling.
 //!
-//! This is the foundation the reactor uses to hand out cheap, copyable handles to
-//! registrations instead of pointers, sidestepping the aliasing that storing
-//! cross-references would otherwise create.
+//! Lets the reactor hand out copyable handles to registrations instead of
+//! pointers, sidestepping the aliasing cross-references would create.
 
 /// A `Copy` handle into an [`Arena`].
 ///
@@ -21,9 +18,9 @@ pub(crate) struct Key {
 }
 
 impl Key {
-    /// Pack the key into a `u64`, recoverable losslessly via
-    /// [`from_u64`](Key::from_u64). The two `u32` halves fit exactly, which lets
-    /// the key ride in an opaque 64-bit slot (such as a kernel readiness token).
+    /// Pack the key into a `u64`, recoverable via [`from_u64`](Key::from_u64). The
+    /// two `u32` halves fit exactly, so the key can ride in an opaque 64-bit slot
+    /// (such as a kernel readiness token).
     #[must_use]
     pub(crate) fn to_u64(self) -> u64 {
         (u64::from(self.index) << 32) | u64::from(self.generation)
@@ -40,8 +37,8 @@ impl Key {
     }
 }
 
-/// One arena slot: occupied (`Some`) or free (`None`), plus the generation that
-/// keys must match to address the current occupant.
+/// One arena slot: occupied (`Some`) or free (`None`), plus the generation a key
+/// must match to address the current occupant.
 struct Slot<T> {
     generation: u32,
     value: Option<T>,
@@ -55,7 +52,6 @@ pub(crate) struct Arena<T> {
 }
 
 impl<T> Arena<T> {
-    /// An empty arena.
     #[must_use]
     pub(crate) fn new() -> Self {
         Self {
@@ -73,10 +69,10 @@ impl<T> Arena<T> {
         self.insert_from(|_| value)
     }
 
-    /// Store a value built from the key that will address it — for a value that must know its own key
-    /// (such as a reactor handler that later watches fds under, or unregisters, its own key). The arena
-    /// resolves the key first and hands it to `make`, whose result occupies the slot; the caller never
-    /// supplies a key.
+    /// Store a value built from the key that will address it — for a value that
+    /// must know its own key (a reactor handler that later watches fds under, or
+    /// unregisters, its own key). The arena resolves the key first, then hands it
+    /// to `make`.
     ///
     /// # Panics
     /// As [`insert`](Self::insert): if the `u32` index space is exhausted.
@@ -119,8 +115,8 @@ impl<T> Arena<T> {
     pub(crate) fn remove(&mut self, key: Key) -> Option<T> {
         let slot = self.slot_mut(key)?;
         let value = slot.value.take()?;
-        // Bumping the generation strands every existing key to this slot; wrapping
-        // keeps it panic-free (a collision would need 2^32 reuses of one slot).
+        // Bumping strands every existing key to this slot; wrapping stays panic-free
+        // (a collision would need 2^32 reuses of one slot).
         slot.generation = slot.generation.wrapping_add(1);
         self.free.push(key.index);
         Some(value)

@@ -33,8 +33,8 @@ struct DialRewrite {
     target_ifindex: u32,
 }
 
-/// Rewrite a target→source SSDP datagram's DIAL `LOCATION` to point at a source-side description proxy,
-/// into `buf`. Returns the rewritten slice when `dial` is set and the rewrite succeeds, else `payload`
+/// Rewrite a target→source SSDP datagram's DIAL `LOCATION` to a source-side description proxy, into
+/// `buf`. Returns the rewritten slice when `dial` is set and the rewrite succeeds, else `payload`
 /// (forward verbatim). `egress` is the source capture the datagram reflects onto. Shared by the
 /// advertisement and search-response directions, which both rewrite a device's `LOCATION`.
 fn dial_rewrite<'a>(
@@ -91,8 +91,8 @@ pub(crate) fn build(
     let source = interfaces.require(reflector.source_if.as_str())?;
     let target = interfaces.require(reflector.target_if.as_str())?;
 
-    // The full reflector re-emits on both interfaces (advertisements on source, searches and their
-    // unicast responses on target), so a required family must be sendable on BOTH.
+    // Re-emits on both interfaces (advertisements on source, searches and their responses on target),
+    // so a required family must be sendable on BOTH.
     require_bidirectional_families(
         dispatcher,
         reflector.address_family,
@@ -106,8 +106,8 @@ pub(crate) fn build(
     // the ifindex the capture already cached (the single source of truth the joiners bake too).
     let target_ifindex = dispatcher.capture_ifindex(target).unwrap_or(0);
 
-    // With `dial`, the target→source reflectors rewrite a device's DIAL `LOCATION` to a source-side
-    // proxy (IPv4 only; a non-rewritable LOCATION passes through). The device sits behind `target`.
+    // With `dial`, target→source reflectors rewrite a device's DIAL `LOCATION` to a source-side proxy
+    // (IPv4 only; a non-rewritable LOCATION passes through). The device sits behind `target`.
     let dial = ssdp.dial.then_some(DialRewrite {
         target,
         target_ifindex,
@@ -115,15 +115,15 @@ pub(crate) fn build(
 
     for group in used_groups(reflector.address_family) {
         let group_ip = group.ip();
-        // Advertisements are captured on the target and searches on the source, so join the group on
-        // BOTH. A family with no address yet is recorded and re-attempted on the next address change.
+        // Advertisements are captured on target, searches on source — join both. A family with no
+        // address yet is recorded and re-attempted on the next address change.
         if let Err(e) = dispatcher.join_group(target, group_ip) {
             log::debug!("SSDP: join {group_ip} on target deferred: {e}");
         }
         if let Err(e) = dispatcher.join_group(source, group_ip) {
             log::debug!("SSDP: join {group_ip} on source deferred: {e}");
         }
-        // target -> source: reflect advertisements, optionally only from the configured device's MAC.
+        // target -> source: advertisements, optionally filtered to the configured device's MAC.
         dispatcher.register(
             target,
             Filter {
@@ -134,8 +134,8 @@ pub(crate) fn build(
             },
             Box::new(SsdpAdvertisementReflector::new(source, dial)),
         );
-        // source -> target: reflect searches (unfiltered — any source client may search) and route
-        // each searcher's unicast 200-OK replies back through a per-searcher session.
+        // source -> target: searches (unfiltered — any source client may search); each searcher's
+        // unicast 200-OK replies route back through a per-searcher session.
         dispatcher.register(
             source,
             Filter {
@@ -162,8 +162,8 @@ pub(crate) fn build(
     Ok(())
 }
 
-/// The SSDP group address(es) (at port 1900) family `family` re-emits to: one IPv4 group, and —
-/// unlike mDNS — BOTH IPv6 scopes (link-local `ff02::c` and site-local `ff05::c`).
+/// The SSDP groups `family` re-emits to: one IPv4 group, and — unlike mDNS — BOTH IPv6 scopes
+/// (link-local `ff02::c` and site-local `ff05::c`).
 fn used_groups(family: AddressFamily) -> Vec<SocketAddr> {
     let mut groups = Vec::with_capacity(3);
     if family.uses_ipv4() {

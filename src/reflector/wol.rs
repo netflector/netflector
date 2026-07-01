@@ -18,7 +18,6 @@ use super::{BuildError, InterfaceMap, egress_sources, missing_required_family};
 
 /// The all-ones prefix that opens a magic packet.
 const PREFIX_LEN: usize = 6;
-/// A MAC address is six bytes.
 const MAC_LEN: usize = 6;
 /// The target MAC repeats this many times after the prefix.
 const MAC_REPS: usize = 16;

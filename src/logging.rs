@@ -126,8 +126,8 @@ pub fn init() {
     log::set_max_level(LevelFilter::from(LogLevel::default()));
 }
 
-/// Set the minimum severity that will be logged. Cheap and idempotent — the
-/// library calls this once the configured level is known.
+/// Set the minimum severity that will be logged, once the configured level is
+/// known. Cheap and idempotent.
 pub(crate) fn set_level(level: LogLevel) {
     log::set_max_level(LevelFilter::from(level));
 }

@@ -63,7 +63,7 @@ pub(crate) fn would_block(err: &io::Error) -> bool {
     matches!(err.raw_os_error(), Some(e) if e == libc::EAGAIN || e == libc::EWOULDBLOCK)
 }
 
-/// The size of `T` as a `socklen_t`, for `setsockopt`/`bind` length arguments.
+/// `size_of::<T>()` as a `socklen_t`, for `setsockopt`/`bind` length arguments.
 pub(crate) fn socklen_of<T>() -> socklen_t {
     socklen_t::try_from(size_of::<T>()).expect("option/address size fits socklen_t")
 }
