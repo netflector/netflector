@@ -185,4 +185,16 @@ mod tests {
         let zero = Ipv6Addr::UNSPECIFIED;
         assert_eq!(udp_v6(zero, zero, &[0xff, 0xe6, 0, 0, 0, 0, 0, 0]), 0xffff);
     }
+
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn ipv4_header_panics_on_a_short_header() {
+        let _ = ipv4_header(&[0u8; 11]);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn udp_panics_on_a_short_datagram() {
+        let _ = udp_v4(Ipv4Addr::UNSPECIFIED, Ipv4Addr::UNSPECIFIED, &[0u8; 7]);
+    }
 }
