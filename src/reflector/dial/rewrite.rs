@@ -5,6 +5,7 @@
 //! registry) if none is live for the device, and refreshing its grace either way. Minting is the means;
 //! the rewrite is the purpose.
 
+use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
@@ -44,20 +45,20 @@ pub(crate) struct ProxyPlacement {
 
 /// Rewrite a DIAL discovery message's `LOCATION` to a source-side description proxy, minting and
 /// registering the proxy if one isn't already live for this device and refreshing its grace either way.
-/// On a rewrite the datagram is written into `out` and its length returned; `None` means forward
-/// `payload` unchanged — it isn't a DIAL message, its `LOCATION` isn't a rewritable IPv4 `http` URL, the
-/// proxy cap was reached / a mint failed (device stays visible but unproxied), or the rewrite wouldn't
-/// fit `out`. `out` is the caller's reused scratch (size it [`REWRITE_BUF_LEN`]).
+/// On a rewrite the datagram is written to `out` and `true` is returned; `false` means forward `payload`
+/// unchanged — it isn't a DIAL message, its `LOCATION` isn't a rewritable IPv4 `http` URL, the proxy cap
+/// was reached / a mint failed (device stays visible but unproxied), or the rewrite didn't fit `out`.
+/// `out` is the caller's reused sink; a fixed-capacity one (sized [`REWRITE_BUF_LEN`]) makes an
+/// over-long rewrite fail rather than truncate.
 pub(crate) fn rewrite_location(
     ctx: &mut DialContext,
     reactor: &mut Reactor,
     payload: &[u8],
     placement: ProxyPlacement,
-    out: &mut [u8],
-) -> Option<usize> {
-    use std::io::Write;
+    out: &mut impl io::Write,
+) -> bool {
     if !is_dial_service_message(payload) {
-        return None;
+        return false;
     }
     let Some(location) = parse_dial_location_authority(payload) else {
         // DIAL, but LOCATION isn't a rewritable IPv4 http URL (https, a hostname, an IPv6 literal, a
@@ -66,7 +67,7 @@ pub(crate) fn rewrite_location(
             "dial: LOCATION {} is not a rewritable IPv4 http URL; forwarding the message unproxied",
             dial_location_value(payload).map_or_else(|| "(absent)".into(), String::from_utf8_lossy)
         );
-        return None;
+        return false;
     };
     // The grace is refreshed on every advertisement / search response, so a re-advertised device's
     // cached LOCATION keeps resolving for another max-age.
@@ -86,26 +87,25 @@ pub(crate) fn rewrite_location(
             location.endpoint
         );
         addr
+    } else if let Some(addr) = mint_proxy(ctx, reactor, placement, location.endpoint, desc_grace) {
+        addr
     } else {
-        mint_proxy(ctx, reactor, placement, location.endpoint, desc_grace)?
+        return false;
     };
-    // The rewrite can grow the datagram, so a short buffer errors (caller forwards verbatim) rather
-    // than truncating.
-    let capacity = out.len();
-    let mut cursor: &mut [u8] = out;
-    let fits = cursor.write_all(&payload[..location.offset]).is_ok()
-        && write!(cursor, "{desc_addr}").is_ok()
-        && cursor
+    // The rewrite can grow the datagram, so a sink that fills up (the fixed-capacity scratch) makes a
+    // write fail — forward verbatim rather than truncating.
+    let fits = out.write_all(&payload[..location.offset]).is_ok()
+        && write!(out, "{desc_addr}").is_ok()
+        && out
             .write_all(&payload[location.offset + location.len..])
             .is_ok();
     if !fits {
         log::warn!(
-            "dial: rewritten LOCATION for {} exceeds the {capacity} B buffer; forwarding verbatim",
+            "dial: rewritten LOCATION for {} exceeds the scratch buffer; forwarding verbatim",
             location.endpoint
         );
-        return None;
     }
-    Some(capacity - cursor.len())
+    fits
 }
 
 /// Mint a description proxy for `endpoint`, register it on `reactor`, and record it in `ctx`; returns the
@@ -187,14 +187,14 @@ mod tests {
         CaptureKey::from_u64(8)
     }
 
-    /// Rewrite `payload` like a reflector would (into a [`REWRITE_BUF_LEN`] stack buffer), returning the
-    /// rewritten datagram, or `None` to forward verbatim.
+    /// Rewrite `payload` like a reflector would (into a `Vec` sink), returning the rewritten datagram,
+    /// or `None` to forward verbatim.
     fn rewrite_advert(
         ctx: &mut DialContext,
         reactor: &mut Reactor,
         payload: &[u8],
     ) -> Option<Vec<u8>> {
-        let mut buf = [0u8; REWRITE_BUF_LEN];
+        let mut buf = Vec::new();
         let placement = ProxyPlacement {
             source_capture: advert_source(),
             source: Ipv4Addr::LOCALHOST,
@@ -202,8 +202,7 @@ mod tests {
             target: Ipv4Addr::LOCALHOST,
             target_ifindex: 0,
         };
-        let n = rewrite_location(ctx, reactor, payload, placement, &mut buf)?;
-        Some(buf[..n].to_vec())
+        rewrite_location(ctx, reactor, payload, placement, &mut buf).then_some(buf)
     }
 
     #[test]

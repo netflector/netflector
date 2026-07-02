@@ -4,7 +4,6 @@ use crate::dispatch::{CaptureKey, PacketDispatcher, PacketHandler};
 use crate::net::packet::Packet;
 use crate::net::ssdp::{SSDP_PORT, SSDP_TTL, SsdpKind, classify};
 use crate::reactor::Reactor;
-use crate::reflector::dial::REWRITE_BUF_LEN;
 use crate::reflector::egress_sources;
 
 use super::{DialRewrite, dial_rewrite};
@@ -44,12 +43,10 @@ impl PacketHandler for SsdpAdvertisementReflector {
                     );
                     return;
                 }
-                let mut buf = [0u8; REWRITE_BUF_LEN];
                 let payload = dial_rewrite(
                     packet.payload,
-                    &mut buf,
                     self.egress,
-                    self.dial,
+                    self.dial.as_mut(),
                     dispatcher,
                     reactor,
                 );

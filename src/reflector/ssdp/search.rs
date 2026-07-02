@@ -11,7 +11,6 @@ use crate::net::packet::Packet;
 use crate::net::port_reservation::PortReservation;
 use crate::net::ssdp::{MSEARCH_MX_DEFAULT, SSDP_TTL, SsdpKind, classify, parse_msearch_mx};
 use crate::reactor::Reactor;
-use crate::reflector::dial::REWRITE_BUF_LEN;
 use crate::reflector::egress_sources;
 
 use super::{DialRewrite, dial_rewrite};
@@ -66,12 +65,10 @@ impl PacketHandler for SsdpResponseReflector {
             );
             return;
         }
-        let mut buf = [0u8; REWRITE_BUF_LEN];
         let payload = dial_rewrite(
             packet.payload,
-            &mut buf,
             self.egress,
-            self.dial,
+            self.dial.as_mut(),
             dispatcher,
             reactor,
         );
@@ -112,8 +109,9 @@ pub(super) struct SsdpSearchReflector {
     target_ifindex: u32,
     /// The configured device allow-set, scoping the response capture as the advertisement direction is.
     device_macs: Option<MacSet>,
-    /// DIAL `LOCATION` rewriting, stamped into each session's [`SsdpResponseReflector`].
-    dial: Option<DialRewrite>,
+    /// Whether DIAL `LOCATION` rewriting is on; each session's [`SsdpResponseReflector`] gets its own
+    /// [`DialRewrite`] (with its own scratch) when set.
+    dial: bool,
     sessions: Vec<Session>,
 }
 
@@ -123,7 +121,7 @@ impl SsdpSearchReflector {
         target: CaptureKey,
         target_ifindex: u32,
         device_macs: Option<MacSet>,
-        dial: Option<DialRewrite>,
+        dial: bool,
     ) -> Self {
         Self {
             source,
@@ -203,7 +201,9 @@ impl SsdpSearchReflector {
                 searcher: packet.source,
                 searcher_mac,
                 egress: self.source,
-                dial: self.dial,
+                dial: self
+                    .dial
+                    .then(|| DialRewrite::new(self.target, self.target_ifindex)),
             }),
         );
         Some(Session {
@@ -374,7 +374,7 @@ mod tests {
             CaptureKey::from_u64(0),
             0,
             None,
-            None,
+            false,
         );
         assert_eq!(
             reflector.next_deadline(),
@@ -409,7 +409,7 @@ mod tests {
             CaptureKey::from_u64(0),
             0,
             None,
-            None,
+            false,
         );
         let base = Instant::now();
         push_session(&mut reflector, &mut dispatcher, "10.0.0.1:5", base); // already due
@@ -454,7 +454,7 @@ mod tests {
             CaptureKey::from_u64(0),
             0,
             None,
-            None,
+            false,
         );
         let base = Instant::now();
         push_session(&mut reflector, &mut dispatcher, "10.0.0.7:50000", base);

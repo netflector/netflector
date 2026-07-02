@@ -17,31 +17,45 @@ use crate::interface::InterfaceAddresses;
 use crate::net::ssdp::{
     SSDP_GROUP_V4, SSDP_GROUP_V6_LINK_LOCAL, SSDP_GROUP_V6_SITE_LOCAL, SSDP_PORT,
 };
+use crate::net::uninit_buf::UninitBuf;
 use crate::reactor::Reactor;
 
 use self::advertisement::SsdpAdvertisementReflector;
 use self::search::SsdpSearchReflector;
-use super::dial::{ProxyPlacement, rewrite_location};
+use super::dial::{ProxyPlacement, REWRITE_BUF_LEN, rewrite_location};
 use super::{BuildError, InterfaceMap, require_bidirectional_families};
 
 /// What a DIAL-enabled SSDP reflector needs to rewrite a device's `LOCATION` to a source-side proxy: the
-/// target capture the device sits behind (for its address) and that interface's egress-pin ifindex. The
-/// source side is the reflector's own egress. `None` on a reflector without `dial`.
-#[derive(Clone, Copy)]
+/// target capture the device sits behind (for its address), that interface's egress-pin ifindex, and a
+/// reused scratch sink the rewritten datagram is built in. Owned per rewriting reflector — the
+/// advertisement direction, and one per M-SEARCH session's response reflector — so it isn't `Copy`.
 struct DialRewrite {
     target: CaptureKey,
     target_ifindex: u32,
+    /// Reused sink for the rewritten datagram; see [`dial_rewrite`].
+    scratch: UninitBuf,
+}
+
+impl DialRewrite {
+    /// A rewriter for the device behind `target` (`target_ifindex` scopes the IPv6 reserved-port bind),
+    /// with a fresh scratch sink.
+    fn new(target: CaptureKey, target_ifindex: u32) -> Self {
+        Self {
+            target,
+            target_ifindex,
+            scratch: UninitBuf::with_capacity(REWRITE_BUF_LEN),
+        }
+    }
 }
 
 /// Rewrite a target→source SSDP datagram's DIAL `LOCATION` to a source-side description proxy, into
-/// `buf`. Returns the rewritten slice when `dial` is set and the rewrite succeeds, else `payload`
-/// (forward verbatim). `egress` is the source capture the datagram reflects onto. Shared by the
-/// advertisement and search-response directions, which both rewrite a device's `LOCATION`.
+/// `dial`'s scratch. Returns the rewritten slice when `dial` is set and the rewrite succeeds, else
+/// `payload` (forward verbatim). `egress` is the source capture the datagram reflects onto. Shared by
+/// the advertisement and search-response directions, which both rewrite a device's `LOCATION`.
 fn dial_rewrite<'a>(
     payload: &'a [u8],
-    buf: &'a mut [u8],
     egress: CaptureKey,
-    dial: Option<DialRewrite>,
+    dial: Option<&'a mut DialRewrite>,
     dispatcher: &mut PacketDispatcher,
     reactor: &mut Reactor,
 ) -> &'a [u8] {
@@ -65,9 +79,17 @@ fn dial_rewrite<'a>(
         target,
         target_ifindex: dial.target_ifindex,
     };
-    match rewrite_location(dispatcher.dial_context(), reactor, payload, placement, buf) {
-        Some(n) => &buf[..n],
-        None => payload,
+    dial.scratch.clear();
+    if rewrite_location(
+        dispatcher.dial_context(),
+        reactor,
+        payload,
+        placement,
+        &mut dial.scratch,
+    ) {
+        dial.scratch.filled()
+    } else {
+        payload
     }
 }
 
@@ -106,13 +128,6 @@ pub(crate) fn build(
     // the ifindex the capture already cached (the single source of truth the joiners bake too).
     let target_ifindex = dispatcher.capture_ifindex(target).unwrap_or(0);
 
-    // With `dial`, target→source reflectors rewrite a device's DIAL `LOCATION` to a source-side proxy
-    // (IPv4 only; a non-rewritable LOCATION passes through). The device sits behind `target`.
-    let dial = ssdp.dial.then_some(DialRewrite {
-        target,
-        target_ifindex,
-    });
-
     // Advertisements are captured on target, searches on source — join every group on both. A family
     // with no address yet is recorded and re-attempted on the next address change.
     let groups = used_groups(reflector.address_family);
@@ -135,7 +150,10 @@ pub(crate) fn build(
             src_mac: reflector.macs.clone(),
             ..Filter::default()
         },
-        Box::new(SsdpAdvertisementReflector::new(source, dial)),
+        Box::new(SsdpAdvertisementReflector::new(
+            source,
+            ssdp.dial.then(|| DialRewrite::new(target, target_ifindex)),
+        )),
     );
     // source -> target: searches (unfiltered — any source client may search); each searcher's
     // unicast 200-OK replies route back through a per-searcher session.
@@ -151,7 +169,7 @@ pub(crate) fn build(
             target,
             target_ifindex,
             reflector.macs.clone(),
-            dial,
+            ssdp.dial,
         )),
     );
     log::info!(
@@ -159,7 +177,7 @@ pub(crate) fn build(
         reflector.name.as_str(),
         reflector.source_if.as_str(),
         reflector.target_if.as_str(),
-        if dial.is_some() { " + DIAL" } else { "" }
+        if ssdp.dial { " + DIAL" } else { "" }
     );
     Ok(())
 }
