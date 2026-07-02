@@ -11,6 +11,7 @@ pub(crate) mod port_reservation;
 pub(crate) mod ssdp;
 pub(crate) mod stream_buffer;
 pub(crate) mod tcp;
+pub(crate) mod uninit_buf;
 
 /// The link-layer framing of a captured or injected frame. The capture layer reports
 /// it per interface; [`frame`] adds the matching link header and [`packet`] strips it
