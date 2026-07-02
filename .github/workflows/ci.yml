@@ -311,3 +311,25 @@ jobs:
           cache-to: type=gha,mode=max,scope=valgrind
       - name: Run e2e under Valgrind memcheck
         run: python3 e2e/run.py --valgrind --skip-build
+
+  # A single aggregate status check: green only when every job above is green (or was legitimately skipped
+  # by `gate` because this tree already passed CI). Make THIS the sole required check in branch protection --
+  # then adding, renaming, or removing a job never means editing the required-checks list; its `needs` below
+  # is the one place that set is maintained. `if: !cancelled()` forces it to run even when upstream jobs were
+  # skipped (a skipped dependency would otherwise skip this job too); the failure step then treats only real
+  # failures / cancellations as fatal, so a gate-driven skip still passes.
+  success:
+    name: Success
+    if: ${{ !cancelled() }}
+    needs: [gate, fmt, lint, test, cross-test, freebsd, docker-e2e, valgrind-e2e]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Report upstream results
+        run: |
+          echo "Upstream job results: ${{ join(needs.*.result, ', ') }}"
+      - name: Fail if any required job did not succeed
+        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: |
+          echo "::error::One or more required jobs failed or were cancelled."
+          exit 1
