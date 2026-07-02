@@ -2,6 +2,15 @@
 //! interface. Each implements the dispatcher's `PacketHandler` and is registered by `run()`
 //! from config.
 
+pub(crate) mod dial;
+pub(crate) mod mdns;
+pub(crate) mod ssdp;
+pub(crate) mod wol;
+
+mod simple;
+
+pub(crate) use simple::{SimpleReflector, Verdict};
+
 use std::fmt;
 use std::net::SocketAddr;
 
@@ -10,11 +19,6 @@ use thiserror::Error;
 use crate::config::AddressFamily;
 use crate::dispatch::{CaptureKey, PacketDispatcher};
 use crate::interface::InterfaceAddresses;
-
-pub(crate) mod dial;
-pub(crate) mod mdns;
-pub(crate) mod ssdp;
-pub(crate) mod wol;
 
 /// A concrete IP version — the family a reflector requires of an interface. Distinct from the
 /// config's `AddressFamily` policy (which may name both at once).

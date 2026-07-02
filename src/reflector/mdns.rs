@@ -1,78 +1,34 @@
 //! The mDNS reflector: reflects multicast DNS between the source and target interfaces so service
-//! discovery crosses the link. For each address family it registers two directional handlers —
-//! queries flow source → target, responses target → source — which, atop the capture's own-egress
-//! drop, breaks the reflection loop. Each re-emits to the same group at TTL 255 (RFC 6762 §11),
-//! sourced from the egress interface. The dispatcher's filter pins the group, so a handler only
-//! classifies the message and re-emits.
+//! discovery crosses the link. For each address family it registers two directional
+//! [`SimpleReflector`]s — queries flow source → target, responses target → source — which, atop the
+//! capture's own-egress drop, breaks the reflection loop. Each re-emits to the same group at TTL 255
+//! (RFC 6762 §11), sourced from the egress interface; the dispatcher's filter pins the group, so the
+//! reflector only gates on the query/response classifier.
 
 use std::net::SocketAddr;
 
 use crate::config::{AddressFamily, Reflector};
-use crate::dispatch::{CaptureKey, Filter, PacketDispatcher, PacketHandler};
+use crate::dispatch::{Filter, PacketDispatcher};
 use crate::net::mdns::{MDNS_GROUP_V4, MDNS_GROUP_V6, MDNS_PORT, MDNS_TTL, MdnsKind, classify};
-use crate::net::packet::Packet;
-use crate::reactor::Reactor;
 
-use super::{BuildError, InterfaceMap, egress_sources, require_bidirectional_families};
+use super::{BuildError, InterfaceMap, SimpleReflector, Verdict, require_bidirectional_families};
 
-/// One direction of one family: re-emits each message of its `kind` (query or response) captured on
-/// its ingress onto `egress`, to the message's own destination.
-struct MdnsReflector {
-    egress: CaptureKey,
-    kind: MdnsKind,
+/// The directional gate for the source → target reflector: reflect queries, skip responses (they
+/// flow the other way), and treat a too-short / non-DNS payload on the group as junk.
+fn query_verdict(payload: &[u8]) -> Verdict {
+    match classify(payload) {
+        Some(MdnsKind::Query) => Verdict::Reflect,
+        Some(MdnsKind::Response) => Verdict::Skip,
+        None => Verdict::Junk,
+    }
 }
 
-impl PacketHandler for MdnsReflector {
-    fn on_packet(
-        &mut self,
-        packet: &Packet,
-        dispatcher: &mut PacketDispatcher,
-        _reactor: &mut Reactor,
-    ) {
-        match classify(packet.payload) {
-            // A non-DNS payload on the group is anomalous but harmless; drop it quietly.
-            None => log::debug!(
-                "mDNS: dropping non-DNS payload ({} B) to {} from {}",
-                packet.payload.len(),
-                packet.dest,
-                packet.source
-            ),
-            Some(kind) if kind == self.kind => {
-                // A family the egress can't currently source is a quiet drop (transient address
-                // loss), keeping send_udp_group's error meaning a genuine failure.
-                if !egress_sources(dispatcher, self.egress, packet.dest) {
-                    log::debug!(
-                        "mDNS: egress has no source for {} yet; dropping reflection from {}",
-                        packet.dest,
-                        packet.source
-                    );
-                    return;
-                }
-                match dispatcher.send_udp_group(
-                    self.egress,
-                    packet.dest,
-                    MDNS_PORT,
-                    MDNS_TTL,
-                    packet.payload,
-                ) {
-                    Ok(()) => log::debug!(
-                        "reflected mDNS {:?} from {} to {}",
-                        self.kind,
-                        packet.source,
-                        packet.dest
-                    ),
-                    Err(e) => log::warn!(
-                        "mDNS: cannot reflect from {} to {}: {e}",
-                        packet.source,
-                        packet.dest
-                    ),
-                }
-            }
-            // The other direction's traffic. Dropping it is the loop-breaker: a reflected query
-            // re-emitted on the target is still a query, so the target's response-only handler
-            // ignores it (and vice versa).
-            Some(_) => {}
-        }
+/// The directional gate for the target → source reflector: the mirror of [`query_verdict`].
+fn response_verdict(payload: &[u8]) -> Verdict {
+    match classify(payload) {
+        Some(MdnsKind::Query) => Verdict::Skip,
+        Some(MdnsKind::Response) => Verdict::Reflect,
+        None => Verdict::Junk,
     }
 }
 
@@ -124,10 +80,13 @@ pub(crate) fn build(
                 dst_port: Some(MDNS_PORT),
                 ..Filter::default()
             },
-            Box::new(MdnsReflector {
-                egress: target,
-                kind: MdnsKind::Query,
-            }),
+            Box::new(SimpleReflector::new(
+                target,
+                "mDNS query",
+                MDNS_PORT,
+                MDNS_TTL,
+                query_verdict,
+            )),
         );
         // target → source: reflect responses, optionally only from the configured device's MAC.
         dispatcher.register(
@@ -138,10 +97,13 @@ pub(crate) fn build(
                 src_mac: reflector.macs.clone(),
                 ..Filter::default()
             },
-            Box::new(MdnsReflector {
-                egress: source,
-                kind: MdnsKind::Response,
-            }),
+            Box::new(SimpleReflector::new(
+                source,
+                "mDNS response",
+                MDNS_PORT,
+                MDNS_TTL,
+                response_verdict,
+            )),
         );
     }
     log::info!(
@@ -178,5 +140,19 @@ mod tests {
         assert_eq!(used_groups(AddressFamily::Dual), vec![v4, v6]);
         assert_eq!(used_groups(AddressFamily::Ipv4), vec![v4]);
         assert_eq!(used_groups(AddressFamily::Ipv6), vec![v6]);
+    }
+
+    #[test]
+    fn verdicts_gate_by_direction() {
+        // A 12-byte DNS header: QR bit (offset 2, 0x80) clear = query, set = response; shorter = junk.
+        let query = [0u8; 12];
+        let mut response = [0u8; 12];
+        response[2] = 0x80;
+        assert_eq!(query_verdict(&query), Verdict::Reflect);
+        assert_eq!(query_verdict(&response), Verdict::Skip);
+        assert_eq!(query_verdict(&[0u8; 4]), Verdict::Junk);
+        assert_eq!(response_verdict(&query), Verdict::Skip);
+        assert_eq!(response_verdict(&response), Verdict::Reflect);
+        assert_eq!(response_verdict(&[0u8; 4]), Verdict::Junk);
     }
 }
