@@ -1,13 +1,11 @@
 //! The SSDP reflector: reflects Simple Service Discovery Protocol (`UPnP`) between the source and
 //! target interfaces so service discovery crosses the link. Advertisements (`NOTIFY`) reflect
-//! target → source as a plain multicast re-emit (the [`advertisement`] module); searches (`M-SEARCH`)
+//! target → source as a plain multicast re-emit (a [`SimpleReflector`]); searches (`M-SEARCH`)
 //! reflect source → target and each searcher's unicast `200 OK` replies route back through a
 //! per-searcher session (the shared [`SearchReflector`]). Re-emits go to the same group at TTL 2,
 //! sourced from the egress interface. With `dial`, a target→source datagram's DIAL `LOCATION` is
 //! rewritten to a source-side proxy: [`DialRewrite`] is the SSDP [`ReplyRewrite`], used by both the
 //! advertisement direction and each search session's response.
-
-mod advertisement;
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -22,10 +20,9 @@ use crate::net::ssdp::{
 use crate::net::uninit_buf::UninitBuf;
 use crate::reactor::Reactor;
 
-use self::advertisement::SsdpAdvertisementReflector;
 use super::dial::{ProxyPlacement, REWRITE_BUF_LEN, rewrite_location};
 use super::{
-    BuildError, InterfaceMap, NoRewrite, ReplyRewrite, SearchReflector, Verdict,
+    BuildError, InterfaceMap, NoRewrite, ReplyRewrite, SearchReflector, SimpleReflector, Verdict,
     require_bidirectional_families,
 };
 
@@ -96,6 +93,16 @@ impl ReplyRewrite for DialRewrite {
     }
 }
 
+/// The directional gate for the advertisement leg: a `NOTIFY` is an advertisement to reflect, an
+/// `M-SEARCH` belongs to the search direction, and anything else on the group is junk.
+fn advertisement_verdict(payload: &[u8]) -> Verdict {
+    match classify(payload) {
+        Some(SsdpKind::Advertisement) => Verdict::Reflect,
+        Some(SsdpKind::Search) => Verdict::Skip,
+        None => Verdict::Junk,
+    }
+}
+
 /// The directional gate for the search leg: an `M-SEARCH` is a search to reflect, a `NOTIFY` belongs to
 /// the advertisement direction, and anything else on the group is junk.
 fn search_verdict(payload: &[u8]) -> Verdict {
@@ -124,7 +131,7 @@ fn search_window(payload: &[u8]) -> Duration {
 
 /// Build the SSDP reflector for `reflector` and register both directions on `dispatcher` — a no-op
 /// when SSDP isn't enabled. For each address family in use it joins every group on BOTH interfaces and
-/// registers two handlers per group: advertisements target → source ([`SsdpAdvertisementReflector`]),
+/// registers two handlers per group: advertisements target → source (a [`SimpleReflector`]),
 /// and searches source → target with their unicast 200-OK replies (the shared [`SearchReflector`]). A
 /// required family must be sendable on BOTH interfaces, since the reflector re-emits on both.
 ///
@@ -170,7 +177,21 @@ pub(crate) fn build(
     }
     // One handler per direction spans every group; its filter matches the group set at the SSDP port.
     let group_ips: IpSet = groups.iter().map(SocketAddr::ip).collect();
-    // target -> source: advertisements, optionally filtered to the configured device's MAC.
+    // target -> source: advertisements (a stateless re-emit), optionally filtered to the configured
+    // device's MAC. With `dial`, the reflected `LOCATION` is rewritten to a source-side proxy.
+    let advertisement = SimpleReflector::new(
+        source,
+        "SSDP",
+        "advertisement",
+        SSDP_PORT,
+        SSDP_TTL,
+        advertisement_verdict,
+    );
+    let advertisement = if ssdp.dial {
+        advertisement.with_rewrite(Box::new(DialRewrite::new(target, target_ifindex)))
+    } else {
+        advertisement
+    };
     dispatcher.register(
         target,
         Filter {
@@ -179,10 +200,7 @@ pub(crate) fn build(
             src_mac: reflector.macs.clone(),
             ..Filter::default()
         },
-        Box::new(SsdpAdvertisementReflector::new(
-            source,
-            ssdp.dial.then(|| DialRewrite::new(target, target_ifindex)),
-        )),
+        Box::new(advertisement),
     );
     // source -> target: searches (unfiltered — any source client may search); each searcher's unicast
     // 200-OK replies route back through a per-searcher session. With `dial`, each session's reply
