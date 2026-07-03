@@ -8,7 +8,7 @@
 //!
 //! Protocol specifics enter as parameters: the [`Verdict`] classifier (is this payload a search?), the
 //! session-window policy, the re-emit TTL, and a [`ReplyRewrite`] factory — SSDP injects its DIAL
-//! `LOCATION` rewrite, WSD uses the [`NoRewrite`] no-op.
+//! `LOCATION` rewrite, WSD uses the [`NoRewrite`](super::NoRewrite) no-op.
 
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
@@ -20,40 +20,11 @@ use crate::net::packet::Packet;
 use crate::net::port_reservation::PortReservation;
 use crate::reactor::Reactor;
 
-use super::{Verdict, egress_sources};
+use super::{ReplyRewrite, Verdict, egress_sources};
 
 /// In-flight session cap, so a burst of searchers can't exhaust ephemeral ports or registrations. At
 /// the cap a new search is dropped (no live session is evicted early).
 const MAX_SESSIONS: usize = 64;
-
-/// Transforms a reply datagram before it is routed back to the searcher. The returned slice is either
-/// `payload` verbatim or a rewrite held in the implementor's own reused scratch — a lending signature
-/// the `Fn` traits can't express, which is why this is a trait and not a closure.
-pub(crate) trait ReplyRewrite {
-    fn rewrite<'a>(
-        &'a mut self,
-        payload: &'a [u8],
-        egress: CaptureKey,
-        dispatcher: &mut PacketDispatcher,
-        reactor: &mut Reactor,
-    ) -> &'a [u8];
-}
-
-/// The identity transform: forward the reply verbatim. A ZST for protocols (WSD) whose replies are
-/// relayed unchanged.
-pub(crate) struct NoRewrite;
-
-impl ReplyRewrite for NoRewrite {
-    fn rewrite<'a>(
-        &'a mut self,
-        payload: &'a [u8],
-        _egress: CaptureKey,
-        _dispatcher: &mut PacketDispatcher,
-        _reactor: &mut Reactor,
-    ) -> &'a [u8] {
-        payload
-    }
-}
 
 /// One in-flight search. The searcher (`ip:port`) is the dedup key; `expiry` is when the session
 /// lapses; `reservation` holds the ephemeral target port the replies arrive on for the session's life
@@ -388,6 +359,7 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use super::*;
+    use crate::reflector::NoRewrite;
 
     const TEST_TTL: u8 = 2;
 
