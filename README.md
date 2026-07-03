@@ -432,7 +432,8 @@ The `[package]` version in `Cargo.toml` is the single source of truth: `version.
 `release.sh` (the git tag), the published image tag, and the GitHub release name all derive from it. To
 cut a release:
 
-- Bump the version in `Cargo.toml` and merge it to `origin/main`.
+- Bump the version in `Cargo.toml`, refresh `Cargo.lock` (`cargo build` updates its `reflector`
+  entry — CI builds `--locked`, so a stale lockfile fails the release), and merge it to `origin/main`.
 - From a clean `main` in sync with `origin/main`, run `./release.sh`.
 
 `./release.sh` does only the local half: it waits for CI (`ci.yml`) to pass on the release commit, prints
