@@ -30,8 +30,10 @@ pub(crate) enum Verdict {
 /// group). Stateless — the `classify` fn is the entire directional gate.
 pub(crate) struct SimpleReflector {
     egress: CaptureKey,
-    /// Protocol + direction label for logs, e.g. `"mDNS query"`.
+    /// Protocol tag for logs, e.g. `"mDNS"`.
     name: &'static str,
+    /// The message kind/direction this reflector handles, for logs, e.g. `"query"`.
+    kind: &'static str,
     /// The UDP source port to emit from (a protocol's well-known port; `dst` carries the dest port).
     src_port: u16,
     ttl: u8,
@@ -42,6 +44,7 @@ impl SimpleReflector {
     pub(crate) fn new(
         egress: CaptureKey,
         name: &'static str,
+        kind: &'static str,
         src_port: u16,
         ttl: u8,
         classify: fn(&[u8]) -> Verdict,
@@ -49,6 +52,7 @@ impl SimpleReflector {
         Self {
             egress,
             name,
+            kind,
             src_port,
             ttl,
             classify,
@@ -69,9 +73,10 @@ impl PacketHandler for SimpleReflector {
                 // loss), so send_udp_group's error stays a genuine failure.
                 if !egress_sources(dispatcher, self.egress, packet.dest) {
                     log::debug!(
-                        "{}: egress has no source for {} yet; dropping reflection from {}",
+                        "{}: egress has no source for {} yet; dropping {} from {}",
                         self.name,
                         packet.dest,
+                        self.kind,
                         packet.source
                     );
                     return;
@@ -84,14 +89,16 @@ impl PacketHandler for SimpleReflector {
                     packet.payload,
                 ) {
                     Ok(()) => log::debug!(
-                        "reflected {} from {} to {}",
+                        "reflected {} {} from {} to {}",
                         self.name,
+                        self.kind,
                         packet.source,
                         packet.dest
                     ),
                     Err(e) => log::warn!(
-                        "{}: cannot reflect from {} to {}: {e}",
+                        "{}: cannot reflect {} from {} to {}: {e}",
                         self.name,
+                        self.kind,
                         packet.source,
                         packet.dest
                     ),
