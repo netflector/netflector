@@ -1,0 +1,10 @@
+log_level = "debug"
+
+# A WSD-only reflector for the WS-Discovery e2e cases: bridges wol_src <-> wol_dst under the default
+# address-family policy, so both IPv4 (239.255.255.250) and IPv6 (ff02::c) announcements and searches
+# on UDP 3702 are exercised.
+
+[reflectors.discovery]
+source_if = "wol_src"
+target_if = "wol_dst"
+wsd = true
