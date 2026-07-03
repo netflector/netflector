@@ -105,6 +105,108 @@ SSDP_DIAL_MSEARCH_HEX = (
     f"ST: {DIAL_SERVICE_TYPE}\r\n\r\n"
 ).encode().hex()
 DIAL_CLIENT_SOURCE_PORT = 49153
+# --- WSD (WS-Discovery): SOAP-over-UDP. Groups 239.255.255.250 / ff02::c (shared with SSDP) on UDP
+# 3702 -- the port distinguishes it from SSDP. The reflector classifies on the <Action> URI segment and
+# relays the bytes verbatim, so the receiver expects exactly what was sent. Real ONVIF-style envelopes
+# (2005/04 namespace). ---
+WSD_GROUP_V4 = SSDP_GROUP_V4
+WSD_GROUP_V6 = SSDP_GROUP_V6
+WSD_PORT = 3702
+WSD_HELLO_HEX = (
+    '<?xml version="1.0" encoding="utf-8"?>'
+    '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"'
+    ' xmlns:a="http://schemas.xmlsoap.org/ws/2004/08/addressing"'
+    ' xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery">'
+    "<s:Header>"
+    "<a:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/Hello</a:Action>"
+    "<a:MessageID>urn:uuid:hello-0001</a:MessageID>"
+    "<a:To>urn:schemas-xmlsoap-org:ws:2005:04:discovery</a:To>"
+    "</s:Header>"
+    "<s:Body><d:Hello>"
+    "<a:EndpointReference><a:Address>urn:uuid:camera-0001</a:Address></a:EndpointReference>"
+    "<d:Types>dn:NetworkVideoTransmitter</d:Types><d:MetadataVersion>1</d:MetadataVersion>"
+    "</d:Hello></s:Body></s:Envelope>"
+).encode().hex()
+WSD_BYE_HEX = (
+    '<?xml version="1.0" encoding="utf-8"?>'
+    '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"'
+    ' xmlns:a="http://schemas.xmlsoap.org/ws/2004/08/addressing"'
+    ' xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery">'
+    "<s:Header>"
+    "<a:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/Bye</a:Action>"
+    "<a:MessageID>urn:uuid:bye-0001</a:MessageID>"
+    "<a:To>urn:schemas-xmlsoap-org:ws:2005:04:discovery</a:To>"
+    "</s:Header>"
+    "<s:Body><d:Bye>"
+    "<a:EndpointReference><a:Address>urn:uuid:camera-0001</a:Address></a:EndpointReference>"
+    "</d:Bye></s:Body></s:Envelope>"
+).encode().hex()
+WSD_PROBE_HEX = (
+    '<?xml version="1.0" encoding="utf-8"?>'
+    '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"'
+    ' xmlns:a="http://schemas.xmlsoap.org/ws/2004/08/addressing"'
+    ' xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery">'
+    "<s:Header>"
+    "<a:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</a:Action>"
+    "<a:MessageID>urn:uuid:probe-0001</a:MessageID>"
+    "<a:To>urn:schemas-xmlsoap-org:ws:2005:04:discovery</a:To>"
+    "</s:Header>"
+    "<s:Body><d:Probe><d:Types>dn:NetworkVideoTransmitter</d:Types></d:Probe></s:Body>"
+    "</s:Envelope>"
+).encode().hex()
+WSD_RESOLVE_HEX = (
+    '<?xml version="1.0" encoding="utf-8"?>'
+    '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"'
+    ' xmlns:a="http://schemas.xmlsoap.org/ws/2004/08/addressing"'
+    ' xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery">'
+    "<s:Header>"
+    "<a:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/Resolve</a:Action>"
+    "<a:MessageID>urn:uuid:resolve-0001</a:MessageID>"
+    "<a:To>urn:schemas-xmlsoap-org:ws:2005:04:discovery</a:To>"
+    "</s:Header>"
+    "<s:Body><d:Resolve>"
+    "<a:EndpointReference><a:Address>urn:uuid:camera-0001</a:Address></a:EndpointReference>"
+    "</d:Resolve></s:Body></s:Envelope>"
+).encode().hex()
+# The unicast ProbeMatches a device answers a Probe with; the round-trip responder replies with this and
+# the searcher asserts it arrives verbatim after the reflector proxies it back across segments.
+WSD_PROBEMATCHES_HEX = (
+    '<?xml version="1.0" encoding="utf-8"?>'
+    '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"'
+    ' xmlns:a="http://schemas.xmlsoap.org/ws/2004/08/addressing"'
+    ' xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery">'
+    "<s:Header>"
+    "<a:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/ProbeMatches</a:Action>"
+    "<a:MessageID>urn:uuid:match-0001</a:MessageID>"
+    "<a:RelatesTo>urn:uuid:probe-0001</a:RelatesTo>"
+    "<a:To>http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</a:To>"
+    "</s:Header>"
+    "<s:Body><d:ProbeMatches><d:ProbeMatch>"
+    "<a:EndpointReference><a:Address>urn:uuid:camera-0001</a:Address></a:EndpointReference>"
+    "<d:Types>dn:NetworkVideoTransmitter</d:Types>"
+    "<d:XAddrs>http://device.invalid/onvif/device_service</d:XAddrs>"
+    "<d:MetadataVersion>1</d:MetadataVersion>"
+    "</d:ProbeMatch></d:ProbeMatches></s:Body></s:Envelope>"
+).encode().hex()
+# The unicast ResolveMatches a device answers a Resolve with.
+WSD_RESOLVEMATCHES_HEX = (
+    '<?xml version="1.0" encoding="utf-8"?>'
+    '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"'
+    ' xmlns:a="http://schemas.xmlsoap.org/ws/2004/08/addressing"'
+    ' xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery">'
+    "<s:Header>"
+    "<a:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/ResolveMatches</a:Action>"
+    "<a:MessageID>urn:uuid:resolvematch-0001</a:MessageID>"
+    "<a:RelatesTo>urn:uuid:resolve-0001</a:RelatesTo>"
+    "<a:To>http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</a:To>"
+    "</s:Header>"
+    "<s:Body><d:ResolveMatches><d:ResolveMatch>"
+    "<a:EndpointReference><a:Address>urn:uuid:camera-0001</a:Address></a:EndpointReference>"
+    "<d:Types>dn:NetworkVideoTransmitter</d:Types>"
+    "<d:XAddrs>http://device.invalid/onvif/device_service</d:XAddrs>"
+    "<d:MetadataVersion>1</d:MetadataVersion>"
+    "</d:ResolveMatch></d:ResolveMatches></s:Body></s:Envelope>"
+).encode().hex()
 # --- Address-change cases: knock out one (interface, family) source on the reflector, prove
 # reflection of that family stops, then restore it and prove it resumes. The reflector reacts on
 # its own event loop after the netlink notification, so each check polls across that async window.
@@ -494,6 +596,89 @@ SSDP_CASES = [
     ),
 ]
 
+WSD_CASES = [
+    # Hello/Bye announcements reflect device (target) -> client (source). A Hello sent on the target is
+    # relayed verbatim to the source. (Announcement direction = "reverse".)
+    TestCase(
+        name="reflects_wsd_hello",
+        config="config-wsd.toml",
+        send_port=WSD_PORT,
+        receive_port=WSD_PORT,
+        expect_mac=None,
+        timeout_seconds=5.0,
+        send_payload_hex=WSD_HELLO_HEX,
+        expect_payload_hex=WSD_HELLO_HEX,
+        group=WSD_GROUP_V4,
+        direction="reverse",
+    ),
+    # The IPv6 mirror: WSD uses the link-local ff02::c group.
+    TestCase(
+        name="reflects_wsd_hello_ipv6",
+        config="config-wsd.toml",
+        send_port=WSD_PORT,
+        receive_port=WSD_PORT,
+        expect_mac=None,
+        timeout_seconds=5.0,
+        send_payload_hex=WSD_HELLO_HEX,
+        expect_payload_hex=WSD_HELLO_HEX,
+        group=WSD_GROUP_V6,
+        family=6,
+        direction="reverse",
+    ),
+    # Bye relays through the same announcement path as Hello (both classify as an announcement).
+    TestCase(
+        name="reflects_wsd_bye",
+        config="config-wsd.toml",
+        send_port=WSD_PORT,
+        receive_port=WSD_PORT,
+        expect_mac=None,
+        timeout_seconds=5.0,
+        send_payload_hex=WSD_BYE_HEX,
+        expect_payload_hex=WSD_BYE_HEX,
+        group=WSD_GROUP_V4,
+        direction="reverse",
+    ),
+    # A Probe on the target hits the announcement handler, which classifies it as the search direction
+    # and skips it -- never relayed to the source.
+    TestCase(
+        name="ignores_wsd_probe_in_announcement_direction",
+        config="config-wsd.toml",
+        send_port=WSD_PORT,
+        receive_port=WSD_PORT,
+        expect_mac=None,
+        timeout_seconds=1.5,
+        send_payload_hex=WSD_PROBE_HEX,
+        group=WSD_GROUP_V4,
+        direction="reverse",
+    ),
+    # A Hello on the source hits the search handler, which classifies it as the announcement direction
+    # and skips it -- never relayed to the target.
+    TestCase(
+        name="ignores_wsd_hello_in_search_direction",
+        config="config-wsd.toml",
+        send_port=WSD_PORT,
+        receive_port=WSD_PORT,
+        expect_mac=None,
+        timeout_seconds=1.5,
+        send_payload_hex=WSD_HELLO_HEX,
+        group=WSD_GROUP_V4,
+        direction="forward",
+    ),
+    # A non-WSD payload on the WSD group (an SSDP M-SEARCH carries no <Action>): classified as junk and
+    # dropped.
+    TestCase(
+        name="ignores_non_wsd_on_wsd_group",
+        config="config-wsd.toml",
+        send_port=WSD_PORT,
+        receive_port=WSD_PORT,
+        expect_mac=None,
+        timeout_seconds=1.5,
+        send_payload_hex=SSDP_MSEARCH_HEX,
+        group=WSD_GROUP_V4,
+        direction="reverse",
+    ),
+]
+
 
 @dataclasses.dataclass(frozen=True)
 class RoundTripCase:
@@ -502,8 +687,15 @@ class RoundTripCase:
     group: str
     timeout_seconds: float = 8.0
     # When False, no responder is started and the searcher must receive nothing -- the reflector must
-    # not fabricate or loop back a reply to an M-SEARCH no device answered.
+    # not fabricate or loop back a reply to a search no device answered.
     expect_reply: bool = True
+    # Protocol parameters, defaulting to SSDP's M-SEARCH round trip; WSD overrides them (its Probe ->
+    # ProbeMatches uses the same session machinery on a different port / with different payloads).
+    port: int = SSDP_PORT
+    probe_hex: str = SSDP_MSEARCH_HEX
+    reply_hex: str = SSDP_OK_HEX
+    config: str = "config.toml"
+    evict_log: str = "evicted SSDP session"
 
 
 ROUNDTRIP_CASES = [
@@ -515,6 +707,15 @@ ROUNDTRIP_CASES = [
     RoundTripCase(name="ssdp_msearch_roundtrip_ipv6_site_local", family=6, group=SSDP_GROUP_V6_SITE),
     RoundTripCase(name="ssdp_msearch_no_responder_no_reply", family=4, group=SSDP_GROUP_V4,
         timeout_seconds=2.0, expect_reply=False),
+    # WSD Probe -> ProbeMatches: the same per-searcher session machinery on port 3702, replies relayed
+    # verbatim (no DIAL). Eviction fires after the fixed 5s WSD window.
+    RoundTripCase(name="wsd_probe_roundtrip", family=4, group=WSD_GROUP_V4, port=WSD_PORT,
+        probe_hex=WSD_PROBE_HEX, reply_hex=WSD_PROBEMATCHES_HEX, config="config-wsd.toml",
+        evict_log="evicted WSD session"),
+    # Resolve -> ResolveMatches: the same search-session path as Probe (both classify as a search).
+    RoundTripCase(name="wsd_resolve_roundtrip", family=4, group=WSD_GROUP_V4, port=WSD_PORT,
+        probe_hex=WSD_RESOLVE_HEX, reply_hex=WSD_RESOLVEMATCHES_HEX, config="config-wsd.toml",
+        evict_log="evicted WSD session"),
 ]
 
 @dataclasses.dataclass(frozen=True)
@@ -603,8 +804,8 @@ ADDRESS_CHANGE_CASES = [
 ]
 
 ALL_CASES: list[TestCase | RoundTripCase | DialCase | DialAddressChangeCase | AddressChangeCase] = [
-    *TEST_CASES, *MDNS_CASES, *SSDP_CASES, *ROUNDTRIP_CASES, *DIAL_CASES, *DIAL_ADDRESS_CHANGE_CASES,
-    *ADDRESS_CHANGE_CASES]
+    *TEST_CASES, *MDNS_CASES, *SSDP_CASES, *WSD_CASES, *ROUNDTRIP_CASES, *DIAL_CASES,
+    *DIAL_ADDRESS_CHANGE_CASES, *ADDRESS_CHANGE_CASES]
 
 
 def format_command(command: list[str]) -> str:
@@ -950,9 +1151,9 @@ class DockerRoundTrip(DockerE2E):
     def __init__(self, args: argparse.Namespace, case: RoundTripCase) -> None:
         # The base __init__ only reads case.name and case.direction; a TestCase shim reuses all its
         # network/reflector setup + cleanup with no duplication.
-        shim = TestCase(name=case.name, send_port=SSDP_PORT, receive_port=SSDP_PORT,
+        shim = TestCase(name=case.name, send_port=case.port, receive_port=case.port,
             expect_mac=None, timeout_seconds=case.timeout_seconds, family=case.family,
-            group=case.group, direction="forward")
+            group=case.group, direction="forward", config=case.config)
         super().__init__(args, shim)
         self.rt = case
         self.responder_container = f"{self.prefix}-responder"
@@ -965,22 +1166,22 @@ class DockerRoundTrip(DockerE2E):
             "--network", f"name={self.target_network},driver-opt=com.docker.network.endpoint.ifname={RECEIVER_IFNAME}",
             "--mount", f"type=bind,source={E2E_DIR},target=/e2e,readonly",
             self.args.helper_image, "python3", "/e2e/probe.py", "respond",
-            "--port", str(SSDP_PORT), "--timeout", str(self.rt.timeout_seconds),
+            "--port", str(self.rt.port), "--timeout", str(self.rt.timeout_seconds),
             "--family", str(self.rt.family), "--join-group", self.rt.group,
-            "--interface", RECEIVER_IFNAME, "--reply-hex", SSDP_OK_HEX,
+            "--interface", RECEIVER_IFNAME, "--reply-hex", self.rt.reply_hex,
         ])
         self.wait_for_container_log(self.responder_container, "responder ready", "responder")
 
     def run_searcher(self) -> None:
-        expectation = ["--expect-payload-hex", SSDP_OK_HEX] if self.rt.expect_reply else ["--expect-none"]
+        expectation = ["--expect-payload-hex", self.rt.reply_hex] if self.rt.expect_reply else ["--expect-none"]
         docker([
             "run", "-d", "--name", self.searcher_container,
             "--network", f"name={self.source_network},driver-opt=com.docker.network.endpoint.ifname={REFLECTOR_SOURCE_IFNAME}",
             "--mount", f"type=bind,source={E2E_DIR},target=/e2e,readonly",
             self.args.helper_image, "python3", "/e2e/probe.py", "search",
-            "--source-port", str(SEARCHER_SOURCE_PORT), "--port", str(SSDP_PORT),
+            "--source-port", str(SEARCHER_SOURCE_PORT), "--port", str(self.rt.port),
             "--address", self.rt.group, "--interface", REFLECTOR_SOURCE_IFNAME,
-            "--family", str(self.rt.family), "--payload-hex", SSDP_MSEARCH_HEX,
+            "--family", str(self.rt.family), "--payload-hex", self.rt.probe_hex,
             "--timeout", str(self.rt.timeout_seconds), *expectation,
         ])
 
@@ -1002,10 +1203,10 @@ class DockerRoundTrip(DockerE2E):
             self.start_responder()  # must be listening before the search goes out
         self.run_searcher()
         self.wait_for_searcher()
-        # The per-searcher session must be torn down once it expires (MX 2 + 2s grace ~= 4s): the
-        # deadline timer sweeps it, drops its port reservation, and unregisters its response capture --
-        # logged by the reflector. wait_for_container_log raises if the eviction never fires.
-        self.wait_for_container_log(self.reflector_container, "evicted SSDP session", "session eviction")
+        # The per-searcher session must be torn down once it expires (SSDP: MX 2 + 2s grace ~= 4s; WSD:
+        # a fixed 5s window): the deadline timer sweeps it, drops its port reservation, and unregisters
+        # its response capture -- logged by the reflector. wait_for_container_log raises if it never fires.
+        self.wait_for_container_log(self.reflector_container, self.rt.evict_log, "session eviction")
         print(f"{self.rt.name}: session evicted after expiry", flush=True)
         print(f"PASS {self.rt.name}", flush=True)
         if self.args.show_reflector_logs:
