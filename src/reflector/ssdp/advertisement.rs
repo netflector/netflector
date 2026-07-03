@@ -4,13 +4,13 @@ use crate::dispatch::{CaptureKey, PacketDispatcher, PacketHandler};
 use crate::net::packet::Packet;
 use crate::net::ssdp::{SSDP_PORT, SSDP_TTL, SsdpKind, classify};
 use crate::reactor::Reactor;
-use crate::reflector::egress_sources;
+use crate::reflector::{ReplyRewrite, egress_sources};
 
-use super::{DialRewrite, dial_rewrite};
+use super::DialRewrite;
 
 /// Reflects SSDP advertisements (`NOTIFY`) target → source, onto `egress`, to the message's own
 /// destination — the dispatcher's filter pins that to the group. Searches (`M-SEARCH`) flow the other
-/// way through `SsdpSearchReflector`, so this handler only ever reflects advertisements.
+/// way through the shared `SearchReflector`, so this handler only ever reflects advertisements.
 pub(super) struct SsdpAdvertisementReflector {
     egress: CaptureKey,
     /// DIAL `LOCATION` rewriting; `None` leaves advertisements verbatim.
@@ -43,13 +43,10 @@ impl PacketHandler for SsdpAdvertisementReflector {
                     );
                     return;
                 }
-                let payload = dial_rewrite(
-                    packet.payload,
-                    self.egress,
-                    self.dial.as_mut(),
-                    dispatcher,
-                    reactor,
-                );
+                let payload = match self.dial.as_mut() {
+                    Some(dial) => dial.rewrite(packet.payload, self.egress, dispatcher, reactor),
+                    None => packet.payload,
+                };
                 match dispatcher.send_udp_group(
                     self.egress,
                     packet.dest,
@@ -69,7 +66,7 @@ impl PacketHandler for SsdpAdvertisementReflector {
                     ),
                 }
             }
-            // Searches flow source → target through SsdpSearchReflector, not this direction.
+            // Searches flow source → target through the search reflector, not this direction.
             Some(SsdpKind::Search) => {}
             // Non-SSDP payload on the group: anomalous but harmless, drop quietly.
             None => log::debug!(

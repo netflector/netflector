@@ -7,8 +7,10 @@ pub(crate) mod mdns;
 pub(crate) mod ssdp;
 pub(crate) mod wol;
 
+mod search;
 mod simple;
 
+pub(crate) use search::{NoRewrite, ReplyRewrite, SearchReflector};
 pub(crate) use simple::{SimpleReflector, Verdict};
 
 use std::fmt;
