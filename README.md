@@ -5,7 +5,7 @@ talk to each other sit on different L2 segments that don't forward each other's 
 multicasts — the classic case being a router with a wired LAN on one side and a Wi-Fi or IoT VLAN on
 the other, where (say) a phone on Wi-Fi can't discover or cast to a TV on the LAN.
 
-It reflects three link-local protocols, and layers an optional DIAL proxy on top of SSDP:
+It reflects four link-local protocols, and layers an optional DIAL proxy on top of SSDP:
 
 - **Wake-on-LAN** — magic packets sent on one interface are re-emitted on another, so a sender can
   wake a host on a different segment.
@@ -17,6 +17,8 @@ It reflects three link-local protocols, and layers an optional DIAL proxy on top
   own subnet; the proxy bridges that gap so a client on the other segment can actually launch apps on
   it. It is not a separate reflector — it augments an SSDP entry, enabled with `dial = true`. See
   [DIAL](#dial).
+- **WS-Discovery (WSD)** — SOAP-over-UDP discovery is relayed both ways, so a client on one segment can
+  discover ONVIF cameras or Windows devices (printers, scanners) on the other.
 
 Each named entry bridges one `source_if` → `target_if` interface pair and enables any combination of
 these. The same shape serves one or a few specific devices (`macs`) or a whole network (omit it).
@@ -203,6 +205,7 @@ wol       = true         # enable Wake-on-LAN, disabled by default
 mdns      = true         # enable mDNS, disabled by default
 ssdp      = true         # enable SSDP, disabled by default
 dial      = true         # enable the DIAL proxy, disabled by default
+wsd       = true         # enable WS-Discovery, disabled by default
 ```
 
 On RouterOS, setting the container's environment variables is usually easier than mounting a file: the
@@ -232,6 +235,7 @@ wol       = true                 # optional; enable Wake-on-LAN reflection (defa
 mdns      = true                 # optional; enable mDNS reflection (default false)
 ssdp      = true                 # optional; enable SSDP reflection (default false)
 dial      = true                 # optional; enable the DIAL app proxy (requires ssdp; IPv4-only; default false)
+wsd       = true                 # optional; enable WS-Discovery reflection (default false)
 wol_ports = [7, 9]               # optional; WoL UDP ports (default [7, 9]); only valid when wol = true
 address_family = "default"       # optional; default | dual | ipv4 | ipv6 (default "default")
 ```
@@ -268,6 +272,7 @@ REFLECTOR_TV_WOL=true
 REFLECTOR_TV_MDNS=true
 REFLECTOR_TV_SSDP=true
 REFLECTOR_TV_DIAL=true
+REFLECTOR_TV_WSD=true
 ```
 
 When a file and environment variables are both given they are merged: each contributes entries to one
@@ -328,11 +333,12 @@ address refresh.
 | mDNS | 5353 | `224.0.0.251` / `ff02::fb` | queries source→target, responses target→source |
 | SSDP | 1900 | `239.255.255.250` / `ff02::c` + `ff05::c` | M-SEARCH source→target, NOTIFY target→source |
 | DIAL | 1900 + ephemeral TCP | (uses SSDP discovery) | terminating HTTP reverse proxy (IPv4 only) |
+| WSD | 3702 | `239.255.255.250` / `ff02::c` | Probe/Resolve source→target, Hello/Bye target→source |
 
 WoL matching requires the magic-packet sequence (six `0xFF` bytes followed by the target MAC repeated 16
 times) at the start of the UDP payload; trailing bytes such as a SecureOn password are ignored when
 matching and forwarded as-is. mDNS responses include unsolicited announcements (so they flow
-target→source too); mDNS/SSDP datagrams are re-emitted verbatim to the same group (SSDP at hop limit 2).
+target→source too); mDNS/SSDP/WSD datagrams are re-emitted verbatim to the same group (SSDP at hop limit 2, WSD at 1).
 A site-local SSDP group (`ff05::c`) is sourced from a routable address, not the interface's link-local.
 
 For SSDP, multicast reflection delivers **passive** discovery — devices' periodic `NOTIFY ssdp:alive`
@@ -343,6 +349,13 @@ The proxy is always on whenever `ssdp` is enabled — it keeps one short-lived s
 search (expiring shortly after the search's `MX` window) and needs no configuration. Reaching a
 device's `LOCATION` URL and driving an app launch across segments is the job of the optional DIAL proxy
 below.
+
+WSD (WS-Discovery) works the same way but on port 3702 with SOAP messages instead of HTTPU: `Hello` /
+`Bye` announcements are relayed target→source, and a client's `Probe` / `Resolve` is relayed
+source→target with the device's unicast `ProbeMatches` / `ResolveMatches` proxied back through a
+per-searcher session — the same machinery as SSDP's `M-SEARCH`, with no DIAL layer. It shares SSDP's
+IPv4 group but uses only the link-local IPv6 scope (`ff02::c`), and covers ONVIF NVR↔camera and Windows
+device/printer discovery across segments.
 
 ### DIAL
 
