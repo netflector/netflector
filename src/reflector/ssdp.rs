@@ -2,29 +2,32 @@
 //! target interfaces so service discovery crosses the link. Advertisements (`NOTIFY`) reflect
 //! target → source as a plain multicast re-emit (the [`advertisement`] module); searches (`M-SEARCH`)
 //! reflect source → target and each searcher's unicast `200 OK` replies route back through a
-//! per-searcher session (the [`search`] leg over the shared `reflector::search`). Re-emits go to the
-//! same group at TTL 2,
+//! per-searcher session (the shared [`SearchReflector`]). Re-emits go to the same group at TTL 2,
 //! sourced from the egress interface. With `dial`, a target→source datagram's DIAL `LOCATION` is
 //! rewritten to a source-side proxy: [`DialRewrite`] is the SSDP [`ReplyRewrite`], used by both the
 //! advertisement direction and each search session's response.
 
 mod advertisement;
-mod search;
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use crate::config::{AddressFamily, Reflector};
 use crate::dispatch::{CaptureKey, Filter, IpSet, PacketDispatcher};
 use crate::interface::InterfaceAddresses;
 use crate::net::ssdp::{
-    SSDP_GROUP_V4, SSDP_GROUP_V6_LINK_LOCAL, SSDP_GROUP_V6_SITE_LOCAL, SSDP_PORT,
+    MSEARCH_MX_DEFAULT, SSDP_GROUP_V4, SSDP_GROUP_V6_LINK_LOCAL, SSDP_GROUP_V6_SITE_LOCAL,
+    SSDP_PORT, SSDP_TTL, SsdpKind, classify, parse_msearch_mx,
 };
 use crate::net::uninit_buf::UninitBuf;
 use crate::reactor::Reactor;
 
 use self::advertisement::SsdpAdvertisementReflector;
 use super::dial::{ProxyPlacement, REWRITE_BUF_LEN, rewrite_location};
-use super::{BuildError, InterfaceMap, ReplyRewrite, require_bidirectional_families};
+use super::{
+    BuildError, InterfaceMap, NoRewrite, ReplyRewrite, SearchReflector, Verdict,
+    require_bidirectional_families,
+};
 
 /// What a DIAL-enabled SSDP reflector needs to rewrite a device's `LOCATION` to a source-side proxy: the
 /// target capture the device sits behind (for its address), that interface's egress-pin ifindex, and a
@@ -93,10 +96,36 @@ impl ReplyRewrite for DialRewrite {
     }
 }
 
+/// The directional gate for the search leg: an `M-SEARCH` is a search to reflect, a `NOTIFY` belongs to
+/// the advertisement direction, and anything else on the group is junk.
+fn search_verdict(payload: &[u8]) -> Verdict {
+    match classify(payload) {
+        Some(SsdpKind::Search) => Verdict::Reflect,
+        Some(SsdpKind::Advertisement) => Verdict::Skip,
+        None => Verdict::Junk,
+    }
+}
+
+/// A session outlives the searcher's MX window by this grace, since a device's 200-OK may lag the
+/// search (mirrors the C++).
+const SESSION_GRACE: Duration = Duration::from_secs(2);
+
+/// An `M-SEARCH`'s session window: its MX response window (clamped by [`parse_msearch_mx`]) plus the
+/// reply grace. A search with no usable MX falls back to the protocol default.
+fn search_window(payload: &[u8]) -> Duration {
+    let mx = parse_msearch_mx(payload).unwrap_or_else(|| {
+        log::info!(
+            "SSDP: M-SEARCH has no usable MX; using the default {MSEARCH_MX_DEFAULT}s window"
+        );
+        MSEARCH_MX_DEFAULT
+    });
+    Duration::from_secs(u64::from(mx)) + SESSION_GRACE
+}
+
 /// Build the SSDP reflector for `reflector` and register both directions on `dispatcher` — a no-op
 /// when SSDP isn't enabled. For each address family in use it joins every group on BOTH interfaces and
 /// registers two handlers per group: advertisements target → source ([`SsdpAdvertisementReflector`]),
-/// and searches source → target with their unicast 200-OK replies (the [`search`] leg). A
+/// and searches source → target with their unicast 200-OK replies (the shared [`SearchReflector`]). A
 /// required family must be sendable on BOTH interfaces, since the reflector re-emits on both.
 ///
 /// # Errors
@@ -155,8 +184,16 @@ pub(crate) fn build(
             ssdp.dial.then(|| DialRewrite::new(target, target_ifindex)),
         )),
     );
-    // source -> target: searches (unfiltered — any source client may search); each searcher's
-    // unicast 200-OK replies route back through a per-searcher session (the search leg's glue).
+    // source -> target: searches (unfiltered — any source client may search); each searcher's unicast
+    // 200-OK replies route back through a per-searcher session. With `dial`, each session's reply
+    // rewrites the device's DIAL `LOCATION` (a fresh DialRewrite per session); else it passes through.
+    let make_reply: Box<dyn Fn() -> Box<dyn ReplyRewrite>> = if ssdp.dial {
+        Box::new(move || {
+            Box::new(DialRewrite::new(target, target_ifindex)) as Box<dyn ReplyRewrite>
+        })
+    } else {
+        Box::new(|| Box::new(NoRewrite) as Box<dyn ReplyRewrite>)
+    };
     dispatcher.register(
         source,
         Filter {
@@ -164,12 +201,16 @@ pub(crate) fn build(
             dst_port: Some(SSDP_PORT.into()),
             ..Filter::default()
         },
-        Box::new(search::reflector(
+        Box::new(SearchReflector::new(
             source,
             target,
             target_ifindex,
             reflector.macs.clone(),
-            ssdp.dial,
+            "SSDP",
+            SSDP_TTL,
+            search_verdict,
+            search_window,
+            make_reply,
         )),
     );
     log::info!(
