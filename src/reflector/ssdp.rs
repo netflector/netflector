@@ -1,10 +1,12 @@
 //! The SSDP reflector: reflects Simple Service Discovery Protocol (`UPnP`) between the source and
 //! target interfaces so service discovery crosses the link. Advertisements (`NOTIFY`) reflect
 //! target → source as a plain multicast re-emit (the [`advertisement`] module); searches (`M-SEARCH`)
-//! reflect source → target and each searcher's unicast `200 OK` replies are routed back through a
-//! per-searcher session (the [`search`] module). Re-emits go to the same group at TTL 2, sourced from
-//! the egress interface. With `dial`, a target→source datagram's DIAL `LOCATION` is rewritten to a
-//! source-side proxy ([`dial_rewrite`]).
+//! reflect source → target and each searcher's unicast `200 OK` replies route back through a
+//! per-searcher session (the [`search`] leg over the shared `reflector::search`). Re-emits go to the
+//! same group at TTL 2,
+//! sourced from the egress interface. With `dial`, a target→source datagram's DIAL `LOCATION` is
+//! rewritten to a source-side proxy: [`DialRewrite`] is the SSDP [`ReplyRewrite`], used by both the
+//! advertisement direction and each search session's response.
 
 mod advertisement;
 mod search;
@@ -21,9 +23,8 @@ use crate::net::uninit_buf::UninitBuf;
 use crate::reactor::Reactor;
 
 use self::advertisement::SsdpAdvertisementReflector;
-use self::search::SsdpSearchReflector;
 use super::dial::{ProxyPlacement, REWRITE_BUF_LEN, rewrite_location};
-use super::{BuildError, InterfaceMap, require_bidirectional_families};
+use super::{BuildError, InterfaceMap, ReplyRewrite, require_bidirectional_families};
 
 /// What a DIAL-enabled SSDP reflector needs to rewrite a device's `LOCATION` to a source-side proxy: the
 /// target capture the device sits behind (for its address), that interface's egress-pin ifindex, and a
@@ -32,7 +33,7 @@ use super::{BuildError, InterfaceMap, require_bidirectional_families};
 struct DialRewrite {
     target: CaptureKey,
     target_ifindex: u32,
-    /// Reused sink for the rewritten datagram; see [`dial_rewrite`].
+    /// Reused sink for the rewritten datagram; see the [`ReplyRewrite`] impl.
     scratch: UninitBuf,
 }
 
@@ -48,55 +49,54 @@ impl DialRewrite {
     }
 }
 
-/// Rewrite a target→source SSDP datagram's DIAL `LOCATION` to a source-side description proxy, into
-/// `dial`'s scratch. Returns the rewritten slice when `dial` is set and the rewrite succeeds, else
-/// `payload` (forward verbatim). `egress` is the source capture the datagram reflects onto. Shared by
-/// the advertisement and search-response directions, which both rewrite a device's `LOCATION`.
-fn dial_rewrite<'a>(
-    payload: &'a [u8],
-    egress: CaptureKey,
-    dial: Option<&'a mut DialRewrite>,
-    dispatcher: &mut PacketDispatcher,
-    reactor: &mut Reactor,
-) -> &'a [u8] {
-    let Some(dial) = dial else {
-        return payload;
-    };
-    let (Some(source), Some(target)) = (
-        dispatcher
-            .egress_addrs(egress)
-            .and_then(InterfaceAddresses::v4),
-        dispatcher
-            .egress_addrs(dial.target)
-            .and_then(InterfaceAddresses::v4),
-    ) else {
-        return payload; // a family the proxy can't bridge yet — forward unchanged
-    };
-    let placement = ProxyPlacement {
-        source_capture: egress,
-        source,
-        target_capture: dial.target,
-        target,
-        target_ifindex: dial.target_ifindex,
-    };
-    dial.scratch.clear();
-    if rewrite_location(
-        dispatcher.dial_context(),
-        reactor,
-        payload,
-        placement,
-        &mut dial.scratch,
-    ) {
-        dial.scratch.filled()
-    } else {
-        payload
+impl ReplyRewrite for DialRewrite {
+    /// Rewrite a target→source SSDP datagram's DIAL `LOCATION` to a source-side description proxy, into
+    /// the reused scratch. Returns the rewritten slice on success, else `payload` (forward verbatim).
+    /// `egress` is the source capture the datagram reflects onto. Used by both the advertisement
+    /// direction and each search session's response.
+    fn rewrite<'a>(
+        &'a mut self,
+        payload: &'a [u8],
+        egress: CaptureKey,
+        dispatcher: &mut PacketDispatcher,
+        reactor: &mut Reactor,
+    ) -> &'a [u8] {
+        let (Some(source), Some(target)) = (
+            dispatcher
+                .egress_addrs(egress)
+                .and_then(InterfaceAddresses::v4),
+            dispatcher
+                .egress_addrs(self.target)
+                .and_then(InterfaceAddresses::v4),
+        ) else {
+            return payload; // a family the proxy can't bridge yet — forward unchanged
+        };
+        let placement = ProxyPlacement {
+            source_capture: egress,
+            source,
+            target_capture: self.target,
+            target,
+            target_ifindex: self.target_ifindex,
+        };
+        self.scratch.clear();
+        if rewrite_location(
+            dispatcher.dial_context(),
+            reactor,
+            payload,
+            placement,
+            &mut self.scratch,
+        ) {
+            self.scratch.filled()
+        } else {
+            payload
+        }
     }
 }
 
 /// Build the SSDP reflector for `reflector` and register both directions on `dispatcher` — a no-op
 /// when SSDP isn't enabled. For each address family in use it joins every group on BOTH interfaces and
 /// registers two handlers per group: advertisements target → source ([`SsdpAdvertisementReflector`]),
-/// and searches source → target with their unicast 200-OK replies ([`SsdpSearchReflector`]). A
+/// and searches source → target with their unicast 200-OK replies (the [`search`] leg). A
 /// required family must be sendable on BOTH interfaces, since the reflector re-emits on both.
 ///
 /// # Errors
@@ -156,7 +156,7 @@ pub(crate) fn build(
         )),
     );
     // source -> target: searches (unfiltered — any source client may search); each searcher's
-    // unicast 200-OK replies route back through a per-searcher session.
+    // unicast 200-OK replies route back through a per-searcher session (the search leg's glue).
     dispatcher.register(
         source,
         Filter {
@@ -164,7 +164,7 @@ pub(crate) fn build(
             dst_port: Some(SSDP_PORT.into()),
             ..Filter::default()
         },
-        Box::new(SsdpSearchReflector::new(
+        Box::new(search::reflector(
             source,
             target,
             target_ifindex,
