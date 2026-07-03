@@ -9,8 +9,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use crate::config::{AddressFamily, Reflector};
-use crate::dispatch::{CaptureKey, Filter, IpSet, PacketDispatcher};
-use crate::net::mac::MacSet;
+use crate::dispatch::{Filter, IpSet, PacketDispatcher};
 use crate::net::wsd::{WSD_GROUP_V4, WSD_GROUP_V6, WSD_PORT, WSD_TTL, WsdKind, classify};
 
 use super::{
@@ -43,27 +42,6 @@ const SESSION_WINDOW: Duration = Duration::from_secs(5);
 
 fn window(_: &[u8]) -> Duration {
     SESSION_WINDOW
-}
-
-/// The shared [`SearchReflector`] configured for WSD: source → target `Probe` / `Resolve` reflection
-/// with per-searcher match sessions. WSD replies are relayed verbatim (no DIAL), so [`NoRewrite`].
-fn search_reflector(
-    source: CaptureKey,
-    target: CaptureKey,
-    target_ifindex: u32,
-    device_macs: Option<MacSet>,
-) -> SearchReflector {
-    SearchReflector::new(
-        source,
-        target,
-        target_ifindex,
-        device_macs,
-        "WSD",
-        WSD_TTL,
-        search_verdict,
-        window,
-        Box::new(|| Box::new(NoRewrite) as Box<dyn ReplyRewrite>),
-    )
 }
 
 /// Build the WSD reflector for `reflector` and register both directions on `dispatcher` — a no-op when
@@ -141,11 +119,16 @@ pub(crate) fn build(
             dst_port: Some(WSD_PORT.into()),
             ..Filter::default()
         },
-        Box::new(search_reflector(
+        Box::new(SearchReflector::new(
             source,
             target,
             target_ifindex,
             reflector.macs.clone(),
+            "WSD",
+            WSD_TTL,
+            search_verdict,
+            window,
+            Box::new(|| Box::new(NoRewrite) as Box<dyn ReplyRewrite>),
         )),
     );
     log::info!(
