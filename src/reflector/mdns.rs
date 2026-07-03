@@ -85,7 +85,8 @@ pub(crate) fn build(
         },
         Box::new(SimpleReflector::new(
             target,
-            "mDNS query",
+            "mDNS",
+            "query",
             MDNS_PORT,
             MDNS_TTL,
             query_verdict,
@@ -102,7 +103,8 @@ pub(crate) fn build(
         },
         Box::new(SimpleReflector::new(
             source,
-            "mDNS response",
+            "mDNS",
+            "response",
             MDNS_PORT,
             MDNS_TTL,
             response_verdict,

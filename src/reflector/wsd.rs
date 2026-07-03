@@ -125,7 +125,8 @@ pub(crate) fn build(
         },
         Box::new(SimpleReflector::new(
             source,
-            "WSD announcement",
+            "WSD",
+            "announcement",
             WSD_PORT,
             WSD_TTL,
             announcement_verdict,
