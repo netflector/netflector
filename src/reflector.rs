@@ -11,8 +11,8 @@ pub(crate) mod wsd;
 mod search;
 mod simple;
 
-pub(crate) use search::{NoRewrite, ReplyRewrite, SearchReflector};
-pub(crate) use simple::{SimpleReflector, Verdict};
+pub(crate) use search::SearchReflector;
+pub(crate) use simple::SimpleReflector;
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -22,6 +22,50 @@ use thiserror::Error;
 use crate::config::AddressFamily;
 use crate::dispatch::{CaptureKey, PacketDispatcher};
 use crate::interface::InterfaceAddresses;
+use crate::reactor::Reactor;
+
+/// A reflector's verdict on a captured payload, from its protocol's classifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Verdict {
+    /// A message for this direction — re-emit it.
+    Reflect,
+    /// A message for the *other* direction — drop it silently. Dropping the opposite direction is
+    /// the loop-breaker (atop the capture's own-egress drop): a reflected query re-emitted on the
+    /// egress is still a query, which the egress side's response-only reflector skips.
+    Skip,
+    /// Not a recognizable protocol message on this dedicated group — drop it with a debug log.
+    Junk,
+}
+
+/// Transforms a datagram's payload before it is re-emitted — the SSDP DIAL `LOCATION` rewrite, applied
+/// on both the advertisement direction and each search session's reply. The returned slice is either
+/// `payload` verbatim or a rewrite held in the implementor's own reused scratch — a lending signature
+/// the `Fn` traits can't express, which is why this is a trait and not a closure.
+pub(crate) trait ReplyRewrite {
+    fn rewrite<'a>(
+        &'a mut self,
+        payload: &'a [u8],
+        egress: CaptureKey,
+        dispatcher: &mut PacketDispatcher,
+        reactor: &mut Reactor,
+    ) -> &'a [u8];
+}
+
+/// The identity transform: forward the payload verbatim. A ZST for the reflectors (mDNS, WSD, and SSDP
+/// without DIAL) that re-emit unchanged.
+pub(crate) struct NoRewrite;
+
+impl ReplyRewrite for NoRewrite {
+    fn rewrite<'a>(
+        &'a mut self,
+        payload: &'a [u8],
+        _egress: CaptureKey,
+        _dispatcher: &mut PacketDispatcher,
+        _reactor: &mut Reactor,
+    ) -> &'a [u8] {
+        payload
+    }
+}
 
 /// A concrete IP version — the family a reflector requires of an interface. Distinct from the
 /// config's `AddressFamily` policy (which may name both at once).

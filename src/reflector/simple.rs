@@ -10,20 +10,7 @@ use crate::dispatch::{CaptureKey, PacketDispatcher, PacketHandler};
 use crate::net::packet::Packet;
 use crate::reactor::Reactor;
 
-use super::{NoRewrite, ReplyRewrite, egress_sources};
-
-/// A reflector's verdict on a captured payload, from its protocol's classifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Verdict {
-    /// A message for this direction — re-emit it.
-    Reflect,
-    /// A message for the *other* direction — drop it silently. Dropping the opposite direction is
-    /// the loop-breaker (atop the capture's own-egress drop): a reflected query re-emitted on the
-    /// egress is still a query, which the egress side's response-only reflector skips.
-    Skip,
-    /// Not a recognizable protocol message on this dedicated group — drop it with a debug log.
-    Junk,
-}
+use super::{NoRewrite, ReplyRewrite, Verdict, egress_sources};
 
 /// One direction of one multicast-discovery protocol: re-emits each accepted message captured on its
 /// ingress onto `egress`, to the message's own destination (the dispatcher's filter pins that to the
