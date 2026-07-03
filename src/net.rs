@@ -12,8 +12,6 @@ pub(crate) mod ssdp;
 pub(crate) mod stream_buffer;
 pub(crate) mod tcp;
 pub(crate) mod uninit_buf;
-// The WSD reflector (next step) consumes the group/port/TTL consts; this holds until then.
-#[allow(dead_code)]
 pub(crate) mod wsd;
 
 /// The link-layer framing of a captured or injected frame. The capture layer reports

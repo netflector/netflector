@@ -6,6 +6,7 @@ pub(crate) mod dial;
 pub(crate) mod mdns;
 pub(crate) mod ssdp;
 pub(crate) mod wol;
+pub(crate) mod wsd;
 
 mod search;
 mod simple;

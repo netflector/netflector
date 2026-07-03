@@ -37,16 +37,18 @@ pub(super) struct RawReflector {
     pub(super) target_if: InterfaceName,
     pub(super) macs: Option<MacSet>,
     #[serde(default)]
+    pub(super) address_family: AddressFamily,
+    #[serde(default)]
     pub(super) wol: bool,
+    pub(super) wol_ports: Option<WolPorts>,
     #[serde(default)]
     pub(super) mdns: bool,
     #[serde(default)]
     pub(super) ssdp: bool,
     #[serde(default)]
     pub(super) dial: bool,
-    pub(super) wol_ports: Option<WolPorts>,
     #[serde(default)]
-    pub(super) address_family: AddressFamily,
+    pub(super) wsd: bool,
 }
 
 impl RawConfig {
