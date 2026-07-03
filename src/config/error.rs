@@ -44,7 +44,7 @@ pub(crate) enum ConfigError {
         value: InterfaceName,
     },
 
-    #[error("reflector \"{name}\" enables no protocol (set wol, mdns, or ssdp)")]
+    #[error("reflector \"{name}\" enables no protocol (set wol, mdns, ssdp, or wsd)")]
     NoProtocol { name: ReflectorName },
 
     #[error("reflector \"{name}\" sets wol_ports but does not enable wol")]
@@ -122,6 +122,7 @@ pub(crate) enum Protocol {
     Wol,
     Mdns,
     Ssdp,
+    Wsd,
 }
 
 impl fmt::Display for Protocol {
@@ -130,6 +131,7 @@ impl fmt::Display for Protocol {
             Self::Wol => "WoL",
             Self::Mdns => "mDNS",
             Self::Ssdp => "SSDP",
+            Self::Wsd => "WSD",
         })
     }
 }

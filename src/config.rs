@@ -64,6 +64,8 @@ pub(crate) struct Reflector {
     pub(crate) mdns: bool,
     /// SSDP settings, or `None` when SSDP is disabled.
     pub(crate) ssdp: Option<Ssdp>,
+    /// Whether WS-Discovery (WSD) is enabled.
+    pub(crate) wsd: bool,
 }
 
 impl Reflector {
@@ -90,6 +92,9 @@ impl Reflector {
         if self.ssdp.is_some() && other.ssdp.is_some() {
             return Some(Protocol::Ssdp);
         }
+        if self.wsd && other.wsd {
+            return Some(Protocol::Wsd);
+        }
         None
     }
 }
@@ -114,7 +119,7 @@ impl TryFrom<(String, RawReflector)> for Reflector {
             });
         }
 
-        if !raw.wol && !raw.mdns && !raw.ssdp {
+        if !raw.wol && !raw.mdns && !raw.ssdp && !raw.wsd {
             return Err(ConfigError::NoProtocol { name });
         }
         if raw.wol_ports.is_some() && !raw.wol {
@@ -149,6 +154,7 @@ impl TryFrom<(String, RawReflector)> for Reflector {
             wol,
             mdns: raw.mdns,
             ssdp,
+            wsd: raw.wsd,
         })
     }
 }
@@ -280,6 +286,9 @@ fn protocol_list(reflector: &Reflector) -> String {
             "ssdp".to_owned()
         });
     }
+    if reflector.wsd {
+        protocols.push("wsd".to_owned());
+    }
     protocols.join(", ")
 }
 
@@ -349,6 +358,25 @@ mod tests {
         assert!(r.mdns);
         assert!(r.macs.is_none());
         assert_eq!(r.address_family, AddressFamily::Default);
+        assert!(r.wol.is_none());
+        assert!(r.ssdp.is_none());
+        assert!(!r.wsd);
+    }
+
+    #[test]
+    fn wsd_reflector_parses() {
+        let cfg = from_toml(
+            r#"
+            [reflectors.cameras]
+            source_if = "lan"
+            target_if = "cams"
+            wsd = true
+            "#,
+        )
+        .unwrap();
+        let r = &cfg.reflectors[0];
+        assert!(r.wsd);
+        assert!(!r.mdns);
         assert!(r.wol.is_none());
         assert!(r.ssdp.is_none());
     }
@@ -704,6 +732,28 @@ mod tests {
             err(text),
             ConfigError::ConflictingReflectors {
                 protocol: Protocol::Mdns,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn conflicting_wsd_reflectors_rejected() {
+        let text = r#"
+            [reflectors.a]
+            source_if = "lan"
+            target_if = "cams"
+            wsd = true
+
+            [reflectors.b]
+            source_if = "lan"
+            target_if = "cams"
+            wsd = true
+        "#;
+        assert!(matches!(
+            err(text),
+            ConfigError::ConflictingReflectors {
+                protocol: Protocol::Wsd,
                 ..
             }
         ));

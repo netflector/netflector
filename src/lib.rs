@@ -67,6 +67,8 @@ pub fn run(args: &[String]) -> Result<()> {
             .map_err(|e| Error::reflector(reflector.name.as_str(), e))?;
         crate::reflector::ssdp::build(reflector, &interfaces, &mut dispatcher)
             .map_err(|e| Error::reflector(reflector.name.as_str(), e))?;
+        crate::reflector::wsd::build(reflector, &interfaces, &mut dispatcher)
+            .map_err(|e| Error::reflector(reflector.name.as_str(), e))?;
     }
 
     let mut reactor = Reactor::new()?;

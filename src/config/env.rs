@@ -24,6 +24,7 @@ struct PartialReflector {
     mdns: Option<bool>,
     ssdp: Option<bool>,
     dial: Option<bool>,
+    wsd: Option<bool>,
     wol_ports: Option<WolPorts>,
     address_family: Option<AddressFamily>,
 }
@@ -42,6 +43,7 @@ impl PartialReflector {
             "mdns" => self.mdns = Some(env_bool(value, var)?),
             "ssdp" => self.ssdp = Some(env_bool(value, var)?),
             "dial" => self.dial = Some(env_bool(value, var)?),
+            "wsd" => self.wsd = Some(env_bool(value, var)?),
             _ => {
                 return Err(ConfigError::EnvUnknownParam {
                     var: var.to_owned(),
@@ -69,6 +71,7 @@ impl PartialReflector {
             mdns: self.mdns.unwrap_or(false),
             ssdp: self.ssdp.unwrap_or(false),
             dial: self.dial.unwrap_or(false),
+            wsd: self.wsd.unwrap_or(false),
             wol_ports: self.wol_ports,
             address_family: self.address_family.unwrap_or_default(),
         })
@@ -226,6 +229,17 @@ mod tests {
         let r = &cfg.reflectors[0];
         assert!(r.wol.is_some());
         assert!(!r.mdns);
+    }
+
+    #[test]
+    fn env_wsd_flag() {
+        let cfg = from_env(&[
+            ("REFLECTOR_CAMS_SOURCE_IF", "lan"),
+            ("REFLECTOR_CAMS_TARGET_IF", "cams"),
+            ("REFLECTOR_CAMS_WSD", "true"),
+        ])
+        .unwrap();
+        assert!(cfg.reflectors[0].wsd);
     }
 
     #[test]
