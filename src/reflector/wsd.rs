@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use crate::config::{AddressFamily, Reflector};
-use crate::dispatch::{Filter, IpSet, PacketDispatcher};
+use crate::dispatch::{Filter, IpSet, MessageType, PacketDispatcher};
 use crate::net::wsd::{WSD_GROUP_V4, WSD_GROUP_V6, WSD_PORT, WSD_TTL, WsdKind, classify};
 
 use super::{
@@ -17,12 +17,23 @@ use super::{
     require_bidirectional_families,
 };
 
+/// WSD's classifier kind maps to its group message types. The `ProbeMatches`/`ResolveMatches` unicast
+/// replies are a separate leg ([`MessageType::WsdResponse`]), carried by the response reflector.
+impl From<WsdKind> for MessageType {
+    fn from(kind: WsdKind) -> Self {
+        match kind {
+            WsdKind::Announcement => Self::WsdAnnouncement,
+            WsdKind::Search => Self::WsdSearch,
+        }
+    }
+}
+
 /// The directional gate for the announcement direction: reflect `Hello` / `Bye`, skip a search (it
 /// flows the other way), and treat anything else on the group as junk.
 fn announcement_verdict(payload: &[u8]) -> Verdict {
     match classify(payload) {
-        Some(WsdKind::Announcement) => Verdict::Reflect,
-        Some(WsdKind::Search) => Verdict::Skip,
+        Some(kind @ WsdKind::Announcement) => Verdict::Reflect(kind.into()),
+        Some(kind @ WsdKind::Search) => Verdict::Skip(kind.into()),
         None => Verdict::Junk,
     }
 }
@@ -30,8 +41,8 @@ fn announcement_verdict(payload: &[u8]) -> Verdict {
 /// The directional gate for the search direction: the mirror of [`announcement_verdict`].
 fn search_verdict(payload: &[u8]) -> Verdict {
     match classify(payload) {
-        Some(WsdKind::Search) => Verdict::Reflect,
-        Some(WsdKind::Announcement) => Verdict::Skip,
+        Some(kind @ WsdKind::Search) => Verdict::Reflect(kind.into()),
+        Some(kind @ WsdKind::Announcement) => Verdict::Skip(kind.into()),
         None => Verdict::Junk,
     }
 }
@@ -125,6 +136,7 @@ pub(crate) fn build(
             target_ifindex,
             reflector.macs.clone(),
             "WSD",
+            MessageType::WsdResponse,
             WSD_TTL,
             search_verdict,
             window,
@@ -172,11 +184,23 @@ mod tests {
     fn verdicts_gate_by_direction() {
         let hello = b"<a:Action>http://x/Hello</a:Action>";
         let probe = b"<a:Action>http://x/Probe</a:Action>";
-        assert_eq!(announcement_verdict(hello), Verdict::Reflect);
-        assert_eq!(announcement_verdict(probe), Verdict::Skip);
+        assert_eq!(
+            announcement_verdict(hello),
+            Verdict::Reflect(MessageType::WsdAnnouncement)
+        );
+        assert_eq!(
+            announcement_verdict(probe),
+            Verdict::Skip(MessageType::WsdSearch)
+        );
         assert_eq!(announcement_verdict(b"junk"), Verdict::Junk);
-        assert_eq!(search_verdict(probe), Verdict::Reflect);
-        assert_eq!(search_verdict(hello), Verdict::Skip);
+        assert_eq!(
+            search_verdict(probe),
+            Verdict::Reflect(MessageType::WsdSearch)
+        );
+        assert_eq!(
+            search_verdict(hello),
+            Verdict::Skip(MessageType::WsdAnnouncement)
+        );
         assert_eq!(search_verdict(b"junk"), Verdict::Junk);
     }
 }

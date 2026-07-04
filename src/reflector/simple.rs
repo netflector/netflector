@@ -6,7 +6,7 @@
 //! advertisement direction rewrites the DIAL `LOCATION`). The search directions are stateful
 //! (per-searcher sessions), so they use the shared `SearchReflector` instead.
 
-use crate::dispatch::{CaptureKey, PacketDispatcher, PacketHandler};
+use crate::dispatch::{CaptureKey, Outcome, PacketDispatcher, PacketHandler};
 use crate::net::packet::Packet;
 use crate::reactor::Reactor;
 
@@ -64,55 +64,61 @@ impl PacketHandler for SimpleReflector {
         packet: &Packet,
         dispatcher: &mut PacketDispatcher,
         reactor: &mut Reactor,
-    ) {
-        match (self.classify)(packet.payload) {
-            Verdict::Reflect => {
-                // A family the egress can't currently source is a quiet drop (transient address
-                // loss), so send_udp_group's error stays a genuine failure.
-                if !egress_sources(dispatcher, self.egress, packet.dest) {
-                    log::debug!(
-                        "{}: egress has no source for {} yet; dropping {} from {}",
-                        self.name,
-                        packet.dest,
-                        self.kind,
-                        packet.source
-                    );
-                    return;
-                }
-                let payload =
-                    self.rewrite
-                        .rewrite(packet.payload, self.egress, dispatcher, reactor);
-                match dispatcher.send_udp_group(
-                    self.egress,
+    ) -> Outcome {
+        let message_type = match (self.classify)(packet.payload) {
+            Verdict::Reflect(message_type) => message_type,
+            Verdict::Skip(message_type) => return Outcome::Skipped(message_type),
+            Verdict::Junk => {
+                log::debug!(
+                    "{}: dropping unrecognized payload ({} B) to {} from {}",
+                    self.name,
+                    packet.payload.len(),
                     packet.dest,
-                    self.src_port,
-                    self.ttl,
-                    payload,
-                ) {
-                    Ok(()) => log::debug!(
-                        "reflected {} {} from {} to {}",
-                        self.name,
-                        self.kind,
-                        packet.source,
-                        packet.dest
-                    ),
-                    Err(e) => log::warn!(
-                        "{}: cannot reflect {} from {} to {}: {e}",
-                        self.name,
-                        self.kind,
-                        packet.source,
-                        packet.dest
-                    ),
-                }
+                    packet.source
+                );
+                return Outcome::Filtered;
             }
-            Verdict::Skip => {}
-            Verdict::Junk => log::debug!(
-                "{}: dropping unrecognized payload ({} B) to {} from {}",
+        };
+
+        // A family the egress can't currently source is a quiet, transient drop (address
+        // loss) — a Stalled, not a genuine send failure.
+        if !egress_sources(dispatcher, self.egress, packet.dest) {
+            log::debug!(
+                "{}: egress has no source for {} yet; dropping {} from {}",
                 self.name,
-                packet.payload.len(),
                 packet.dest,
+                self.kind,
                 packet.source
-            ),
+            );
+            return Outcome::Stalled(message_type);
+        }
+
+        let payload = self
+            .rewrite
+            .rewrite(packet.payload, self.egress, dispatcher, reactor);
+
+        match dispatcher.send_udp_group(self.egress, packet.dest, self.src_port, self.ttl, payload)
+        {
+            Ok(()) => {
+                log::debug!(
+                    "reflected {} {} from {} to {}",
+                    self.name,
+                    self.kind,
+                    packet.source,
+                    packet.dest
+                );
+                Outcome::Reflected(message_type)
+            }
+            Err(e) => {
+                log::warn!(
+                    "{}: cannot reflect {} from {} to {}: {e}",
+                    self.name,
+                    self.kind,
+                    packet.source,
+                    packet.dest
+                );
+                Outcome::Dropped(message_type)
+            }
         }
     }
 }

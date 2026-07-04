@@ -9,6 +9,7 @@ use crate::capture::Capture;
 use crate::interface::{AddressChange, Interface, InterfaceAddresses};
 
 use super::CaptureKey;
+use super::counters::{CaptureCounters, Outcome};
 use super::multicast::MulticastJoiner;
 
 /// A `Copy` handle into the interface table's interface entries — an insert-only index, like
@@ -16,12 +17,15 @@ use super::multicast::MulticastJoiner;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) struct InterfaceKey(u32);
 
-/// One capture plus the interface it runs on. The `capture` is `Option` so the drain can
-/// take it OUT (leaving the `interface` link resident, so a capture's addresses resolve
-/// even mid-drain) and restore it; `None` marks "currently draining". Never removed.
+/// One capture, the interface it runs on, and its observability tallies. The `capture` is
+/// `Option` so the drain can take it OUT (leaving the `interface` link and `counters` resident, so a
+/// capture's addresses resolve and its routed outcomes still record mid-drain) and restore it; `None`
+/// marks "currently draining". Never removed — so the tallies accrue for the whole run. Bundling the
+/// counters here (rather than a parallel `Vec`) makes them impossible to desync: one push adds both.
 struct CaptureEntry {
     capture: Option<Capture>,
     interface: InterfaceKey,
+    counters: CaptureCounters,
 }
 
 /// One interface paired with its multicast joiner. Bundling them makes the two impossible to
@@ -90,6 +94,7 @@ impl InterfaceTable {
         self.captures.push(CaptureEntry {
             capture: Some(capture),
             interface,
+            counters: CaptureCounters::default(),
         });
         key
     }
@@ -159,6 +164,13 @@ impl InterfaceTable {
         }
     }
 
+    /// Tally a routed packet's folded [`Outcome`] on `capture`'s counter row. Indexed directly:
+    /// recording is reached only from `route`, with the ingress key of a real, in-range capture (the
+    /// drain's take-out guard rejects any other), so the row always exists.
+    pub(super) fn record(&mut self, capture: CaptureKey, outcome: Outcome) {
+        self.captures[capture.0 as usize].counters.record(outcome);
+    }
+
     /// Re-resolve the interface with kernel index `ifindex`, in place. A real index matches at
     /// most one interface — they dedup by name, and the kernel gives each a distinct index —
     /// so this finds rather than scans. Returns the fields that changed if one matched, or `None`
@@ -224,8 +236,34 @@ mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     use super::*;
+    use crate::dispatch::MessageType;
     use crate::dispatch::multicast::join_unsupported;
     use crate::interface::{LOOPBACK_IFACE, if_index};
+
+    impl InterfaceTable {
+        /// Push a capture-less entry (no fd) so a routing test can mint a valid [`CaptureKey`] and
+        /// exercise the record path without opening a capture; the dangling [`InterfaceKey`] is
+        /// never resolved. Reachable from the dispatcher's own tests, hence `pub(in crate::dispatch)`.
+        pub(in crate::dispatch) fn add_test_capture(&mut self) -> CaptureKey {
+            let key =
+                CaptureKey(u32::try_from(self.captures.len()).expect("capture count fits a u32"));
+            self.captures.push(CaptureEntry {
+                capture: None,
+                interface: InterfaceKey(0),
+                counters: CaptureCounters::default(),
+            });
+            key
+        }
+
+        /// The `(reflected, skipped, dropped, stalled)` tally recorded for `ty` on `capture`'s row.
+        pub(in crate::dispatch) fn typed_counts(
+            &self,
+            capture: CaptureKey,
+            ty: MessageType,
+        ) -> (u64, u64, u64, u64) {
+            self.captures[capture.0 as usize].counters.typed(ty)
+        }
+    }
 
     // refresh_by_ifindex re-resolves only the interface(s) with the matching kernel index, reporting
     // the changed fields (`None` for an unwatched index). Resolution is unprivileged (no capture

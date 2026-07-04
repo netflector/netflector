@@ -20,19 +20,21 @@ use std::net::SocketAddr;
 use thiserror::Error;
 
 use crate::config::AddressFamily;
-use crate::dispatch::{CaptureKey, PacketDispatcher};
+use crate::dispatch::{CaptureKey, MessageType, PacketDispatcher};
 use crate::interface::InterfaceAddresses;
 use crate::reactor::Reactor;
 
-/// A reflector's verdict on a captured payload, from its protocol's classifier.
+/// A reflector's verdict on a captured payload, from its protocol's classifier. `Reflect`/`Skip` carry
+/// the message's own [`MessageType`] (the packet's *intrinsic* type, from the classifier) so the handler
+/// can tally it — see [`From`] impls like `From<MdnsKind>` in each protocol reflector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Verdict {
     /// A message for this direction — re-emit it.
-    Reflect,
+    Reflect(MessageType),
     /// A message for the *other* direction — drop it silently. Dropping the opposite direction is
     /// the loop-breaker (atop the capture's own-egress drop): a reflected query re-emitted on the
     /// egress is still a query, which the egress side's response-only reflector skips.
-    Skip,
+    Skip(MessageType),
     /// Not a recognizable protocol message on this dedicated group — drop it with a debug log.
     Junk,
 }

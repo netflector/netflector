@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use crate::config::{AddressFamily, Reflector};
-use crate::dispatch::{CaptureKey, Filter, IpSet, PacketDispatcher};
+use crate::dispatch::{CaptureKey, Filter, IpSet, MessageType, PacketDispatcher};
 use crate::interface::InterfaceAddresses;
 use crate::net::ssdp::{
     MSEARCH_MX_DEFAULT, SSDP_GROUP_V4, SSDP_GROUP_V6_LINK_LOCAL, SSDP_GROUP_V6_SITE_LOCAL,
@@ -93,12 +93,23 @@ impl ReplyRewrite for DialRewrite {
     }
 }
 
+/// SSDP's classifier kind maps to its two group message types. The unicast `200 OK` reply is a
+/// separate leg ([`MessageType::SsdpResponse`]), carried by the response reflector, not the classifier.
+impl From<SsdpKind> for MessageType {
+    fn from(kind: SsdpKind) -> Self {
+        match kind {
+            SsdpKind::Advertisement => Self::SsdpAdvertisement,
+            SsdpKind::Search => Self::SsdpSearch,
+        }
+    }
+}
+
 /// The directional gate for the advertisement leg: a `NOTIFY` is an advertisement to reflect, an
 /// `M-SEARCH` belongs to the search direction, and anything else on the group is junk.
 fn advertisement_verdict(payload: &[u8]) -> Verdict {
     match classify(payload) {
-        Some(SsdpKind::Advertisement) => Verdict::Reflect,
-        Some(SsdpKind::Search) => Verdict::Skip,
+        Some(kind @ SsdpKind::Advertisement) => Verdict::Reflect(kind.into()),
+        Some(kind @ SsdpKind::Search) => Verdict::Skip(kind.into()),
         None => Verdict::Junk,
     }
 }
@@ -107,8 +118,8 @@ fn advertisement_verdict(payload: &[u8]) -> Verdict {
 /// the advertisement direction, and anything else on the group is junk.
 fn search_verdict(payload: &[u8]) -> Verdict {
     match classify(payload) {
-        Some(SsdpKind::Search) => Verdict::Reflect,
-        Some(SsdpKind::Advertisement) => Verdict::Skip,
+        Some(kind @ SsdpKind::Search) => Verdict::Reflect(kind.into()),
+        Some(kind @ SsdpKind::Advertisement) => Verdict::Skip(kind.into()),
         None => Verdict::Junk,
     }
 }
@@ -225,6 +236,7 @@ pub(crate) fn build(
             target_ifindex,
             reflector.macs.clone(),
             "SSDP",
+            MessageType::SsdpResponse,
             SSDP_TTL,
             search_verdict,
             search_window,
@@ -278,5 +290,29 @@ mod tests {
             used_groups(AddressFamily::Ipv6),
             vec![link_local, site_local]
         );
+    }
+
+    #[test]
+    fn verdicts_gate_by_direction() {
+        let notify = b"NOTIFY * HTTP/1.1\r\n";
+        let msearch = b"M-SEARCH * HTTP/1.1\r\n";
+        assert_eq!(
+            advertisement_verdict(notify),
+            Verdict::Reflect(MessageType::SsdpAdvertisement)
+        );
+        assert_eq!(
+            advertisement_verdict(msearch),
+            Verdict::Skip(MessageType::SsdpSearch)
+        );
+        assert_eq!(advertisement_verdict(b"junk"), Verdict::Junk);
+        assert_eq!(
+            search_verdict(msearch),
+            Verdict::Reflect(MessageType::SsdpSearch)
+        );
+        assert_eq!(
+            search_verdict(notify),
+            Verdict::Skip(MessageType::SsdpAdvertisement)
+        );
+        assert_eq!(search_verdict(b"junk"), Verdict::Junk);
     }
 }
