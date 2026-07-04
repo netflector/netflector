@@ -171,4 +171,43 @@ mod tests {
         // Too large for u32 is present-but-unparseable (None), not clamped to 5 like a large-but-fits value.
         assert_eq!(parse_msearch_mx(&msearch("99999999999999")), None);
     }
+
+    // --- Real on-the-wire messages, verbatim from captures (see each provenance) ---
+
+    /// Real M-SEARCH from Chrome's Cast/DIAL discovery, searching the DIAL service type
+    /// (Cloudflare `blog.cloudflare.com/ssdp-100gbps`).
+    const MSEARCH_CHROME_DIAL: &str = "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 1\r\nST: urn:dial-multiscreen-org:service:dial:1\r\nUSER-AGENT: Google Chrome/58.0.3029.110 Windows\r\n\r\n";
+
+    /// Real `ssdp:all` M-SEARCH with mixed-case `Host`/`Man` headers (Metasploit `ssdp_amp`
+    /// scanner module).
+    const MSEARCH_SSDP_ALL: &str = "M-SEARCH * HTTP/1.1\r\nHost: 239.255.255.250:1900\r\nST: ssdp:all\r\nMan: \"ssdp:discover\"\r\nMX: 1\r\n\r\n";
+
+    /// Real NOTIFY `ssdp:alive` off a Sony A7s camera's `UPnP` service (airmtp `ssdp.py`).
+    const NOTIFY_ALIVE_SONY: &str = "NOTIFY * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nCACHE-CONTROL: max-age=1800\r\nLOCATION: http://192.168.1.209:1900/DeviceDescription.xml\r\nNT: urn:microsoft-com:service:MtpNullService:1\r\nNTS: ssdp:alive\r\nSERVER: FedoraCore/2 UPnP/1.0 MINT-X/1.8.1\r\nUSN: uuid:00000000-0001-0010-8000-98f17039c6fc::urn:microsoft-com:service:MtpNullService:1\r\n\r\n";
+
+    /// Real NOTIFY `ssdp:byebye` off a Canon EOS 6D going to sleep (airmtp `ssdp.py`).
+    const NOTIFY_BYEBYE_CANON: &str = "NOTIFY * HTTP/1.1\r\nHost: 239.255.255.250:1900\r\nNT: urn:schemas-canon-com:service:ICPO-SmartPhoneEOSSystemService:1\r\nNTS: ssdp:byebye\r\nUSN: uuid:00000000-0000-0000-0001-2C9EFCD137BE::urn:schemas-canon-com:service:ICPO-SmartPhoneEOSSystemService:1\r\n\r\n";
+
+    #[test]
+    fn classifies_real_on_the_wire_messages() {
+        assert_eq!(
+            classify(MSEARCH_CHROME_DIAL.as_bytes()),
+            Some(SsdpKind::Search)
+        );
+        assert_eq!(
+            classify(MSEARCH_SSDP_ALL.as_bytes()),
+            Some(SsdpKind::Search)
+        );
+        assert_eq!(
+            classify(NOTIFY_ALIVE_SONY.as_bytes()),
+            Some(SsdpKind::Advertisement)
+        );
+        assert_eq!(
+            classify(NOTIFY_BYEBYE_CANON.as_bytes()),
+            Some(SsdpKind::Advertisement)
+        );
+        // Both real M-SEARCHes carry a concrete MX (here at the clamp floor of 1).
+        assert_eq!(parse_msearch_mx(MSEARCH_CHROME_DIAL.as_bytes()), Some(1));
+        assert_eq!(parse_msearch_mx(MSEARCH_SSDP_ALL.as_bytes()), Some(1));
+    }
 }

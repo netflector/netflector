@@ -179,4 +179,34 @@ mod tests {
         assert!(parse_dial_location_authority(b"NOTIFY * HTTP/1.1\r\nLOCATION:\r\n\r\n").is_none());
         assert!(dial_location_value(b"NOTIFY * HTTP/1.1\r\nLOCATION:   \r\n\r\n").is_none());
     }
+
+    // --- Real on-the-wire DIAL messages, verbatim from captures (see each provenance) ---
+
+    /// Real DIAL M-SEARCH `200 OK` from a Vizio E420i-A0 TV (Neohapsis Labs capture).
+    const DIAL_RESP_VIZIO: &str = "HTTP/1.1 200 OK\r\nLOCATION: http://192.168.1.222:44047/dd.xml\r\nCACHE-CONTROL: max-age=1800\r\nEXT:\r\nBOOTID.UPNP.ORG: 1\r\nSERVER: Linux/2.6 UPnP/1.0 quick_ssdp/1.0\r\nST: urn:dial-multiscreen-org:service:dial:1\r\nUSN: uuid:bcb36992-2281-12e4-8000-006b9e40ad7d::urn:dial-multiscreen-org:service:dial:1\r\n\r\n";
+
+    /// Real DIAL M-SEARCH `200 OK` from a Roku (`MiniUPnPd`) -- CACHE-CONTROL before LOCATION
+    /// (williamboles.com SSDP writeup).
+    const DIAL_RESP_ROKU: &str = "HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=3600\r\nST: urn:dial-multiscreen-org:service:dial:1\r\nUSN: uuid:0175c106-5400-10f8-802d-b0a7374360b7::urn:dial-multiscreen-org:service:dial:1\r\nEXT:\r\nSERVER: Roku UPnP/1.0 MiniUPnPd/1.4\r\nLOCATION: http://192.168.1.104:8060/dial/dd.xml\r\n\r\n";
+
+    /// Real DIAL NOTIFY `ssdp:alive` from a Roku -- the advertisement path (same writeup).
+    const DIAL_NOTIFY_ROKU: &str = "NOTIFY * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nCACHE-CONTROL: max-age=3600\r\nNT: urn:dial-multiscreen-org:service:dial:1\r\nNTS: ssdp:alive\r\nLOCATION: http://192.168.1.104:8060/dial/dd.xml\r\nUSN: uuid:0175c106-5400-10f8-802d-b0a7374360b7::urn:dial-multiscreen-org:service:dial:1\r\n\r\n";
+
+    #[test]
+    fn parses_real_on_the_wire_dial_messages() {
+        for (msg, host, max_age) in [
+            (DIAL_RESP_VIZIO, "192.168.1.222:44047", 1800u32),
+            (DIAL_RESP_ROKU, "192.168.1.104:8060", 3600),
+            (DIAL_NOTIFY_ROKU, "192.168.1.104:8060", 3600),
+        ] {
+            assert!(
+                is_dial_service_message(msg.as_bytes()),
+                "not detected as DIAL: {msg}"
+            );
+            let a =
+                parse_dial_location_authority(msg.as_bytes()).expect("a rewritable http LOCATION");
+            assert_eq!(a.endpoint, host.parse().unwrap());
+            assert_eq!(parse_cache_control_max_age(msg.as_bytes()), Some(max_age));
+        }
+    }
 }
