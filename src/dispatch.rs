@@ -23,6 +23,7 @@ mod dial_context;
 mod interface_table;
 mod multicast;
 
+pub(crate) use self::counters::{MessageType, Outcome};
 pub(crate) use self::dial_context::DialContext;
 
 use std::io;
@@ -174,7 +175,7 @@ pub(crate) trait PacketHandler {
         packet: &Packet,
         dispatcher: &mut PacketDispatcher,
         reactor: &mut Reactor,
-    );
+    ) -> Outcome;
 
     /// The earliest instant this handler wants [`on_deadline`](Self::on_deadline) called, or `None`
     /// (the default) if it keeps no timer. The dispatcher reports the soonest of these to the reactor,
@@ -491,6 +492,7 @@ impl PacketDispatcher {
                 .iter()
                 .map(|(key, _)| RegistrationKey(key)),
         );
+        let mut final_outcome: Option<Outcome> = None;
         for i in 0..self.route_keys.len() {
             let key = self.route_keys[i];
             let applies = self
@@ -511,10 +513,37 @@ impl PacketDispatcher {
                 .handler
                 .take()
                 .expect("a matching registration has its handler present");
-            handler.on_packet(packet, self, reactor);
+            let outcome = handler.on_packet(packet, self, reactor);
             if let Some(reg) = self.registrations.get_mut(key.0) {
                 reg.handler = Some(handler);
             }
+            // Fold this handler's outcome into the packet's running result (highest disposition wins),
+            // logging the "can't happen under a valid config" anomalies the fold surfaces.
+            final_outcome = Some(match final_outcome {
+                None => outcome,
+                Some(prev) => {
+                    let (merged, anomalies) = prev.combine(outcome);
+                    if anomalies.double_reflect {
+                        log::error!(
+                            "two handlers reflected one packet on {ingress:?} ({prev:?} + {outcome:?}) \
+                             — a duplicate-direction config the conflict check should have caught"
+                        );
+                    }
+                    if anomalies.type_mismatch {
+                        log::error!(
+                            "handlers disagree on a packet's message type on {ingress:?} \
+                             ({prev:?} vs {outcome:?})"
+                        );
+                    }
+                    merged
+                }
+            });
+        }
+        // One packet, one tally: record the folded outcome on the ingress capture's row. The row
+        // always exists — `route` is reached only via the drain, whose take-out guard admits only a
+        // real, in-range ingress key.
+        if let Some(outcome) = final_outcome {
+            self.table.record(ingress, outcome);
         }
     }
 
@@ -846,9 +875,9 @@ mod tests {
             packet: &Packet,
             dispatcher: &mut PacketDispatcher,
             _reactor: &mut Reactor,
-        ) {
+        ) -> Outcome {
             let (SocketAddr::V4(src), SocketAddr::V4(dst)) = (packet.source, packet.dest) else {
-                return;
+                return Outcome::Filtered;
             };
             let dst = SocketAddr::V4(SocketAddrV4::new(*dst.ip(), ECHO_DST_PORT));
             // Re-emit through the real link-aware send so the framing matches the egress link type
@@ -865,6 +894,7 @@ mod tests {
                 )
                 .is_ok();
             self.seen.borrow_mut().push((packet.payload.to_vec(), sent));
+            Outcome::Reflected(MessageType::MdnsQuery)
         }
     }
 
@@ -927,8 +957,14 @@ mod tests {
     }
 
     impl PacketHandler for Recorder {
-        fn on_packet(&mut self, packet: &Packet, _: &mut PacketDispatcher, _: &mut Reactor) {
+        fn on_packet(
+            &mut self,
+            packet: &Packet,
+            _: &mut PacketDispatcher,
+            _: &mut Reactor,
+        ) -> Outcome {
             self.seen.borrow_mut().push(packet.payload.to_vec());
+            Outcome::Reflected(MessageType::MdnsQuery)
         }
     }
 
@@ -948,7 +984,7 @@ mod tests {
     fn unregister_stops_routing_to_a_handler() -> io::Result<()> {
         let mut dispatcher = PacketDispatcher::new();
         let mut reactor = Reactor::new()?;
-        let ingress = CaptureKey::from_u64(0);
+        let ingress = dispatcher.add_test_capture();
         let seen = Rc::new(RefCell::new(Vec::new()));
         let key = dispatcher.register(
             ingress,
@@ -969,6 +1005,75 @@ mod tests {
         Ok(())
     }
 
+    /// A reflector that returns a preset [`Outcome`] — drives `route`'s outcome fold and per-capture
+    /// recording without a real egress.
+    struct Outcomer(Outcome);
+
+    impl PacketHandler for Outcomer {
+        fn on_packet(&mut self, _: &Packet, _: &mut PacketDispatcher, _: &mut Reactor) -> Outcome {
+            self.0
+        }
+    }
+
+    impl PacketDispatcher {
+        /// Add a capture-less table entry so a routing test can mint a valid `CaptureKey` and
+        /// exercise `route`'s record path without opening a real capture; read the row back with
+        /// [`tally`](Self::tally).
+        fn add_test_capture(&mut self) -> CaptureKey {
+            self.table.add_test_capture()
+        }
+
+        /// The `(reflected, skipped, dropped, stalled)` tally recorded for `ty` on `key`'s row.
+        fn tally(&self, key: CaptureKey, ty: MessageType) -> (u64, u64, u64, u64) {
+            self.table.typed_counts(key, ty)
+        }
+    }
+
+    // route folds every matched handler's outcome into one and records it once on the ingress row:
+    // a reflect and its mirror skip (both matching) tally a single reflect, and a handler whose filter
+    // misses doesn't contribute at all.
+    #[test]
+    fn route_folds_matched_outcomes_and_records_once() -> io::Result<()> {
+        let mut dispatcher = PacketDispatcher::new();
+        let mut reactor = Reactor::new()?;
+        let ingress = dispatcher.add_test_capture();
+
+        // Mirrored a->b / b->a reflectors both match here: one reflects the query, its mirror skips it.
+        dispatcher.register(
+            ingress,
+            Filter::default(),
+            Box::new(Outcomer(Outcome::Reflected(MessageType::MdnsQuery))),
+        );
+        dispatcher.register(
+            ingress,
+            Filter::default(),
+            Box::new(Outcomer(Outcome::Skipped(MessageType::MdnsQuery))),
+        );
+        // A third handler whose filter never matches (wrong dst port) must not reach the tally.
+        dispatcher.register(
+            ingress,
+            Filter {
+                dst_port: Some(4242.into()),
+                ..Filter::default()
+            },
+            Box::new(Outcomer(Outcome::Reflected(MessageType::SsdpSearch))),
+        );
+
+        dispatcher.route(ingress, &probe_packet(b"q"), &mut reactor);
+
+        // The reflect wins the fold and is counted once; the skip is shadowed, not a second tally.
+        assert_eq!(
+            dispatcher.tally(ingress, MessageType::MdnsQuery),
+            (1, 0, 0, 0)
+        );
+        // The unmatched handler contributed nothing.
+        assert_eq!(
+            dispatcher.tally(ingress, MessageType::SsdpSearch),
+            (0, 0, 0, 0)
+        );
+        Ok(())
+    }
+
     /// A reflector carrying only a timer: reports `deadline` and counts each `on_deadline` sweep —
     /// for the dispatcher's deadline aggregation/dispatch, with no packets involved.
     struct Ticker {
@@ -977,7 +1082,9 @@ mod tests {
     }
 
     impl PacketHandler for Ticker {
-        fn on_packet(&mut self, _: &Packet, _: &mut PacketDispatcher, _: &mut Reactor) {}
+        fn on_packet(&mut self, _: &Packet, _: &mut PacketDispatcher, _: &mut Reactor) -> Outcome {
+            Outcome::Filtered
+        }
         fn next_deadline(&self) -> Option<Instant> {
             self.deadline
         }
@@ -1029,7 +1136,12 @@ mod tests {
     }
 
     impl PacketHandler for Registrar {
-        fn on_packet(&mut self, _: &Packet, dispatcher: &mut PacketDispatcher, _: &mut Reactor) {
+        fn on_packet(
+            &mut self,
+            _: &Packet,
+            dispatcher: &mut PacketDispatcher,
+            _: &mut Reactor,
+        ) -> Outcome {
             if !std::mem::replace(&mut self.done, true) {
                 dispatcher.register(
                     self.ingress,
@@ -1039,6 +1151,7 @@ mod tests {
                     }),
                 );
             }
+            Outcome::Filtered
         }
     }
 
@@ -1049,7 +1162,7 @@ mod tests {
     fn a_mid_route_registration_is_not_fed_the_in_flight_frame() -> io::Result<()> {
         let mut dispatcher = PacketDispatcher::new();
         let mut reactor = Reactor::new()?;
-        let ingress = CaptureKey::from_u64(0);
+        let ingress = dispatcher.add_test_capture();
         let late = Rc::new(RefCell::new(Vec::new()));
         dispatcher.register(
             ingress,
@@ -1088,9 +1201,10 @@ mod tests {
             _packet: &Packet,
             dispatcher: &mut PacketDispatcher,
             reactor: &mut Reactor,
-        ) {
+        ) -> Outcome {
             *self.calls.borrow_mut() += 1;
             dispatcher.drain_and_route(self.ingress, reactor);
+            Outcome::Filtered
         }
     }
 
@@ -1232,12 +1346,13 @@ mod tests {
             _packet: &Packet,
             dispatcher: &mut PacketDispatcher,
             _reactor: &mut Reactor,
-        ) {
+        ) -> Outcome {
             let addrs = dispatcher
                 .egress_addrs(self.ingress)
                 .and_then(InterfaceAddresses::v4);
             let sent_ok = dispatcher.send(self.ingress, b"x").is_ok();
             *self.result.borrow_mut() = Some((addrs, sent_ok));
+            Outcome::Filtered
         }
     }
 

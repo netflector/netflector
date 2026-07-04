@@ -8,17 +8,28 @@
 use std::net::SocketAddr;
 
 use crate::config::{AddressFamily, Reflector};
-use crate::dispatch::{Filter, IpSet, PacketDispatcher};
+use crate::dispatch::{Filter, IpSet, MessageType, PacketDispatcher};
 use crate::net::mdns::{MDNS_GROUP_V4, MDNS_GROUP_V6, MDNS_PORT, MDNS_TTL, MdnsKind, classify};
 
 use super::{BuildError, InterfaceMap, SimpleReflector, Verdict, require_bidirectional_families};
 
+/// mDNS's classifier kind *is* its message type — `Query`/`Response` map straight across.
+impl From<MdnsKind> for MessageType {
+    fn from(kind: MdnsKind) -> Self {
+        match kind {
+            MdnsKind::Query => Self::MdnsQuery,
+            MdnsKind::Response => Self::MdnsResponse,
+        }
+    }
+}
+
 /// The directional gate for the source → target reflector: reflect queries, skip responses (they
-/// flow the other way), and treat a too-short / non-DNS payload on the group as junk.
+/// flow the other way), and treat a too-short / non-DNS payload on the group as junk. The verdict
+/// carries the packet's own message type (via [`From<MdnsKind>`]) for the counters.
 fn query_verdict(payload: &[u8]) -> Verdict {
     match classify(payload) {
-        Some(MdnsKind::Query) => Verdict::Reflect,
-        Some(MdnsKind::Response) => Verdict::Skip,
+        Some(kind @ MdnsKind::Query) => Verdict::Reflect(kind.into()),
+        Some(kind @ MdnsKind::Response) => Verdict::Skip(kind.into()),
         None => Verdict::Junk,
     }
 }
@@ -26,8 +37,8 @@ fn query_verdict(payload: &[u8]) -> Verdict {
 /// The directional gate for the target → source reflector: the mirror of [`query_verdict`].
 fn response_verdict(payload: &[u8]) -> Verdict {
     match classify(payload) {
-        Some(MdnsKind::Query) => Verdict::Skip,
-        Some(MdnsKind::Response) => Verdict::Reflect,
+        Some(kind @ MdnsKind::Query) => Verdict::Skip(kind.into()),
+        Some(kind @ MdnsKind::Response) => Verdict::Reflect(kind.into()),
         None => Verdict::Junk,
     }
 }
@@ -152,11 +163,23 @@ mod tests {
         let query = [0u8; 12];
         let mut response = [0u8; 12];
         response[2] = 0x80;
-        assert_eq!(query_verdict(&query), Verdict::Reflect);
-        assert_eq!(query_verdict(&response), Verdict::Skip);
+        assert_eq!(
+            query_verdict(&query),
+            Verdict::Reflect(MessageType::MdnsQuery)
+        );
+        assert_eq!(
+            query_verdict(&response),
+            Verdict::Skip(MessageType::MdnsResponse)
+        );
         assert_eq!(query_verdict(&[0u8; 4]), Verdict::Junk);
-        assert_eq!(response_verdict(&query), Verdict::Skip);
-        assert_eq!(response_verdict(&response), Verdict::Reflect);
+        assert_eq!(
+            response_verdict(&query),
+            Verdict::Skip(MessageType::MdnsQuery)
+        );
+        assert_eq!(
+            response_verdict(&response),
+            Verdict::Reflect(MessageType::MdnsResponse)
+        );
         assert_eq!(response_verdict(&[0u8; 4]), Verdict::Junk);
     }
 }

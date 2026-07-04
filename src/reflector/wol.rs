@@ -9,7 +9,9 @@
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use crate::config::{AddressFamily, Reflector};
-use crate::dispatch::{CaptureKey, Filter, PacketDispatcher, PacketHandler, PortSet};
+use crate::dispatch::{
+    CaptureKey, Filter, MessageType, Outcome, PacketDispatcher, PacketHandler, PortSet,
+};
 use crate::net::mac::MacSet;
 use crate::net::packet::Packet;
 use crate::reactor::Reactor;
@@ -44,26 +46,26 @@ impl PacketHandler for WolReflector {
         packet: &Packet,
         dispatcher: &mut PacketDispatcher,
         _reactor: &mut Reactor,
-    ) {
+    ) -> Outcome {
         if !is_magic_packet(packet.payload, self.target_macs.as_ref()) {
             log::debug!("WoL: ignoring non-magic packet from {}", packet.source);
-            return;
+            return Outcome::Filtered;
         }
         let Some(dst) = wol_destination(self.family, packet) else {
             log::debug!(
                 "WoL: {} is not a handled address family; ignoring",
                 packet.source
             );
-            return;
+            return Outcome::Filtered;
         };
-        // A family the egress can't currently source is a quiet drop (a transient address loss);
-        // that keeps send_udp_group's error meaning a genuine build/send failure.
+        // A family the egress can't currently source is a quiet, transient drop (address loss) —
+        // Stalled, not a genuine send failure.
         if !egress_sources(dispatcher, self.egress, dst) {
             log::debug!(
                 "WoL: egress has no source for {dst} yet; dropping wake from {}",
                 packet.source
             );
-            return;
+            return Outcome::Stalled(MessageType::WakeOnLan);
         }
         match dispatcher.send_udp_group(
             self.egress,
@@ -72,11 +74,17 @@ impl PacketHandler for WolReflector {
             packet.ttl,
             packet.payload,
         ) {
-            Ok(()) => log::debug!("reflected WoL packet from {} to {dst}", packet.source),
-            Err(e) => log::warn!(
-                "WoL: cannot reflect packet from {} to {dst}: {e}",
-                packet.source
-            ),
+            Ok(()) => {
+                log::debug!("reflected WoL packet from {} to {dst}", packet.source);
+                Outcome::Reflected(MessageType::WakeOnLan)
+            }
+            Err(e) => {
+                log::warn!(
+                    "WoL: cannot reflect packet from {} to {dst}: {e}",
+                    packet.source
+                );
+                Outcome::Dropped(MessageType::WakeOnLan)
+            }
         }
     }
 }

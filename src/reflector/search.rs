@@ -13,7 +13,9 @@
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
-use crate::dispatch::{CaptureKey, Filter, PacketDispatcher, PacketHandler, RegistrationKey};
+use crate::dispatch::{
+    CaptureKey, Filter, MessageType, Outcome, PacketDispatcher, PacketHandler, RegistrationKey,
+};
 use crate::interface::{InterfaceAddresses, Ipv6Scope};
 use crate::net::mac::{MacAddr, MacSet};
 use crate::net::packet::Packet;
@@ -48,6 +50,8 @@ struct ResponseReflector {
     egress: CaptureKey,
     /// Protocol label for logs, e.g. `"SSDP"`.
     name: &'static str,
+    /// This reply leg's message type, for the counters (e.g. [`MessageType::SsdpResponse`]).
+    message_type: MessageType,
     ttl: u8,
     reply: Box<dyn ReplyRewrite>,
 }
@@ -58,10 +62,10 @@ impl PacketHandler for ResponseReflector {
         packet: &Packet,
         dispatcher: &mut PacketDispatcher,
         reactor: &mut Reactor,
-    ) {
+    ) -> Outcome {
         // The dispatcher's filter already pinned this capture to the reserved port, so every packet
         // here is a unicast reply for this searcher — nothing to classify. A family the source can't
-        // currently send is a quiet drop (transient address loss).
+        // currently send is a quiet, transient drop (address loss) — Stalled, not a failure.
         if !egress_sources(dispatcher, self.egress, self.searcher) {
             log::debug!(
                 "{}: egress has no source for searcher {} yet; dropping response from {}",
@@ -69,7 +73,7 @@ impl PacketHandler for ResponseReflector {
                 self.searcher,
                 packet.source
             );
-            return;
+            return Outcome::Stalled(self.message_type);
         }
         let payload = self
             .reply
@@ -82,17 +86,23 @@ impl PacketHandler for ResponseReflector {
             self.ttl,
             payload,
         ) {
-            Ok(()) => log::debug!(
-                "reflected {} response from {} to searcher {}",
-                self.name,
-                packet.source,
-                self.searcher
-            ),
-            Err(e) => log::warn!(
-                "{}: cannot reflect response to searcher {}: {e}",
-                self.name,
-                self.searcher
-            ),
+            Ok(()) => {
+                log::debug!(
+                    "reflected {} response from {} to searcher {}",
+                    self.name,
+                    packet.source,
+                    self.searcher
+                );
+                Outcome::Reflected(self.message_type)
+            }
+            Err(e) => {
+                log::warn!(
+                    "{}: cannot reflect response to searcher {}: {e}",
+                    self.name,
+                    self.searcher
+                );
+                Outcome::Dropped(self.message_type)
+            }
         }
     }
 }
@@ -118,6 +128,8 @@ pub(crate) struct SearchReflector {
     device_macs: Option<MacSet>,
     /// Protocol label for logs, e.g. `"SSDP"`.
     name: &'static str,
+    /// The reply leg's message type, handed to each session's [`ResponseReflector`] for the counters.
+    response_type: MessageType,
     /// The TTL each reflected search and reply is re-emitted at.
     ttl: u8,
     /// The ingress gate: is this payload a search for this direction?
@@ -137,6 +149,7 @@ impl SearchReflector {
         target_ifindex: u32,
         device_macs: Option<MacSet>,
         name: &'static str,
+        response_type: MessageType,
         ttl: u8,
         classify: fn(&[u8]) -> Verdict,
         window: fn(&[u8]) -> Duration,
@@ -148,6 +161,7 @@ impl SearchReflector {
             target_ifindex,
             device_macs,
             name,
+            response_type,
             ttl,
             classify,
             window,
@@ -158,21 +172,24 @@ impl SearchReflector {
 
     /// Open a session for a new searcher: reserve an ephemeral port on the target's own address of the
     /// search's family and register the reply capture there — before the caller reflects, so a fast
-    /// responder can't beat the capture. `None` (logged) if the cap is hit, the frame carries no
-    /// source MAC to reply to, the target has no address of that family, or the reservation fails.
+    /// responder can't beat the capture. `message_type` is the search's own type, carried on the
+    /// failure outcomes. `Err` (logged): the target has no source address of the search's family yet —
+    /// [`Outcome::Stalled`] (transient / best-effort v6) — or a real inability to open the session
+    /// (session cap, no source MAC to reply to, reservation failure) — [`Outcome::Dropped`].
     fn make_session(
         &self,
         packet: &Packet,
         dispatcher: &mut PacketDispatcher,
         expiry: Instant,
-    ) -> Option<Session> {
+        message_type: MessageType,
+    ) -> Result<Session, Outcome> {
         if self.sessions.len() >= MAX_SESSIONS {
             log::warn!(
                 "{}: dropping search from {}: {MAX_SESSIONS} sessions in flight (cap)",
                 self.name,
                 packet.source
             );
-            return None;
+            return Err(Outcome::Dropped(message_type));
         }
         let Some(searcher_mac) = packet.src_mac else {
             log::warn!(
@@ -180,7 +197,7 @@ impl SearchReflector {
                 self.name,
                 packet.source
             );
-            return None;
+            return Err(Outcome::Dropped(message_type));
         };
         // The replies come to the address the reflected search is sourced from, at the reserved port —
         // so this must be the same scope-matched pick `build_udp` makes for `packet.dest`, or the
@@ -197,12 +214,12 @@ impl SearchReflector {
         };
         let Some(our_addr) = our_addr else {
             log::warn!(
-                "{}: cannot reflect search from {}: target has no source address for {}",
+                "{}: cannot reflect search from {}: target has no source address for {} yet",
                 self.name,
                 packet.source,
                 packet.dest.ip()
             );
-            return None;
+            return Err(Outcome::Stalled(message_type));
         };
         let reservation = match PortReservation::create(our_addr, self.target_ifindex) {
             Ok(reservation) => reservation,
@@ -212,7 +229,7 @@ impl SearchReflector {
                     self.name,
                     packet.source
                 );
-                return None;
+                return Err(Outcome::Dropped(message_type));
             }
         };
         // Register before the reflect so a fast responder's reply is captured, not ICMP-rejected.
@@ -229,11 +246,12 @@ impl SearchReflector {
                 searcher_mac,
                 egress: self.source,
                 name: self.name,
+                message_type: self.response_type,
                 ttl: self.ttl,
                 reply: (self.make_reply)(),
             }),
         );
-        Some(Session {
+        Ok(Session {
             searcher: packet.source,
             expiry,
             reservation,
@@ -248,11 +266,11 @@ impl PacketHandler for SearchReflector {
         packet: &Packet,
         dispatcher: &mut PacketDispatcher,
         _reactor: &mut Reactor,
-    ) {
-        match (self.classify)(packet.payload) {
-            Verdict::Reflect => {}
+    ) -> Outcome {
+        let message_type = match (self.classify)(packet.payload) {
+            Verdict::Reflect(message_type) => message_type,
             // A message for the other direction (an announcement) flows through that reflector.
-            Verdict::Skip => return,
+            Verdict::Skip(message_type) => return Outcome::Skipped(message_type),
             Verdict::Junk => {
                 log::debug!(
                     "{}: dropping unrecognized payload ({} B) on the search path from {}",
@@ -260,9 +278,9 @@ impl PacketHandler for SearchReflector {
                     packet.payload.len(),
                     packet.source
                 );
-                return;
+                return Outcome::Filtered;
             }
-        }
+        };
         let expiry = Instant::now() + (self.window)(packet.payload);
 
         // A retransmit from a known searcher reuses its session: refresh the window and re-reflect from
@@ -273,7 +291,7 @@ impl PacketHandler for SearchReflector {
             .find(|s| s.searcher == packet.source)
         {
             let port = session.reservation.port();
-            match dispatcher.send_udp_group(
+            return match dispatcher.send_udp_group(
                 self.target,
                 packet.dest,
                 port,
@@ -288,19 +306,23 @@ impl PacketHandler for SearchReflector {
                         packet.source,
                         packet.dest
                     );
+                    Outcome::Reflected(message_type)
                 }
-                Err(e) => log::warn!(
-                    "{}: cannot reflect search from {} to {}: {e}",
-                    self.name,
-                    packet.source,
-                    packet.dest
-                ),
-            }
-            return;
+                Err(e) => {
+                    log::warn!(
+                        "{}: cannot reflect search from {} to {}: {e}",
+                        self.name,
+                        packet.source,
+                        packet.dest
+                    );
+                    Outcome::Dropped(message_type)
+                }
+            };
         }
 
-        let Some(session) = self.make_session(packet, dispatcher, expiry) else {
-            return; // make_session logged the cause
+        let session = match self.make_session(packet, dispatcher, expiry, message_type) {
+            Ok(session) => session,
+            Err(outcome) => return outcome, // make_session logged the cause
         };
         let port = session.reservation.port();
         match dispatcher.send_udp_group(self.target, packet.dest, port, self.ttl, packet.payload) {
@@ -313,6 +335,7 @@ impl PacketHandler for SearchReflector {
                     packet.dest,
                     self.sessions.len()
                 );
+                Outcome::Reflected(message_type)
             }
             Err(e) => {
                 // Roll back the response capture just registered; the reservation drops with `session`.
@@ -323,6 +346,7 @@ impl PacketHandler for SearchReflector {
                     packet.dest
                 );
                 dispatcher.unregister(session.response_key);
+                Outcome::Dropped(message_type)
             }
         }
     }
@@ -366,7 +390,7 @@ mod tests {
     /// A trivial ingress gate: every payload is a search. The session bookkeeping under test is
     /// independent of how a protocol classifies.
     fn always_reflect(_: &[u8]) -> Verdict {
-        Verdict::Reflect
+        Verdict::Reflect(MessageType::SsdpSearch)
     }
 
     /// A fixed session window, standing in for a protocol's window policy.
@@ -381,6 +405,7 @@ mod tests {
             0,
             None,
             "TEST",
+            MessageType::SsdpResponse,
             TEST_TTL,
             always_reflect,
             fixed_window,
@@ -409,6 +434,7 @@ mod tests {
                 searcher_mac: MacAddr::from([0; 6]),
                 egress: source,
                 name: "TEST",
+                message_type: MessageType::SsdpResponse,
                 ttl: TEST_TTL,
                 reply: Box::new(NoRewrite),
             }),

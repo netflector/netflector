@@ -11,11 +11,6 @@
 //! The interface dimension is the ingress [`CaptureKey`](super::CaptureKey), which the dispatcher
 //! supplies; a [`CaptureCounters`] row per interface holds the tallies.
 
-// Nothing here is used until the module is wired into the dispatcher's `route()` (the next build step),
-// so the whole module reads as dead in a non-test build. Allow it module-wide meanwhile rather than
-// scattering per-item attributes; remove this once `combine`/`record` are called from `route()`.
-#![allow(dead_code)]
-
 use std::fmt;
 
 /// Declare [`MessageType`] from a single `Variant => (protocol, direction)` list, deriving its report
@@ -198,8 +193,9 @@ mod tests {
     use super::*;
 
     impl CaptureCounters {
-        /// The four typed tallies for `ty` (test oracle for [`record`](Self::record)).
-        fn typed(&self, ty: MessageType) -> (u64, u64, u64, u64) {
+        /// The four typed tallies (`reflected, skipped, dropped, stalled`) for `ty` — the test reader
+        /// for recorded outcomes, here and in the dispatcher's route-fold test.
+        pub(crate) fn typed(&self, ty: MessageType) -> (u64, u64, u64, u64) {
             let c = self.types[ty as usize];
             (c.reflected, c.skipped, c.dropped, c.stalled)
         }
