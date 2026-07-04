@@ -17,6 +17,7 @@
 //! [`drain_and_route`]: PacketDispatcher::drain_and_route
 //! [`send`]: PacketDispatcher::send
 
+mod counters;
 mod datagram;
 mod dial_context;
 mod interface_table;
