@@ -1,0 +1,337 @@
+//! Observability counters: what the reflector did with each packet, tallied per message type and
+//! interface.
+//!
+//! A single packet can match several handlers — e.g. mirrored `a→b` and `b→a` reflectors both put a
+//! handler on the same interface, one that reflects it and one that skips it. Each handler returns an
+//! [`Outcome`]; the dispatcher folds them with [`Outcome::combine`] into the single highest-precedence
+//! disposition and records that once, so one packet is counted once (the reflecting handler wins; the
+//! other's skip is shadowed). The fold also surfaces "can't happen under a valid config" [`Anomalies`]
+//! for the dispatcher to log.
+//!
+//! The interface dimension is the ingress [`CaptureKey`](super::CaptureKey), which the dispatcher
+//! supplies; a [`CaptureCounters`] row per interface holds the tallies.
+
+// Nothing here is used until the module is wired into the dispatcher's `route()` (the next build step),
+// so the whole module reads as dead in a non-test build. Allow it module-wide meanwhile rather than
+// scattering per-item attributes; remove this once `combine`/`record` are called from `route()`.
+#![allow(dead_code)]
+
+use std::fmt;
+
+/// Declare [`MessageType`] from a single `Variant => (protocol, direction)` list, deriving its report
+/// labels, the `ALL` roster, and [`MESSAGE_TYPE_COUNT`] from that one list. Because the count and the
+/// counter-row order both come from the variant list, reordering variants is harmless and adding or
+/// removing one can't leave the count (the counter-array width) stale.
+macro_rules! message_types {
+    ($($variant:ident => ($protocol:literal, $direction:literal)),+ $(,)?) => {
+        /// A protocol and direction — the flat set of reflector legs the counters key on, one variant
+        /// per direction of each protocol. Handlers report the packet's *intrinsic* type (what it is),
+        /// not the leg they serve, so every handler that sees one packet agrees on it (a disagreement
+        /// is a bug — see [`Anomalies::type_mismatch`]).
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub(crate) enum MessageType {
+            $($variant),+
+        }
+
+        impl MessageType {
+            /// Every variant, in declaration (counter-row) order — the source of truth for the count.
+            const ALL: &'static [MessageType] = &[$(Self::$variant),+];
+
+            /// The protocol and direction words for the report, e.g. `("mDNS", "query")`. A type with
+            /// no direction pair (Wake-on-LAN) leaves the second word empty.
+            fn labels(self) -> (&'static str, &'static str) {
+                match self {
+                    $(Self::$variant => ($protocol, $direction)),+
+                }
+            }
+        }
+
+        /// The number of [`MessageType`] variants — the width of a per-interface counter row. Derived
+        /// from the variant list, so it can never drift from the enum.
+        pub(crate) const MESSAGE_TYPE_COUNT: usize = MessageType::ALL.len();
+    };
+}
+
+message_types! {
+    MdnsQuery => ("mDNS", "query"),
+    MdnsResponse => ("mDNS", "response"),
+    SsdpAdvertisement => ("SSDP", "advertisement"),
+    SsdpSearch => ("SSDP", "search"),
+    SsdpResponse => ("SSDP", "response"),
+    WsdAnnouncement => ("WSD", "announcement"),
+    WsdSearch => ("WSD", "search"),
+    WsdResponse => ("WSD", "response"),
+    WakeOnLan => ("WoL", ""),
+}
+
+impl fmt::Display for MessageType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.labels() {
+            (protocol, "") => f.write_str(protocol),
+            (protocol, direction) => write!(f, "{protocol} {direction}"),
+        }
+    }
+}
+
+/// Fold precedence for [`Outcome`], ordered worst-to-best so the higher variant wins when several
+/// handlers see one packet (the derived `Ord` follows declaration order). `Reflected` dominates (the
+/// packet crossed); a reflect that failed (`Dropped`/`Stalled`) outranks a `Skipped` (a correct
+/// non-forward); `Filtered` (junk) is last. Fieldless, so precedence is a property of the disposition
+/// alone — `MessageType` needn't be `Ord`.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum Disposition {
+    Filtered,
+    Skipped,
+    Stalled,
+    Dropped,
+    Reflected,
+}
+
+/// Invariants an [`Outcome::combine`] fold can violate — never expected under a valid config, so the
+/// dispatcher logs them rather than silently miscounting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Anomalies {
+    /// Two handlers both tried to reflect one packet — duplicate same-direction reflectors, which the
+    /// config's conflict check should have rejected.
+    pub(crate) double_reflect: bool,
+    /// Two handlers classified one packet to different message types — a classifier or config bug.
+    pub(crate) type_mismatch: bool,
+}
+
+/// What a handler did with a packet — its `on_packet` return, folded by the dispatcher. The carried
+/// [`MessageType`] is the packet's intrinsic type (present on every disposition but junk).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Outcome {
+    /// Re-emitted on the egress interface.
+    Reflected(MessageType),
+    /// Recognized, but the wrong direction for this leg — the loop-breaker; not ours to forward.
+    Skipped(MessageType),
+    /// The right direction, but the re-emit failed (a send error or a resource cap).
+    Dropped(MessageType),
+    /// The right direction, but the egress has no source address of the family yet (transient).
+    Stalled(MessageType),
+    /// Not a message we handle — unrecognized junk on the group, or an unhandled address family.
+    Filtered,
+}
+
+impl Outcome {
+    /// This outcome's fold-precedence key (see [`Disposition`]).
+    fn disposition(self) -> Disposition {
+        match self {
+            Self::Reflected(_) => Disposition::Reflected,
+            Self::Dropped(_) => Disposition::Dropped,
+            Self::Stalled(_) => Disposition::Stalled,
+            Self::Skipped(_) => Disposition::Skipped,
+            Self::Filtered => Disposition::Filtered,
+        }
+    }
+
+    /// The packet's message type, or `None` for `Filtered` — junk has no direction to attribute.
+    fn message_type(self) -> Option<MessageType> {
+        match self {
+            Self::Reflected(t) | Self::Skipped(t) | Self::Dropped(t) | Self::Stalled(t) => Some(t),
+            Self::Filtered => None,
+        }
+    }
+
+    /// Whether the handler *tried* to reflect (a right-direction disposition, whether it succeeded,
+    /// failed, or stalled). At most one handler may per packet; a second is a duplicate-reflector bug.
+    fn is_reflect_attempt(self) -> bool {
+        matches!(
+            self,
+            Self::Reflected(_) | Self::Dropped(_) | Self::Stalled(_)
+        )
+    }
+
+    /// Fold another handler's outcome for the *same* packet into this running one: keep the
+    /// higher-precedence disposition, and report any invariant [`Anomalies`]. Order-independent (a max
+    /// over [`disposition`](Self::disposition)), so handler visitation order doesn't change the result.
+    pub(crate) fn combine(self, other: Outcome) -> (Outcome, Anomalies) {
+        let anomalies = Anomalies {
+            double_reflect: self.is_reflect_attempt() && other.is_reflect_attempt(),
+            type_mismatch: matches!(
+                (self.message_type(), other.message_type()),
+                (Some(a), Some(b)) if a != b
+            ),
+        };
+        let merged = if other.disposition() > self.disposition() {
+            other
+        } else {
+            self
+        };
+        (merged, anomalies)
+    }
+}
+
+/// The four typed tallies for one message type on one interface.
+#[derive(Clone, Copy, Default)]
+struct TypeCounters {
+    reflected: u64,
+    skipped: u64,
+    dropped: u64,
+    stalled: u64,
+}
+
+/// Every tally for one interface (capture): one [`TypeCounters`] per [`MessageType`], plus a
+/// type-less `filtered` count for junk (which has no direction to attribute to a message type).
+#[derive(Clone, Default)]
+pub(crate) struct CaptureCounters {
+    types: [TypeCounters; MESSAGE_TYPE_COUNT],
+    filtered: u64,
+}
+
+impl CaptureCounters {
+    /// Tally one packet's folded [`Outcome`].
+    pub(crate) fn record(&mut self, outcome: Outcome) {
+        match outcome {
+            Outcome::Reflected(t) => self.types[t as usize].reflected += 1,
+            Outcome::Skipped(t) => self.types[t as usize].skipped += 1,
+            Outcome::Dropped(t) => self.types[t as usize].dropped += 1,
+            Outcome::Stalled(t) => self.types[t as usize].stalled += 1,
+            Outcome::Filtered => self.filtered += 1,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    impl CaptureCounters {
+        /// The four typed tallies for `ty` (test oracle for [`record`](Self::record)).
+        fn typed(&self, ty: MessageType) -> (u64, u64, u64, u64) {
+            let c = self.types[ty as usize];
+            (c.reflected, c.skipped, c.dropped, c.stalled)
+        }
+        fn filtered(&self) -> u64 {
+            self.filtered
+        }
+    }
+
+    #[test]
+    fn message_type_display_omits_the_empty_direction() {
+        assert_eq!(MessageType::MdnsQuery.to_string(), "mDNS query");
+        assert_eq!(
+            MessageType::SsdpAdvertisement.to_string(),
+            "SSDP advertisement"
+        );
+        assert_eq!(MessageType::WakeOnLan.to_string(), "WoL");
+    }
+
+    #[test]
+    fn message_types_are_labelled_and_contiguously_indexed() {
+        // `record` indexes the counter array by `ty as usize`, so each variant's discriminant must
+        // equal its position in `ALL`, and every label must be non-empty.
+        for (index, &ty) in MessageType::ALL.iter().enumerate() {
+            assert!(!ty.to_string().is_empty(), "{ty:?} has an empty label");
+            assert_eq!(
+                ty as usize, index,
+                "discriminants must be contiguous from 0"
+            );
+        }
+    }
+
+    #[test]
+    fn disposition_orders_worst_to_best() {
+        use Disposition::*;
+        assert!(
+            Reflected > Dropped && Dropped > Stalled && Stalled > Skipped && Skipped > Filtered
+        );
+    }
+
+    #[test]
+    fn record_bumps_the_matching_bucket() {
+        let mut c = CaptureCounters::default();
+        c.record(Outcome::Reflected(MessageType::MdnsQuery));
+        c.record(Outcome::Reflected(MessageType::MdnsQuery));
+        c.record(Outcome::Skipped(MessageType::MdnsQuery));
+        c.record(Outcome::Dropped(MessageType::SsdpSearch));
+        c.record(Outcome::Stalled(MessageType::SsdpSearch));
+        c.record(Outcome::Filtered);
+        assert_eq!(c.typed(MessageType::MdnsQuery), (2, 1, 0, 0));
+        assert_eq!(c.typed(MessageType::SsdpSearch), (0, 0, 1, 1));
+        assert_eq!(c.typed(MessageType::WakeOnLan), (0, 0, 0, 0));
+        assert_eq!(c.filtered(), 1);
+    }
+
+    #[test]
+    fn combine_takes_the_higher_precedence_disposition() {
+        use MessageType::MdnsQuery as Q;
+        // Reflected dominates a skip; a failed reflect (dropped/stalled) still outranks a skip; junk
+        // is last.
+        assert_eq!(
+            Outcome::Reflected(Q).combine(Outcome::Skipped(Q)).0,
+            Outcome::Reflected(Q)
+        );
+        assert_eq!(
+            Outcome::Dropped(Q).combine(Outcome::Skipped(Q)).0,
+            Outcome::Dropped(Q)
+        );
+        assert_eq!(
+            Outcome::Stalled(Q).combine(Outcome::Skipped(Q)).0,
+            Outcome::Stalled(Q)
+        );
+        assert_eq!(
+            Outcome::Skipped(Q).combine(Outcome::Filtered).0,
+            Outcome::Skipped(Q)
+        );
+    }
+
+    #[test]
+    fn combine_is_order_independent() {
+        use MessageType::MdnsResponse as R;
+        let a = Outcome::Skipped(R);
+        let b = Outcome::Reflected(R);
+        assert_eq!(a.combine(b).0, b.combine(a).0);
+    }
+
+    #[test]
+    fn combine_flags_a_second_reflect_attempt() {
+        use MessageType::MdnsQuery as Q;
+        // The valid mirrored case (one reflect, one skip) is clean.
+        assert!(
+            !Outcome::Reflected(Q)
+                .combine(Outcome::Skipped(Q))
+                .1
+                .double_reflect
+        );
+        // Two reflect-attempts of any kind on one packet is the duplicate-reflector bug.
+        assert!(
+            Outcome::Reflected(Q)
+                .combine(Outcome::Reflected(Q))
+                .1
+                .double_reflect
+        );
+        assert!(
+            Outcome::Reflected(Q)
+                .combine(Outcome::Dropped(Q))
+                .1
+                .double_reflect
+        );
+    }
+
+    #[test]
+    fn combine_flags_a_type_mismatch() {
+        use MessageType::{MdnsQuery as Q, MdnsResponse as R};
+        // Handlers seeing one packet must agree on its type; a mismatch is a classifier/config bug.
+        assert!(
+            Outcome::Reflected(Q)
+                .combine(Outcome::Skipped(R))
+                .1
+                .type_mismatch
+        );
+        assert!(
+            !Outcome::Reflected(Q)
+                .combine(Outcome::Skipped(Q))
+                .1
+                .type_mismatch
+        );
+        // Junk carries no type, so it never triggers a mismatch.
+        assert!(
+            !Outcome::Filtered
+                .combine(Outcome::Skipped(Q))
+                .1
+                .type_mismatch
+        );
+    }
+}
