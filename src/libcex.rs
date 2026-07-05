@@ -15,6 +15,8 @@ mod bpf_device;
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 mod in6_ifreq;
 mod multicast;
+#[cfg(target_os = "linux")]
+mod netlink;
 
 pub(crate) use self::bpf::BpfInsn;
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
@@ -26,3 +28,8 @@ pub(crate) use self::in6_ifreq::{IN6_IFF_UNUSABLE, In6Ifreq, siocgifaflag_in6};
 #[cfg(all(test, any(target_os = "macos", target_os = "freebsd")))]
 pub(crate) use self::bpf_device::BPF_ALIGN;
 pub(crate) use self::multicast::{GroupReq, MCAST_JOIN_GROUP};
+#[cfg(target_os = "linux")]
+pub(crate) use self::netlink::{
+    IfAddrMsg, NETLINK_ROUTE, NLM_F_DUMP, NLM_F_REQUEST, NLMSG_DONE, NLMSG_ERROR, NlMsgHdr, RtAttr,
+    SockAddrNl, nl_align,
+};

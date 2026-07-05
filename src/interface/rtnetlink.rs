@@ -11,37 +11,14 @@ use std::ptr;
 use libc::c_int;
 
 use super::{InterfaceAddresses, V6Pick, v6_rank};
+use crate::libcex::{
+    IfAddrMsg, NETLINK_ROUTE, NLM_F_DUMP, NLM_F_REQUEST, NLMSG_DONE, NLMSG_ERROR, NlMsgHdr, RtAttr,
+    nl_align,
+};
 use crate::net::mac::MacAddr;
 
-const NETLINK_ROUTE: c_int = 0;
-const NLM_F_REQUEST: u16 = 0x01;
-const NLM_F_DUMP: u16 = 0x0300; // NLM_F_ROOT | NLM_F_MATCH
-const NLMSG_DONE: u16 = 0x03;
-const NLMSG_ERROR: u16 = 0x02;
 /// `IFA_F_*` bits that disqualify a v6 address as a source.
 const IFA_F_UNUSABLE: u32 = 0x40 | 0x20 | 0x08; // TENTATIVE | DEPRECATED | DADFAILED
-
-/// `struct nlmsghdr`. Shared with the address monitor (`len`/`msg_type` drive its walk).
-#[repr(C)]
-pub(super) struct NlMsgHdr {
-    pub(super) len: u32,
-    pub(super) msg_type: u16,
-    flags: u16,
-    seq: u32,
-    pid: u32,
-}
-
-/// `struct ifaddrmsg` — the body of an `RTM_*ADDR` message. A zeroed value (family
-/// `AF_UNSPEC`) is the dump request body. The address monitor reads `index` from it.
-#[repr(C)]
-#[derive(Default)]
-pub(super) struct IfAddrMsg {
-    family: u8,
-    prefixlen: u8,
-    flags: u8,
-    scope: u8,
-    pub(super) index: u32,
-}
 
 /// `struct ifinfomsg` — the body of an `RTM_*LINK` message. A zeroed value is the dump
 /// request body. The address monitor reads `index` from it.
@@ -54,13 +31,6 @@ pub(super) struct IfInfoMsg {
     pub(super) index: i32,
     flags: u32,
     change: u32,
-}
-
-/// `struct rtattr` — a type-length-value attribute header within a message.
-#[repr(C)]
-struct RtAttr {
-    len: u16,
-    attr_type: u16,
 }
 
 /// Iterator over the `rtattr` TLVs of a message: yields `(attr_type, value)` per attribute,
@@ -88,11 +58,6 @@ impl<'a> Iterator for RtAttrs<'a> {
         self.at += nl_align(rta_len);
         Some((rta.attr_type, data))
     }
-}
-
-/// `(n + 3) & !3` — netlink's 4-byte alignment for message and attribute lengths.
-pub(super) const fn nl_align(n: usize) -> usize {
-    (n + 3) & !3
 }
 
 /// Read a `repr(C)` POD `T` at `off` in `buf`, or `None` if `buf` is too short (or `off`
