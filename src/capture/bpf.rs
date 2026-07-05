@@ -16,44 +16,10 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use libc::{c_uint, c_ulong, c_void};
 
-use super::filter::{BpfInsn, DLT_NULL_UDP_FILTER, ETHERNET_UDP_FILTER};
+use super::filter::{DLT_NULL_UDP_FILTER, ETHERNET_UDP_FILTER};
+use crate::libcex::{BpfInsn, BpfProgram, DLT_EN10MB, DLT_NULL, bpf_wordalign};
 use crate::net::LinkType;
 use crate::sys::IoStatus;
-
-// DLT_EN10MB (Ethernet, 1) and DLT_NULL (0) are stable BPF link types,
-// but libc exposes them only on apple — define them locally, anchored to libc's
-// values where available.
-const DLT_EN10MB: c_uint = 1;
-const DLT_NULL: c_uint = 0;
-#[cfg(target_os = "macos")]
-const _: () = assert!(DLT_EN10MB == libc::DLT_EN10MB);
-#[cfg(target_os = "macos")]
-const _: () = assert!(DLT_NULL == libc::DLT_NULL);
-
-/// `struct bpf_program` — the filter handed to `BIOCSETF`. libc provides this
-/// (and `bpf_insn`) on FreeBSD but not apple, so define it for both; the asserts
-/// anchor the layout to libc where it exists. The per-frame header is read as
-/// `libc::bpf_hdr` (apple + FreeBSD both have it, with the right per-OS timestamp).
-#[repr(C)]
-struct BpfProgram {
-    bf_len: c_uint,
-    bf_insns: *mut BpfInsn,
-}
-#[cfg(target_os = "freebsd")]
-const _: () = assert!(size_of::<BpfProgram>() == size_of::<libc::bpf_program>());
-#[cfg(target_os = "freebsd")]
-const _: () = assert!(size_of::<BpfInsn>() == size_of::<libc::bpf_insn>());
-
-// `BPF_ALIGNMENT` as a usize. libc types it differently per platform (`c_int` on
-// apple, `usize` on FreeBSD), so normalize it once here.
-#[cfg(target_os = "macos")]
-const BPF_ALIGN: usize = libc::BPF_ALIGNMENT as usize;
-#[cfg(target_os = "freebsd")]
-const BPF_ALIGN: usize = libc::BPF_ALIGNMENT;
-
-const fn bpf_wordalign(x: usize) -> usize {
-    (x + (BPF_ALIGN - 1)) & !(BPF_ALIGN - 1)
-}
 
 /// A raw-capture handle on one interface.
 pub(crate) struct Capture {
@@ -335,6 +301,7 @@ mod tests {
 
     use super::*;
     use crate::capture::open_or_skip;
+    use crate::libcex::BPF_ALIGN;
 
     /// Append one synthetic BPF record (header + frame + word-align padding) to
     /// `batch`. Serializes the header field-by-field at its repr(C) offsets rather
@@ -351,16 +318,6 @@ mod tests {
         while !batch.len().is_multiple_of(BPF_ALIGN) {
             batch.push(0);
         }
-    }
-
-    #[test]
-    fn wordalign_rounds_up_to_alignment() {
-        // BPF_ALIGN is per-OS (4 on macOS, sizeof(long)=8 on FreeBSD/64-bit), so assert the round-up
-        // invariant against the real boundary rather than a hardcoded width.
-        assert_eq!(bpf_wordalign(0), 0);
-        assert_eq!(bpf_wordalign(1), BPF_ALIGN);
-        assert_eq!(bpf_wordalign(BPF_ALIGN), BPF_ALIGN);
-        assert_eq!(bpf_wordalign(BPF_ALIGN + 1), 2 * BPF_ALIGN);
     }
 
     #[test]

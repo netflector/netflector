@@ -14,7 +14,8 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
 use libc::{c_int, c_void};
 
-use super::filter::{BpfInsn, DROP_OUTGOING_PROLOGUE, ETHERNET_UDP_FILTER};
+use super::filter::{DROP_OUTGOING_PROLOGUE, ETHERNET_UDP_FILTER};
+use crate::libcex::BpfInsn;
 use crate::net::LinkType;
 use crate::sys::{IoStatus, socklen_of};
 
