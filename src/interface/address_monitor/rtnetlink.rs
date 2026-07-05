@@ -5,11 +5,10 @@
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
 
-use libc::{c_int, socklen_t};
+use libc::socklen_t;
 
-use super::super::rtnetlink::{IfAddrMsg, IfInfoMsg, NlMsgHdr, nl_align, read_at};
-
-const NETLINK_ROUTE: c_int = 0;
+use super::super::rtnetlink::{IfInfoMsg, read_at};
+use crate::libcex::{IfAddrMsg, NETLINK_ROUTE, NlMsgHdr, SockAddrNl, nl_align};
 
 /// Holds one notification — multicast delivers one message per datagram, never a coalesced
 /// dump. Sized for the largest: an `RTM_NEWLINK` carries the interface's whole attribute set
@@ -20,16 +19,6 @@ pub(super) const READ_BUF: usize = 8192;
 /// as `RTM_NEWLINK`, not an address event, so `RTMGRP_LINK` is needed to catch it.
 const SUBSCRIBED_GROUPS: u32 =
     (libc::RTMGRP_IPV4_IFADDR | libc::RTMGRP_IPV6_IFADDR | libc::RTMGRP_LINK) as u32;
-
-/// `struct sockaddr_nl` — hand-rolled (`libc` exposes it for Android only).
-#[repr(C)]
-#[derive(Default)]
-struct SockAddrNl {
-    family: u16,
-    pad: u16,
-    pid: u32,
-    groups: u32,
-}
 
 /// Open a `NETLINK_ROUTE` socket bound to the change groups, non-blocking + close-on-exec.
 pub(super) fn open() -> io::Result<OwnedFd> {
