@@ -171,6 +171,14 @@ impl InterfaceTable {
         self.captures[capture.0 as usize].counters.record(outcome);
     }
 
+    /// Each capture's `(interface name, counter row)` for the periodic report — the table owns the
+    /// capture→interface-name mapping, and stays log-free (the dispatcher does the logging).
+    pub(super) fn counter_rows(&self) -> impl Iterator<Item = (&str, &CaptureCounters)> {
+        self.captures
+            .iter()
+            .filter_map(move |entry| Some((self.interface_name(entry.interface)?, &entry.counters)))
+    }
+
     /// Re-resolve the interface with kernel index `ifindex`, in place. A real index matches at
     /// most one interface — they dedup by name, and the kernel gives each a distinct index —
     /// so this finds rather than scans. Returns the fields that changed if one matched, or `None`

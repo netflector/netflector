@@ -71,6 +71,14 @@ pub fn run(args: &[String]) -> Result<()> {
             .map_err(|e| Error::reflector(reflector.name.as_str(), e))?;
     }
 
+    if let Some(interval) = config.counter_interval {
+        log::info!(
+            "packet counters enabled; reporting every {}s",
+            interval.as_secs()
+        );
+        dispatcher.enable_counter_report(interval, std::time::Instant::now());
+    }
+
     let mut reactor = Reactor::new()?;
     let watches = dispatcher.capture_watches();
     reactor.register_with_fds(Box::new(dispatcher), &watches)?;
