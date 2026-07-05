@@ -12,11 +12,15 @@
 mod bpf;
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 mod bpf_device;
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+mod in6_ifreq;
 mod multicast;
 
 pub(crate) use self::bpf::BpfInsn;
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub(crate) use self::bpf_device::{BpfProgram, DLT_EN10MB, DLT_NULL, bpf_wordalign};
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+pub(crate) use self::in6_ifreq::{IN6_IFF_UNUSABLE, In6Ifreq, siocgifaflag_in6};
 // `BPF_ALIGN` is used outside `bpf_device` only by the BPF capture's test helpers (production rounds
 // via `bpf_wordalign`), so re-export it only for tests.
 #[cfg(all(test, any(target_os = "macos", target_os = "freebsd")))]
