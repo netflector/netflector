@@ -37,7 +37,7 @@ use crate::interface::{AddressMonitor, InterfaceAddresses};
 use crate::net::LinkType;
 use crate::net::mac::{MacAddr, MacSet};
 use crate::net::packet::Packet;
-use crate::reactor::{Arena, Handler, Key, Reactor, ReadyEvent};
+use crate::reactor::{Arena, ControlEvent, Handler, Key, Reactor, ReadyEvent};
 
 use self::counters::log_counters;
 use self::datagram::{build_udp, ethernet_dst};
@@ -704,6 +704,14 @@ impl Handler for PacketDispatcher {
         {
             log_counters(self.table.counter_rows());
             report.next = now + report.interval;
+        }
+    }
+
+    /// A SIGUSR1 diagnostics dump: log the per-interface counter summary on demand. Independent of the
+    /// periodic report's interval (the counters accrue regardless), so it works even when unconfigured.
+    fn on_control(&mut self, event: ControlEvent, _reactor: &mut Reactor) {
+        match event {
+            ControlEvent::Dump => log_counters(self.table.counter_rows()),
         }
     }
 }

@@ -77,6 +77,11 @@ pub(crate) trait Handler {
     /// a real clock.
     fn on_deadline(&mut self, _now: Instant, _reactor: &mut Reactor) {}
 
+    /// The run loop is broadcasting a [`ControlEvent`] to every handler — an out-of-band request
+    /// (currently a SIGUSR1 diagnostics dump), distinct from fd readiness and timers. Defaulted to a
+    /// no-op; a handler with state worth dumping overrides it.
+    fn on_control(&mut self, _event: ControlEvent, _reactor: &mut Reactor) {}
+
     /// Called once, right after [`register`](Reactor::register) inserts this handler, handing it its
     /// own [`HandlerKey`]. A handler that later watches fds it opens — or unregisters itself — records
     /// the key here. Defaulted to a no-op: most handlers act only through the `event` they are handed.
@@ -99,6 +104,14 @@ pub(crate) struct ReadyEvent {
     pub(crate) fd: RawFd,
     /// The opaque value the handler passed to [`watch`](Reactor::watch).
     pub(crate) user_data: u64,
+}
+
+/// An out-of-band control request the run loop broadcasts to every handler, separate from fd
+/// readiness and timer deadlines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ControlEvent {
+    /// Dump diagnostics: each handler logs whatever operational state it holds. Raised by SIGUSR1.
+    Dump,
 }
 
 /// A registered handler plus the keys of the fd-registrations that dispatch to it (so
@@ -125,12 +138,15 @@ struct Registration {
 pub(crate) struct Reactor {
     handlers: Arena<HandlerEntry>,
     registrations: Arena<Registration>,
-    /// Reused across deadline sweeps: the due handlers' keys, snapshotted so a handler firing
-    /// mid-sweep can touch the reactor without the buffer aliasing `&mut self`. Kept allocated so a
-    /// sweep doesn't allocate.
-    deadline_keys: Vec<Key>,
+    /// Reused across dispatch sweeps — deadline firing and control broadcasts — for the swept handlers'
+    /// keys, snapshotted so a handler firing mid-sweep can touch the reactor without the buffer aliasing
+    /// `&mut self`. Kept allocated so a sweep doesn't allocate.
+    dispatch_keys: Vec<Key>,
     poll: Poller,
     shutdown: bool,
+    /// Set by [`request_dump`](Self::request_dump) (the signal pipe, on SIGUSR1); the run loop
+    /// broadcasts a [`ControlEvent::Dump`] and clears it.
+    dump_pending: bool,
 }
 
 impl Reactor {
@@ -142,9 +158,10 @@ impl Reactor {
         Ok(Self {
             handlers: Arena::new(),
             registrations: Arena::new(),
-            deadline_keys: Vec::new(),
+            dispatch_keys: Vec::new(),
             poll: Poller::new(EVENT_CAPACITY)?,
             shutdown: false,
+            dump_pending: false,
         })
     }
 
@@ -362,15 +379,16 @@ impl Reactor {
     /// # Errors
     /// Returns an error if the shutdown handler cannot be installed or a wait fails.
     pub(crate) fn run(&mut self) -> io::Result<()> {
-        let (shutdown, pipe) = signal::ShutdownPipe::install()?;
+        let (guard, pipe) = signal::SignalGuard::install()?;
         let fd = pipe.read_fd();
         // The signal pipe is read-only with no per-fd token, so `user_data` is unused (0).
         let handler_key = self.register_with_fds(Box::new(pipe), &[(fd, 0)])?;
         self.shutdown = false;
+        self.dump_pending = false;
         let result = self.run_loop();
         // Restore the signal handlers and unpublish the write fd *before* closing
         // the read end, so a late signal can't write to a reader-less pipe.
-        drop(shutdown);
+        drop(guard);
         self.unregister(handler_key).ok();
         result
     }
@@ -383,6 +401,11 @@ impl Reactor {
             let deadline = self.next_deadline();
             let timeout = deadline.map(|d| d.saturating_duration_since(Instant::now()));
             self.poll_once(timeout)?;
+            // A signal handler may have set this via the signal pipe just dispatched; broadcast it now.
+            if self.dump_pending {
+                self.dump_pending = false;
+                self.dispatch_control(ControlEvent::Dump);
+            }
             // Sweep only if a deadline has actually come due — an fd wakeup before it leaves
             // `now < deadline`, so no scan.
             let now = Instant::now();
@@ -410,8 +433,8 @@ impl Reactor {
         // buffer borrow before the `&mut self` call; a handler that removes itself (or another due
         // handler) mid-sweep leaves a stale key, and the `get_mut` miss makes take and restore no-ops.
         // Deadline sweeps never nest, so one shared buffer suffices.
-        self.deadline_keys.clear();
-        self.deadline_keys.extend(
+        self.dispatch_keys.clear();
+        self.dispatch_keys.extend(
             self.handlers
                 .iter()
                 .filter(|(_, entry)| {
@@ -423,8 +446,8 @@ impl Reactor {
                 })
                 .map(|(key, _)| key),
         );
-        for i in 0..self.deadline_keys.len() {
-            let key = self.deadline_keys[i];
+        for i in 0..self.dispatch_keys.len() {
+            let key = self.dispatch_keys[i];
             // Gone if an earlier sweep in this pass removed it (its key went stale) — benign.
             let Some(mut handler) = self
                 .handlers
@@ -441,11 +464,45 @@ impl Reactor {
         }
     }
 
+    /// Broadcast `event` to every handler, taking each out for its call (as [`dispatch_deadlines`] and
+    /// [`dispatch`] do) so it can touch the reactor. Unconditional — a control request isn't tied to
+    /// any one handler. Shares the [`dispatch_keys`](Self::dispatch_keys) snapshot buffer with the
+    /// deadline sweep; the two never nest (the run loop runs them in sequence), so one buffer suffices.
+    ///
+    /// [`dispatch_deadlines`]: Self::dispatch_deadlines
+    /// [`dispatch`]: Self::dispatch
+    fn dispatch_control(&mut self, event: ControlEvent) {
+        self.dispatch_keys.clear();
+        self.dispatch_keys
+            .extend(self.handlers.iter().map(|(key, _)| key));
+        for i in 0..self.dispatch_keys.len() {
+            let key = self.dispatch_keys[i];
+            // Gone if an earlier handler in this pass removed it (its key went stale) — benign.
+            let Some(mut handler) = self
+                .handlers
+                .get_mut(key)
+                .and_then(|entry| entry.handler.take())
+            else {
+                continue;
+            };
+            handler.on_control(event, self);
+            if let Some(entry) = self.handlers.get_mut(key) {
+                entry.handler = Some(handler);
+            }
+        }
+    }
+
     /// Ask the run loop to stop once the current dispatch returns. Handlers call
     /// this (the self-pipe handler does, on a shutdown signal); calling it outside
     /// a run loop just arms the next one to exit immediately.
     pub(crate) fn request_shutdown(&mut self) {
         self.shutdown = true;
+    }
+
+    /// Ask the run loop to broadcast a [`ControlEvent::Dump`] to every handler once the current
+    /// dispatch returns. The signal pipe calls this on SIGUSR1.
+    pub(crate) fn request_dump(&mut self) {
+        self.dump_pending = true;
     }
 
     /// Deliver `readiness` to the fd that `reg_key` addresses — the seam
@@ -835,6 +892,52 @@ mod tests {
         (&peer).write_all(b"x").unwrap();
         reactor.run_loop().unwrap();
         assert!(reactor.shutdown);
+    }
+
+    /// Counts [`Handler::on_control`] broadcasts, for the SIGUSR1 dump fan-out tests.
+    struct ControlCounter(Rc<Cell<u32>>);
+
+    impl Handler for ControlCounter {
+        fn on_readable(&mut self, _event: ReadyEvent, _reactor: &mut Reactor) {}
+        fn on_control(&mut self, _event: ControlEvent, _reactor: &mut Reactor) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    #[test]
+    fn dispatch_control_reaches_every_handler() {
+        let mut reactor = Reactor::new().unwrap();
+        let count = Rc::new(Cell::new(0u32));
+        reactor.register(Box::new(ControlCounter(count.clone())));
+        reactor.register(Box::new(ControlCounter(count.clone())));
+        reactor.dispatch_control(ControlEvent::Dump);
+        assert_eq!(
+            count.get(),
+            2,
+            "every registered handler gets the control event"
+        );
+    }
+
+    #[test]
+    fn run_loop_broadcasts_a_pending_dump() {
+        let mut reactor = Reactor::new().unwrap();
+        let (a, peer) = pair();
+        let raw = a.as_raw_fd();
+        // On its read the trigger requests a dump and a shutdown, so the loop broadcasts once and exits.
+        let trigger = TestHandler::read(a, |_event, reactor| {
+            reactor.request_dump();
+            reactor.request_shutdown();
+        });
+        watch1(&mut reactor, trigger, raw);
+        let dumps = Rc::new(Cell::new(0u32));
+        reactor.register(Box::new(ControlCounter(dumps.clone())));
+        (&peer).write_all(b"x").unwrap();
+        reactor.run_loop().unwrap();
+        assert_eq!(
+            dumps.get(),
+            1,
+            "the pending dump broadcasts once before the loop stops"
+        );
     }
 
     #[test]

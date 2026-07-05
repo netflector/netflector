@@ -102,7 +102,9 @@ Releases publish that multi-arch manifest to GHCR automatically (see [Release](#
 Configuration comes from a TOML file, from environment variables, or from both. With a path argument
 the file is read and merged with any `REFLECTOR_*` environment variables; with **no argument** the
 configuration comes entirely from the environment (see [Environment variables](#environment-variables)).
-The process logs to stderr with UTC timestamps and shuts down cleanly on `SIGINT` / `SIGTERM`.
+The process logs to stderr with UTC timestamps, shuts down cleanly on `SIGINT` / `SIGTERM`, and on
+`SIGUSR1` dumps the per-interface [packet counters](#configuration) to the log on demand (regardless of
+`counters_interval_secs`).
 
 ### Runtime privileges
 
