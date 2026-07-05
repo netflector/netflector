@@ -7,7 +7,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 
 use libc::socklen_t;
 
-use super::super::rtnetlink::{IfInfoMsg, read_at};
+use super::super::rtnetlink::read_at;
 use crate::libcex::{IfAddrMsg, NETLINK_ROUTE, NlMsgHdr, SockAddrNl, nl_align};
 
 /// Holds one notification — multicast delivers one message per datagram, never a coalesced
@@ -77,8 +77,8 @@ pub(super) fn for_each_change(buf: &[u8], on_change: &mut impl FnMut(u32)) {
             }
             libc::RTM_NEWLINK | libc::RTM_DELLINK => {
                 // `ifi_index` is i32 but always a positive kernel index.
-                if let Some(body) = read_at::<IfInfoMsg>(&buf[..end], body_at)
-                    && let Ok(index) = u32::try_from(body.index)
+                if let Some(body) = read_at::<libc::ifinfomsg>(&buf[..end], body_at)
+                    && let Ok(index) = u32::try_from(body.ifi_index)
                 {
                     report(index, on_change);
                 }
@@ -126,7 +126,7 @@ mod tests {
 
     /// An `ifinfomsg` body carrying `ifi_index` (an `i32` at body offset 4).
     fn ifinfomsg(index: i32) -> Vec<u8> {
-        let mut b = vec![0u8; size_of::<IfInfoMsg>()];
+        let mut b = vec![0u8; size_of::<libc::ifinfomsg>()];
         b[4..8].copy_from_slice(&index.to_ne_bytes());
         b
     }

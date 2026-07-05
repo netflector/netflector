@@ -18,20 +18,7 @@ use crate::libcex::{
 use crate::net::mac::MacAddr;
 
 /// `IFA_F_*` bits that disqualify a v6 address as a source.
-const IFA_F_UNUSABLE: u32 = 0x40 | 0x20 | 0x08; // TENTATIVE | DEPRECATED | DADFAILED
-
-/// `struct ifinfomsg` — the body of an `RTM_*LINK` message. A zeroed value is the dump
-/// request body. The address monitor reads `index` from it.
-#[repr(C)]
-#[derive(Default)]
-pub(super) struct IfInfoMsg {
-    family: u8,
-    pad: u8,
-    dev_type: u16,
-    pub(super) index: i32,
-    flags: u32,
-    change: u32,
-}
+const IFA_F_UNUSABLE: u32 = libc::IFA_F_TENTATIVE | libc::IFA_F_DEPRECATED | libc::IFA_F_DADFAILED;
 
 /// Iterator over the `rtattr` TLVs of a message: yields `(attr_type, value)` per attribute,
 /// stopping at the first malformed length (as the kernel's own walk does).
@@ -97,11 +84,13 @@ pub(super) fn resolve(if_name: &str, ifindex: u32) -> io::Result<InterfaceAddres
             scan_addr(msg, if_name, ifindex, &mut addrs, &mut v6_pick);
         },
     )?;
+    // SAFETY: a zeroed `ifinfomsg` (an all-integer POD) is a valid `AF_UNSPEC` link-dump request body.
+    let link_req: libc::ifinfomsg = unsafe { std::mem::zeroed() };
     dump(
         &sock,
         libc::RTM_GETLINK,
         libc::RTM_NEWLINK,
-        IfInfoMsg::default(),
+        link_req,
         |msg| {
             scan_link(msg, if_name, ifindex, &mut addrs);
         },
@@ -278,14 +267,14 @@ fn scan_addr(
 /// record it as the MAC. `msg` spans one netlink message.
 fn scan_link(msg: &[u8], if_name: &str, ifindex: u32, addrs: &mut InterfaceAddresses) {
     let body_at = nl_align(size_of::<NlMsgHdr>());
-    let Some(body) = read_at::<IfInfoMsg>(msg, body_at) else {
+    let Some(body) = read_at::<libc::ifinfomsg>(msg, body_at) else {
         return;
     };
-    if u32::try_from(body.index).ok() != Some(ifindex) {
+    if u32::try_from(body.ifi_index).ok() != Some(ifindex) {
         return;
     }
 
-    for (attr_type, data) in rtattrs(msg, body_at + nl_align(size_of::<IfInfoMsg>())) {
+    for (attr_type, data) in rtattrs(msg, body_at + nl_align(size_of::<libc::ifinfomsg>())) {
         if attr_type == libc::IFLA_ADDRESS
             && let Ok(mac) = <[u8; 6]>::try_from(data)
         {
