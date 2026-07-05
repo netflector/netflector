@@ -165,8 +165,8 @@ impl TryFrom<(String, RawReflector)> for Reflector {
 pub(crate) struct Config {
     /// Minimum severity to log.
     pub(crate) log_level: LogLevel,
-    /// Whether to periodically log memory-footprint diagnostics.
-    pub(crate) debug_memory: bool,
+    /// How often to log memory-footprint diagnostics, or `None` to disable them.
+    pub(crate) debug_memory_interval: Option<Duration>,
     /// How often to log per-interface packet counters, or `None` to disable them.
     pub(crate) counter_interval: Option<Duration>,
     pub(crate) reflectors: Vec<Reflector>,
@@ -220,8 +220,11 @@ impl TryFrom<RawConfig> for Config {
 
         Ok(Config {
             log_level: raw.log_level.unwrap_or_default(),
-            debug_memory: raw.debug_memory.unwrap_or_default(),
-            // 0 or absent disables the summary; any positive count is its period.
+            // 0 or absent disables each report; any positive count is its period.
+            debug_memory_interval: raw
+                .debug_memory_interval_secs
+                .filter(|&s| s > 0)
+                .map(Duration::from_secs),
             counter_interval: raw
                 .counters_interval_secs
                 .filter(|&s| s > 0)
@@ -357,7 +360,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.log_level, LogLevel::Info);
-        assert!(!cfg.debug_memory);
+        assert!(cfg.debug_memory_interval.is_none());
         assert_eq!(cfg.reflectors.len(), 1);
         let r = &cfg.reflectors[0];
         assert_eq!(r.name.as_str(), "discovery");
@@ -394,7 +397,7 @@ mod tests {
         let cfg = from_toml(
             r#"
             log_level = "DEBUG"
-            debug_memory = true
+            debug_memory_interval_secs = 30
 
             [reflectors.tv]
             source_if = "en0"
@@ -410,7 +413,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.log_level, LogLevel::Debug);
-        assert!(cfg.debug_memory);
+        assert_eq!(cfg.debug_memory_interval, Some(Duration::from_secs(30)));
         assert_eq!(cfg.reflectors.len(), 1);
         let r = &cfg.reflectors[0];
         assert_eq!(r.name.as_str(), "tv");
@@ -457,6 +460,50 @@ mod tests {
             None
         );
         assert_eq!(from_toml(&toml("")).unwrap().counter_interval, None);
+    }
+
+    #[test]
+    fn debug_memory_interval_parses_and_zero_disables() {
+        // A positive interval becomes a Duration; 0 disables it, as does omitting the key.
+        let toml = |secs: &str| {
+            format!(
+                r#"
+                {secs}
+                [reflectors.d]
+                source_if = "a"
+                target_if = "b"
+                mdns = true
+                "#
+            )
+        };
+        assert_eq!(
+            from_toml(&toml("debug_memory_interval_secs = 30"))
+                .unwrap()
+                .debug_memory_interval,
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            from_toml(&toml("debug_memory_interval_secs = 0"))
+                .unwrap()
+                .debug_memory_interval,
+            None
+        );
+        assert_eq!(from_toml(&toml("")).unwrap().debug_memory_interval, None);
+    }
+
+    #[test]
+    fn old_debug_memory_bool_is_rejected() {
+        // The 0.10.x `debug_memory = true` no longer parses (renamed to an interval, and the config
+        // denies unknown fields) — the deliberate breaking change fails loud at startup rather than
+        // silently ignoring a stale setting.
+        let text = r#"
+            debug_memory = true
+            [reflectors.d]
+            source_if = "a"
+            target_if = "b"
+            mdns = true
+            "#;
+        assert!(matches!(err(text), ConfigError::Parse(_)));
     }
 
     #[test]

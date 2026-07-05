@@ -223,12 +223,12 @@ side — enabling container mode, creating the `veth`s, and attaching each to it
 `config.toml` contains optional top-level settings plus at least one reflector entry. Entries are tables
 under `reflectors`, keyed by name (`[reflectors.<name>]`) — the name is the label used in logs — each
 describing one `source_if` → `target_if` bridge that enables any combination of the protocols. The
-top-level settings are `log_level`, `debug_memory`, and `counters_interval_secs`:
+top-level settings are `log_level`, `debug_memory_interval_secs`, and `counters_interval_secs`:
 
 ```toml
-log_level = "info"               # optional; one of debug | info | warning | error (default: info)
-debug_memory = false             # optional; periodically log RSS + heap stats for footprint debugging (default false)
-counters_interval_secs = 0       # optional; seconds between per-interface packet-counter summaries; 0 disables (default 0)
+log_level = "info"                 # optional; one of debug | info | warning | error (default: info)
+debug_memory_interval_secs = 0     # optional; seconds between memory (RSS/peak) diagnostic reports; 0 disables (default 0)
+counters_interval_secs = 0         # optional; seconds between per-interface packet-counter summaries; 0 disables (default 0)
 
 [reflectors.tv]
 source_if = "en0"                # required; interface to listen on (must differ from target_if)
@@ -261,8 +261,9 @@ then optional; with none, the environment is the whole configuration. Variables 
 - `<PARAM>` is `NAME` or any field from the entry table above (`SOURCE_IF`, `TARGET_IF`, `MACS`,
   `WOL`, `MDNS`, `SSDP`, `DIAL`, `WOL_PORTS`, `ADDRESS_FAMILY`), case-insensitive.
 
-The globals are `REFLECTOR_LOG_LEVEL`, `REFLECTOR_DEBUG_MEMORY`, and `REFLECTOR_COUNTERS_INTERVAL_SECS`,
-so `LOG`, `DEBUG`, and `COUNTERS` are reserved tags. Booleans are `true`/`false` or `1`/`0`; `WOL_PORTS`
+The globals are `REFLECTOR_LOG_LEVEL`, `REFLECTOR_DEBUG_MEMORY_INTERVAL_SECS`, and
+`REFLECTOR_COUNTERS_INTERVAL_SECS`, so `LOG`, `DEBUG`, and `COUNTERS` are reserved tags. Booleans are
+`true`/`false` or `1`/`0`; `WOL_PORTS`
 and `MACS` are comma-separated (`7,9` / `B0:...,C4:...`). The `[reflectors.tv]` entry above looks like
 this in the environment:
 
@@ -279,8 +280,9 @@ REFLECTOR_TV_WSD=true
 ```
 
 When a file and environment variables are both given they are merged: each contributes entries to one
-combined configuration, and each global variable (`REFLECTOR_LOG_LEVEL`, `REFLECTOR_DEBUG_MEMORY`,
-`REFLECTOR_COUNTERS_INTERVAL_SECS`) overrides its file counterpart. The
+combined configuration, and each global variable (`REFLECTOR_LOG_LEVEL`,
+`REFLECTOR_DEBUG_MEMORY_INTERVAL_SECS`, `REFLECTOR_COUNTERS_INTERVAL_SECS`) overrides its file
+counterpart. The
 [duplicate detection](#duplicate-detection) below applies across both
 sources. An unknown `<PARAM>`, a non-alphanumeric or reserved tag, and a tag with no parameter are all
 rejected at startup.

@@ -1,21 +1,14 @@
-//! Optional memory-footprint diagnostics, enabled by the `debug_memory` config flag.
+//! Optional memory-footprint diagnostics, enabled by the `debug_memory_interval_secs` config setting.
 //!
 //! [`MemoryReporter`] is a timer-only reactor handler that logs the process's resident set size every
-//! [`INTERVAL`]; [`run`](crate::run) also emits a baseline at startup and one report at shutdown. The
-//! peak RSS comes from `getrusage` (cross-platform); on Linux the current RSS is read from
+//! configured interval; [`run`](crate::run) also emits a baseline at startup and one report at
+//! shutdown. The peak RSS comes from `getrusage` (cross-platform); on Linux the current RSS is read from
 //! `/proc/self/status`. Heap-arena stats (glibc `mallinfo2`) are intentionally omitted — the static
 //! musl build has no equivalent.
 
 use std::time::{Duration, Instant};
 
 use crate::reactor::{Handler, Reactor, ReadyEvent};
-
-/// How often the periodic report fires.
-#[expect(
-    clippy::duration_suboptimal_units,
-    reason = "the report cadence is 60 seconds; Duration::from_mins is still unstable"
-)]
-pub(crate) const INTERVAL: Duration = Duration::from_secs(60);
 
 /// Peak resident set size in KiB via `getrusage` — no `/proc` needed, so it works on every target.
 /// `ru_maxrss` is reported in KiB on Linux and FreeBSD, in bytes on macOS.
@@ -59,16 +52,18 @@ pub(crate) fn log_report() {
     log::info!("memory: peak={peak} KiB");
 }
 
-/// A timer-only reactor handler (it watches no fds) that logs [`log_report`] every [`INTERVAL`].
+/// A timer-only reactor handler (it watches no fds) that logs [`log_report`] every `interval`.
 pub(crate) struct MemoryReporter {
+    interval: Duration,
     next: Instant,
 }
 
 impl MemoryReporter {
-    /// A reporter whose first periodic report fires [`INTERVAL`] after `now`.
-    pub(crate) fn new(now: Instant) -> Self {
+    /// A reporter whose first report fires `interval` after `now`, then every `interval`.
+    pub(crate) fn new(interval: Duration, now: Instant) -> Self {
         Self {
-            next: now + INTERVAL,
+            interval,
+            next: now + interval,
         }
     }
 }
@@ -83,7 +78,7 @@ impl Handler for MemoryReporter {
 
     fn on_deadline(&mut self, now: Instant, _reactor: &mut Reactor) {
         log_report();
-        self.next = now + INTERVAL;
+        self.next = now + self.interval;
     }
 }
 
@@ -105,11 +100,12 @@ mod tests {
 
     #[test]
     fn reporter_schedules_the_next_report_an_interval_out() {
+        let interval = Duration::from_secs(30);
         let now = Instant::now();
-        let mut reporter = MemoryReporter::new(now);
-        assert_eq!(reporter.next_deadline(), Some(now + INTERVAL));
-        let later = now + INTERVAL;
+        let mut reporter = MemoryReporter::new(interval, now);
+        assert_eq!(reporter.next_deadline(), Some(now + interval));
+        let later = now + interval;
         reporter.on_deadline(later, &mut Reactor::new().unwrap());
-        assert_eq!(reporter.next_deadline(), Some(later + INTERVAL));
+        assert_eq!(reporter.next_deadline(), Some(later + interval));
     }
 }
