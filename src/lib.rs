@@ -9,6 +9,7 @@ mod config;
 mod dispatch;
 mod error;
 mod interface;
+mod libcex;
 mod logging;
 mod memory_report;
 mod net;

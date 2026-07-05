@@ -9,25 +9,10 @@ use std::io;
 use std::net::IpAddr;
 use std::os::fd::{AsRawFd, OwnedFd};
 
-use libc::{c_int, c_void};
+use libc::c_void;
 
+use crate::libcex::{GroupReq, MCAST_JOIN_GROUP};
 use crate::sys::{open_socket, sockaddr_for, socklen_of};
-
-/// `MCAST_JOIN_GROUP` (RFC 3678): by-index interface selection, no IPv4 by-address fallback to the
-/// wrong NIC. libc defines it only on Linux; the BSDs share the value 80 (checked against the Darwin
-/// SDK and FreeBSD headers).
-#[cfg(target_os = "linux")]
-const MCAST_JOIN_GROUP: c_int = libc::MCAST_JOIN_GROUP;
-#[cfg(any(target_os = "macos", target_os = "freebsd"))]
-const MCAST_JOIN_GROUP: c_int = 80;
-
-/// `struct group_req` (RFC 3678) — absent from libc everywhere, so hand-rolled. `#[repr(C)]` plus
-/// `sockaddr_storage`'s alignment reproduce the C layout (4 bytes of padding after `gr_interface`).
-#[repr(C)]
-struct GroupReq {
-    gr_interface: u32,
-    gr_group: libc::sockaddr_storage,
-}
 
 /// One capture interface's multicast memberships: one unbound `SOCK_DGRAM` fd per family, opened on
 /// that family's first join, under a fixed `ifindex`. `desired` records requested groups so they can
