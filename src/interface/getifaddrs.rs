@@ -12,11 +12,8 @@ use std::ptr;
 use libc::c_int;
 
 use super::{InterfaceAddresses, V6Pick, v6_rank};
+use crate::libcex::{IN6_IFF_UNUSABLE, In6Ifreq, siocgifaflag_in6};
 use crate::net::mac::MacAddr;
-
-/// `IN6_IFF_*` bits that disqualify a v6 address as a source: DAD in progress, DAD failed
-/// (duplicate), or preferred-lifetime expired. Same values on macOS and FreeBSD.
-const IN6_IFF_UNUSABLE: c_int = 0x02 | 0x04 | 0x10; // TENTATIVE | DUPLICATED | DEPRECATED
 
 /// Resolve `if_name`'s current source addresses in one `getifaddrs` pass.
 ///
@@ -168,45 +165,6 @@ fn inet6_socket() -> Option<OwnedFd> {
     })
 }
 
-/// `in6_ifreq` for `SIOCGIFAFLAG_IN6`: an interface name plus a union holding the queried
-/// address (going in) and its flags (coming out). Hand-rolled — `libc` exposes it on
-/// macOS only, not FreeBSD.
-#[repr(C)]
-struct In6Ifreq {
-    name: [libc::c_char; libc::IFNAMSIZ],
-    ifru: In6Ifru,
-}
-
-#[repr(C)]
-union In6Ifru {
-    addr: libc::sockaddr_in6,
-    flags6: c_int,
-    // The kernel's `in6_ifreq` union is sized by its largest member, `icmp6_ifstat` — 34
-    // `u_quad_t` on both macOS and FreeBSD. This pad makes the whole struct match — load-
-    // bearing: `_IOWR` bakes `sizeof(in6_ifreq)` into the request code and the kernel
-    // dispatches on the whole code, so a too-small struct yields a request the kernel
-    // rejects, and every v6 address would be silently dropped. See the size assertions.
-    _icmp6_ifstat: [u64; 34],
-}
-
-// `libc` exposes `in6_ifreq` on macOS, so cross-check the hand-rolled size against it
-// there; FreeBSD's (16 + 34×8) is 288.
-#[cfg(target_os = "macos")]
-const _: () = assert!(size_of::<In6Ifreq>() == size_of::<libc::in6_ifreq>());
-#[cfg(target_os = "freebsd")]
-const _: () = assert!(size_of::<In6Ifreq>() == 288);
-
-/// `_IOWR('i', 73, in6_ifreq)` — the BSD `ioctl` request code, derived from the (now
-/// kernel-accurate) struct size rather than hardcoded.
-fn siocgifaflag_in6() -> libc::c_ulong {
-    const IOC_INOUT: libc::c_ulong = 0xc000_0000;
-    const IOCPARM_MASK: libc::c_ulong = 0x1fff;
-    const GROUP: libc::c_ulong = 0x69; // 'i'
-    const NUM: libc::c_ulong = 73;
-    let size = size_of::<In6Ifreq>() as libc::c_ulong;
-    IOC_INOUT | ((size & IOCPARM_MASK) << 16) | (GROUP << 8) | NUM
-}
-
 /// The `IN6_IFF_*` flags of `addr` on `if_name`, queried via `SIOCGIFAFLAG_IN6`, or `None`
 /// if the ioctl fails (the address is then treated as unusable).
 fn v6_flags(sock: &OwnedFd, if_name: &str, addr: libc::sockaddr_in6) -> Option<c_int> {
@@ -224,18 +182,4 @@ fn v6_flags(sock: &OwnedFd, if_name: &str, addr: libc::sockaddr_in6) -> Option<c
     }
     // SAFETY: a successful ioctl wrote `ifru_flags6` into the union.
     Some(unsafe { req.ifru.flags6 })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // The encoded request must equal the kernel's registered `SIOCGIFAFLAG_IN6`, or the
-    // ioctl is rejected and every v6 address is silently dropped. A too-small `In6Ifreq`
-    // (omitting the large union members) is exactly how that regresses.
-    #[test]
-    fn siocgifaflag_in6_is_the_kernel_request_code() {
-        // Identical on macOS and FreeBSD: both size `in6_ifreq` at 288 bytes.
-        assert_eq!(siocgifaflag_in6(), 0xc120_6949);
-    }
 }
