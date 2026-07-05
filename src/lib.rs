@@ -88,11 +88,13 @@ pub fn run(args: &[String]) -> Result<()> {
             interval.as_secs()
         );
         memory_report::log_report(); // a baseline before the loop starts
-        reactor.register(Box::new(memory_report::MemoryReporter::new(
-            interval,
-            std::time::Instant::now(),
-        )));
     }
+    // Always registered: it reports periodically only when an interval is configured, but dumps on a
+    // SIGUSR1 control event regardless — memory stats are always cheaply available.
+    reactor.register(Box::new(memory_report::MemoryReporter::new(
+        config.debug_memory_interval,
+        std::time::Instant::now(),
+    )));
     log::info!("running; press Ctrl-C or send SIGTERM to stop");
     reactor.run()?;
     if config.debug_memory_interval.is_some() {

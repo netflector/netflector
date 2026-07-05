@@ -1,14 +1,16 @@
-//! Optional memory-footprint diagnostics, enabled by the `debug_memory_interval_secs` config setting.
+//! Optional memory-footprint diagnostics. A periodic report is enabled by `debug_memory_interval_secs`;
+//! a report is also emitted on demand on a SIGUSR1 [`ControlEvent::Dump`], regardless of that setting.
 //!
-//! [`MemoryReporter`] is a timer-only reactor handler that logs the process's resident set size every
-//! configured interval; [`run`](crate::run) also emits a baseline at startup and one report at
-//! shutdown. The peak RSS comes from `getrusage` (cross-platform); on Linux the current RSS is read from
+//! [`MemoryReporter`] is a timer-only reactor handler (it watches no fds) that logs the process's
+//! resident set size every configured interval, and on a control-event dump; [`run`](crate::run) also
+//! emits a baseline at startup and one report at shutdown when the periodic report is on. The peak RSS
+//! comes from `getrusage` (cross-platform); on Linux the current RSS is read from
 //! `/proc/self/status`. Heap-arena stats (glibc `mallinfo2`) are intentionally omitted — the static
 //! musl build has no equivalent.
 
 use std::time::{Duration, Instant};
 
-use crate::reactor::{Handler, Reactor, ReadyEvent};
+use crate::reactor::{ControlEvent, Handler, Reactor, ReadyEvent};
 
 /// Peak resident set size in KiB via `getrusage` — no `/proc` needed, so it works on every target.
 /// `ru_maxrss` is reported in KiB on Linux and FreeBSD, in bytes on macOS.
@@ -52,18 +54,21 @@ pub(crate) fn log_report() {
     log::info!("memory: peak={peak} KiB");
 }
 
-/// A timer-only reactor handler (it watches no fds) that logs [`log_report`] every `interval`.
+/// A reactor handler (it watches no fds) that logs [`log_report`] every `interval`, and on a control
+/// dump. `interval` is `None` for a dump-only reporter: no periodic timer, but it still dumps on demand.
 pub(crate) struct MemoryReporter {
-    interval: Duration,
-    next: Instant,
+    interval: Option<Duration>,
+    /// The next periodic report instant, or `None` when there is no periodic cadence.
+    next: Option<Instant>,
 }
 
 impl MemoryReporter {
-    /// A reporter whose first report fires `interval` after `now`, then every `interval`.
-    pub(crate) fn new(interval: Duration, now: Instant) -> Self {
+    /// A reporter that logs every `interval` starting `interval` after `now` — or, when `interval` is
+    /// `None`, only on a SIGUSR1 dump.
+    pub(crate) fn new(interval: Option<Duration>, now: Instant) -> Self {
         Self {
             interval,
-            next: now + interval,
+            next: interval.map(|i| now + i),
         }
     }
 }
@@ -73,12 +78,19 @@ impl Handler for MemoryReporter {
     fn on_readable(&mut self, _event: ReadyEvent, _reactor: &mut Reactor) {}
 
     fn next_deadline(&self) -> Option<Instant> {
-        Some(self.next)
+        self.next
     }
 
     fn on_deadline(&mut self, now: Instant, _reactor: &mut Reactor) {
         log_report();
-        self.next = now + self.interval;
+        self.next = self.interval.map(|i| now + i);
+    }
+
+    /// A SIGUSR1 diagnostics dump: log a memory report on demand, alongside the dispatcher's counters.
+    fn on_control(&mut self, event: ControlEvent, _reactor: &mut Reactor) {
+        match event {
+            ControlEvent::Dump => log_report(),
+        }
     }
 }
 
@@ -102,10 +114,20 @@ mod tests {
     fn reporter_schedules_the_next_report_an_interval_out() {
         let interval = Duration::from_secs(30);
         let now = Instant::now();
-        let mut reporter = MemoryReporter::new(interval, now);
+        let mut reporter = MemoryReporter::new(Some(interval), now);
         assert_eq!(reporter.next_deadline(), Some(now + interval));
         let later = now + interval;
         reporter.on_deadline(later, &mut Reactor::new().unwrap());
         assert_eq!(reporter.next_deadline(), Some(later + interval));
+    }
+
+    #[test]
+    fn dump_only_reporter_keeps_no_deadline() {
+        // A reporter with no interval never schedules a periodic report — it only dumps on a control
+        // event — so it reports no deadline and a dump leaves it that way.
+        let mut reporter = MemoryReporter::new(None, Instant::now());
+        assert_eq!(reporter.next_deadline(), None);
+        reporter.on_control(ControlEvent::Dump, &mut Reactor::new().unwrap());
+        assert_eq!(reporter.next_deadline(), None);
     }
 }
