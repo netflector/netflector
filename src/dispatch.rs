@@ -30,7 +30,7 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::ops::Deref;
 use std::os::fd::{AsRawFd, RawFd};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::capture::Capture;
 use crate::interface::{AddressMonitor, InterfaceAddresses};
@@ -39,6 +39,7 @@ use crate::net::mac::{MacAddr, MacSet};
 use crate::net::packet::Packet;
 use crate::reactor::{Arena, Handler, Key, Reactor, ReadyEvent};
 
+use self::counters::log_counters;
 use self::datagram::{build_udp, ethernet_dst};
 use self::interface_table::InterfaceTable;
 
@@ -205,6 +206,13 @@ struct Registration {
     handler: Option<Box<dyn PacketHandler>>,
 }
 
+/// The periodic counter-summary schedule: log every capture's tallies every `interval`. Held as an
+/// `Option` on the dispatcher — `None` disables reporting, and the counters accrue regardless.
+struct CounterReport {
+    interval: Duration,
+    next: Instant,
+}
+
 /// Owns the interface table and the routing registrations. The sole owner of capture fds:
 /// egress goes through [`send`](Self::send), keyed.
 pub(crate) struct PacketDispatcher {
@@ -222,6 +230,8 @@ pub(crate) struct PacketDispatcher {
     dial: DialContext,
     /// The reused frame-build buffer shared by every reflector's send (see [`SCRATCH_LEN`]).
     scratch: Box<[u8]>,
+    /// The periodic counter-summary schedule, or `None` when the summary is disabled.
+    report: Option<CounterReport>,
 }
 
 impl PacketDispatcher {
@@ -236,7 +246,18 @@ impl PacketDispatcher {
             monitor: Self::open_monitor(),
             dial: DialContext::new(),
             scratch: vec![0u8; SCRATCH_LEN].into_boxed_slice(),
+            report: None,
         }
+    }
+
+    /// Enable the periodic counter summary: log each capture's tallies every `interval`, first firing
+    /// `interval` after `now`. Called from [`run`](crate::run) when the config sets a positive
+    /// interval; the counters accrue regardless, so this controls only whether they are reported.
+    pub(crate) fn enable_counter_report(&mut self, interval: Duration, now: Instant) {
+        self.report = Some(CounterReport {
+            interval,
+            next: now + interval,
+        });
     }
 
     /// Open the address-change monitor. Best-effort: a failure logs and yields `None` — the
@@ -640,6 +661,7 @@ impl Handler for PacketDispatcher {
             .iter()
             .filter_map(|(_, reg)| reg.handler.as_ref().and_then(|h| h.next_deadline()))
             .chain(self.dial.next_grace()) // and the soonest DIAL proxy grace, for its eviction sweep
+            .chain(self.report.as_ref().map(|r| r.next)) // and the next counter summary, if enabled
             .min()
     }
 
@@ -675,6 +697,14 @@ impl Handler for PacketDispatcher {
             }
         }
         self.dial.sweep(now, reactor); // evict DIAL proxies whose advertisement grace has lapsed
+
+        // The periodic counter summary, when enabled and due.
+        if let Some(report) = &mut self.report
+            && now >= report.next
+        {
+            log_counters(self.table.counter_rows());
+            report.next = now + report.interval;
+        }
     }
 }
 
@@ -1071,6 +1101,27 @@ mod tests {
             dispatcher.tally(ingress, MessageType::SsdpSearch),
             (0, 0, 0, 0)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn counter_report_fires_on_its_interval() -> io::Result<()> {
+        let mut dispatcher = PacketDispatcher::new();
+        let mut reactor = Reactor::new()?;
+        let now = Instant::now();
+        assert_eq!(
+            dispatcher.next_deadline(),
+            None,
+            "no deadline until enabled"
+        );
+
+        let interval = Duration::from_secs(30);
+        dispatcher.enable_counter_report(interval, now);
+        assert_eq!(dispatcher.next_deadline(), Some(now + interval));
+
+        // Firing the report at its deadline reschedules it exactly one interval out.
+        dispatcher.on_deadline(now + interval, &mut reactor);
+        assert_eq!(dispatcher.next_deadline(), Some(now + interval + interval));
         Ok(())
     }
 

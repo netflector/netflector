@@ -25,6 +25,7 @@ pub(crate) use self::error::{ConfigError, Protocol};
 pub(crate) use self::value::{AddressFamily, InterfaceName, LogLevel, ReflectorName, WolPorts};
 
 use std::str::FromStr;
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -166,6 +167,8 @@ pub(crate) struct Config {
     pub(crate) log_level: LogLevel,
     /// Whether to periodically log memory-footprint diagnostics.
     pub(crate) debug_memory: bool,
+    /// How often to log per-interface packet counters, or `None` to disable them.
+    pub(crate) counter_interval: Option<Duration>,
     pub(crate) reflectors: Vec<Reflector>,
 }
 
@@ -218,6 +221,11 @@ impl TryFrom<RawConfig> for Config {
         Ok(Config {
             log_level: raw.log_level.unwrap_or_default(),
             debug_memory: raw.debug_memory.unwrap_or_default(),
+            // 0 or absent disables the summary; any positive count is its period.
+            counter_interval: raw
+                .counters_interval_secs
+                .filter(|&s| s > 0)
+                .map(Duration::from_secs),
             reflectors,
         })
     }
@@ -420,6 +428,35 @@ mod tests {
             [7, 9, 4000]
         );
         assert_eq!(r.address_family, AddressFamily::Dual);
+    }
+
+    #[test]
+    fn counter_interval_parses_and_zero_disables() {
+        // A positive interval becomes a Duration; 0 disables it, as does omitting the key.
+        let toml = |secs: &str| {
+            format!(
+                r#"
+                {secs}
+                [reflectors.d]
+                source_if = "a"
+                target_if = "b"
+                mdns = true
+                "#
+            )
+        };
+        assert_eq!(
+            from_toml(&toml("counters_interval_secs = 30"))
+                .unwrap()
+                .counter_interval,
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            from_toml(&toml("counters_interval_secs = 0"))
+                .unwrap()
+                .counter_interval,
+            None
+        );
+        assert_eq!(from_toml(&toml("")).unwrap().counter_interval, None);
     }
 
     #[test]

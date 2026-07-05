@@ -167,6 +167,24 @@ struct TypeCounters {
     stalled: u64,
 }
 
+impl TypeCounters {
+    /// The non-zero tallies as `reflected=.. skipped=..`, or `None` when every tally is zero (so the
+    /// report omits a message type nothing has happened to).
+    fn format_nonzero(&self) -> Option<String> {
+        let parts: Vec<String> = [
+            ("reflected", self.reflected),
+            ("skipped", self.skipped),
+            ("dropped", self.dropped),
+            ("stalled", self.stalled),
+        ]
+        .into_iter()
+        .filter(|&(_, count)| count > 0)
+        .map(|(label, count)| format!("{label}={count}"))
+        .collect();
+        (!parts.is_empty()).then(|| parts.join(" "))
+    }
+}
+
 /// Every tally for one interface (capture): one [`TypeCounters`] per [`MessageType`], plus a
 /// type-less `filtered` count for junk (which has no direction to attribute to a message type).
 #[derive(Clone, Default)]
@@ -184,6 +202,36 @@ impl CaptureCounters {
             Outcome::Dropped(t) => self.types[t as usize].dropped += 1,
             Outcome::Stalled(t) => self.types[t as usize].stalled += 1,
             Outcome::Filtered => self.filtered += 1,
+        }
+    }
+
+    /// This row's non-zero tallies as one line — e.g. `mDNS query reflected=42 skipped=10; SSDP
+    /// search reflected=5 dropped=1; filtered=2` — or `None` when nothing has been counted, so an
+    /// idle interface produces no report line.
+    fn format_nonzero(&self) -> Option<String> {
+        let mut parts: Vec<String> = MessageType::ALL
+            .iter()
+            .zip(&self.types)
+            .filter_map(|(ty, counts)| {
+                counts
+                    .format_nonzero()
+                    .map(|fields| format!("{ty} {fields}"))
+            })
+            .collect();
+        if self.filtered > 0 {
+            parts.push(format!("filtered={}", self.filtered));
+        }
+        (!parts.is_empty()).then(|| parts.join("; "))
+    }
+}
+
+/// Log one `info` line per interface with any non-zero tallies (idle interfaces stay silent). The
+/// dispatcher calls this from its periodic report; the `(interface, row)` pairs come from the
+/// interface table, which owns the capture→interface-name mapping.
+pub(crate) fn log_counters<'a>(rows: impl Iterator<Item = (&'a str, &'a CaptureCounters)>) {
+    for (interface, counters) in rows {
+        if let Some(summary) = counters.format_nonzero() {
+            log::info!("counters {interface}: {summary}");
         }
     }
 }
@@ -248,6 +296,22 @@ mod tests {
         assert_eq!(c.typed(MessageType::SsdpSearch), (0, 0, 1, 1));
         assert_eq!(c.typed(MessageType::WakeOnLan), (0, 0, 0, 0));
         assert_eq!(c.filtered(), 1);
+    }
+
+    #[test]
+    fn format_nonzero_summarizes_only_touched_tallies() {
+        let mut c = CaptureCounters::default();
+        assert_eq!(c.format_nonzero(), None, "an untouched row logs no line");
+        c.record(Outcome::Reflected(MessageType::MdnsQuery));
+        c.record(Outcome::Reflected(MessageType::MdnsQuery));
+        c.record(Outcome::Skipped(MessageType::MdnsQuery));
+        c.record(Outcome::Dropped(MessageType::SsdpSearch));
+        c.record(Outcome::Filtered);
+        // Only touched types and sub-tallies appear, in declaration order, then the filtered total.
+        assert_eq!(
+            c.format_nonzero().as_deref(),
+            Some("mDNS query reflected=2 skipped=1; SSDP search dropped=1; filtered=1"),
+        );
     }
 
     #[test]

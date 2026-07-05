@@ -18,6 +18,8 @@ use crate::net::mac::MacSet;
 pub(super) struct RawConfig {
     pub(super) log_level: Option<LogLevel>,
     pub(super) debug_memory: Option<bool>,
+    /// Seconds between periodic counter summaries; `0` or absent disables them.
+    pub(super) counters_interval_secs: Option<u64>,
     #[serde(default)]
     pub(super) reflectors: BTreeMap<String, RawReflector>,
 }
@@ -57,6 +59,7 @@ impl RawConfig {
     pub(super) fn merge_env(&mut self, env: RawConfig) -> Result<(), ConfigError> {
         self.log_level = env.log_level.or(self.log_level);
         self.debug_memory = env.debug_memory.or(self.debug_memory);
+        self.counters_interval_secs = env.counters_interval_secs.or(self.counters_interval_secs);
         for (name, reflector) in env.reflectors {
             // Compare folded: an env tag is already lowercase and unpadded, but a TOML table key is
             // stored verbatim, so `[reflectors.TV]` (or `"  tv  "`) and env `REFLECTOR_TV_*` name the

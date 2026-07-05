@@ -162,6 +162,9 @@ pub(crate) enum ParseValueError {
     ReflectorName(#[from] ParseReflectorNameError),
     #[error(transparent)]
     Bool(#[from] ParseBoolError),
+    /// A whole-number setting, e.g. `COUNTERS_INTERVAL_SECS`.
+    #[error(transparent)]
+    Integer(#[from] std::num::ParseIntError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
