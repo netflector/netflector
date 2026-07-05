@@ -4,20 +4,7 @@
 //! BSD BPF device (`BIOCSETF`): [`BpfInsn`] is layout-identical to libc's
 //! `sock_filter` and `bpf_insn`, so the same array installs on either backend.
 
-/// One classic-BPF instruction (`{ u16 code; u8 jt; u8 jf; u32 k }`).
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct BpfInsn {
-    pub(crate) code: u16,
-    pub(crate) jt: u8,
-    pub(crate) jf: u8,
-    pub(crate) k: u32,
-}
-
-// On Linux the same array installs via `SO_ATTACH_FILTER` as a `sock_filter`
-// program; anchor the layout to libc where it provides the type.
-#[cfg(target_os = "linux")]
-const _: () = assert!(size_of::<BpfInsn>() == size_of::<libc::sock_filter>());
+use crate::libcex::BpfInsn;
 
 const fn insn(code: u16, jt: u8, jf: u8, k: u32) -> BpfInsn {
     BpfInsn { code, jt, jf, k }

@@ -9,6 +9,16 @@
 //! *some* platform, the hand-rolled arm is anchored to it with a `const _: () = assert!(…)` so it can't
 //! silently drift.
 
+mod bpf;
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+mod bpf_device;
 mod multicast;
 
+pub(crate) use self::bpf::BpfInsn;
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+pub(crate) use self::bpf_device::{BpfProgram, DLT_EN10MB, DLT_NULL, bpf_wordalign};
+// `BPF_ALIGN` is used outside `bpf_device` only by the BPF capture's test helpers (production rounds
+// via `bpf_wordalign`), so re-export it only for tests.
+#[cfg(all(test, any(target_os = "macos", target_os = "freebsd")))]
+pub(crate) use self::bpf_device::BPF_ALIGN;
 pub(crate) use self::multicast::{GroupReq, MCAST_JOIN_GROUP};
