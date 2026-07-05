@@ -80,14 +80,14 @@ impl PartialReflector {
 
 /// Parse `REFLECTOR_*` variables into the raw configuration they describe.
 ///
-/// `REFLECTOR_LOG_LEVEL`, `REFLECTOR_DEBUG_MEMORY`, and `REFLECTOR_COUNTERS_INTERVAL_SECS` set
-/// the globals; every other `REFLECTOR_<tag>_<param>` contributes to the reflector keyed by the
-/// lowercased `tag`. Unprefixed variables are ignored.
+/// `REFLECTOR_LOG_LEVEL`, `REFLECTOR_DEBUG_MEMORY_INTERVAL_SECS`, and
+/// `REFLECTOR_COUNTERS_INTERVAL_SECS` set the globals; every other `REFLECTOR_<tag>_<param>`
+/// contributes to the reflector keyed by the lowercased `tag`. Unprefixed variables are ignored.
 pub(super) fn parse_env(
     vars: impl IntoIterator<Item = (String, String)>,
 ) -> Result<RawConfig, ConfigError> {
     let mut log_level = None;
-    let mut debug_memory = None;
+    let mut debug_memory_interval_secs = None;
     let mut counters_interval_secs = None;
     let mut partials: BTreeMap<String, PartialReflector> = BTreeMap::new();
 
@@ -101,9 +101,9 @@ pub(super) fn parse_env(
                 log_level = Some(env_value(&value, &key)?);
                 continue;
             }
-            "DEBUG_MEMORY" => {
+            "DEBUG_MEMORY_INTERVAL_SECS" => {
                 log::trace!("env {key} = {value}");
-                debug_memory = Some(env_bool(&value, &key)?);
+                debug_memory_interval_secs = Some(env_value(&value, &key)?);
                 continue;
             }
             "COUNTERS_INTERVAL_SECS" => {
@@ -139,7 +139,7 @@ pub(super) fn parse_env(
     }
     Ok(RawConfig {
         log_level,
-        debug_memory,
+        debug_memory_interval_secs,
         counters_interval_secs,
         reflectors,
     })
@@ -224,7 +224,7 @@ mod tests {
     fn env_globals_and_bool_forms() {
         let cfg = from_env(&[
             ("REFLECTOR_LOG_LEVEL", "debug"),
-            ("REFLECTOR_DEBUG_MEMORY", "1"),
+            ("REFLECTOR_DEBUG_MEMORY_INTERVAL_SECS", "30"),
             ("REFLECTOR_COUNTERS_INTERVAL_SECS", "45"),
             ("REFLECTOR_TV_SOURCE_IF", "a"),
             ("REFLECTOR_TV_TARGET_IF", "b"),
@@ -233,7 +233,10 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(cfg.log_level, LogLevel::Debug);
-        assert!(cfg.debug_memory);
+        assert_eq!(
+            cfg.debug_memory_interval,
+            Some(std::time::Duration::from_secs(30))
+        );
         assert_eq!(
             cfg.counter_interval,
             Some(std::time::Duration::from_secs(45))

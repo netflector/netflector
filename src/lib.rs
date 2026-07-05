@@ -82,19 +82,20 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut reactor = Reactor::new()?;
     let watches = dispatcher.capture_watches();
     reactor.register_with_fds(Box::new(dispatcher), &watches)?;
-    if config.debug_memory {
+    if let Some(interval) = config.debug_memory_interval {
         log::info!(
             "memory diagnostics enabled; reporting every {}s",
-            memory_report::INTERVAL.as_secs()
+            interval.as_secs()
         );
         memory_report::log_report(); // a baseline before the loop starts
         reactor.register(Box::new(memory_report::MemoryReporter::new(
+            interval,
             std::time::Instant::now(),
         )));
     }
     log::info!("running; press Ctrl-C or send SIGTERM to stop");
     reactor.run()?;
-    if config.debug_memory {
+    if config.debug_memory_interval.is_some() {
         memory_report::log_report(); // a final report at shutdown
     }
     log::info!("stopped");
