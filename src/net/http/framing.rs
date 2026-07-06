@@ -42,9 +42,14 @@ enum Phase {
     BodyCloseDelimited,
 }
 
-/// A malformed or over-cap message. The proxy maps any variant to drop-and-close.
+/// A message the proxy can't safely forward: malformed, over-cap, or a method whose response it can't
+/// delimit. The proxy maps any variant to drop-and-close.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum FramingError {
+    /// A `HEAD` request. A HEAD response carries no body yet may still send `Content-Length`,
+    /// indistinguishable from a real body without tracking the request method, so the proxy refuses HEAD
+    /// rather than risk desyncing the keep-alive stream. DIAL itself never uses HEAD.
+    UnsupportedMethod,
     /// A header block that never terminated within [`MAX_HEADER`] bytes.
     HeaderTooLong,
     /// A `Content-Length` value that isn't a bare non-negative integer.
@@ -230,8 +235,14 @@ impl HttpFraming {
             let line_end = find_crlf(&block[pos..]).map_or(block.len(), |i| pos + i);
             let line = &block[pos..line_end];
             if first {
-                if matches!(self.kind, Kind::Response) {
-                    status = parse_status_code(line);
+                match self.kind {
+                    Kind::Response => status = parse_status_code(line),
+                    // Refuse HEAD: its bodyless response can't be told from a Content-Length body
+                    // without tracking the request method (see FramingError::UnsupportedMethod).
+                    Kind::Request if line.starts_with(b"HEAD ") => {
+                        return Err(FramingError::UnsupportedMethod);
+                    }
+                    Kind::Request => {}
                 }
                 self.copy_line(line);
                 first = false;
@@ -467,6 +478,23 @@ mod tests {
         assert_eq!(
             f.header,
             b"GET /apps/YouTube HTTP/1.1\r\nHost: 10.1.3.80:36866\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn refuses_a_head_request() {
+        // A HEAD response is bodyless but may still carry Content-Length, which would desync the
+        // keep-alive stream, so the proxy refuses HEAD outright (DIAL never uses it).
+        let mut f = HttpFraming::new(Kind::Request, RewritePolicy::NONE);
+        assert_eq!(
+            f.scan_and_rewrite_header(b"HEAD /dd.xml HTTP/1.1\r\nHost: 10.0.0.1:80\r\n\r\n"),
+            Err(FramingError::UnsupportedMethod)
+        );
+        // A normal request method still frames.
+        let mut g = HttpFraming::new(Kind::Request, RewritePolicy::NONE);
+        assert!(
+            g.scan_and_rewrite_header(b"GET /dd.xml HTTP/1.1\r\nHost: 10.0.0.1:80\r\n\r\n")
+                .is_ok()
         );
     }
 
