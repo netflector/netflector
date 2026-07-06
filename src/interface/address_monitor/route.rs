@@ -72,6 +72,12 @@ pub(super) fn for_each_change(buf: &[u8], on_change: &mut impl FnMut(u32)) {
     }
 }
 
+/// `PF_ROUTE` messages have no per-message sender identity; every one is the kernel's, so accept all.
+/// (Mirrors the netlink backend's `sender_ok`, which rejects locally-spoofed datagrams.)
+pub(super) fn sender_ok(_src: &libc::sockaddr_storage, _len: libc::socklen_t) -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

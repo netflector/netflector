@@ -65,13 +65,20 @@ impl AddressMonitor {
     pub(crate) fn drain(&mut self, mut on_change: impl FnMut(u32)) -> io::Result<()> {
         let mut overflows = 0u32;
         loop {
-            // SAFETY: `recv` fills up to `buf.len()` bytes of the owned buffer.
+            // SAFETY: an all-zero sockaddr_storage is a valid, inert source-address out-param.
+            let mut src: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+            let mut addrlen = libc::socklen_t::try_from(size_of::<libc::sockaddr_storage>())
+                .expect("sockaddr_storage fits socklen_t");
+            // SAFETY: `recvfrom` fills up to `buf.len()` bytes of the owned buffer and writes the
+            // datagram's source address into the `src`/`addrlen` out-params.
             let n = unsafe {
-                libc::recv(
+                libc::recvfrom(
                     self.sock.as_raw_fd(),
                     self.buf.as_mut_ptr().cast(),
                     self.buf.len(),
                     0,
+                    (&raw mut src).cast::<libc::sockaddr>(),
+                    &raw mut addrlen,
                 )
             };
             // ENOBUFS is the drain's own signal (a dropped-notification overflow → re-resolve
@@ -101,7 +108,13 @@ impl AddressMonitor {
                 // don't EOF).
                 IoStatus::WouldBlock | IoStatus::Ready(0) => return Ok(()),
                 IoStatus::Ready(len) => {
-                    backend::for_each_change(&self.buf[..len], &mut on_change);
+                    if backend::sender_ok(&src, addrlen) {
+                        backend::for_each_change(&self.buf[..len], &mut on_change);
+                    } else {
+                        log::debug!(
+                            "address monitor: dropping a notification from a non-kernel sender"
+                        );
+                    }
                 }
             }
         }
