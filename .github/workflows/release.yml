@@ -81,7 +81,7 @@ jobs:
             target: armv7-unknown-linux-musleabihf
           - variant: linux-armv5
             runner: ubuntu-24.04
-            target: arm-unknown-linux-musleabi
+            target: armv5te-unknown-linux-musleabi
           - variant: macos-arm64
             runner: macos-15
             target: aarch64-apple-darwin

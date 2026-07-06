@@ -17,7 +17,7 @@ RUN set -eux; \
         arm) \
             case "${TARGETVARIANT}" in \
                 v7) triple=armv7-unknown-linux-musleabihf ;; \
-                v5) triple=arm-unknown-linux-musleabi ;; \
+                v5) triple=armv5te-unknown-linux-musleabi ;; \
                 *)  echo "unsupported arm variant: ${TARGETVARIANT}" >&2; exit 1 ;; \
             esac ;; \
         *) echo "unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
