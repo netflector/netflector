@@ -20,6 +20,9 @@ mod sys;
 pub use self::error::{Error, Result};
 pub use self::logging::init as init_logging;
 
+use std::ffi::OsString;
+use std::path::Path;
+
 use self::capture::Capture;
 use self::config::Config;
 use self::dispatch::PacketDispatcher;
@@ -35,8 +38,8 @@ use self::reflector::InterfaceMap;
 /// # Errors
 /// Returns [`Error`] if configuration loading or validation fails, or if the
 /// reactor cannot be created or its event loop fails.
-pub fn run(args: &[String]) -> Result<()> {
-    let path = args.first().map(String::as_str);
+pub fn run(args: &[OsString]) -> Result<()> {
+    let path = args.first().map(Path::new);
     let toml_text = path.map(config::read_config_file).transpose()?;
     let env: Vec<(String, String)> = std::env::vars().collect();
 
@@ -45,7 +48,10 @@ pub fn run(args: &[String]) -> Result<()> {
     logging::set_level(config::resolve_log_level(toml_text.as_deref(), &env)?);
     log::info!("reflector {} starting", env!("CARGO_PKG_VERSION"));
     if let Some(path) = path {
-        log::debug!("loading configuration from {path} with REFLECTOR_* overrides");
+        log::debug!(
+            "loading configuration from {} with REFLECTOR_* overrides",
+            path.display()
+        );
     } else {
         log::debug!("loading configuration from REFLECTOR_* environment only");
     }

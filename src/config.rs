@@ -24,6 +24,7 @@ mod value;
 pub(crate) use self::error::{ConfigError, Protocol};
 pub(crate) use self::value::{AddressFamily, InterfaceName, LogLevel, ReflectorName, WolPorts};
 
+use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -260,10 +261,11 @@ struct LogLevelProbe {
     log_level: Option<LogLevel>,
 }
 
-/// Read a configuration file, mapping I/O failure to [`ConfigError::ReadFile`].
-pub(crate) fn read_config_file(path: &str) -> Result<String, ConfigError> {
+/// Read a configuration file, mapping I/O failure to [`ConfigError::ReadFile`]. Takes a `Path` so a
+/// non-UTF-8 path (valid on Unix) reads without loss; only the error message renders it lossily.
+pub(crate) fn read_config_file(path: &Path) -> Result<String, ConfigError> {
     std::fs::read_to_string(path).map_err(|source| ConfigError::ReadFile {
-        path: path.to_owned(),
+        path: path.display().to_string(),
         source,
     })
 }
@@ -584,6 +586,17 @@ mod tests {
         assert!(matches!(
             from_toml(&cfg("\"  tv  \"", "tv")),
             Err(ConfigError::DuplicateReflectorName { name }) if name.as_str() == "tv"
+        ));
+    }
+
+    #[test]
+    fn read_config_file_tolerates_a_non_utf8_path() {
+        use std::os::unix::ffi::OsStrExt;
+        // An invalid-UTF-8 path byte must not panic; a missing file yields ReadFile (rendered lossily).
+        let path = std::path::Path::new(std::ffi::OsStr::from_bytes(b"/no/\xff/such.toml"));
+        assert!(matches!(
+            read_config_file(path),
+            Err(ConfigError::ReadFile { .. })
         ));
     }
 
