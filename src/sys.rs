@@ -67,6 +67,30 @@ pub(crate) fn socklen_of<T>() -> socklen_t {
     socklen_t::try_from(size_of::<T>()).expect("option/address size fits socklen_t")
 }
 
+/// Best-effort: request a larger `SO_RCVBUF` so a burst can't overflow the kernel receive queue as
+/// easily. The kernel clamps it to its own maximum, and a failure is logged and ignored (the default
+/// buffer still works), so this never fails the caller. Only the BSD route socket needs it (Linux
+/// netlink already defaults to the system max).
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+pub(crate) fn set_recv_buffer(fd: RawFd, bytes: c_int) {
+    // SAFETY: setsockopt reads `bytes` (a c_int of the given length) on a valid socket fd.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            (&raw const bytes).cast(),
+            socklen_of::<c_int>(),
+        )
+    };
+    if rc != 0 {
+        log::warn!(
+            "could not set the socket receive buffer to {bytes} bytes: {}",
+            io::Error::last_os_error()
+        );
+    }
+}
+
 /// Open a socket of `family` and `base_type` (e.g. `SOCK_DGRAM`/`SOCK_STREAM`), close-on-exec and
 /// non-blocking. Non-blocking keeps a stray read from freezing the single-threaded reactor. Linux and
 /// FreeBSD set both flags in the socket type; macOS lacks them and applies them by `fcntl`.
