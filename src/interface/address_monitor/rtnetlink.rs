@@ -57,7 +57,10 @@ pub(super) fn for_each_change(buf: &[u8], on_change: &mut impl FnMut(u32)) {
     let mut offset = 0;
     while let Some(hdr) = read_at::<NlMsgHdr>(buf, offset) {
         let len = hdr.len as usize;
-        if len < size_of::<NlMsgHdr>() || offset + len > buf.len() {
+        // checked_add: a crafted len must not wrap `offset + len` past the bound on a 32-bit usize
+        // (which would also make `nl_align(len)` wrap to 0 and spin the walk forever).
+        if len < size_of::<NlMsgHdr>() || offset.checked_add(len).is_none_or(|end| end > buf.len())
+        {
             // Not a normal end (that's the `while` running out): a message claims an
             // impossible length (truncated datagram or corruption), so a change is dropped.
             log::warn!(
@@ -175,5 +178,19 @@ mod tests {
         let mut seen = Vec::new();
         for_each_change(&buf, &mut |i| seen.push(i));
         assert!(seen.is_empty());
+    }
+
+    #[test]
+    fn stops_at_a_length_that_would_overflow_the_offset() {
+        // A crafted second message with len ~usize::MAX (u32::MAX on the 32-bit targets) must not wrap
+        // `offset + len` past the bound check and spin the walk forever (the wrap needs a non-zero
+        // offset); the walk reports the valid first message, then breaks.
+        let mut buf = message(libc::RTM_NEWADDR, &ifaddrmsg(7));
+        let second = buf.len();
+        buf.extend(message(libc::RTM_NEWADDR, &ifaddrmsg(9)));
+        buf[second..second + 4].copy_from_slice(&u32::MAX.to_ne_bytes());
+        let mut seen = Vec::new();
+        for_each_change(&buf, &mut |i| seen.push(i));
+        assert_eq!(seen, [7]);
     }
 }

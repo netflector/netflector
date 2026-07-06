@@ -180,21 +180,46 @@ fn dump<B>(
         }
         let received = usize::try_from(received).expect("recv count is non-negative");
 
-        let mut offset = 0;
-        while let Some(hdr) = read_at::<NlMsgHdr>(&buf[..received], offset) {
-            let len = hdr.len as usize;
-            if len < size_of::<NlMsgHdr>() || offset + len > received {
-                break;
-            }
-            match hdr.msg_type {
-                NLMSG_DONE => return Ok(()),
-                NLMSG_ERROR => return Err(io::Error::other("netlink dump failed")),
-                t if t == reply_type => on_msg(&buf[offset..offset + len]),
-                _ => {}
-            }
-            offset += nl_align(len);
+        match walk_dump(&buf[..received], reply_type, &mut on_msg) {
+            DumpStep::Done => return Ok(()),
+            DumpStep::Failed => return Err(io::Error::other("netlink dump failed")),
+            DumpStep::More => {} // read the next datagram
         }
     }
+}
+
+/// One dump datagram's outcome from [`walk_dump`].
+enum DumpStep {
+    /// `NLMSG_DONE`: the dump is complete.
+    Done,
+    /// `NLMSG_ERROR`: the kernel reported a dump error.
+    Failed,
+    /// The datagram was fully walked; read the next one.
+    More,
+}
+
+/// Walk one dump datagram, feeding each `reply_type` message to `on_msg`, and report whether the dump is
+/// done, failed, or needs another datagram. Split from [`dump`]'s socket loop so the message walk (and
+/// its bounds handling) is unit-testable.
+fn walk_dump(buf: &[u8], reply_type: u16, on_msg: &mut impl FnMut(&[u8])) -> DumpStep {
+    let mut offset = 0;
+    while let Some(hdr) = read_at::<NlMsgHdr>(buf, offset) {
+        let len = hdr.len as usize;
+        // checked_add: a crafted len must not wrap `offset + len` past the bound on a 32-bit usize,
+        // which would then panic the `&buf[offset..offset + len]` slice (start > end) below.
+        if len < size_of::<NlMsgHdr>() || offset.checked_add(len).is_none_or(|end| end > buf.len())
+        {
+            break;
+        }
+        match hdr.msg_type {
+            NLMSG_DONE => return DumpStep::Done,
+            NLMSG_ERROR => return DumpStep::Failed,
+            t if t == reply_type => on_msg(&buf[offset..offset + len]),
+            _ => {}
+        }
+        offset += nl_align(len);
+    }
+    DumpStep::More
 }
 
 /// Parse one `RTM_NEWADDR` message; if it carries a usable address of `ifindex`, record it
@@ -325,6 +350,16 @@ mod tests {
         m
     }
 
+    /// A netlink message with its `nlmsghdr` len/type set from `body`, length-padded.
+    fn nl_message(msg_type: u16, body: &[u8]) -> Vec<u8> {
+        let len = size_of::<NlMsgHdr>() + body.len();
+        let mut m = vec![0u8; nl_align(len)];
+        m[0..4].copy_from_slice(&u32::try_from(len).unwrap().to_ne_bytes());
+        m[4..6].copy_from_slice(&msg_type.to_ne_bytes());
+        m[size_of::<NlMsgHdr>()..size_of::<NlMsgHdr>() + body.len()].copy_from_slice(body);
+        m
+    }
+
     #[test]
     fn nl_align_rounds_up_to_four() {
         assert_eq!(nl_align(0), 0);
@@ -342,6 +377,24 @@ mod tests {
         );
         assert_eq!(read_at::<u32>(&buf, 2), None); // 2 + 4 > 5
         assert_eq!(read_at::<u16>(&buf, usize::MAX), None); // offset overflow
+    }
+
+    #[test]
+    fn walk_dump_stops_at_a_length_that_would_overflow_the_offset() {
+        // A crafted second message with len ~usize::MAX (u32::MAX on the 32-bit targets) must not wrap
+        // `offset + len` past the bound and panic the `&buf[offset..offset + len]` slice (start > end);
+        // the walk delivers the valid first message, then breaks and asks for the next datagram.
+        let mut buf = nl_message(libc::RTM_NEWADDR, &[0u8; size_of::<IfAddrMsg>()]);
+        let second = buf.len();
+        buf.extend(nl_message(
+            libc::RTM_NEWADDR,
+            &[0u8; size_of::<IfAddrMsg>()],
+        ));
+        buf[second..second + 4].copy_from_slice(&u32::MAX.to_ne_bytes());
+        let mut count = 0;
+        let step = walk_dump(&buf, libc::RTM_NEWADDR, &mut |_| count += 1);
+        assert!(matches!(step, DumpStep::More));
+        assert_eq!(count, 1); // only the valid first message was delivered
     }
 
     #[test]
