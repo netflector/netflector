@@ -16,6 +16,8 @@ mod in6_ifreq;
 mod multicast;
 #[cfg(target_os = "linux")]
 mod netlink;
+#[cfg(target_os = "freebsd")]
+mod sockopt;
 
 pub(crate) use self::bpf::BpfInsn;
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
@@ -32,3 +34,5 @@ pub(crate) use self::netlink::{
     IfAddrMsg, NETLINK_ROUTE, NLM_F_DUMP, NLM_F_REQUEST, NLMSG_DONE, NLMSG_ERROR, NlMsgHdr, RtAttr,
     SockAddrNl, nl_align,
 };
+#[cfg(target_os = "freebsd")]
+pub(crate) use self::sockopt::SO_RERROR;
