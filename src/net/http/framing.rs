@@ -54,6 +54,9 @@ pub(crate) enum FramingError {
     HeaderTooLong,
     /// A `Content-Length` value that isn't a bare non-negative integer.
     MalformedContentLength,
+    /// Multiple `Content-Length` header fields with differing values: RFC 9112 §6.3 treats a message with
+    /// conflicting Content-Lengths as unrecoverable (a request-smuggling vector), so the proxy refuses it.
+    ConflictingContentLength,
     /// A chunk-size line that isn't a hex integer.
     MalformedChunkSize,
     /// A chunk size so large that adding its terminating CRLF would overflow `usize`. No legitimate
@@ -266,7 +269,13 @@ impl HttpFraming {
         chunked: &mut bool,
     ) -> Result<Option<AuthorityHeader>, FramingError> {
         if let Some(value) = strip_prefix_ignore_ascii_case(line, b"Content-Length:") {
-            *content_length = Some(parse_content_length(value)?);
+            let n = parse_content_length(value)?;
+            // A second, differing Content-Length is a request-smuggling vector (RFC 9112 §6.3): refuse
+            // the message rather than pick a last-wins length. Identical repeats agree, so they're kept.
+            if content_length.is_some_and(|prev| prev != n) {
+                return Err(FramingError::ConflictingContentLength);
+            }
+            *content_length = Some(n);
             self.copy_line(line);
             return Ok(None);
         }
@@ -495,6 +504,26 @@ mod tests {
         assert!(
             g.scan_and_rewrite_header(b"GET /dd.xml HTTP/1.1\r\nHost: 10.0.0.1:80\r\n\r\n")
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn rejects_conflicting_content_lengths() {
+        // Two differing Content-Length headers are a smuggling vector; refuse rather than last-wins.
+        let mut f = HttpFraming::new(Kind::Response, RewritePolicy::NONE);
+        assert_eq!(
+            f.scan_and_rewrite_header(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nContent-Length: 100\r\n\r\n"
+            ),
+            Err(FramingError::ConflictingContentLength)
+        );
+        // Identical repeats agree on the framing, so they are tolerated.
+        let mut g = HttpFraming::new(Kind::Response, RewritePolicy::NONE);
+        assert!(
+            g.scan_and_rewrite_header(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\n"
+            )
+            .is_ok()
         );
     }
 
