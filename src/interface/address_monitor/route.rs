@@ -14,6 +14,12 @@ use libc::c_int;
 /// backend's 8 KiB suffices.
 pub(super) const READ_BUF: usize = 2048;
 
+/// Requested `SO_RCVBUF` for the route socket, whose default receive queue is only ~8 KiB. Enlarge it so
+/// a burst of routing messages is far less likely to overflow it and drop changes. Best-effort and
+/// kernel-clamped; FreeBSD's `SO_RERROR` still recovers from an overflow, and macOS (no `SO_RERROR`)
+/// relies on this alone. Linux's netlink monitor already defaults to the system max, so it isn't grown.
+const RECV_BUFFER: c_int = 256 * 1024;
+
 /// `ifam_index` (in `ifa_msghdr`) and `ifm_index` (in `if_msghdr`) are both a `u16` at this
 /// offset; the asserts pin it against the libc layout.
 const INDEX_OFFSET: usize = 12;
@@ -31,6 +37,7 @@ pub(super) fn open() -> io::Result<OwnedFd> {
     let sock = crate::sys::owned_fd_from(unsafe { libc::socket(libc::PF_ROUTE, socktype, 0) })?;
     #[cfg(target_os = "macos")]
     crate::sys::set_cloexec_nonblock(sock.as_raw_fd())?;
+    crate::sys::set_recv_buffer(sock.as_raw_fd(), RECV_BUFFER);
     // FreeBSD only: without SO_RERROR a receive-buffer overflow is dropped silently, so the drain's
     // ENOBUFS re-resolve-all recovery never fires and address changes are lost under pressure. Enabling
     // it surfaces the overflow as ENOBUFS on the next recv; Linux netlink already reports it. macOS has
