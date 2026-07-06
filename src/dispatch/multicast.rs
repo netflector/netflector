@@ -103,10 +103,10 @@ impl MulticastJoiner {
     }
 }
 
-/// Whether a join error means the membership is already held, a benign duplicate. The errno isn't
-/// uniform: Linux and the BSDs' IPv4 path return `EADDRINUSE`, FreeBSD's IPv6 path `EINVAL`.
+/// Whether a join error means the membership is already held, the benign duplicate the idempotent join
+/// relies on. Every target returns `EADDRINUSE` for an any-source re-join of an existing membership.
 fn already_member(err: &io::Error) -> bool {
-    matches!(err.raw_os_error(), Some(libc::EADDRINUSE | libc::EINVAL))
+    err.raw_os_error() == Some(libc::EADDRINUSE)
 }
 
 /// Whether a join error means the environment can't perform the join at all (vs a real rejection),
@@ -127,10 +127,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn already_member_only_for_the_duplicate_join_errnos() {
+    fn already_member_only_for_the_duplicate_join_errno() {
         let of = io::Error::from_raw_os_error;
-        assert!(already_member(&of(libc::EADDRINUSE))); // Linux / BSD IPv4 duplicate
-        assert!(already_member(&of(libc::EINVAL))); // FreeBSD IPv6 duplicate
+        assert!(already_member(&of(libc::EADDRINUSE))); // duplicate any-source join, every target
+        assert!(!already_member(&of(libc::EINVAL))); // a genuine rejection (bad / non-multicast group)
         assert!(!already_member(&of(libc::ENOBUFS))); // membership cap, a real failure
         assert!(!already_member(&of(libc::EADDRNOTAVAIL))); // interface transiently down
     }
