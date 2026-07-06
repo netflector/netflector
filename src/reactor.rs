@@ -314,6 +314,10 @@ impl Reactor {
             log::trace!("set_write_interest: {reg_key:?} already gone");
             return Ok(false);
         };
+        // Already in the wanted state: skip the redundant epoll_ctl/kevent.
+        if registration.write_interest == enabled {
+            return Ok(true);
+        }
         // Program the kernel first; flip the in-memory flag only on success, so the arena and
         // kernel never disagree about interest. (`self.poll` and `self.registrations` are disjoint
         // fields, so the `registration` borrow stays live across the syscall.)
