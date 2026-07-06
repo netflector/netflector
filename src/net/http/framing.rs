@@ -382,8 +382,12 @@ fn parse_chunk_size(line: &[u8]) -> Result<usize, FramingError> {
         Some(semi) => &line[..semi],
         None => line,
     };
-    let text =
-        std::str::from_utf8(hex.trim_ascii()).map_err(|_| FramingError::MalformedChunkSize)?;
+    let hex = hex.trim_ascii();
+    // Reject a sign or other non-hex lead (RFC 9112 §7.1 is 1*HEXDIG): from_str_radix tolerates a '+'.
+    if !hex.first().is_some_and(u8::is_ascii_hexdigit) {
+        return Err(FramingError::MalformedChunkSize);
+    }
+    let text = std::str::from_utf8(hex).map_err(|_| FramingError::MalformedChunkSize)?;
     usize::from_str_radix(text, 16).map_err(|_| FramingError::MalformedChunkSize)
 }
 
@@ -405,7 +409,12 @@ fn parse_status_code(line: &[u8]) -> u16 {
 /// Parse a `Content-Length` value: surrounding whitespace (RFC 7230 OWS) is tolerated, but the rest
 /// must be a bare integer. `12abc` is rejected, not truncated to 12.
 fn parse_content_length(value: &[u8]) -> Result<usize, FramingError> {
-    std::str::from_utf8(value.trim_ascii())
+    let digits = value.trim_ascii();
+    // Reject a sign or other non-digit lead (RFC 9110 §8.6 is 1*DIGIT): parse tolerates a '+'.
+    if !digits.first().is_some_and(u8::is_ascii_digit) {
+        return Err(FramingError::MalformedContentLength);
+    }
+    std::str::from_utf8(digits)
         .ok()
         .and_then(|s| s.parse().ok())
         .ok_or(FramingError::MalformedContentLength)
@@ -525,6 +534,21 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn rejects_a_signed_length_or_chunk_size() {
+        // Rust's integer parsing accepts a leading '+', but the RFC grammars are 1*DIGIT / 1*HEXDIG.
+        let mut f = HttpFraming::new(Kind::Response, RewritePolicy::NONE);
+        assert_eq!(
+            f.scan_and_rewrite_header(b"HTTP/1.1 200 OK\r\nContent-Length: +5\r\n\r\n"),
+            Err(FramingError::MalformedContentLength)
+        );
+        assert_eq!(
+            parse_chunk_size(b"+ff"),
+            Err(FramingError::MalformedChunkSize)
+        );
+        assert_eq!(parse_chunk_size(b"ff"), Ok(255)); // a bare hex size still parses
     }
 
     #[test]
