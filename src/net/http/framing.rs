@@ -10,9 +10,10 @@ const CRLF: &[u8] = b"\r\n";
 
 const HEADER_TERMINATOR: &[u8] = b"\r\n\r\n";
 
-/// Header-block byte cap. A header not terminated by this point is refused, so a peer can't grow the
-/// owner's buffer unbounded. The proxy's receive buffer must EXCEED this (a const-assert there), else
-/// the over-cap refusal can't fire before the buffer fills and the reader livelocks.
+/// Header-block byte cap: a header block larger than this is refused whether or not it has terminated,
+/// so the limit doesn't depend on TCP segmentation and a peer can't grow the owner's buffer unbounded.
+/// The proxy's receive buffer must EXCEED this (a const-assert there), else the over-cap refusal can't
+/// fire before the buffer fills and the reader livelocks.
 pub(crate) const MAX_HEADER: usize = 2 * 1024;
 
 /// The unterminated-line guard for a single chunk-size line (`1a3\r\n`, plus any chunk extensions).
@@ -137,6 +138,9 @@ impl HttpFraming {
                     authority: None,
                 }); // incomplete: read more
             };
+            if end > MAX_HEADER {
+                return Err(FramingError::HeaderTooLong);
+            }
             authority = self.scan_and_rewrite_header(&input[..end])?;
             pos = end;
             header_complete = true;
@@ -549,6 +553,17 @@ mod tests {
             Err(FramingError::MalformedChunkSize)
         );
         assert_eq!(parse_chunk_size(b"ff"), Ok(255)); // a bare hex size still parses
+    }
+
+    #[test]
+    fn rejects_an_over_cap_header_even_when_terminated() {
+        // The cap must not depend on TCP segmentation: a terminated header block over MAX_HEADER is
+        // refused just like an unterminated one, so a coalesced recv can't slip a huge header through.
+        let mut f = HttpFraming::new(Kind::Response, RewritePolicy::NONE);
+        let mut msg = b"HTTP/1.1 200 OK\r\nX-Pad: ".to_vec();
+        msg.resize(msg.len() + MAX_HEADER, b'a');
+        msg.extend_from_slice(b"\r\n\r\n");
+        assert!(matches!(f.feed(&msg), Err(FramingError::HeaderTooLong)));
     }
 
     #[test]
