@@ -96,6 +96,13 @@ pub(crate) enum ConfigError {
 
     #[error("reflector \"{name}\" (from the environment) has no {field}")]
     EnvMissingField { name: String, field: RequiredField },
+
+    #[error("{field} = {secs} is too large; the maximum is {max} seconds")]
+    IntervalTooLarge {
+        field: &'static str,
+        secs: u64,
+        max: u64,
+    },
 }
 
 /// A required reflector field, named in [`ConfigError::EnvMissingField`].

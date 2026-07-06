@@ -220,17 +220,34 @@ impl TryFrom<RawConfig> for Config {
 
         Ok(Config {
             log_level: raw.log_level.unwrap_or_default(),
-            // 0 or absent disables each report; any positive count is its period.
-            debug_memory_interval: raw
-                .debug_memory_interval_secs
-                .filter(|&s| s > 0)
-                .map(Duration::from_secs),
-            counter_interval: raw
-                .counters_interval_secs
-                .filter(|&s| s > 0)
-                .map(Duration::from_secs),
+            debug_memory_interval: interval_from(
+                raw.debug_memory_interval_secs,
+                "debug_memory_interval_secs",
+            )?,
+            counter_interval: interval_from(raw.counters_interval_secs, "counters_interval_secs")?,
             reflectors,
         })
+    }
+}
+
+/// One year. A diagnostic cadence beyond this is a config typo, and a value large enough to overflow the
+/// reporter's `Instant + Duration` deadline would panic it at startup; reject it with a clear error.
+const MAX_INTERVAL_SECS: u64 = 60 * 60 * 24 * 365;
+
+/// A positive-seconds report interval as a `Duration`; `0` or absent disables the report. `field` is the
+/// config key, named in the error for an over-large value.
+///
+/// # Errors
+/// [`ConfigError::IntervalTooLarge`] when `secs` exceeds [`MAX_INTERVAL_SECS`].
+fn interval_from(secs: Option<u64>, field: &'static str) -> Result<Option<Duration>, ConfigError> {
+    match secs {
+        Some(s) if s > MAX_INTERVAL_SECS => Err(ConfigError::IntervalTooLarge {
+            field,
+            secs: s,
+            max: MAX_INTERVAL_SECS,
+        }),
+        Some(s) if s > 0 => Ok(Some(Duration::from_secs(s))),
+        _ => Ok(None),
     }
 }
 
@@ -489,6 +506,50 @@ mod tests {
             None
         );
         assert_eq!(from_toml(&toml("")).unwrap().debug_memory_interval, None);
+    }
+
+    #[test]
+    fn an_over_large_interval_is_rejected_by_field() {
+        // Past the cap is a typo that would overflow the reporter's Instant+Duration deadline and panic
+        // at startup; reject it, naming the key, rather than accept it. The cap itself is valid.
+        let toml = |line: &str| {
+            format!(
+                r#"
+                {line}
+                [reflectors.d]
+                source_if = "a"
+                target_if = "b"
+                mdns = true
+                "#
+            )
+        };
+        let too_big = MAX_INTERVAL_SECS + 1;
+        assert!(matches!(
+            from_toml(&toml(&format!("debug_memory_interval_secs = {too_big}"))),
+            Err(ConfigError::IntervalTooLarge { field: "debug_memory_interval_secs", secs, .. })
+                if secs == too_big
+        ));
+        assert!(matches!(
+            from_toml(&toml(&format!("counters_interval_secs = {too_big}"))),
+            Err(ConfigError::IntervalTooLarge {
+                field: "counters_interval_secs",
+                ..
+            })
+        ));
+        // The cap itself is accepted, for both keys.
+        let at_cap = from_toml(&toml(&format!(
+            "debug_memory_interval_secs = {MAX_INTERVAL_SECS}\n\
+             counters_interval_secs = {MAX_INTERVAL_SECS}"
+        )))
+        .unwrap();
+        assert_eq!(
+            at_cap.debug_memory_interval,
+            Some(Duration::from_secs(MAX_INTERVAL_SECS))
+        );
+        assert_eq!(
+            at_cap.counter_interval,
+            Some(Duration::from_secs(MAX_INTERVAL_SECS))
+        );
     }
 
     #[test]
