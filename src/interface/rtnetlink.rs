@@ -202,7 +202,7 @@ fn dump<B>(
 
         match walk_dump(&buf[..received], reply_type, &mut on_msg) {
             DumpStep::Done => return Ok(()),
-            DumpStep::Failed => return Err(io::Error::other("netlink dump failed")),
+            DumpStep::Failed(e) => return Err(e),
             DumpStep::More => {} // read the next datagram
         }
     }
@@ -212,8 +212,8 @@ fn dump<B>(
 enum DumpStep {
     /// `NLMSG_DONE`: the dump is complete.
     Done,
-    /// `NLMSG_ERROR`: the kernel reported a dump error.
-    Failed,
+    /// `NLMSG_ERROR`: the kernel reported a dump error (carrying its errno).
+    Failed(io::Error),
     /// The datagram was fully walked; read the next one.
     More,
 }
@@ -233,13 +233,22 @@ fn walk_dump(buf: &[u8], reply_type: u16, on_msg: &mut impl FnMut(&[u8])) -> Dum
         }
         match hdr.msg_type {
             NLMSG_DONE => return DumpStep::Done,
-            NLMSG_ERROR => return DumpStep::Failed,
+            NLMSG_ERROR => return DumpStep::Failed(nlmsg_error(buf, offset)),
             t if t == reply_type => on_msg(&buf[offset..offset + len]),
             _ => {}
         }
         offset += nl_align(len);
     }
     DumpStep::More
+}
+
+/// The error for an `NLMSG_ERROR` reply at `offset`. Its payload is `struct nlmsgerr { int error; ... }`
+/// where `error` is a negative errno, or 0 for an ACK (which our dumps never request).
+fn nlmsg_error(buf: &[u8], offset: usize) -> io::Error {
+    match read_at::<c_int>(buf, offset + nl_align(size_of::<NlMsgHdr>())) {
+        Some(errno) if errno != 0 => io::Error::from_raw_os_error(errno.saturating_neg()),
+        _ => io::Error::other("netlink dump failed (NLMSG_ERROR without an errno)"),
+    }
 }
 
 /// Parse one `RTM_NEWADDR` message; if it carries a usable address of `ifindex`, record it
@@ -415,6 +424,17 @@ mod tests {
         let step = walk_dump(&buf, libc::RTM_NEWADDR, &mut |_| count += 1);
         assert!(matches!(step, DumpStep::More));
         assert_eq!(count, 1); // only the valid first message was delivered
+    }
+
+    #[test]
+    fn walk_dump_surfaces_the_nlmsg_error_errno() {
+        // NLMSG_ERROR's first payload word is a negative errno; the walk must report it, not a blank
+        // failure. -EPERM here.
+        let buf = nl_message(NLMSG_ERROR, &(-libc::EPERM).to_ne_bytes());
+        match walk_dump(&buf, libc::RTM_NEWADDR, &mut |_| {}) {
+            DumpStep::Failed(e) => assert_eq!(e.raw_os_error(), Some(libc::EPERM)),
+            _ => panic!("expected DumpStep::Failed carrying the errno"),
+        }
     }
 
     #[test]
