@@ -542,12 +542,6 @@ impl PacketDispatcher {
                 None => outcome,
                 Some(prev) => {
                     let (merged, anomalies) = prev.combine(outcome);
-                    if anomalies.double_reflect {
-                        log::error!(
-                            "two handlers reflected one packet on {ingress:?} ({prev:?} + {outcome:?}), \
-                             a duplicate-direction config the conflict check should have caught"
-                        );
-                    }
                     if anomalies.type_mismatch {
                         log::error!(
                             "handlers disagree on a packet's message type on {ingress:?} \
@@ -1106,6 +1100,35 @@ mod tests {
         assert_eq!(
             dispatcher.tally(ingress, MessageType::SsdpSearch),
             (0, 0, 0, 0)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn route_folds_fan_out_reflects_and_records_once() -> io::Result<()> {
+        let mut dispatcher = PacketDispatcher::new();
+        let mut reactor = Reactor::new()?;
+        let ingress = dispatcher.add_test_capture();
+
+        // A source fanned out to two targets (a->b, a->c) puts two reflecting handlers on the shared
+        // ingress; both reflect the same query. A legal config, not a duplicate-reflector bug.
+        dispatcher.register(
+            ingress,
+            Filter::default(),
+            Box::new(Outcomer(Outcome::Reflected(MessageType::MdnsQuery))),
+        );
+        dispatcher.register(
+            ingress,
+            Filter::default(),
+            Box::new(Outcomer(Outcome::Reflected(MessageType::MdnsQuery))),
+        );
+
+        dispatcher.route(ingress, &probe_packet(b"q"), &mut reactor);
+
+        // One packet, one tally per ingress: the two reflects fold to a single reflected count.
+        assert_eq!(
+            dispatcher.tally(ingress, MessageType::MdnsQuery),
+            (1, 0, 0, 0)
         );
         Ok(())
     }
