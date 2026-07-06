@@ -505,9 +505,9 @@ impl Reactor {
         }
     }
 
-    /// Ask the run loop to stop once the current dispatch returns. Handlers call
-    /// this (the self-pipe handler does, on a shutdown signal); calling it outside
-    /// a run loop just arms the next one to exit immediately.
+    /// Ask the run loop to stop once the current dispatch returns. Handlers call this (the self-pipe
+    /// handler does, on a shutdown signal). Calling it outside a run loop has no lasting effect:
+    /// [`run`](Self::run) clears the flag before entering the loop.
     pub(crate) fn request_shutdown(&mut self) {
         self.shutdown = true;
     }
