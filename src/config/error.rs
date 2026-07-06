@@ -61,6 +61,11 @@ pub(crate) enum ConfigError {
     #[error("reflector \"{name}\" is defined in both the configuration file and the environment")]
     DuplicateReflector { name: String },
 
+    #[error(
+        "reflector name \"{name}\" is used by more than one reflector (names are compared case-insensitively and trimmed)"
+    )]
+    DuplicateReflectorName { name: ReflectorName },
+
     /// Two reflectors would reflect the same protocol's packets twice.
     #[error(
         "reflectors \"{first}\" and \"{second}\" both reflect {protocol} on {source_if} -> {target_if} with overlapping MAC selection and address family"

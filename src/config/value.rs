@@ -157,7 +157,9 @@ impl<'de> Deserialize<'de> for InterfaceName {
     }
 }
 
-/// A reflector's display name: surrounding whitespace trimmed, never empty.
+/// A reflector's name: surrounding whitespace trimmed and ASCII-lowercased (names are the reflector's
+/// case-insensitive identity), never empty. The canonical form makes `Eq` the identity check, so no
+/// caller has to fold case itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReflectorName(String);
 
@@ -186,7 +188,7 @@ impl FromStr for ReflectorName {
         if trimmed.is_empty() {
             return Err(ParseReflectorNameError);
         }
-        Ok(Self(trimmed.to_owned()))
+        Ok(Self(trimmed.to_ascii_lowercase()))
     }
 }
 
@@ -315,6 +317,8 @@ mod tests {
     #[test]
     fn reflector_name_parses_via_fromstr() {
         assert_eq!("  tv  ".parse::<ReflectorName>().unwrap().as_str(), "tv");
+        // Canonicalized to lowercase, so casing is not part of the identity.
+        assert_eq!("TV".parse::<ReflectorName>().unwrap().as_str(), "tv");
         assert_eq!("".parse::<ReflectorName>(), Err(ParseReflectorNameError));
         assert_eq!("   ".parse::<ReflectorName>(), Err(ParseReflectorNameError));
     }
