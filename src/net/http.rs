@@ -28,7 +28,7 @@ pub(crate) fn parse_authority(value: &[u8], bare: bool) -> Option<Authority> {
     };
     let len = rest
         .iter()
-        .position(|&b| matches!(b, b'/' | b' ' | b'\t' | b'\r'))
+        .position(|&b| matches!(b, b'/' | b'?' | b'#' | b' ' | b'\t' | b'\r'))
         .unwrap_or(rest.len());
     let authority = &rest[..len];
     let (host, port) = match authority.iter().rposition(|&b| b == b':') {
@@ -88,6 +88,18 @@ mod tests {
                 .endpoint,
             "10.0.0.7:80".parse().unwrap()
         );
+    }
+
+    #[test]
+    fn authority_terminates_at_query_or_fragment() {
+        // A pathless URL with a query or fragment: the authority ends at '?'/'#' (RFC 3986), so the
+        // host:port is still parsed and rewritten instead of poisoning the port parse.
+        let a = parse_authority(b"http://10.0.0.7:8008?token=x", false).unwrap();
+        assert_eq!(a.endpoint, "10.0.0.7:8008".parse().unwrap());
+        assert_eq!(a.len, "10.0.0.7:8008".len());
+        let a = parse_authority(b"http://10.0.0.7#frag", false).unwrap();
+        assert_eq!(a.endpoint, "10.0.0.7:80".parse().unwrap());
+        assert_eq!(a.len, "10.0.0.7".len());
     }
 
     #[test]
