@@ -8,10 +8,10 @@ use crate::reactor::{HandlerKey, Reactor};
 
 use super::CaptureKey;
 
-/// Cap on concurrent minted DIAL proxies, so a burst of advertised devices can't exhaust source-side
-/// listeners or reactor slots. At the cap a new device's `LOCATION` is reflected unchanged (visible but
-/// unproxied) rather than evicting a live proxy.
-const MAX_DIAL_PROXIES: usize = 32;
+/// Cap on concurrent minted DIAL proxies (daemon-wide), so a burst of advertised devices can't exhaust
+/// source-side listeners or reactor slots. At the cap a new device's `LOCATION` is reflected unchanged
+/// (visible but unproxied) rather than evicting a live proxy.
+const MAX_DIAL_PROXIES: usize = 64;
 
 /// One minted DIAL description proxy, keyed by `(source, endpoint)`:
 /// - `target`: capture the device connections egress on; a change on either interface evicts the proxy.
