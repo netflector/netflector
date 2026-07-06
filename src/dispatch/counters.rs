@@ -1,12 +1,12 @@
 //! Observability counters: what the reflector did with each packet, tallied per message type and
 //! interface.
 //!
-//! A single packet can match several handlers. E.g. mirrored `a→b` and `b→a` reflectors both put a
-//! handler on the same interface, one reflecting it and one skipping it. Each handler returns an
-//! [`Outcome`]; the dispatcher folds them with [`Outcome::combine`] into the single highest-precedence
-//! disposition and records that once, so one packet is counted once: the reflecting handler wins, the
-//! other's skip is shadowed. The fold also surfaces "can't happen under a valid config" [`Anomalies`]
-//! for the dispatcher to log.
+//! A single packet can match several handlers: mirrored `a→b`/`b→a` reflectors put one reflecting and
+//! one skipping handler on the same interface, and a source fanned out to several targets (`a→b`,
+//! `a→c`) puts several reflecting handlers there. Each handler returns an [`Outcome`]; the dispatcher
+//! folds them with [`Outcome::combine`] into the single highest-precedence disposition and records that
+//! once, so one packet is counted once per ingress. The fold also surfaces "can't happen under a valid
+//! config" [`Anomalies`] for the dispatcher to log.
 //!
 //! The interface dimension is the ingress [`CaptureKey`](super::CaptureKey), which the dispatcher
 //! supplies; a [`CaptureCounters`] row per interface holds the tallies.
@@ -86,9 +86,6 @@ enum Disposition {
 /// dispatcher logs them rather than silently miscounting.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Anomalies {
-    /// Two handlers both tried to reflect one packet: duplicate same-direction reflectors, which the
-    /// config's conflict check should have rejected.
-    pub(crate) double_reflect: bool,
     /// Two handlers classified one packet to different message types: a classifier or config bug.
     pub(crate) type_mismatch: bool,
 }
@@ -129,21 +126,11 @@ impl Outcome {
         }
     }
 
-    /// Whether the handler *tried* to reflect (a right-direction disposition, whether it succeeded,
-    /// failed, or stalled). At most one handler may per packet; a second is a duplicate-reflector bug.
-    fn is_reflect_attempt(self) -> bool {
-        matches!(
-            self,
-            Self::Reflected(_) | Self::Dropped(_) | Self::Stalled(_)
-        )
-    }
-
     /// Fold another handler's outcome for the *same* packet into this running one: keep the
     /// higher-precedence disposition, and report any invariant [`Anomalies`]. Order-independent (a max
     /// over [`disposition`](Self::disposition)), so handler visitation order doesn't change the result.
     pub(crate) fn combine(self, other: Outcome) -> (Outcome, Anomalies) {
         let anomalies = Anomalies {
-            double_reflect: self.is_reflect_attempt() && other.is_reflect_attempt(),
             type_mismatch: matches!(
                 (self.message_type(), other.message_type()),
                 (Some(a), Some(b)) if a != b
@@ -346,28 +333,14 @@ mod tests {
     }
 
     #[test]
-    fn combine_flags_a_second_reflect_attempt() {
+    fn fan_out_folds_multiple_reflects_without_anomaly() {
         use MessageType::MdnsQuery as Q;
-        // The valid mirrored case (one reflect, one skip) is clean.
-        assert!(
-            !Outcome::Reflected(Q)
-                .combine(Outcome::Skipped(Q))
-                .1
-                .double_reflect
-        );
-        // Two reflect-attempts of any kind on one packet is the duplicate-reflector bug.
-        assert!(
-            Outcome::Reflected(Q)
-                .combine(Outcome::Reflected(Q))
-                .1
-                .double_reflect
-        );
-        assert!(
-            Outcome::Reflected(Q)
-                .combine(Outcome::Dropped(Q))
-                .1
-                .double_reflect
-        );
+        // A source fanned out to several targets (a->b, a->c) reflects one query from each leg on the
+        // shared ingress. That is a legal config, not a duplicate-reflector bug: the fold keeps one
+        // Reflected and flags nothing.
+        let (merged, anomalies) = Outcome::Reflected(Q).combine(Outcome::Reflected(Q));
+        assert_eq!(merged, Outcome::Reflected(Q));
+        assert_eq!(anomalies, Anomalies::default());
     }
 
     #[test]
