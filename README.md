@@ -329,6 +329,12 @@ appears. Gaining a family logs at `info`; losing a *required* family logs at `er
 `info`. The monitor is best-effort: if it cannot start, the reflector logs a warning and runs without
 address refresh.
 
+It does not, however, adapt to an interface being destroyed and recreated (a fresh kernel ifindex,
+e.g. a PPPoE reconnect or a bridge/VLAN rebuild): the ifindex and capture are pinned when the interface
+is opened, so reflection on a recreated interface stays dead until you restart the daemon. The interfaces
+a reflector bridges are normally stable LAN segments, so this rarely bites, and it matches avahi, which
+likewise needs a restart when an interface disappears and returns.
+
 ### Per-protocol behavior
 
 | Protocol | Port(s) | Group / destination | Relay direction |
