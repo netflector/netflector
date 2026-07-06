@@ -18,6 +18,9 @@
   denies broken/private intra-doc links, but only `cargo doc` runs that check
   (clippy/build don't). It's a separate gate step; run it on Linux too
   (`./docker_test.sh doc --no-deps --document-private-items`) for `cfg` items.
+- Gate shared-logic changes (errno classifier, parser, struct layout) with the full
+  `cargo test --lib`, not a name-filtered subset that can skip the integration test
+  exercising the real syscall path.
 - Platform `cfg` code (the epoll backend now, AF_PACKET capture later) isn't built
   on the macOS dev host — verify it on Linux with `./docker_test.sh` (forwards to
   cargo, e.g. `./docker_test.sh clippy --all-targets -- -D warnings`). Check both
