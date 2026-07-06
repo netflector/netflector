@@ -92,7 +92,7 @@ jobs:
           - x86_64-unknown-linux-musl
           - aarch64-unknown-linux-musl
           - armv7-unknown-linux-musleabihf
-          - arm-unknown-linux-musleabi
+          - armv5te-unknown-linux-musleabi
           - x86_64-unknown-freebsd
           - aarch64-apple-darwin
     steps:
@@ -176,7 +176,7 @@ jobs:
           - { name: release, flags: '--release' }
         target:
           - { name: linux-armv7, triple: armv7-unknown-linux-musleabihf }
-          - { name: linux-armv5, triple: arm-unknown-linux-musleabi }
+          - { name: linux-armv5, triple: armv5te-unknown-linux-musleabi }
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
@@ -210,7 +210,7 @@ jobs:
           [target.armv7-unknown-linux-musleabihf]
           runner = "qemu-arm-static"
 
-          [target.arm-unknown-linux-musleabi]
+          [target.armv5te-unknown-linux-musleabi]
           runner = "qemu-arm-static"
           EOF
       - name: Show toolchain
