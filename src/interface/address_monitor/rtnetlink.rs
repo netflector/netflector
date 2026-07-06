@@ -92,6 +92,18 @@ pub(super) fn for_each_change(buf: &[u8], on_change: &mut impl FnMut(u32)) {
     }
 }
 
+/// Whether a notification came from the kernel. The kernel's netlink source address has `nl_pid == 0`;
+/// a user process's carries its port id, so a non-zero pid is a locally-spoofed datagram (netlink
+/// user-to-user unicast needs no privilege) and is dropped.
+pub(super) fn sender_ok(src: &libc::sockaddr_storage, len: socklen_t) -> bool {
+    if usize::try_from(len).unwrap_or(0) < size_of::<SockAddrNl>() {
+        return false;
+    }
+    // SAFETY: the len check guarantees the storage holds a full sockaddr_nl; read its prefix unaligned.
+    let nl = unsafe { std::ptr::read_unaligned((&raw const *src).cast::<SockAddrNl>()) };
+    nl.pid == 0
+}
+
 /// Forward a change for `index`, unless `index` is 0. Zero names no interface (kernel
 /// indices are >= 1) and is the parent's "re-resolve everything" overflow signal, so a stray
 /// 0 must never be forwarded.
@@ -132,6 +144,29 @@ mod tests {
         let mut b = vec![0u8; size_of::<libc::ifinfomsg>()];
         b[4..8].copy_from_slice(&index.to_ne_bytes());
         b
+    }
+
+    /// A `sockaddr_storage` holding a `sockaddr_nl` with `pid` as its `nl_pid`.
+    fn storage_with_pid(pid: u32) -> libc::sockaddr_storage {
+        let nl = SockAddrNl {
+            pid,
+            ..SockAddrNl::default()
+        };
+        // SAFETY: an all-zero sockaddr_storage is valid, and it is large enough and aligned to hold a
+        // sockaddr_nl written into its prefix.
+        unsafe {
+            let mut ss: libc::sockaddr_storage = std::mem::zeroed();
+            std::ptr::write((&raw mut ss).cast::<SockAddrNl>(), nl);
+            ss
+        }
+    }
+
+    #[test]
+    fn sender_ok_accepts_only_the_kernel() {
+        let full = socklen_t::try_from(size_of::<SockAddrNl>()).unwrap();
+        assert!(sender_ok(&storage_with_pid(0), full)); // the kernel (nl_pid 0)
+        assert!(!sender_ok(&storage_with_pid(1234), full)); // a user process's port id
+        assert!(!sender_ok(&storage_with_pid(0), 4)); // a too-short source address
     }
 
     #[test]

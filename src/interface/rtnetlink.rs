@@ -8,12 +8,12 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::ptr;
 
-use libc::c_int;
+use libc::{c_int, socklen_t};
 
 use super::{InterfaceAddresses, V6Pick, v6_rank};
 use crate::libcex::{
     IfAddrMsg, NETLINK_ROUTE, NLM_F_DUMP, NLM_F_REQUEST, NLMSG_DONE, NLMSG_ERROR, NlMsgHdr, RtAttr,
-    nl_align,
+    SockAddrNl, nl_align,
 };
 use crate::net::mac::MacAddr;
 
@@ -171,12 +171,32 @@ fn dump<B>(
         let size = usize::try_from(size).expect("recv count is non-negative");
         buf.resize(size, 0);
 
-        // SAFETY: `recv` fills up to `buf.len()` bytes of the owned buffer, which now holds
-        // the whole datagram.
-        let received =
-            unsafe { libc::recv(sock.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
+        let mut src = SockAddrNl::default();
+        let mut addrlen =
+            socklen_t::try_from(size_of::<SockAddrNl>()).expect("sockaddr_nl fits socklen_t");
+        // SAFETY: `recvfrom` fills up to `buf.len()` bytes of the owned buffer (now the whole
+        // datagram) and writes the source address into the `src`/`addrlen` out-params.
+        let received = unsafe {
+            libc::recvfrom(
+                sock.as_raw_fd(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                0,
+                (&raw mut src).cast::<libc::sockaddr>(),
+                &raw mut addrlen,
+            )
+        };
         if received < 0 {
             return Err(io::Error::last_os_error());
+        }
+        // Only the kernel (nl_pid == 0) may answer the dump; a local process could unicast a spoofed
+        // reply to inject a bogus address. Discard anything else and read the next datagram.
+        if src.pid != 0 {
+            log::debug!(
+                "netlink dump: ignoring a reply from a non-kernel sender (pid {})",
+                src.pid
+            );
+            continue;
         }
         let received = usize::try_from(received).expect("recv count is non-negative");
 
