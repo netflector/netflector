@@ -23,6 +23,11 @@ use super::proxy::{DialDeviceProxy, Listener};
 /// UDA-recommended minimum device validity (DIAL's own example advertises `max-age=1800`).
 const DEFAULT_DESC_GRACE: Duration = Duration::from_mins(30);
 
+/// Ceiling on an advertised `max-age`, which sets the proxy's grace-sweep deadline, so clamp it to bound
+/// how long one advertisement (a spoofed burst included) can pin a scarce proxy slot. Well above any real
+/// DIAL device's re-advertise interval, so a live device still refreshes its grace in time.
+const MAX_DESC_GRACE: Duration = Duration::from_hours(2);
+
 /// Stack scratch to rewrite one SSDP datagram into. Anchored to the dispatcher's send frame buffer
 /// ([`SCRATCH_LEN`](crate::dispatch::SCRATCH_LEN)): the reflector builds its outgoing frame there, so
 /// anything that doesn't fit can't be forwarded anyway. A `LOCATION` rewrite can grow the datagram;
@@ -69,9 +74,10 @@ pub(crate) fn rewrite_location(
         return false;
     };
     // The grace is refreshed on every advertisement / search response, so a re-advertised device's
-    // cached LOCATION keeps resolving for another max-age.
+    // cached LOCATION keeps resolving for another max-age. Clamp it (MAX_DESC_GRACE): the value is
+    // attacker-controlled and sets a proxy-slot eviction deadline.
     let max_age = parse_cache_control_max_age(payload).map_or(DEFAULT_DESC_GRACE, |seconds| {
-        Duration::from_secs(u64::from(seconds))
+        Duration::from_secs(u64::from(seconds)).min(MAX_DESC_GRACE)
     });
     let desc_grace = Instant::now() + max_age;
     let desc_addr = if let Some(addr) = ctx.lookup(
@@ -356,6 +362,24 @@ mod tests {
         assert!(
             !reactor.is_registered(key),
             "and torn down from the reactor"
+        );
+    }
+
+    #[test]
+    fn rewrite_location_clamps_an_oversized_max_age() {
+        let mut reactor = Reactor::new().expect("reactor");
+        let mut ctx = DialContext::new();
+        // A spoofed advertisement with an enormous max-age must not pin the proxy slot for ~136 years.
+        let advert = b"NOTIFY * HTTP/1.1\r\nNT: urn:dial-multiscreen-org:service:dial:1\r\n\
+            LOCATION: http://10.0.0.5:8008/dd.xml\r\nCACHE-CONTROL: max-age=4294967295\r\n\r\n";
+        assert!(rewrite_advert(&mut ctx, &mut reactor, advert).is_some());
+        let ceiling = Instant::now() + MAX_DESC_GRACE;
+        let grace = ctx
+            .grace_of(advert_source(), ADVERT_ENDPOINT.parse().unwrap())
+            .expect("a grace was recorded");
+        assert!(
+            grace <= ceiling,
+            "an oversized max-age is clamped to MAX_DESC_GRACE"
         );
     }
 }
