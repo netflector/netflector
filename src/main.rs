@@ -5,11 +5,13 @@
 //! and turns a [`reflector::Result`] into an exit code: on failure it logs the
 //! error and exits non-zero.
 
+use std::ffi::OsString;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
     reflector::init_logging();
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // args_os, not args: a non-UTF-8 argument (a path can be non-UTF-8 on Unix) makes args() panic.
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     match reflector::run(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
