@@ -117,7 +117,9 @@ impl<'de> Deserialize<'de> for AddressFamily {
     }
 }
 
-/// A non-empty network interface name.
+/// A network interface name: non-empty and whitespace-free. OS interface names never contain
+/// whitespace; a padded one would miss the interface (a confusing capture error) and slip past the
+/// `source_if`/`target_if` equality check, so reject it here rather than downstream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InterfaceName(String);
 
@@ -135,14 +137,14 @@ impl fmt::Display for InterfaceName {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
-#[error("interface name must not be empty")]
+#[error("interface name must not be empty or contain whitespace")]
 pub(crate) struct ParseInterfaceNameError;
 
 impl FromStr for InterfaceName {
     type Err = ParseInterfaceNameError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if s.is_empty() {
+        if s.is_empty() || s.chars().any(char::is_whitespace) {
             return Err(ParseInterfaceNameError);
         }
         Ok(Self(s.to_owned()))
@@ -312,6 +314,15 @@ mod tests {
     fn interface_name_parses_via_fromstr() {
         assert_eq!("en0".parse::<InterfaceName>().unwrap().as_str(), "en0");
         assert_eq!("".parse::<InterfaceName>(), Err(ParseInterfaceNameError));
+        // Whitespace is rejected: a padded name misses the interface and dodges SameInterface.
+        assert_eq!(
+            " en0 ".parse::<InterfaceName>(),
+            Err(ParseInterfaceNameError)
+        );
+        assert_eq!(
+            "e n0".parse::<InterfaceName>(),
+            Err(ParseInterfaceNameError)
+        );
     }
 
     #[test]
