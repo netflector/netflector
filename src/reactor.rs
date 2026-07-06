@@ -226,6 +226,15 @@ impl Reactor {
                 "watch: no such handler",
             ));
         };
+        // Enforce add-once here, not in the Poller: kqueue's EV_ADD silently modifies an existing
+        // filter instead of reporting a re-add, so a double-watch would retag one fd's routing and
+        // let a later unwatch strip both regs' kernel interest. A caller bug, rejected uniformly.
+        if self.registrations.iter().any(|(_, reg)| reg.fd == fd) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "watch: fd already watched",
+            ));
+        }
         let reg_key = RegKey(self.registrations.insert(Registration {
             fd,
             handler_key,
@@ -1019,6 +1028,18 @@ mod tests {
         // A live fd, so the rejection is due to the stale handler key, not a bad fd.
         let (b, _pb) = pair();
         assert!(reactor.watch(hk, b.as_raw_fd(), 0).is_err());
+    }
+
+    #[test]
+    fn watch_rejects_a_duplicate_fd() {
+        let mut reactor = Reactor::new().unwrap();
+        let (a, _pa) = pair();
+        let raw = a.as_raw_fd();
+        let (hk, _rk) = watch1(&mut reactor, TestHandler::read(a, |_, _| {}), raw);
+        // A second watch of the same fd is a caller bug the reactor rejects uniformly: kqueue's
+        // EV_ADD can't report the re-add, so without this the BSD backend would retag the fd and a
+        // later unwatch would strip both regs' interest.
+        assert!(reactor.watch(hk, raw, 0).is_err());
     }
 
     #[test]
