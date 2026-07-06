@@ -574,8 +574,13 @@ impl PacketDispatcher {
                 changed.push(ifindex);
             }
         }) {
-            log::warn!("address monitor read failed; skipping refresh: {e}");
-            return;
+            // The drain already consumed and collected these notifications before failing, so refresh
+            // what we have rather than discard it; the socket's unread remainder stays readable and the
+            // level-triggered wait re-drains it.
+            log::warn!("address monitor read failed mid-drain; refreshing what was collected: {e}");
+        }
+        if changed.is_empty() {
+            return; // nothing collected (a spurious wakeup, or a drain error before the first read)
         }
         // The DIAL proxies bind IPv4 only, so collect the interfaces whose v4 address actually moved. A
         // routine v6 or MAC change must not churn a proxy whose v4 (and cached LOCATION) is unchanged.
