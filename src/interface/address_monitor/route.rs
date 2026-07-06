@@ -5,9 +5,7 @@
 //! the BSDs.
 
 use std::io;
-#[cfg(target_os = "macos")]
-use std::os::fd::AsRawFd;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 
 use libc::c_int;
 
@@ -33,6 +31,28 @@ pub(super) fn open() -> io::Result<OwnedFd> {
     let sock = crate::sys::owned_fd_from(unsafe { libc::socket(libc::PF_ROUTE, socktype, 0) })?;
     #[cfg(target_os = "macos")]
     crate::sys::set_cloexec_nonblock(sock.as_raw_fd())?;
+    // FreeBSD only: without SO_RERROR a receive-buffer overflow is dropped silently, so the drain's
+    // ENOBUFS re-resolve-all recovery never fires and address changes are lost under pressure. Enabling
+    // it surfaces the overflow as ENOBUFS on the next recv; Linux netlink already reports it. macOS has
+    // the same silent drop but no SO_RERROR (a FreeBSD 13.0+ option) or equivalent, so the
+    // overflow-recovery gap is unfixable there.
+    #[cfg(target_os = "freebsd")]
+    {
+        let on: c_int = 1;
+        // SAFETY: setsockopt reads `on` (a c_int of the given length) on a valid socket fd.
+        let rc = unsafe {
+            libc::setsockopt(
+                sock.as_raw_fd(),
+                libc::SOL_SOCKET,
+                crate::libcex::SO_RERROR,
+                (&raw const on).cast(),
+                libc::socklen_t::try_from(size_of::<c_int>()).expect("c_int fits socklen_t"),
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
     Ok(sock)
 }
 
