@@ -1,26 +1,24 @@
-//! The per-direction streaming HTTP/1.1 framer: buffers and rewrites the header, then forwards the
-//! body as a zero-copy slice of the fed input via [`feed`](HttpFraming::feed). Built on the parent
-//! module's authority parser.
+//! Per-direction streaming HTTP/1.1 framer. Buffers and rewrites the header, then forwards the body as
+//! a zero-copy slice of the fed input via [`feed`](HttpFraming::feed). Built on the parent module's
+//! authority parser.
 
 use std::net::SocketAddrV4;
 
 use super::{Authority, parse_authority, strip_prefix_ignore_ascii_case};
 
-/// CRLF, the HTTP line terminator.
 const CRLF: &[u8] = b"\r\n";
 
-/// The blank line that ends a header block.
 const HEADER_TERMINATOR: &[u8] = b"\r\n\r\n";
 
-/// The header-block byte cap: a header that has not terminated by this point is refused, so a peer
-/// can't grow the owner's buffer unbounded. The proxy's receive buffer must EXCEED this (a const-assert
-/// there) or the over-cap refusal can't fire before the buffer fills and the reader livelocks.
+/// Header-block byte cap. A header not terminated by this point is refused, so a peer can't grow the
+/// owner's buffer unbounded. The proxy's receive buffer must EXCEED this (a const-assert there), else
+/// the over-cap refusal can't fire before the buffer fills and the reader livelocks.
 pub(crate) const MAX_HEADER: usize = 2 * 1024;
 
 /// The unterminated-line guard for a single chunk-size line (`1a3\r\n`, plus any chunk extensions).
 const MAX_CHUNK_LINE: usize = 256;
 
-/// The unterminated-line guard for a single trailer field line — looser than a chunk-size line, since
+/// The unterminated-line guard for a single trailer field line. Looser than a chunk-size line since
 /// trailers carry header-like field values.
 const MAX_TRAILER_LINE: usize = 1024;
 
@@ -32,8 +30,8 @@ pub(crate) enum Kind {
     Response,
 }
 
-/// The body framing the header determined — what `feed` streams after the header. `Header` doubles as
-/// "no body: the message ends at the blank line".
+/// The body framing the header determined: what `feed` streams after the header. `Header` doubles as
+/// "no body, the message ends at the blank line".
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Phase {
     Header,
@@ -44,7 +42,7 @@ enum Phase {
     BodyCloseDelimited,
 }
 
-/// A malformed or over-cap message — the proxy maps any variant to drop-and-close.
+/// A malformed or over-cap message. The proxy maps any variant to drop-and-close.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum FramingError {
     /// A header block that never terminated within [`MAX_HEADER`] bytes.
@@ -53,8 +51,8 @@ pub(crate) enum FramingError {
     MalformedContentLength,
     /// A chunk-size line that isn't a hex integer.
     MalformedChunkSize,
-    /// A chunk size so large that adding its terminating CRLF would overflow `usize` — no legitimate
-    /// device emits a near-`2^64` chunk, and the unchecked add would otherwise panic (debug) or wrap
+    /// A chunk size so large that adding its terminating CRLF would overflow `usize`. No legitimate
+    /// device emits a near-`2^64` chunk; the unchecked add would otherwise panic (debug) or wrap
     /// (release) and misframe the stream.
     ChunkSizeTooLarge,
     /// A chunk-size line that never terminated within [`MAX_CHUNK_LINE`] bytes.
@@ -64,12 +62,12 @@ pub(crate) enum FramingError {
 }
 
 /// One [`feed`](HttpFraming::feed) call's forwardable output: the rewritten `header` (a view into the
-/// framer's scratch; empty while a body streams across feeds), the `body` (a zero-copy slice of the fed
-/// input; possibly empty), and `consumed` — how many fed bytes to drop. `consumed == 0` means an
+/// framer's scratch, empty while a body streams across feeds), the `body` (a zero-copy slice of the fed
+/// input, possibly empty), and `consumed`, how many fed bytes to drop. `consumed == 0` means an
 /// incomplete header: read more and feed again. `authority` is the authority header this message carried
-/// (with the endpoint it named, *before* the rewrite), reported on the feed that completes the header; the
-/// DIAL proxy acts on `Application-URL` (to learn and re-learn the device's REST target). `None` when the
-/// header carried no rewritable authority.
+/// (with the endpoint it named, *before* the rewrite), reported on the feed that completes the header;
+/// the DIAL proxy acts on `Application-URL` to learn and re-learn the device's REST target. `None` when
+/// the header carried no rewritable authority.
 pub(crate) struct Framed<'a> {
     pub(crate) header: &'a [u8],
     pub(crate) body: &'a [u8],
@@ -77,10 +75,10 @@ pub(crate) struct Framed<'a> {
     pub(crate) authority: Option<AuthorityHeader>,
 }
 
-/// Per-direction incremental HTTP/1.1 framing with an authority-header rewrite. It buffers only the
-/// header — copied into a scratch so it can be rewritten — and forwards the body as a zero-copy slice
-/// of the fed input. The [`RewritePolicy`] is fixed for the framer's lifetime (the owner's per-direction
-/// targets don't change over a connection), so it is stored at construction rather than passed per feed.
+/// Per-direction incremental HTTP/1.1 framing with an authority-header rewrite. Buffers only the header
+/// (copied into a scratch so it can be rewritten) and forwards the body as a zero-copy slice of the fed
+/// input. The [`RewritePolicy`] is fixed for the framer's lifetime (the owner's per-direction targets
+/// don't change over a connection), so it is stored at construction rather than passed per feed.
 pub(crate) struct HttpFraming {
     kind: Kind,
     rewrite: RewritePolicy,
@@ -106,12 +104,12 @@ impl HttpFraming {
     /// Feed a contiguous view of the owner's buffered bytes; returns the forwardable [`Framed`]. Each
     /// call yields at most one message's header plus as much of its body as arrived; the owner forwards
     /// `header` then `body`, drops `consumed` bytes, and feeds again until `consumed` is 0 (an
-    /// incomplete header — read more). `header` borrows the framer's scratch and `body` the input, so
+    /// incomplete header, read more). `header` borrows the framer's scratch and `body` the input, so
     /// the owner forwards both before advancing past `consumed`.
     ///
     /// Each authority header (`Host` on requests, `Application-URL` / `Location` on responses) is
-    /// rewritten per the framer's [`RewritePolicy`] — a per-header target, so one direction can send,
-    /// say, `Application-URL` and `Location` to different listeners.
+    /// rewritten per the framer's [`RewritePolicy`]. The target is per-header, so one direction can
+    /// send, say, `Application-URL` and `Location` to different listeners.
     ///
     /// # Errors
     /// A malformed or over-cap message: see [`FramingError`].
@@ -143,7 +141,7 @@ impl HttpFraming {
                 break;
             }
             match self.phase {
-                Phase::Header => break, // the next message starts here — one message per feed
+                Phase::Header => break, // the next message starts here; one message per feed
                 Phase::BodyContentLength => {
                     let take = self.body_remaining.min(input.len() - pos);
                     pos += take;
@@ -212,8 +210,8 @@ impl HttpFraming {
     }
 
     /// Rewrite the authority headers of `block` (a complete header block ending in the blank line) into
-    /// `self.header`, and set the body phase from its framing. Transforms on copy — each line is
-    /// inspected and written to the scratch in one pass, so there is no in-place splice to re-offset.
+    /// `self.header`, and set the body phase from its framing. Transforms on copy: each line is inspected
+    /// and written to the scratch in one pass, so there is no in-place splice to re-offset.
     ///
     /// # Errors
     /// [`FramingError::MalformedContentLength`] for an unparseable `Content-Length`.
@@ -292,8 +290,8 @@ impl HttpFraming {
     }
 
     /// Set the body phase from what the header scan found (RFC 7230 §3.3.3 + status-line awareness): a
-    /// `1xx`/`204`/`304` response is bodyless regardless of headers; else chunked, then a
-    /// `Content-Length` run, else — a request is bodyless, a response is close-delimited (until EOF).
+    /// `1xx`/`204`/`304` response is bodyless regardless of headers; else chunked, then a `Content-Length`
+    /// run; else a request is bodyless and a response is close-delimited (until EOF).
     fn set_body_phase(&mut self, status: u16, content_length: Option<usize>, chunked: bool) {
         self.body_remaining = 0;
         self.chunk_remaining = 0;
@@ -319,8 +317,8 @@ impl HttpFraming {
     }
 }
 
-/// Which authority-bearing header a line is, carrying the endpoint it named — so the framer rewrites it
-/// and reports it, and the owner can act on `ApplicationUrl` alone (the DIAL REST base).
+/// Which authority-bearing header a line is, carrying the endpoint it named, so the framer can rewrite
+/// and report it and the owner can act on `ApplicationUrl` alone (the DIAL REST base).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum AuthorityHeader {
     Host(SocketAddrV4),
@@ -328,7 +326,7 @@ pub(crate) enum AuthorityHeader {
     Location(SocketAddrV4),
 }
 
-/// Where a framer rewrites each authority header to — one optional target per [`AuthorityHeader`] kind,
+/// Where a framer rewrites each authority header to: one optional target per [`AuthorityHeader`] kind,
 /// `None` leaving that kind unchanged. The owner picks the targets (the DIAL proxy points `Host` at the
 /// device, `Application-URL` at its REST listener, `Location` at the connection's own listener).
 #[derive(Clone, Copy)]
@@ -374,7 +372,7 @@ fn find_crlf(s: &[u8]) -> Option<usize> {
     s.windows(2).position(|w| w == CRLF)
 }
 
-/// The status code from a response start line (`HTTP/1.1 200 OK` → 200), or 0 if unparseable — 0 is no
+/// The status code from a response start line (`HTTP/1.1 200 OK` → 200), or 0 if unparseable. 0 is no
 /// known bodyless status, so it falls through to the header-driven framing.
 fn parse_status_code(line: &[u8]) -> u16 {
     line.split(|&b| b == b' ')
@@ -385,7 +383,7 @@ fn parse_status_code(line: &[u8]) -> u16 {
 }
 
 /// Parse a `Content-Length` value: surrounding whitespace (RFC 7230 OWS) is tolerated, but the rest
-/// must be a bare integer — `12abc` is rejected, not truncated to 12.
+/// must be a bare integer. `12abc` is rejected, not truncated to 12.
 fn parse_content_length(value: &[u8]) -> Result<usize, FramingError> {
     std::str::from_utf8(value.trim_ascii())
         .ok()
@@ -401,7 +399,7 @@ fn value_has_chunked(value: &[u8]) -> bool {
         .any(|coding| coding.trim_ascii().eq_ignore_ascii_case(b"chunked"))
 }
 
-/// If `line` is a `Host` / `Application-URL` / `Location` header, parse its authority — returning the
+/// If `line` is a `Host` / `Application-URL` / `Location` header, parse its authority, returning the
 /// value's offset within `line`, the [`Authority`] (the span to rewrite, whose own offset is relative to
 /// that value), and the header it was (carrying the endpoint it named).
 fn rewritable_authority(line: &[u8]) -> Option<(usize, Authority, AuthorityHeader)> {
@@ -422,7 +420,7 @@ fn rewritable_authority(line: &[u8]) -> Option<(usize, Authority, AuthorityHeade
     Some((value_off, found, header))
 }
 
-/// Append `addr` as `host:port` text — the IPv4 [`SocketAddrV4`] `Display` form.
+/// Append `addr` as `host:port` text, the IPv4 [`SocketAddrV4`] `Display` form.
 fn append_authority(buf: &mut Vec<u8>, addr: SocketAddrV4) {
     use std::io::Write;
     write!(buf, "{addr}").expect("writing to a Vec is infallible");
@@ -433,7 +431,7 @@ mod tests {
     use super::*;
 
     impl RewritePolicy {
-        /// A no-op policy — every authority header passes through unchanged. Tests only; the proxy
+        /// A no-op policy: every authority header passes through unchanged. Tests only; the proxy
         /// always frames with a live policy.
         pub(crate) const NONE: Self = Self {
             host: None,
@@ -492,8 +490,8 @@ mod tests {
             framed.header,
             &b"HTTP/1.1 200 OK\r\nApplication-URL: http://10.1.1.5:44747/apps\r\nContent-Length: 0\r\n\r\n"[..]
         );
-        // A Location reports as its own variant (a launched-instance child URL), which the owner —
-        // acting on Application-URL only — ignores.
+        // A Location reports as its own variant (a launched-instance child URL), which the owner (acting
+        // on Application-URL only) ignores.
         let mut g = HttpFraming::new(Kind::Response, rewrite_all(repl));
         let framed = g
             .feed(
@@ -520,7 +518,7 @@ mod tests {
             b"HTTP/1.1 201 Created\r\nLocation: http://10.1.1.5:44747/apps/YouTube/run\r\n\
               Transfer-Encoding: chunked\r\n\r\n"
         );
-        assert_eq!(f.phase, Phase::BodyChunked); // 201 is NOT special-cased — chunked frames it
+        assert_eq!(f.phase, Phase::BodyChunked); // 201 is NOT special-cased; chunked frames it
     }
 
     #[test]
@@ -684,8 +682,8 @@ mod tests {
 
     #[test]
     fn a_trailer_line_past_the_chunk_cap_is_tolerated() {
-        // A trailer line longer than MAX_CHUNK_LINE but within MAX_TRAILER_LINE isn't refused — it's
-        // just incomplete, awaiting its CRLF. A chunk-size line of the same length would be rejected.
+        // A trailer line longer than MAX_CHUNK_LINE but within MAX_TRAILER_LINE isn't refused, just
+        // incomplete, awaiting its CRLF. A chunk-size line of the same length would be rejected.
         let mut f = HttpFraming::new(Kind::Response, RewritePolicy::NONE);
         let mut input = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n".to_vec();
         input.resize(input.len() + MAX_CHUNK_LINE + 1, b'a');

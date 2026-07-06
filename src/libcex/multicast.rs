@@ -10,8 +10,8 @@ pub(crate) const MCAST_JOIN_GROUP: c_int = libc::MCAST_JOIN_GROUP;
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub(crate) const MCAST_JOIN_GROUP: c_int = 80;
 
-/// `struct group_req` (RFC 3678) — absent from libc everywhere, so hand-rolled. `#[repr(C)]` plus
-/// `sockaddr_storage`'s alignment reproduce the C layout (4 bytes of padding after `gr_interface`).
+/// `struct group_req` (RFC 3678). Absent from libc everywhere, so hand-rolled. `#[repr(C)]` plus
+/// `sockaddr_storage`'s alignment reproduce the C layout: 4 bytes of padding after `gr_interface`.
 #[repr(C)]
 pub(crate) struct GroupReq {
     pub(crate) gr_interface: u32,

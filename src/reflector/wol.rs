@@ -1,9 +1,9 @@
-//! The Wake-on-LAN reflector: re-broadcasts magic packets seen on the source interface onto
-//! the target interface, so a wake sent on one link reaches a sleeping device on another.
+//! Wake-on-LAN reflector: re-broadcasts magic packets seen on the source interface onto the
+//! target interface, so a wake sent on one link reaches a sleeping device on another.
 //!
 //! A magic packet is 6 bytes of `0xFF` followed by the target device's MAC repeated 16 times
-//! (102 bytes); a trailing `SecureOn` password, if present, is forwarded verbatim. The reflector
-//! validates the payload, then re-emits it on the target interface as a v4 limited broadcast /
+//! (102 bytes). A trailing `SecureOn` password, if present, is forwarded verbatim. The reflector
+//! validates the payload, then re-emits it on the target interface as a v4 limited broadcast or
 //! v6 link-local all-nodes multicast, sourced from that interface's own address.
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -18,20 +18,17 @@ use crate::reactor::Reactor;
 
 use super::{BuildError, InterfaceMap, egress_sources, missing_required_family};
 
-/// The all-ones prefix that opens a magic packet.
 const PREFIX_LEN: usize = 6;
 const MAC_LEN: usize = 6;
-/// The target MAC repeats this many times after the prefix.
 const MAC_REPS: usize = 16;
-/// The smallest valid magic packet: the prefix plus the 16 MAC repetitions.
+/// Smallest valid magic packet: prefix plus the 16 MAC repetitions.
 const MAGIC_LEN: usize = PREFIX_LEN + MAC_REPS * MAC_LEN;
 
-/// The IPv6 link-local all-nodes multicast group (`ff02::1`): every node on the link, the v6
-/// equivalent of the IPv4 limited broadcast a magic packet re-emits to.
+/// IPv6 link-local all-nodes group (`ff02::1`), the v6 equivalent of the IPv4 limited broadcast.
 const V6_ALL_NODES: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
 
-/// A built Wake-on-LAN reflector: re-emits each validated magic packet on its `egress` interface.
-/// One is registered per configured port.
+/// Built Wake-on-LAN reflector: re-emits each validated magic packet on its `egress` interface.
+/// One handler covers all configured ports.
 struct WolReflector {
     egress: CaptureKey,
     /// Optional device allow-set; `None` reflects a wake for any device.
@@ -58,8 +55,8 @@ impl PacketHandler for WolReflector {
             );
             return Outcome::Filtered;
         };
-        // A family the egress can't currently source is a quiet, transient drop (address loss) —
-        // Stalled, not a genuine send failure.
+        // A family the egress can't currently source is a transient drop (address loss): Stalled,
+        // not a genuine send failure.
         if !egress_sources(dispatcher, self.egress, dst) {
             log::debug!(
                 "WoL: egress has no source for {dst} yet; dropping wake from {}",
@@ -89,11 +86,10 @@ impl PacketHandler for WolReflector {
     }
 }
 
-/// Whether `payload` opens with a Wake-on-LAN magic packet for an acceptable target: the
-/// `6×0xFF` prefix followed by one MAC repeated 16 times. Trailing bytes (a `SecureOn` password)
-/// are ignored — only the leading [`MAGIC_LEN`] are inspected — and the caller forwards them
-/// as-is. When `targets` is set, the repeated MAC must be a member, so only those devices'
-/// wakes are reflected.
+/// Whether `payload` opens with a Wake-on-LAN magic packet for an acceptable target: the `6×0xFF`
+/// prefix followed by one MAC repeated 16 times. Only the leading [`MAGIC_LEN`] bytes are inspected;
+/// trailing bytes (a `SecureOn` password) are ignored here and forwarded as-is by the caller. When
+/// `targets` is set, the repeated MAC must be a member, so only those devices' wakes are reflected.
 fn is_magic_packet(payload: &[u8], targets: Option<&MacSet>) -> bool {
     let Some(magic) = payload.get(..MAGIC_LEN) else {
         return false;
@@ -109,13 +105,12 @@ fn is_magic_packet(payload: &[u8], targets: Option<&MacSet>) -> bool {
     {
         return false;
     }
-    // A configured allow-set narrows the reflector to those devices' wakes.
     targets.is_none_or(|targets| targets.iter().any(|target| mac == target.octets()))
 }
 
-/// The link-wide destination a magic packet captured as `packet` re-emits to under `family`: the
-/// IPv4 limited broadcast or the IPv6 link-local all-nodes group, at the captured destination
-/// port. `None` when `family` doesn't handle the packet's IP version, so the reflector ignores it.
+/// Link-wide destination a captured magic `packet` re-emits to under `family`: the IPv4 limited
+/// broadcast or the IPv6 link-local all-nodes group, at the captured destination port. `None` when
+/// `family` doesn't handle the packet's IP version.
 fn wol_destination(family: AddressFamily, packet: &Packet) -> Option<SocketAddr> {
     match packet.dest {
         SocketAddr::V4(dest) if family.uses_ipv4() => {
@@ -128,9 +123,9 @@ fn wol_destination(family: AddressFamily, packet: &Packet) -> Option<SocketAddr>
     }
 }
 
-/// Build the Wake-on-LAN reflector(s) for `reflector` and register them on `dispatcher` — a no-op
-/// when Wake-on-LAN isn't enabled for it. Registers one handler per configured port (the dispatcher
-/// filters a single port each), all re-emitting on the target interface.
+/// Build the Wake-on-LAN reflector for `reflector` and register it on `dispatcher`. No-op when
+/// Wake-on-LAN isn't enabled. Registers a single handler covering all configured ports, re-emitting
+/// on the target interface.
 ///
 /// # Errors
 /// [`BuildError::UnknownInterface`] if no capture was opened for the source/target, or
@@ -154,8 +149,8 @@ pub(crate) fn build(
         });
     }
 
-    // One handler spans every configured port; its filter matches the port set. The re-emit uses the
-    // captured destination port, so a single reflector serves them all.
+    // One handler spans every configured port via its filter. The re-emit uses the captured
+    // destination port, so a single reflector serves them all.
     let ports: PortSet = wol.ports.iter().map(|port| port.get()).collect();
     dispatcher.register(
         ingress,

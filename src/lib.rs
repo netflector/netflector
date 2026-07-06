@@ -1,4 +1,4 @@
-//! reflector — reflects link-local service traffic (Wake-on-LAN, mDNS, SSDP,
+//! reflector: reflects link-local service traffic (Wake-on-LAN, mDNS, SSDP,
 //! and an optional DIAL proxy) between two network interfaces.
 //!
 //! The behavior lives in this library crate so it stays testable in-process;
@@ -40,8 +40,8 @@ pub fn run(args: &[String]) -> Result<()> {
     let toml_text = path.map(config::read_config_file).transpose()?;
     let env: Vec<(String, String)> = std::env::vars().collect();
 
-    // Resolve the log level first, from a minimal read of env + file, so the full
-    // parse below is logged at the configured verbosity (see resolve_log_level).
+    // Resolve the log level first from a minimal read of env + file, so the full parse below
+    // logs at the configured verbosity (see resolve_log_level).
     logging::set_level(config::resolve_log_level(toml_text.as_deref(), &env)?);
     log::info!("reflector {} starting", env!("CARGO_PKG_VERSION"));
     if let Some(path) = path {
@@ -57,8 +57,7 @@ pub fn run(args: &[String]) -> Result<()> {
         if count == 1 { "" } else { "s" }
     );
 
-    // Build the data path: one capture per interface, the reflectors that bridge them, then
-    // hand the dispatcher to the reactor to drive until a shutdown signal.
+    // Build the data path: one capture per interface, then the reflectors that bridge them.
     let mut dispatcher = PacketDispatcher::new();
     let interfaces = open_captures(&config, &mut dispatcher)?;
     for reflector in &config.reflectors {
@@ -90,8 +89,8 @@ pub fn run(args: &[String]) -> Result<()> {
         );
         memory_report::log_report(); // a baseline before the loop starts
     }
-    // Always registered: it reports periodically only when an interval is configured, but dumps on a
-    // SIGUSR1 control event regardless — memory stats are always cheaply available.
+    // Always registered: reports periodically only when an interval is configured, but dumps on a
+    // SIGUSR1 control event regardless. Memory stats are always cheaply available.
     reactor.register(Box::new(memory_report::MemoryReporter::new(
         config.debug_memory_interval,
         std::time::Instant::now(),
@@ -105,10 +104,10 @@ pub fn run(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Open one capture per distinct interface — the `source ∪ target` of every reflector, in
-/// first-seen order — recording each in an [`InterfaceMap`] for the per-protocol builders.
+/// Open one capture per distinct interface: the `source ∪ target` of every reflector, in
+/// first-seen order. Records each in an [`InterfaceMap`] for the per-protocol builders.
 /// Fail-closed: a capture that can't open (missing `CAP_NET_RAW`, an absent interface) aborts
-/// startup, since a daemon that looks healthy but reflects nothing is the worse failure.
+/// startup, since a daemon that looks healthy but reflects nothing is worse.
 fn open_captures(config: &Config, dispatcher: &mut PacketDispatcher) -> Result<InterfaceMap> {
     let mut interfaces = InterfaceMap::default();
     for reflector in &config.reflectors {

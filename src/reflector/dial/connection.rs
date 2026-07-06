@@ -1,7 +1,7 @@
 //! One proxied client↔device connection: the bidirectional HTTP byte splice.
 //!
-//! Each [`Connection`] pairs two sockets with a per-direction [`Flow`] — an HTTP framer plus a receive
-//! and a send buffer — driven on the reactor's readable/writable edges. A readable edge frames whole
+//! Each [`Connection`] pairs two sockets with a per-direction [`Flow`] (an HTTP framer plus a receive
+//! and a send buffer), driven on the reactor's readable/writable edges. A readable edge frames whole
 //! messages out of the source, rewrites their authority headers per the direction's policy (the
 //! request's `Host` to the device; the response's `Application-URL`/`Location` to the proxy's listeners,
 //! so the device's address never leaks), and forwards them; a writable edge drains the backlog. Each
@@ -104,7 +104,7 @@ struct DirectionContext<'a> {
 
 impl DirectionContext<'_> {
     /// Read one chunk from the source, frame whole messages out of it, rewrite each per this direction's
-    /// policy, and forward to the destination — buffering any unsent tail for the writable edge to drain.
+    /// policy, and forward to the destination, buffering any unsent tail for the writable edge to drain.
     /// The deadline is refreshed only when bytes actually reach the destination, so a wedged connection
     /// still ages out via the idle sweep. A framing/recv/send error or a backpressure overflow is
     /// `Failed`; the source half-closed is `SourceEof`; otherwise `Open`. Reactor-free, so the splice is
@@ -157,8 +157,8 @@ impl DirectionContext<'_> {
         Forwarded::Open
     }
 
-    /// The source half-closed (sent EOF): disarm its read interest — its FIN is now permanently readable,
-    /// so disarming is what keeps it from re-firing — mark the flow `SourceClosed`, then settle. The
+    /// The source half-closed (sent EOF): disarm its read interest (its FIN is now permanently readable,
+    /// so disarming keeps it from re-firing), mark the flow `SourceClosed`, then settle. The
     /// destination stays open and writable, so the reverse direction keeps delivering. `Close` if the
     /// reactor rejects the disarm.
     fn half_close(&mut self, reactor: &mut Reactor) -> Outcome {
@@ -175,12 +175,12 @@ impl DirectionContext<'_> {
 
     /// Settle a flow after a forward or drain: if its source has closed and its backlog is now flushed,
     /// FIN the destination and mark the flow `Done`; then arm the destination's write interest to
-    /// whatever backlog remains — a fully-drained flow disarms it, so `on_writable` never re-enters here
+    /// whatever backlog remains. A fully-drained flow disarms it, so `on_writable` never re-enters here
     /// and the FIN fires exactly once. `Close` if the reactor rejects the change.
     fn settle(&mut self, reactor: &mut Reactor) -> Outcome {
         // Defer finishing while the destination is still connecting: `shutdown_write` would be an
-        // `ENOTCONN` no-op (the FIN lost) and `Done` a lie. The connect-completion edge — kept armed by
-        // `sync_write_interest` below — drives `finish_connect`, after which a later settle finishes.
+        // `ENOTCONN` no-op (the FIN lost) and `Done` a lie. The connect-completion edge (kept armed by
+        // `sync_write_interest` below) drives `finish_connect`, after which a later settle finishes.
         if self.flow.state == FlowState::SourceClosed
             && self.flow.send.is_empty()
             && !self.to.is_connecting()
@@ -218,8 +218,6 @@ impl DirectionContext<'_> {
     /// the connect-completion edge (a writable edge with no backlog) survives. `Close` if the reactor
     /// rejects the change, which would otherwise strand the buffered send with no later re-arm.
     fn sync_write_interest(&self, reactor: &mut Reactor) -> Outcome {
-        // Arm on a backlog to drain it, or while the destination is still connecting so its
-        // connect-completion edge (a writable edge with no backlog) still wakes us.
         let armed = !self.flow.send.is_empty() || self.to.is_connecting();
         let reg = self
             .to_reg
@@ -291,7 +289,7 @@ impl Connection {
         self.device_reg = Some(device_reg);
     }
 
-    /// The device endpoint this connection targets — its `Host` rewrite target and log identity.
+    /// The device endpoint this connection targets: its `Host` rewrite target and log identity.
     pub(super) fn device_endpoint(&self) -> SocketAddrV4 {
         self.device_endpoint
     }
@@ -380,14 +378,14 @@ impl Connection {
 
     /// `direction`'s source peer has fully hung up. Whatever it already sent may still be buffered toward
     /// the *other*, still-live peer, so finish delivering that (`settle` drains it asynchronously, then
-    /// FINs). The reverse direction is dead — its destination is the vanished peer — so abandon it
+    /// FINs). The reverse direction is dead (its destination is the vanished peer), so abandon it
     /// (`Done`, dropping its undeliverable buffer) and disarm its source read, lest a stray edge re-enter
     /// and tear us down early. Unwatch the vanished fd, whose level-triggered HUP would otherwise re-fire
     /// every wait. The connection closes once the forward flow finishes draining.
     fn peer_gone(&mut self, direction: Direction, reactor: &mut Reactor) -> Outcome {
         // The abandoned reverse flow's source is the reg to disarm; the hung-up fd is the reg to unwatch.
         // The guard routes here only with a live destination reg, and the source's reg is still set (its
-        // fd just hung up, and peer_gone — which takes it — runs once), so both expects hold.
+        // fd just hung up, and peer_gone (which takes it) runs once), so both expects hold.
         let (disarm_reg, unwatch_reg) = match direction {
             Direction::ClientToDevice => {
                 self.u2c.state = FlowState::Done; // the response can't reach the gone client
@@ -429,9 +427,9 @@ impl Connection {
     fn forward(&mut self, direction: Direction, reactor: &mut Reactor) -> Outcome {
         let mut ctx = self.context(direction);
         // A non-Open flow means we already disarmed this source's read when it half-closed, yet it woke
-        // us again — only a hangup/reset does that, since epoll delivers HUP/ERR regardless of the read
+        // us again. Only a hangup/reset does that, since epoll delivers HUP/ERR regardless of the read
         // mask. The source peer is fully gone. If its destination is gone too (a prior `peer_gone` took
-        // that reg, leaving it `None`), both peers have vanished — close. Otherwise wind down, finishing
+        // that reg, leaving it `None`), both peers have vanished, so close. Otherwise wind down, finishing
         // any backlog still owed to the live destination, rather than re-running the half-close.
         if ctx.flow.state != FlowState::Open {
             return if ctx.to_reg.is_none() {
@@ -497,7 +495,7 @@ fn send_framed(
         }
     };
     if sent > 0 {
-        // Bytes reached the destination — real forward progress, so hold off the idle timeout.
+        // Real forward progress: hold off the idle timeout.
         *deadline = Instant::now() + IDLE_TIMEOUT;
     }
     if sent == total {
@@ -517,7 +515,7 @@ fn buffer_tail(to_send: &mut StreamBuffer, header: &[u8], body: &[u8]) -> Outcom
 }
 
 /// Split a `header`+`body` pair at the `sent` bytes already written front-to-back, giving the unsent
-/// remainder of each — a single `writev` count can land inside either slice.
+/// remainder of each. A single `writev` count can land inside either slice.
 fn split_remainder<'a>(header: &'a [u8], body: &'a [u8], sent: usize) -> (&'a [u8], &'a [u8]) {
     if sent >= header.len() {
         (&[], &body[sent - header.len()..])
@@ -741,7 +739,7 @@ mod tests {
         assert!(matches!(outcome, Forwarded::SourceEof));
     }
 
-    /// A do-nothing handler — only needed so the reactor will hand out registrations for the
+    /// A do-nothing handler, only needed so the reactor will hand out registrations for the
     /// state-machine tests below (they drive `Connection` directly, never through dispatch).
     struct NoopHandler;
     impl Handler for NoopHandler {
@@ -920,7 +918,7 @@ mod tests {
         assert_eq!(
             conn.u2c.state,
             FlowState::Done,
-            "the reverse direction is abandoned — the client is gone"
+            "the reverse direction is abandoned; the client is gone"
         );
         assert!(
             conn.client_reg.is_none(),
@@ -956,7 +954,7 @@ mod tests {
             conn.forward(Direction::ClientToDevice, &mut reactor),
             Outcome::Keep
         );
-        // Then the device hangs up too — its registration is already gone, so nothing is left to
+        // Then the device hangs up too. Its registration is already gone, so nothing is left to
         // deliver: close, and (the regression) without panicking in settle/sync_write_interest.
         assert_eq!(
             conn.forward(Direction::DeviceToClient, &mut reactor),

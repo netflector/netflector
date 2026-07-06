@@ -1,14 +1,13 @@
 //! Process-wide logging built on the [`log`] facade.
 //!
-//! Subsystems log through the `log` macros (`log::info!`, `log::warn!`, …), which
-//! capture the call site's module path as the record's target. [`init`] installs
-//! this module's [`StderrLogger`] as the one global logger and sets the severity
-//! threshold from the configured [`LogLevel`]. That threshold is the crate-wide
-//! filter the macros apply *before* a record reaches us, so below-threshold calls
-//! cost only a level comparison.
+//! Subsystems log through the `log` macros, which capture the call site's module
+//! path as the record's target. [`init`] installs [`StderrLogger`] as the global
+//! logger and sets the severity threshold from the configured [`LogLevel`]. The
+//! macros apply that threshold before a record reaches us, so below-threshold
+//! calls cost only a level comparison.
 //!
-//! Records are written to stderr (leaving stdout for program output) as
-//! `<utc> <LEVEL> <target>: <message>`, with a UTC ISO-8601 timestamp.
+//! Records go to stderr (stdout is left for program output) as
+//! `<utc> <LEVEL> <target>: <message>` with a UTC ISO-8601 timestamp.
 
 use std::fmt;
 use std::io::Write;
@@ -18,8 +17,8 @@ use log::{LevelFilter, Log, Metadata, Record};
 
 use crate::config::LogLevel;
 
-/// The installed logger. A unit struct: the only mutable state is `log`'s global
-/// max level, set once by [`init`].
+/// The installed logger. The only mutable state is `log`'s global max level, set
+/// once by [`init`].
 struct StderrLogger;
 
 static LOGGER: StderrLogger = StderrLogger;
@@ -114,13 +113,13 @@ impl fmt::Display for Utc {
 
 /// Install the global logger backend with the default severity threshold.
 ///
-/// Installing a process-global logger is the binary's responsibility, not a
-/// library's, so this is called once from `main`; `set_level` then applies the
-/// configured threshold once the configuration has been loaded.
+/// A process-global logger is the binary's responsibility, so this is called once
+/// from `main`. `set_level` then applies the configured threshold after the
+/// configuration is loaded.
 ///
 /// # Panics
-/// Panics if called more than once in the process — a second call would try to
-/// replace the already-installed global logger.
+/// Panics if called more than once: a second call would try to replace the
+/// already-installed global logger.
 pub fn init() {
     log::set_logger(&LOGGER).expect("logging::init called more than once");
     log::set_max_level(LevelFilter::from(LogLevel::default()));

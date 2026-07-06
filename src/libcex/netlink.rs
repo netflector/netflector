@@ -1,6 +1,5 @@
 //! rtnetlink (`NETLINK_ROUTE`) message-framing FFI, hand-rolled because `libc` exposes it for Android
-//! only, not glibc/musl: the netlink/message/attribute header structs, the `sockaddr_nl`, the request
-//! and message-type flags, and the 4-byte `NLMSG_ALIGN`.
+//! only, not glibc/musl.
 
 use libc::c_int;
 
@@ -20,7 +19,7 @@ pub(crate) struct NlMsgHdr {
     pub(crate) pid: u32,
 }
 
-/// `struct ifaddrmsg` — the body of an `RTM_*ADDR` message. A zeroed value (family
+/// `struct ifaddrmsg`: the body of an `RTM_*ADDR` message. A zeroed value (family
 /// `AF_UNSPEC`) is the dump request body. The address monitor reads `index` from it.
 #[repr(C)]
 #[derive(Default)]
@@ -32,14 +31,14 @@ pub(crate) struct IfAddrMsg {
     pub(crate) index: u32,
 }
 
-/// `struct rtattr` — a type-length-value attribute header within a message.
+/// `struct rtattr`: a type-length-value attribute header within a message.
 #[repr(C)]
 pub(crate) struct RtAttr {
     pub(crate) len: u16,
     pub(crate) attr_type: u16,
 }
 
-/// `struct sockaddr_nl` — hand-rolled (`libc` exposes it for Android only).
+/// `struct sockaddr_nl`.
 #[repr(C)]
 #[derive(Default)]
 pub(crate) struct SockAddrNl {
@@ -49,7 +48,7 @@ pub(crate) struct SockAddrNl {
     pub(crate) groups: u32,
 }
 
-/// `(n + 3) & !3` — netlink's 4-byte alignment for message and attribute lengths.
+/// `NLMSG_ALIGN`: netlink's 4-byte alignment for message and attribute lengths.
 pub(crate) const fn nl_align(n: usize) -> usize {
     (n + 3) & !3
 }

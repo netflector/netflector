@@ -1,12 +1,12 @@
 //! `AF_PACKET` packet capture (Linux).
 //!
-//! Unlike the BSD BPF backend, one `recv` returns exactly one frame — no batch to walk.
+//! Unlike the BSD BPF backend, one `recv` returns exactly one frame, with no batch to walk.
 //!
 //! Init order matters: the socket opens with protocol 0, capturing nothing, so the
-//! filter and the loop-prevention option install *before* `bind` sets the real
-//! protocol and starts delivery — there is no window in which unfiltered frames
-//! (e.g. IGMP from a multicast join) queue. (The BSD backend instead binds first
-//! and relies on `BIOCSETF` flushing the kernel buffer.)
+//! filter and the loop-prevention option install before `bind` sets the real
+//! protocol and starts delivery. No window exists in which unfiltered frames
+//! (e.g. IGMP from a multicast join) queue. The BSD backend instead binds first
+//! and relies on `BIOCSETF` flushing the kernel buffer.
 
 use std::ffi::CString;
 use std::io;
@@ -81,7 +81,7 @@ impl Capture {
         })
     }
 
-    /// The link framing — always Ethernet on Linux, loopback included.
+    /// The link framing: always Ethernet on Linux, loopback included.
     #[allow(clippy::unused_self)] // uniform Capture API; the BPF backend reads self
     pub(crate) fn link_type(&self) -> LinkType {
         LinkType::Ethernet
@@ -105,7 +105,7 @@ impl Capture {
             // oversized frame is detectable (and dropped) instead of silently cut.
             if bytes > self.buf.len() {
                 // trace, not warn: per-frame drain loop, and a remote peer can flood oversized
-                // frames — a per-frame warn would break data-path-quiet and spam the log.
+                // frames. A per-frame warn would break data-path-quiet and spam the log.
                 log::trace!(
                     "dropping oversized frame: {bytes} bytes exceeds the {}-byte receive buffer",
                     self.buf.len()
@@ -117,7 +117,7 @@ impl Capture {
         Ok(Some(&self.buf[..len]))
     }
 
-    /// Whether frames are buffered locally — never, for `AF_PACKET`: each `recv` is
+    /// Whether frames are buffered locally. Never, for `AF_PACKET`: each `recv` is
     /// one frame, so a level-triggered wait re-fires while the socket has more.
     #[allow(clippy::unused_self)] // uniform Capture API; the BPF backend reads self
     pub(crate) fn has_buffered(&self) -> bool {
@@ -153,8 +153,8 @@ impl Capture {
     }
 
     /// One `recv` into the buffer. Returns `Ok(None)` when it would block, or the frame's real
-    /// length (which may exceed the buffer, since `MSG_TRUNC` is set — the caller treats that as an
-    /// oversized frame).
+    /// length. The length may exceed the buffer, since `MSG_TRUNC` is set; the caller treats
+    /// that as an oversized frame.
     fn recv_once(&mut self) -> io::Result<Option<usize>> {
         // SAFETY: `recv` writes up to `buf.len()` bytes into our own buffer.
         let n = unsafe {
@@ -178,7 +178,7 @@ impl AsRawFd for Capture {
     }
 }
 
-/// [`DROP_OUTGOING_PROLOGUE`] followed by [`ETHERNET_UDP_FILTER`] — the
+/// [`DROP_OUTGOING_PROLOGUE`] followed by [`ETHERNET_UDP_FILTER`]: the
 /// loop-prevention fallback for kernels without `PACKET_IGNORE_OUTGOING`.
 fn drop_outgoing_filter() -> [BpfInsn; DROP_OUTGOING_FILTER_LEN] {
     std::array::from_fn(|i| match DROP_OUTGOING_PROLOGUE.get(i) {
@@ -189,7 +189,7 @@ fn drop_outgoing_filter() -> [BpfInsn; DROP_OUTGOING_FILTER_LEN] {
 
 /// A zeroed `sockaddr_ll` addressed to `ifindex` (family set, protocol left zero).
 fn link_addr(ifindex: c_int) -> libc::sockaddr_ll {
-    // SAFETY: all-zero is a valid `sockaddr_ll` — integer and byte-array fields only.
+    // SAFETY: all-zero is a valid `sockaddr_ll`: integer and byte-array fields only.
     let mut addr: libc::sockaddr_ll = unsafe { core::mem::zeroed() };
     addr.sll_family = u16::try_from(libc::AF_PACKET).expect("AF_PACKET fits u16");
     addr.sll_ifindex = ifindex;
@@ -336,7 +336,7 @@ mod tests {
 
     // Live send: inject a built Ethernet frame on `lo` via send(), then capture it
     // back. lo loops every transmitted frame to its input tap, and we keep the RX
-    // copy (PACKET_IGNORE_OUTGOING drops only the TX copy) — so this validates that
+    // copy (PACKET_IGNORE_OUTGOING drops only the TX copy), so this validates that
     // send() actually puts the frame on the wire. (Whether the local IP stack then
     // delivers a raw-injected loopback frame to a socket is kernel-specific, and not
     // what send() is for: on a real interface it reaches other hosts, not us.)

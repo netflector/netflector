@@ -1,10 +1,10 @@
 //! Parse a captured frame into a [`Packet`]: strip the link header, then the IP and
 //! UDP headers, yielding the endpoints, TTL, and a borrowed payload.
 //!
-//! The parse is zero-copy — a [`Packet`] borrows the capture buffer and is valid only
-//! until the next read. The kernel filter already restricts capture to IP/UDP, so the
-//! validation here is defense in depth: a malformed frame is rejected with a
-//! [`ParseError`] for the caller to log and skip, never a panic or a partial packet.
+//! The parse is zero-copy: a [`Packet`] borrows the capture buffer, valid only until
+//! the next read. The kernel filter already restricts capture to IP/UDP, so the
+//! validation here is defense in depth: a malformed frame yields a [`ParseError`] to
+//! log and skip, never a panic or partial packet.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -26,7 +26,7 @@ pub(crate) struct Packet<'a> {
     pub(crate) dest: SocketAddr,
     /// IPv4 TTL or IPv6 hop limit, as captured.
     pub(crate) ttl: u8,
-    /// Ethernet destination/source MAC, or `None` on `DLT_NULL` (loopback/tunnel — no L2).
+    /// Ethernet destination/source MAC, or `None` on `DLT_NULL` (loopback/tunnel, no L2).
     pub(crate) dst_mac: Option<MacAddr>,
     pub(crate) src_mac: Option<MacAddr>,
     pub(crate) payload: &'a [u8],
@@ -60,8 +60,8 @@ impl<'a> Packet<'a> {
     /// fragment, or carries an inconsistent length field.
     pub(crate) fn parse(link_type: LinkType, frame: &'a [u8]) -> Result<Self, ParseError> {
         let link = parse_link_header(link_type, frame)?;
-        // Dispatch on the IP version nibble, not the link-layer ethertype / address
-        // family — the nibble governs the header layout we actually parse.
+        // Dispatch on the IP version nibble, not the link-layer ethertype or address
+        // family: the nibble governs the header layout we parse.
         let &first = link.l3.first().ok_or(ParseError::Truncated)?;
         match first >> 4 {
             4 => parse_ipv4(link),
@@ -209,14 +209,14 @@ fn ipv4_addr(bytes: &[u8]) -> Result<Ipv4Addr, ParseError> {
         .map_err(|_| ParseError::Truncated)
 }
 
-/// Read a 16-byte IPv6 address field — the [`ipv4_addr`] counterpart for IPv6.
+/// Read a 16-byte IPv6 address field, the [`ipv4_addr`] counterpart.
 fn ipv6_addr(bytes: &[u8]) -> Result<Ipv6Addr, ParseError> {
     <[u8; 16]>::try_from(bytes)
         .map(Ipv6Addr::from)
         .map_err(|_| ParseError::Truncated)
 }
 
-/// Read a 6-byte MAC field — the [`ipv4_addr`] counterpart for an Ethernet address.
+/// Read a 6-byte MAC field, the [`ipv4_addr`] counterpart.
 fn read_mac(bytes: &[u8]) -> Result<MacAddr, ParseError> {
     <[u8; 6]>::try_from(bytes)
         .map(MacAddr::from)
@@ -286,7 +286,7 @@ mod tests {
         assert_eq!(packet.source, SocketAddr::V4(src));
         assert_eq!(packet.dest, SocketAddr::V4(dst));
         assert_eq!(packet.ttl, 64);
-        // DLT_NULL has no L2 header — no MACs to report.
+        // DLT_NULL has no L2 header, so no MACs to report.
         assert_eq!(packet.dst_mac, None);
         assert_eq!(packet.src_mac, None);
         assert_eq!(packet.payload, &payload);
@@ -333,7 +333,7 @@ mod tests {
         frame[23] = IP_PROTO_UDP;
         frame[26..30].copy_from_slice(&[10, 1, 2, 3]); // src IP
         frame[30..34].copy_from_slice(&[10, 4, 5, 6]); // dst IP
-        // frame[34..38] are the 4 option bytes (left zero — the parser skips them).
+        // frame[34..38] are the 4 option bytes (left zero; the parser skips them).
         frame[38..40].copy_from_slice(&1111u16.to_be_bytes()); // src port
         frame[40..42].copy_from_slice(&2222u16.to_be_bytes()); // dst port
         frame[42..44].copy_from_slice(&12u16.to_be_bytes()); // UDP length
@@ -346,8 +346,8 @@ mod tests {
         assert_eq!(packet.payload, &[0xde, 0xad, 0xbe, 0xef]);
     }
 
-    /// Build a valid Ethernet IPv4 UDP frame into `buf`, returning its length — the
-    /// starting point the rejection tests corrupt one field of.
+    /// Build a valid Ethernet IPv4 UDP frame into `buf`, returning its length. The
+    /// rejection tests corrupt one field of this baseline.
     fn valid_ethernet_ipv4(buf: &mut [u8]) -> usize {
         let src = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 1234);
         let dst = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 5678);
@@ -434,15 +434,15 @@ mod tests {
     fn rejects_ipv4_header_length_below_minimum() {
         let mut buf = [0u8; 64];
         let n = valid_ethernet_ipv4(&mut buf);
-        buf[14] = 0x44; // version 4, IHL 4 — a 16-byte header, below the 20-byte minimum
+        buf[14] = 0x44; // version 4, IHL 4: a 16-byte header, below the 20-byte minimum
         assert_eq!(
             Packet::parse(LinkType::Ethernet, &buf[..n]),
             Err(ParseError::BadLength)
         );
     }
 
-    // The fragment check masks 0x3fff, so Don't-Fragment (0x4000) alone must parse —
-    // guards against a regression that widened the mask to also catch DF.
+    // The fragment check masks 0x3fff, so Don't-Fragment (0x4000) alone must parse.
+    // Guards against a regression that widened the mask to also catch DF.
     #[test]
     fn accepts_dont_fragment_flag() {
         let mut buf = [0u8; 64];
@@ -464,7 +464,7 @@ mod tests {
         assert!(packet.payload.is_empty());
     }
 
-    /// Build a valid Ethernet IPv6 UDP frame into `buf`, returning its length — the
+    /// Build a valid Ethernet IPv6 UDP frame into `buf`, returning its length. The
     /// IPv6 counterpart of [`valid_ethernet_ipv4`] for the rejection tests.
     fn valid_ethernet_ipv6(buf: &mut [u8]) -> usize {
         let src = SocketAddrV6::new(Ipv6Addr::LOCALHOST, 1234, 0, 0);

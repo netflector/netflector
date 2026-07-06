@@ -299,14 +299,14 @@ mod tests {
         ])
         .unwrap();
         let macs = cfg.reflectors[0].macs.as_ref().unwrap();
-        // The two addresses parse, in order, with the surrounding CSV whitespace trimmed.
+        // Parsed in order; CSV whitespace trimmed.
         let addrs: Vec<String> = macs.iter().map(ToString::to_string).collect();
         assert_eq!(addrs, ["00:00:00:00:00:01", "00:00:00:00:00:02"]);
     }
 
     #[test]
     fn env_legacy_mac_param_is_now_unknown() {
-        // `mac` was replaced by `macs` in 0.9.0; the old singular param is no longer recognized.
+        // `mac` was replaced by `macs` in 0.9.0.
         assert!(matches!(
             from_env(&[
                 ("REFLECTOR_TV_SOURCE_IF", "a"),
@@ -390,7 +390,7 @@ mod tests {
     #[test]
     fn duplicate_reflector_across_sources_rejected_case_insensitively() {
         // A verbatim file key "TV" and the lowercased env tag "tv" name the same reflector; the
-        // duplicate guard must fold case (and whitespace) rather than miss the collision.
+        // duplicate guard must fold case (and whitespace) to catch it.
         let toml = r#"
             [reflectors.TV]
             source_if = "a"

@@ -1,5 +1,5 @@
-//! The wire layer: everything that touches on-the-wire packet formats — link-layer
-//! framing, IP/UDP checksums, and building and parsing frames.
+//! The wire layer: on-the-wire packet formats. Link-layer framing, IP/UDP
+//! checksums, building and parsing frames.
 
 mod checksum;
 pub(crate) mod frame;
@@ -14,11 +14,11 @@ pub(crate) mod tcp;
 pub(crate) mod uninit_buf;
 pub(crate) mod wsd;
 
-/// The link-layer framing of a captured or injected frame. The capture layer reports
-/// it per interface; [`frame`] adds the matching link header and [`packet`] strips it
-/// before parsing L3: a 14-byte Ethernet header, or — on BSD — `DLT_NULL`'s 4-byte
-/// host-order address family (loopback/tunnel interfaces). Linux frames every
-/// interface, loopback included, as Ethernet.
+/// Link-layer framing of a captured or injected frame. The capture layer reports
+/// it per interface; [`frame`] adds the matching link header and [`packet`] strips
+/// it before parsing L3. Either a 14-byte Ethernet header, or on BSD `DLT_NULL`'s
+/// 4-byte host-order address family (loopback/tunnel interfaces). Linux frames every
+/// interface as Ethernet, loopback included.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LinkType {
     Ethernet,

@@ -1,11 +1,11 @@
 //! A generational-index arena.
 //!
 //! [`insert`](Arena::insert) returns a `Copy` [`Key`] carrying the slot's `index`
-//! and `generation`; [`remove`](Arena::remove) bumps the generation, so a key to
-//! the old occupant resolves to `None` — a stale key is detected, not dangling.
+//! and `generation`. [`remove`](Arena::remove) bumps the generation, so a key to
+//! the old occupant resolves to `None` rather than dangling.
 //!
 //! Lets the reactor hand out copyable handles to registrations instead of
-//! pointers, sidestepping the aliasing cross-references would create.
+//! pointers, avoiding the aliasing that cross-references would create.
 
 /// A `Copy` handle into an [`Arena`].
 ///
@@ -64,14 +64,14 @@ impl<T> Arena<T> {
     ///
     /// # Panics
     /// Panics if more than `u32::MAX` slots have ever been allocated (the index
-    /// space is exhausted) — unreachable for the reactor's handful of descriptors.
+    /// space is exhausted). Unreachable for the reactor's handful of descriptors.
     pub(crate) fn insert(&mut self, value: T) -> Key {
         self.insert_from(|_| value)
     }
 
-    /// Store a value built from the key that will address it — for a value that
-    /// must know its own key (a reactor handler that later watches fds under, or
-    /// unregisters, its own key). The arena resolves the key first, then hands it
+    /// Store a value built from the key that will address it. Used when the value
+    /// must know its own key: a reactor handler that later watches fds under, or
+    /// unregisters, its own key. The arena resolves the key first, then hands it
     /// to `make`.
     ///
     /// # Panics
@@ -233,7 +233,7 @@ mod tests {
         arena.remove(first);
         let second = arena.insert("second");
         // The free list reuses the slot, so the index matches but the generation
-        // differs — the old key stays stale, the new key is live.
+        // differs: the old key stays stale, the new key is live.
         assert_eq!(first.index, second.index);
         assert_ne!(first.generation, second.generation);
         assert_eq!(arena.get(first), None);
@@ -278,7 +278,7 @@ mod tests {
         let mut arena = Arena::new();
         let key = arena.insert("shared");
         // `Key: Copy`, so this duplicates the handle; `key` stays usable afterward
-        // (a move would forbid the uses below) — copyable handles, not pointers.
+        // (a move would forbid the uses below).
         let copy = key;
         assert_eq!(key, copy);
         assert_eq!(arena.get(key), Some(&"shared"));

@@ -3,12 +3,12 @@
 //!
 //! A signal arrives at an arbitrary point and its handler may call only
 //! async-signal-safe functions, so it cannot touch the reactor (the arena, the
-//! logger, allocation — all off-limits). Instead the handler records which kind of
-//! signal arrived in an atomic flag and `write`s one byte to a pipe to wake the loop.
-//! The pipe's read end is registered with the reactor like any other fd, so the real
-//! work (a shutdown, or a counter dump) happens later, in normal code, when the loop
-//! wakes on it. This needs no per-backend signal support (no `signalfd` /
-//! `EVFILT_SIGNAL`) — the pipe is just a readable fd.
+//! logger, allocation are all off-limits). The handler records which kind of signal
+//! arrived in an atomic flag and `write`s one byte to a pipe to wake the loop. The
+//! pipe's read end is registered with the reactor like any other fd, so the real
+//! work (a shutdown, or a counter dump) happens later in normal code, when the loop
+//! wakes on it. Needs no per-backend signal support (no `signalfd` / `EVFILT_SIGNAL`);
+//! the pipe is just a readable fd.
 
 use std::io;
 use std::mem;
@@ -35,10 +35,9 @@ static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// Set by the handler for [`DUMP_SIGNAL`]; the pipe reader consumes it.
 static DUMP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-/// The signal handler: the one async-signal-safe action we need.
+/// The signal handler: async-signal-safe, so it only records intent and wakes the loop.
 extern "C" fn on_signal(signum: c_int) {
-    // Record which kind arrived in an async-signal-safe atomic, then wake the loop. The pipe byte is
-    // a pure wakeup (its value carries nothing); these flags carry the intent.
+    // The pipe byte is a pure wakeup; its value carries nothing, the atomic flags carry the intent.
     if signum == DUMP_SIGNAL {
         DUMP_REQUESTED.store(true, Ordering::Relaxed);
     } else {
@@ -57,7 +56,7 @@ extern "C" fn on_signal(signum: c_int) {
 }
 
 /// An installed self-pipe with the previous signal dispositions saved. Dropping it
-/// restores those dispositions, unpublishes the fd, and closes the write end — in
+/// restores those dispositions, unpublishes the fd, then closes the write end, in
 /// that order, so no signal can reach a handler that points at a closed fd.
 pub(crate) struct SignalGuard {
     /// Held only so its `OwnedFd` `Drop` closes the write end when the guard drops.
@@ -108,15 +107,14 @@ impl Drop for SignalGuard {
     }
 }
 
-/// Reactor handler for the self-pipe read end (which it owns): drains the pipe and
-/// asks the reactor to stop. The bytes carry nothing beyond "a shutdown signal
-/// arrived".
+/// Reactor handler for the self-pipe read end, which it owns. Drains the pipe and
+/// acts on whichever signal flags are set; the bytes themselves carry nothing.
 pub(crate) struct SignalPipe {
     read: OwnedFd,
 }
 
 impl SignalPipe {
-    /// The read-end fd to watch — handed to [`Reactor::register_with_fds`] at install.
+    /// The read-end fd to watch, handed to [`Reactor::register_with_fds`] at install.
     pub(crate) fn read_fd(&self) -> RawFd {
         self.read.as_raw_fd()
     }
@@ -124,8 +122,7 @@ impl SignalPipe {
 
 impl Handler for SignalPipe {
     fn on_readable(&mut self, _event: ReadyEvent, reactor: &mut Reactor) {
-        // Drain so a level-triggered wait does not keep re-reporting it; the byte values carry
-        // nothing — the atomic flags carry which signal(s) arrived.
+        // Drain so a level-triggered wait does not keep re-reporting it.
         let mut buf = [0u8; 16];
         let fd = self.read.as_raw_fd();
         // SAFETY: `self.read` is the registered, non-blocking read end; draining
@@ -202,7 +199,7 @@ fn install_handlers() -> io::Result<[libc::sigaction; HANDLED_SIGNALS.len()]> {
     Ok(saved)
 }
 
-/// Restore previously-saved signal dispositions (best effort — errors ignored).
+/// Restore previously-saved signal dispositions (best effort, errors ignored).
 fn restore_handlers(saved: &[libc::sigaction]) {
     for (&signum, action) in HANDLED_SIGNALS.iter().zip(saved) {
         // SAFETY: `action` is a disposition a prior `sigaction` produced.
@@ -246,7 +243,7 @@ mod tests {
         // SIGINT flags a shutdown, SIGUSR1 flags a dump.
         // SAFETY: `raise` just delivers a signal to the current process.
         assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
-        // SAFETY: as above — deliver SIGUSR1 to ourselves.
+        // SAFETY: as above, deliver SIGUSR1 to ourselves.
         assert_eq!(unsafe { libc::raise(DUMP_SIGNAL) }, 0);
 
         let mut buf = [0u8; 8];

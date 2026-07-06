@@ -2,7 +2,7 @@
 //!
 //! Level-triggered: read and write interest are toggled per registration via a full-mask
 //! `EPOLL_CTL_MOD` (epoll has no per-direction enable). The reactor [`Key`] travels in each event's
-//! `u64` field, so a wakeup carries its own routing — no fd-to-handler side table.
+//! `u64` field, so a wakeup carries its own routing without an fd-to-handler side table.
 
 use std::io;
 use std::mem;
@@ -139,7 +139,7 @@ impl Poller {
             return Err(err);
         }
         self.ready = usize::try_from(count).expect("epoll_wait count is non-negative");
-        self.next = 0; // start draining the new batch from the front
+        self.next = 0;
         log::trace!("epoll: {} ready", self.ready);
         Ok(self.ready)
     }

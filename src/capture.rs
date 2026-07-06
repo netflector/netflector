@@ -1,6 +1,6 @@
 //! Raw L2 packet capture: a per-interface handle the reactor can poll.
 //!
-//! One backend per platform behind a uniform `Capture` — BPF on macOS/FreeBSD,
+//! One backend per platform behind a uniform `Capture`: BPF on macOS/FreeBSD,
 //! `AF_PACKET` on Linux. The handle owns a pollable fd, reads link-layer frames
 //! into a reused buffer (no per-frame allocation), and injects built frames.
 
@@ -18,7 +18,7 @@ pub(crate) use self::af_packet::Capture;
 pub(crate) use self::bpf::Capture;
 
 /// Open a capture on `if_name`, returning `Ok(None)` (and noting why) when the host
-/// can't — no BPF access / `CAP_NET_RAW`, or the interface is absent. Other errors
+/// can't: no BPF access / `CAP_NET_RAW`, or the interface is absent. Other errors
 /// propagate for the caller to `?`.
 #[cfg(test)]
 pub(crate) fn open_or_skip(if_name: &str, what: &str) -> std::io::Result<Option<Capture>> {
@@ -43,9 +43,9 @@ mod tests {
     use super::open_or_skip;
     use crate::net::LinkType;
 
-    // Live capture against a real interface (`REFLECTOR_TEST_IFACE`) — backend-neutral
-    // because a real interface is Ethernet-framed on both backends (BPF reports
-    // DLT_EN10MB, AF_PACKET delivers the Ethernet header).
+    // Live capture against a real interface (`REFLECTOR_TEST_IFACE`). Backend-neutral
+    // because a real interface is Ethernet-framed on both backends: BPF reports
+    // DLT_EN10MB, AF_PACKET delivers the Ethernet header.
     #[test]
     fn live_capture_decodes_real_frames() -> std::io::Result<()> {
         let Some(iface) = std::env::var_os("REFLECTOR_TEST_IFACE") else {

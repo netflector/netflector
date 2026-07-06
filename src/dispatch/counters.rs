@@ -1,11 +1,11 @@
 //! Observability counters: what the reflector did with each packet, tallied per message type and
 //! interface.
 //!
-//! A single packet can match several handlers — e.g. mirrored `a→b` and `b→a` reflectors both put a
-//! handler on the same interface, one that reflects it and one that skips it. Each handler returns an
+//! A single packet can match several handlers. E.g. mirrored `a→b` and `b→a` reflectors both put a
+//! handler on the same interface, one reflecting it and one skipping it. Each handler returns an
 //! [`Outcome`]; the dispatcher folds them with [`Outcome::combine`] into the single highest-precedence
-//! disposition and records that once, so one packet is counted once (the reflecting handler wins; the
-//! other's skip is shadowed). The fold also surfaces "can't happen under a valid config" [`Anomalies`]
+//! disposition and records that once, so one packet is counted once: the reflecting handler wins, the
+//! other's skip is shadowed. The fold also surfaces "can't happen under a valid config" [`Anomalies`]
 //! for the dispatcher to log.
 //!
 //! The interface dimension is the ingress [`CaptureKey`](super::CaptureKey), which the dispatcher
@@ -14,22 +14,22 @@
 use std::fmt;
 
 /// Declare [`MessageType`] from a single `Variant => (protocol, direction)` list, deriving its report
-/// labels, the `ALL` roster, and [`MESSAGE_TYPE_COUNT`] from that one list. Because the count and the
-/// counter-row order both come from the variant list, reordering variants is harmless and adding or
-/// removing one can't leave the count (the counter-array width) stale.
+/// labels, the `ALL` roster, and [`MESSAGE_TYPE_COUNT`] from it. Count and counter-row order both come
+/// from the list, so reordering variants is harmless and adding or removing one can't leave the count
+/// (the counter-array width) stale.
 macro_rules! message_types {
     ($($variant:ident => ($protocol:literal, $direction:literal)),+ $(,)?) => {
-        /// A protocol and direction — the flat set of reflector legs the counters key on, one variant
-        /// per direction of each protocol. Handlers report the packet's *intrinsic* type (what it is),
-        /// not the leg they serve, so every handler that sees one packet agrees on it (a disagreement
-        /// is a bug — see [`Anomalies::type_mismatch`]).
+        /// A protocol and direction: the flat set of reflector legs the counters key on, one variant
+        /// per direction of each protocol. Handlers report the packet's *intrinsic* type, not the leg
+        /// they serve, so every handler that sees one packet agrees on it. A disagreement is a bug; see
+        /// [`Anomalies::type_mismatch`].
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub(crate) enum MessageType {
             $($variant),+
         }
 
         impl MessageType {
-            /// Every variant, in declaration (counter-row) order — the source of truth for the count.
+            /// Every variant, in declaration (counter-row) order; the source of truth for the count.
             const ALL: &'static [MessageType] = &[$(Self::$variant),+];
 
             /// The protocol and direction words for the report, e.g. `("mDNS", "query")`. A type with
@@ -41,7 +41,7 @@ macro_rules! message_types {
             }
         }
 
-        /// The number of [`MessageType`] variants — the width of a per-interface counter row. Derived
+        /// The number of [`MessageType`] variants: the width of a per-interface counter row. Derived
         /// from the variant list, so it can never drift from the enum.
         pub(crate) const MESSAGE_TYPE_COUNT: usize = MessageType::ALL.len();
     };
@@ -70,9 +70,9 @@ impl fmt::Display for MessageType {
 
 /// Fold precedence for [`Outcome`], ordered worst-to-best so the higher variant wins when several
 /// handlers see one packet (the derived `Ord` follows declaration order). `Reflected` dominates (the
-/// packet crossed); a reflect that failed (`Dropped`/`Stalled`) outranks a `Skipped` (a correct
-/// non-forward); `Filtered` (junk) is last. Fieldless, so precedence is a property of the disposition
-/// alone — `MessageType` needn't be `Ord`.
+/// packet crossed); a failed reflect (`Dropped`/`Stalled`) outranks a `Skipped` (a correct
+/// non-forward); `Filtered` (junk) is last. Fieldless, so precedence belongs to the disposition alone
+/// and `MessageType` needn't be `Ord`.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 enum Disposition {
     Filtered,
@@ -82,30 +82,30 @@ enum Disposition {
     Reflected,
 }
 
-/// Invariants an [`Outcome::combine`] fold can violate — never expected under a valid config, so the
+/// Invariants an [`Outcome::combine`] fold can violate. Never expected under a valid config, so the
 /// dispatcher logs them rather than silently miscounting.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Anomalies {
-    /// Two handlers both tried to reflect one packet — duplicate same-direction reflectors, which the
+    /// Two handlers both tried to reflect one packet: duplicate same-direction reflectors, which the
     /// config's conflict check should have rejected.
     pub(crate) double_reflect: bool,
-    /// Two handlers classified one packet to different message types — a classifier or config bug.
+    /// Two handlers classified one packet to different message types: a classifier or config bug.
     pub(crate) type_mismatch: bool,
 }
 
-/// What a handler did with a packet — its `on_packet` return, folded by the dispatcher. The carried
-/// [`MessageType`] is the packet's intrinsic type (present on every disposition but junk).
+/// What a handler did with a packet: its `on_packet` return, folded by the dispatcher. The carried
+/// [`MessageType`] is the packet's intrinsic type, present on every disposition but junk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Outcome {
     /// Re-emitted on the egress interface.
     Reflected(MessageType),
-    /// Recognized, but the wrong direction for this leg — the loop-breaker; not ours to forward.
+    /// Recognized, but the wrong direction for this leg: the loop-breaker, not ours to forward.
     Skipped(MessageType),
     /// The right direction, but the re-emit failed (a send error or a resource cap).
     Dropped(MessageType),
     /// The right direction, but the egress has no source address of the family yet (transient).
     Stalled(MessageType),
-    /// Not a message we handle — unrecognized junk on the group, or an unhandled address family.
+    /// Not a message we handle: unrecognized junk on the group, or an unhandled address family.
     Filtered,
 }
 
@@ -121,7 +121,7 @@ impl Outcome {
         }
     }
 
-    /// The packet's message type, or `None` for `Filtered` — junk has no direction to attribute.
+    /// The packet's message type, or `None` for `Filtered`: junk has no direction to attribute.
     fn message_type(self) -> Option<MessageType> {
         match self {
             Self::Reflected(t) | Self::Skipped(t) | Self::Dropped(t) | Self::Stalled(t) => Some(t),
@@ -186,7 +186,7 @@ impl TypeCounters {
 }
 
 /// Every tally for one interface (capture): one [`TypeCounters`] per [`MessageType`], plus a
-/// type-less `filtered` count for junk (which has no direction to attribute to a message type).
+/// type-less `filtered` count for junk.
 #[derive(Clone, Default)]
 pub(crate) struct CaptureCounters {
     types: [TypeCounters; MESSAGE_TYPE_COUNT],
@@ -205,8 +205,8 @@ impl CaptureCounters {
         }
     }
 
-    /// This row's non-zero tallies as one line — e.g. `mDNS query reflected=42 skipped=10; SSDP
-    /// search reflected=5 dropped=1; filtered=2` — or `None` when nothing has been counted, so an
+    /// This row's non-zero tallies as one line, e.g. `mDNS query reflected=42 skipped=10; SSDP
+    /// search reflected=5 dropped=1; filtered=2`. `None` when nothing has been counted, so an
     /// idle interface produces no report line.
     fn format_nonzero(&self) -> Option<String> {
         let mut parts: Vec<String> = MessageType::ALL
@@ -241,7 +241,7 @@ mod tests {
     use super::*;
 
     impl CaptureCounters {
-        /// The four typed tallies (`reflected, skipped, dropped, stalled`) for `ty` — the test reader
+        /// The four typed tallies (`reflected, skipped, dropped, stalled`) for `ty`. The test reader
         /// for recorded outcomes, here and in the dispatcher's route-fold test.
         pub(crate) fn typed(&self, ty: MessageType) -> (u64, u64, u64, u64) {
             let c = self.types[ty as usize];

@@ -252,9 +252,9 @@ pub(crate) fn read_config_file(path: &str) -> Result<String, ConfigError> {
 }
 
 /// Resolve just the log level from the environment and TOML text, before the full
-/// configuration is parsed — so the logger can be raised to the configured
-/// verbosity and the rest of loading logged at that level. Environment overrides
-/// the file, which overrides the default.
+/// configuration is parsed. Lets the logger be raised to the configured verbosity
+/// so the rest of loading is logged at that level. Environment overrides the file,
+/// which overrides the default.
 ///
 /// Deliberately lightweight: it reads only `REFLECTOR_LOG_LEVEL` and the file's
 /// top-level `log_level`, never touching the reflector tables, so it can't fail
@@ -279,8 +279,8 @@ pub(crate) fn resolve_log_level(
     Ok(LogLevel::default())
 }
 
-/// The enabled protocols of `reflector` as a comma-separated summary — with
-/// `WoL` ports and the SSDP DIAL flag — for logging.
+/// The enabled protocols of `reflector` as a comma-separated summary for logging,
+/// with `WoL` ports and the SSDP DIAL flag.
 fn protocol_list(reflector: &Reflector) -> String {
     let mut protocols: Vec<String> = Vec::new();
     if let Some(wol) = &reflector.wol {
@@ -494,7 +494,7 @@ mod tests {
     #[test]
     fn old_debug_memory_bool_is_rejected() {
         // The 0.10.x `debug_memory = true` no longer parses (renamed to an interval, and the config
-        // denies unknown fields) — the deliberate breaking change fails loud at startup rather than
+        // denies unknown fields). The deliberate breaking change fails loud at startup rather than
         // silently ignoring a stale setting.
         let text = r#"
             debug_memory = true

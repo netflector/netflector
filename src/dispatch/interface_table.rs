@@ -1,5 +1,5 @@
-//! The dispatcher's interface table: every interface (with its multicast joiner) and every capture,
-//! linking each capture to its interface, all addressed by `Copy` index keys.
+//! The dispatcher's interface table: every interface with its multicast joiner, and every capture
+//! linked to its interface, all addressed by `Copy` index keys.
 
 use std::io;
 use std::net::IpAddr;
@@ -12,25 +12,25 @@ use super::CaptureKey;
 use super::counters::{CaptureCounters, Outcome};
 use super::multicast::MulticastJoiner;
 
-/// A `Copy` handle into the interface table's interface entries — an insert-only index, like
+/// A `Copy` handle into the interface table's interface entries. An insert-only index like
 /// [`CaptureKey`], but a distinct newtype so the two can't be confused.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) struct InterfaceKey(u32);
 
-/// One capture, the interface it runs on, and its observability tallies. The `capture` is
-/// `Option` so the drain can take it OUT (leaving the `interface` link and `counters` resident, so a
-/// capture's addresses resolve and its routed outcomes still record mid-drain) and restore it; `None`
-/// marks "currently draining". Never removed — so the tallies accrue for the whole run. Bundling the
-/// counters here (rather than a parallel `Vec`) makes them impossible to desync: one push adds both.
+/// One capture, the interface it runs on, and its observability tallies. The `capture` is `Option`
+/// so the drain can take it OUT and restore it; the `interface` link and `counters` stay resident,
+/// so a capture's addresses resolve and its routed outcomes still record mid-drain. `None` marks
+/// "currently draining". Never removed, so the tallies accrue for the whole run. Bundling the
+/// counters here rather than a parallel `Vec` makes them impossible to desync: one push adds both.
 struct CaptureEntry {
     capture: Option<Capture>,
     interface: InterfaceKey,
     counters: CaptureCounters,
 }
 
-/// One interface paired with its multicast joiner. Bundling them makes the two impossible to
-/// desync (one push adds both) and bakes the relationship the joiner relies on: it carries the
-/// interface's ifindex, stable for the interface's lifetime, and a refresh re-attempts its joins.
+/// One interface paired with its multicast joiner. Bundling them keeps the two from desyncing (one
+/// push adds both) and bakes in the relationship the joiner relies on: it carries the interface's
+/// ifindex, stable for the interface's lifetime, and a refresh re-attempts its joins.
 struct InterfaceEntry {
     interface: Interface,
     joiner: MulticastJoiner,
@@ -70,8 +70,8 @@ impl InterfaceTable {
         self.entries[interface.0 as usize].joiner.join(group)
     }
 
-    /// The key of the interface named `name`, opening and resolving it if absent — so
-    /// captures on the same interface share one record (and one monitor refresh later).
+    /// The key of the interface named `name`, opening and resolving it if absent, so captures on
+    /// the same interface share one record (and one monitor refresh later).
     ///
     /// # Errors
     /// Propagates a resolution syscall failure when first opening the interface.
@@ -99,8 +99,8 @@ impl InterfaceTable {
         key
     }
 
-    /// The interface a capture runs on — resolves even while the capture is taken out (the
-    /// link is a sibling field of the take-out `Option`).
+    /// The interface a capture runs on. Resolves even while the capture is taken out: the link is
+    /// a sibling field of the take-out `Option`.
     pub(super) fn interface_of(&self, capture: CaptureKey) -> Option<InterfaceKey> {
         self.captures
             .get(capture.0 as usize)
@@ -114,7 +114,7 @@ impl InterfaceTable {
             .map(|entry| &entry.interface.addrs)
     }
 
-    /// The kernel ifindex of the interface `capture` runs on — its stable identity, cached at open.
+    /// The kernel ifindex of the interface `capture` runs on. Its stable identity, cached at open.
     pub(super) fn ifindex_of(&self, capture: CaptureKey) -> Option<u32> {
         let interface = self.interface_of(capture)?;
         self.entries
@@ -129,7 +129,7 @@ impl InterfaceTable {
             .map(|entry| entry.interface.name.as_str())
     }
 
-    /// The current source addresses behind a capture, in one hop.
+    /// The current source addresses behind a capture.
     pub(super) fn egress_addrs(&self, capture: CaptureKey) -> Option<&InterfaceAddresses> {
         self.addrs(self.interface_of(capture)?)
     }
@@ -139,8 +139,8 @@ impl InterfaceTable {
         self.captures.get(capture.0 as usize)?.capture.as_ref()
     }
 
-    /// Whether `capture` names a known (in-range) capture — distinguishes a forged key from
-    /// one that is merely taken out, for the drain's guard.
+    /// Whether `capture` names a known (in-range) capture. Distinguishes a forged key from one
+    /// merely taken out, for the drain's guard.
     pub(super) fn contains(&self, capture: CaptureKey) -> bool {
         (capture.0 as usize) < self.captures.len()
     }
@@ -151,9 +151,9 @@ impl InterfaceTable {
         self.captures.get_mut(capture.0 as usize)?.capture.take()
     }
 
-    /// Restore a drained capture, reporting whether its slot was present — keeping logging
-    /// out of the table, like [`take`](Self::take). The miss can't actually happen (restore
-    /// follows a successful `take` on a Vec that never shrinks); on one, the capture drops.
+    /// Restore a drained capture, reporting whether its slot was present. Keeps logging out of the
+    /// table, like [`take`](Self::take). The miss can't actually happen (restore follows a
+    /// successful `take` on a Vec that never shrinks); on one, the capture drops.
     #[must_use]
     pub(super) fn restore(&mut self, capture: CaptureKey, value: Capture) -> bool {
         if let Some(entry) = self.captures.get_mut(capture.0 as usize) {
@@ -171,8 +171,8 @@ impl InterfaceTable {
         self.captures[capture.0 as usize].counters.record(outcome);
     }
 
-    /// Each capture's `(interface name, counter row)` for the periodic report — the table owns the
-    /// capture→interface-name mapping, and stays log-free (the dispatcher does the logging).
+    /// Each capture's `(interface name, counter row)` for the periodic report. The table owns the
+    /// capture→interface-name mapping and stays log-free (the dispatcher does the logging).
     pub(super) fn counter_rows(&self) -> impl Iterator<Item = (&str, &CaptureCounters)> {
         self.captures
             .iter()
@@ -180,11 +180,11 @@ impl InterfaceTable {
     }
 
     /// Re-resolve the interface with kernel index `ifindex`, in place. A real index matches at
-    /// most one interface — they dedup by name, and the kernel gives each a distinct index —
-    /// so this finds rather than scans. Returns the fields that changed if one matched, or `None`
-    /// for a change on an interface we don't watch. Log-free, like [`take`](Self::take); the
-    /// dispatcher reports the outcome. (The caller routes the `0` overflow-signal to
-    /// [`refresh_all`], so `ifindex` is always a real index here.)
+    /// most one interface (they dedup by name, and the kernel gives each a distinct index), so this
+    /// finds rather than scans. Returns the fields that changed if one matched, or `None` for a
+    /// change on an interface we don't watch. Log-free, like [`take`](Self::take); the dispatcher
+    /// reports the outcome. The caller routes the `0` overflow-signal to [`refresh_all`], so
+    /// `ifindex` is always a real index here.
     ///
     /// [`refresh_all`]: Self::refresh_all
     ///
@@ -205,11 +205,11 @@ impl InterfaceTable {
         Ok(Some(change))
     }
 
-    /// Re-resolve every interface in place — the response to an overflow signal, where dropped
-    /// notifications mean any address could be stale. Returns each interface's ifindex paired with its
-    /// refresh outcome (best-effort: a per-interface failure is reported, not fatal), so the caller logs
-    /// failures and reacts to exactly the interfaces whose addresses moved. Log-free, like
-    /// [`refresh_by_ifindex`](Self::refresh_by_ifindex).
+    /// Re-resolve every interface in place. The response to an overflow signal, where dropped
+    /// notifications mean any address could be stale. Returns each interface's ifindex paired with
+    /// its refresh outcome (best-effort: a per-interface failure is reported, not fatal), so the
+    /// caller logs failures and reacts to exactly the interfaces whose addresses moved. Log-free,
+    /// like [`refresh_by_ifindex`](Self::refresh_by_ifindex).
     pub(super) fn refresh_all(&mut self) -> Vec<(u32, io::Result<AddressChange>)> {
         let results: Vec<(u32, io::Result<AddressChange>)> = self
             .entries
@@ -286,7 +286,7 @@ mod tests {
             .expect("the loopback interface matches its ifindex and re-resolves");
         assert!(
             !change.v4,
-            "re-resolving the unchanged loopback reports no v4 move — the bit the DIAL eviction gates on",
+            "re-resolving the unchanged loopback reports no v4 move, the bit the DIAL eviction gates on",
         );
         assert!(
             table.refresh_by_ifindex(u32::MAX)?.is_none(),

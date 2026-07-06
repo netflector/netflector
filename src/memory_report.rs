@@ -1,19 +1,18 @@
-//! Optional memory-footprint diagnostics. A periodic report is enabled by `debug_memory_interval_secs`;
-//! a report is also emitted on demand on a SIGUSR1 [`ControlEvent::Dump`], regardless of that setting.
+//! Optional memory-footprint diagnostics. `debug_memory_interval_secs` enables a periodic report; a
+//! SIGUSR1 [`ControlEvent::Dump`] emits one on demand regardless of that setting.
 //!
-//! [`MemoryReporter`] is a timer-only reactor handler (it watches no fds) that logs the process's
-//! resident set size every configured interval, and on a control-event dump; [`run`](crate::run) also
-//! emits a baseline at startup and one report at shutdown when the periodic report is on. The peak RSS
-//! comes from `getrusage` (cross-platform); on Linux the current RSS is read from
-//! `/proc/self/status`. Heap-arena stats (glibc `mallinfo2`) are intentionally omitted — the static
-//! musl build has no equivalent.
+//! [`MemoryReporter`] is a timer-only reactor handler (watches no fds) that logs resident set size
+//! every configured interval and on a control-event dump. [`run`](crate::run) also emits a baseline at
+//! startup and one at shutdown when the periodic report is on. Peak RSS comes from `getrusage`
+//! (cross-platform); on Linux current RSS is read from `/proc/self/status`. Heap-arena stats (glibc
+//! `mallinfo2`) are omitted: the static musl build has no equivalent.
 
 use std::time::{Duration, Instant};
 
 use crate::reactor::{ControlEvent, Handler, Reactor, ReadyEvent};
 
-/// Peak resident set size in KiB via `getrusage` — no `/proc` needed, so it works on every target.
-/// `ru_maxrss` is reported in KiB on Linux and FreeBSD, in bytes on macOS.
+/// Peak resident set size in KiB via `getrusage`. No `/proc` needed, so it works on every target.
+/// `ru_maxrss` is in KiB on Linux and FreeBSD, in bytes on macOS.
 fn peak_rss_kib() -> u64 {
     // SAFETY: a zeroed `rusage` is a valid, fully-initialized buffer for `getrusage` to overwrite.
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
@@ -54,8 +53,8 @@ pub(crate) fn log_report() {
     log::info!("memory: peak={peak} KiB");
 }
 
-/// A reactor handler (it watches no fds) that logs [`log_report`] every `interval`, and on a control
-/// dump. `interval` is `None` for a dump-only reporter: no periodic timer, but it still dumps on demand.
+/// A reactor handler (watches no fds) that logs [`log_report`] every `interval` and on a control dump.
+/// `interval` is `None` for a dump-only reporter: no periodic timer, but it still dumps on demand.
 pub(crate) struct MemoryReporter {
     interval: Option<Duration>,
     /// The next periodic report instant, or `None` when there is no periodic cadence.
@@ -63,8 +62,8 @@ pub(crate) struct MemoryReporter {
 }
 
 impl MemoryReporter {
-    /// A reporter that logs every `interval` starting `interval` after `now` — or, when `interval` is
-    /// `None`, only on a SIGUSR1 dump.
+    /// A reporter that logs every `interval` starting `interval` after `now`. When `interval` is
+    /// `None`, it logs only on a SIGUSR1 dump.
     pub(crate) fn new(interval: Option<Duration>, now: Instant) -> Self {
         Self {
             interval,
@@ -123,8 +122,6 @@ mod tests {
 
     #[test]
     fn dump_only_reporter_keeps_no_deadline() {
-        // A reporter with no interval never schedules a periodic report — it only dumps on a control
-        // event — so it reports no deadline and a dump leaves it that way.
         let mut reporter = MemoryReporter::new(None, Instant::now());
         assert_eq!(reporter.next_deadline(), None);
         reporter.on_control(ControlEvent::Dump, &mut Reactor::new().unwrap());

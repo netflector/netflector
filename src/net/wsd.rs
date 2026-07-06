@@ -6,7 +6,7 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-/// WSD runs SOAP-over-UDP on port 3702, re-emitted at TTL 1 — the re-emit is a single hop onto the
+/// WSD runs SOAP-over-UDP on port 3702, re-emitted at TTL 1. The re-emit is a single hop onto the
 /// egress link, matching the link scope of the groups it serves.
 pub(crate) const WSD_PORT: u16 = 3702;
 pub(crate) const WSD_TTL: u8 = 1;
@@ -19,15 +19,15 @@ pub(crate) const WSD_GROUP_V6: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0
 /// (`ProbeMatches` / `ResolveMatches`) never reach the group, so they classify as neither.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WsdKind {
-    /// A device presence announcement — `Hello` or `Bye`.
+    /// A device presence announcement: `Hello` or `Bye`.
     Announcement,
-    /// A client discovery request — `Probe` or `Resolve`.
+    /// A client discovery request: `Probe` or `Resolve`.
     Search,
 }
 
 /// Classify a WSD SOAP-over-UDP datagram by the final path segment of its WS-Addressing `Action` URI
 /// (namespace-agnostic: the 2005/04 and 2009/01 discovery namespaces differ only in the URI prefix).
-/// `None` for a reply type (`ProbeMatches` / `ResolveMatches` — unicast, not expected on the group), a
+/// `None` for a reply type (`ProbeMatches` / `ResolveMatches`, unicast and not expected on the group), a
 /// missing `Action`, or non-WSD junk.
 pub(crate) fn classify(payload: &[u8]) -> Option<WsdKind> {
     match action_segment(payload)? {
@@ -39,7 +39,7 @@ pub(crate) fn classify(payload: &[u8]) -> Option<WsdKind> {
 
 /// The final `/`-delimited segment of the first `Action` element's URI (the WS-Addressing message
 /// type), or `None` when there is no such element. Walks the payload element by element so the match is
-/// scoped to the `Action` tag — tolerant of the namespace prefix (`a:` / `wsa:` / none) and of tag
+/// scoped to the `Action` tag: tolerant of the namespace prefix (`a:` / `wsa:` / none) and of tag
 /// attributes (ONVIF sends `mustUnderstand`), and never fooled by the token appearing in the body.
 fn action_segment(payload: &[u8]) -> Option<&[u8]> {
     let mut rest = payload;
@@ -280,7 +280,7 @@ urn:schemas-xmlsoap-org:ws:2005:04:discovery
 </soap:Body>
 </soap:Envelope>"#;
 
-    /// Real Uniview IP-camera `ProbeMatches` capture (brownfinesecurity.com) — genuine IP/MAC/ONVIF
+    /// Real Uniview IP-camera `ProbeMatches` capture (brownfinesecurity.com): genuine IP/MAC/ONVIF
     /// scopes, `SOAP-ENV:` prefix, `SOAP-ENV:mustUnderstand="true"`. The final segment is
     /// `ProbeMatches`, which must NOT collapse to a `Probe` search.
     const PROBEMATCHES_ONVIF_UNIVIEW: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -317,7 +317,7 @@ urn:schemas-xmlsoap-org:ws:2005:04:discovery
     </SOAP-ENV:Body>
 </SOAP-ENV:Envelope>"#;
 
-    /// `ResolveMatches` from Microsoft's `WsdApi` docs — the `ResolveMatches` segment must not collapse
+    /// `ResolveMatches` from Microsoft's `WsdApi` docs: the `ResolveMatches` segment must not collapse
     /// to a `Resolve` search.
     const RESOLVEMATCHES_MS_WSDAPI: &str = r#"<?xml version="1.0" encoding="utf-8" ?>
 <soap:Envelope

@@ -2,22 +2,20 @@
 //!
 //! When we build a frame to inject ourselves, the kernel UDP/IP stack is out of
 //! the loop, so the IPv4 header and UDP checksums are filled in by hand. The
-//! capture path never verifies checksums — a re-injected packet gets fresh ones.
+//! capture path never verifies checksums; a re-injected packet gets fresh ones.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 /// Internet checksum of an IPv4 header.
 ///
-/// `header` is the full IHL-sized header. Its own checksum field (bytes 10-11)
-/// is treated as zero, so its current contents don't affect the result — there
-/// is no need to pre-zero it, and re-checksumming a header that already carries
-/// one just works.
+/// `header` is the full IHL-sized header. Its own checksum field (bytes 10-11) is
+/// treated as zero, so its current contents don't affect the result. No need to
+/// pre-zero it; re-checksumming a header that already carries a checksum works.
 ///
 /// # Panics
 /// Panics if `header` is shorter than 12 bytes (no room for the checksum field).
 #[must_use]
 pub(crate) fn ipv4_header(header: &[u8]) -> u16 {
-    // Sum the header with its checksum field (bytes 10-11) skipped.
     let sum = sum_words(&header[..10], 0);
     let sum = sum_words(&header[12..], sum);
     fold(sum)
@@ -26,8 +24,8 @@ pub(crate) fn ipv4_header(header: &[u8]) -> u16 {
 /// UDP checksum over the IPv4 pseudo-header and the UDP datagram.
 ///
 /// `udp` is the contiguous UDP header plus payload. Its own checksum field
-/// (bytes 6-7) is treated as zero — no need to pre-zero it. A computed `0x0000`
-/// is returned as `0xffff` (RFC 768).
+/// (bytes 6-7) is treated as zero; no need to pre-zero it. A computed `0x0000` is
+/// returned as `0xffff` (RFC 768).
 ///
 /// # Panics
 /// Panics if `udp` is shorter than the 8-byte UDP header.
@@ -61,8 +59,8 @@ pub(crate) fn udp_v6(src: Ipv6Addr, dst: Ipv6Addr, udp: &[u8]) -> u16 {
     udp_checksum(&pseudo, udp)
 }
 
-/// Sum the pseudo-header and the datagram — with the UDP checksum field (bytes
-/// 6-7) skipped — then fold and apply the RFC 768 zero map.
+/// Sum the pseudo-header and the datagram with the UDP checksum field (bytes 6-7)
+/// skipped, then fold and apply the RFC 768 zero map.
 fn udp_checksum(pseudo: &[u8], udp: &[u8]) -> u16 {
     let sum = sum_words(pseudo, 0);
     let sum = sum_words(&udp[..6], sum);

@@ -1,9 +1,9 @@
 //! An ephemeral-UDP-port reservation: a held, never-read socket that keeps the kernel's UDP demux
 //! satisfied. The SSDP search reflector re-emits an M-SEARCH from this port so devices unicast their
-//! `200 OK` back to it; the port must stay claimed for the session's lifetime so the kernel finds a
-//! socket for the reply and does NOT answer with an ICMP port-unreachable. The raw capture reads the
-//! actual datagram, not this socket; on Linux a drop-all BPF filter makes it enqueue nothing.
-//! Dropping it frees the port.
+//! `200 OK` back to it. The port must stay claimed for the session's lifetime, else the kernel finds
+//! no socket for the reply and answers with an ICMP port-unreachable. The raw capture reads the actual
+//! datagram, not this socket; on Linux a drop-all BPF filter makes it enqueue nothing. Dropping it
+//! frees the port.
 
 use std::io;
 use std::net::IpAddr;
@@ -20,7 +20,7 @@ pub(crate) struct PortReservation {
 }
 
 impl PortReservation {
-    /// Reserve an ephemeral port on `addr` — the egress interface's own address, which the reflector
+    /// Reserve an ephemeral port on `addr`, the egress interface's own address that the reflector
     /// sends from and devices reply to. `ifindex` is required to bind an IPv6 link-local `addr`
     /// (ignored for IPv4).
     ///
@@ -56,9 +56,8 @@ impl PortReservation {
     }
 }
 
-/// The port `fd` was bound to, via `getsockname`. The port field sits at the same offset (right
-/// after the family) in `sockaddr_in` and `sockaddr_in6`, so one read serves both; it is in network
-/// byte order.
+/// The port `fd` was bound to, via `getsockname`. The port field sits at the same offset (after the
+/// family) in `sockaddr_in` and `sockaddr_in6`, so one read serves both; it is in network byte order.
 fn bound_port(fd: RawFd) -> io::Result<u16> {
     // SAFETY: an all-zero `sockaddr_storage` is a valid buffer; `getsockname` fills it and updates
     // `len` to the bytes written.
@@ -85,7 +84,7 @@ fn bound_port(fd: RawFd) -> io::Result<u16> {
 /// suppresses the ICMP port-unreachable, and the raw capture reads the real datagram.
 #[cfg(target_os = "linux")]
 fn attach_drop_all_filter(fd: RawFd) -> io::Result<()> {
-    // A single `BPF_RET | BPF_K` returning 0 — accept zero bytes, i.e. drop every packet.
+    // A single `BPF_RET | BPF_K` returning 0: accept zero bytes, i.e. drop every packet.
     let drop_all = [libc::sock_filter {
         code: 0x0006,
         jt: 0,

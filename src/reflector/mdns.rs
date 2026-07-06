@@ -1,9 +1,9 @@
 //! The mDNS reflector: reflects multicast DNS between the source and target interfaces so service
-//! discovery crosses the link. For each address family it registers two directional
-//! [`SimpleReflector`]s — queries flow source → target, responses target → source — which, atop the
-//! capture's own-egress drop, breaks the reflection loop. Each re-emits to the same group at TTL 255
-//! (RFC 6762 §11), sourced from the egress interface; the dispatcher's filter pins the group, so the
-//! reflector only gates on the query/response classifier.
+//! discovery crosses the link. Per address family it registers two directional
+//! [`SimpleReflector`]s: queries flow source → target, responses target → source. Atop the
+//! capture's own-egress drop, this breaks the reflection loop. Each re-emits to the same group at
+//! TTL 255 (RFC 6762 §11), sourced from the egress interface. The dispatcher's filter pins the
+//! group, so the reflector only gates on the query/response classifier.
 
 use std::net::SocketAddr;
 
@@ -13,7 +13,7 @@ use crate::net::mdns::{MDNS_GROUP_V4, MDNS_GROUP_V6, MDNS_PORT, MDNS_TTL, MdnsKi
 
 use super::{BuildError, InterfaceMap, SimpleReflector, Verdict, require_bidirectional_families};
 
-/// mDNS's classifier kind *is* its message type — `Query`/`Response` map straight across.
+/// mDNS's classifier kind *is* its message type: `Query`/`Response` map straight across.
 impl From<MdnsKind> for MessageType {
     fn from(kind: MdnsKind) -> Self {
         match kind {
@@ -24,8 +24,8 @@ impl From<MdnsKind> for MessageType {
 }
 
 /// The directional gate for the source → target reflector: reflect queries, skip responses (they
-/// flow the other way), and treat a too-short / non-DNS payload on the group as junk. The verdict
-/// carries the packet's own message type (via [`From<MdnsKind>`]) for the counters.
+/// flow the other way), treat a too-short or non-DNS payload on the group as junk. The verdict
+/// carries the packet's message type (via [`From<MdnsKind>`]) for the counters.
 fn query_verdict(payload: &[u8]) -> Verdict {
     match classify(payload) {
         Some(kind @ MdnsKind::Query) => Verdict::Reflect(kind.into()),
@@ -43,8 +43,8 @@ fn response_verdict(payload: &[u8]) -> Verdict {
     }
 }
 
-/// Build the mDNS reflector for `reflector` and register its directional handlers on `dispatcher` —
-/// a no-op when mDNS isn't enabled. For each address family in use it joins the group on both
+/// Build the mDNS reflector for `reflector` and register its directional handlers on `dispatcher`.
+/// A no-op when mDNS isn't enabled. For each address family in use it joins the group on both
 /// interfaces (so each capture is admitted the group's frames) and registers two handlers: queries
 /// source → target, responses target → source. A required family must be sendable on BOTH
 /// interfaces, since both re-emit.

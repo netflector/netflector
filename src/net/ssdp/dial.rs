@@ -1,4 +1,4 @@
-//! DIAL (Discovery and Launch) discovery detection and `LOCATION`-authority parsing — the SSDP-side
+//! DIAL (Discovery and Launch) discovery detection and `LOCATION`-authority parsing: the SSDP-side
 //! inputs the DIAL proxy hook needs.
 
 use crate::net::http::{Authority, parse_authority, strip_prefix_ignore_ascii_case};
@@ -6,8 +6,8 @@ use crate::net::http::{Authority, parse_authority, strip_prefix_ignore_ascii_cas
 /// The DIAL service-type URN; the trailing `:1` version is dropped so any version matches.
 const DIAL_SERVICE_TYPE: &[u8] = b"urn:dial-multiscreen-org:service:dial";
 
-/// Whether `payload` is a DIAL discovery message — the service-type URN appears anywhere (`ST` /
-/// `NT` / `USN`), ASCII-case-insensitively. Gates a `LOCATION` rewrite.
+/// Whether `payload` is a DIAL discovery message: the service-type URN appears anywhere (`ST`,
+/// `NT`, `USN`), ASCII-case-insensitively. Gates a `LOCATION` rewrite.
 pub(crate) fn is_dial_service_message(payload: &[u8]) -> bool {
     contains_ignore_ascii_case(payload, DIAL_SERVICE_TYPE)
 }
@@ -38,7 +38,7 @@ pub(crate) fn parse_dial_location_authority(payload: &[u8]) -> Option<Authority>
     None
 }
 
-/// The raw, trimmed `LOCATION:` header value (the URL), or `None` if the message carries none — for the
+/// The raw, trimmed `LOCATION:` header value (the URL), or `None` if the message carries none. For the
 /// debug log when [`parse_dial_location_authority`] rejects the URL as non-rewritable.
 pub(crate) fn dial_location_value(payload: &[u8]) -> Option<&[u8]> {
     payload.split(|&b| b == b'\n').find_map(|line| {
@@ -48,9 +48,9 @@ pub(crate) fn dial_location_value(payload: &[u8]) -> Option<&[u8]> {
     })
 }
 
-/// The advertisement's freshness lifetime from a `CACHE-CONTROL: max-age=<seconds>` header — the
-/// seconds the proxy's description listener may treat the device as present. `max-age` is matched
-/// case-insensitively among comma-separated directives; `None` (caller falls back to its default grace)
+/// The advertisement's freshness lifetime from a `CACHE-CONTROL: max-age=<seconds>` header: how long
+/// the proxy's description listener may treat the device as present. `max-age` is matched
+/// case-insensitively among comma-separated directives. `None` (caller falls back to its default grace)
 /// if the header or a parseable `max-age` is absent.
 pub(crate) fn parse_cache_control_max_age(payload: &[u8]) -> Option<u32> {
     for line in payload.split(|&b| b == b'\n') {
@@ -185,11 +185,11 @@ mod tests {
     /// Real DIAL M-SEARCH `200 OK` from a Vizio E420i-A0 TV (Neohapsis Labs capture).
     const DIAL_RESP_VIZIO: &str = "HTTP/1.1 200 OK\r\nLOCATION: http://192.168.1.222:44047/dd.xml\r\nCACHE-CONTROL: max-age=1800\r\nEXT:\r\nBOOTID.UPNP.ORG: 1\r\nSERVER: Linux/2.6 UPnP/1.0 quick_ssdp/1.0\r\nST: urn:dial-multiscreen-org:service:dial:1\r\nUSN: uuid:bcb36992-2281-12e4-8000-006b9e40ad7d::urn:dial-multiscreen-org:service:dial:1\r\n\r\n";
 
-    /// Real DIAL M-SEARCH `200 OK` from a Roku (`MiniUPnPd`) -- CACHE-CONTROL before LOCATION
+    /// Real DIAL M-SEARCH `200 OK` from a Roku (`MiniUPnPd`) with CACHE-CONTROL before LOCATION
     /// (williamboles.com SSDP writeup).
     const DIAL_RESP_ROKU: &str = "HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=3600\r\nST: urn:dial-multiscreen-org:service:dial:1\r\nUSN: uuid:0175c106-5400-10f8-802d-b0a7374360b7::urn:dial-multiscreen-org:service:dial:1\r\nEXT:\r\nSERVER: Roku UPnP/1.0 MiniUPnPd/1.4\r\nLOCATION: http://192.168.1.104:8060/dial/dd.xml\r\n\r\n";
 
-    /// Real DIAL NOTIFY `ssdp:alive` from a Roku -- the advertisement path (same writeup).
+    /// Real DIAL NOTIFY `ssdp:alive` from a Roku, the advertisement path (same writeup).
     const DIAL_NOTIFY_ROKU: &str = "NOTIFY * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nCACHE-CONTROL: max-age=3600\r\nNT: urn:dial-multiscreen-org:service:dial:1\r\nNTS: ssdp:alive\r\nLOCATION: http://192.168.1.104:8060/dial/dd.xml\r\nUSN: uuid:0175c106-5400-10f8-802d-b0a7374360b7::urn:dial-multiscreen-org:service:dial:1\r\n\r\n";
 
     #[test]

@@ -30,8 +30,8 @@ pub(super) enum DatagramError {
 
 /// The Ethernet destination MAC for an injected datagram to `dst`: the all-ones broadcast
 /// for the IPv4 limited broadcast, the RFC-derived group MAC for any multicast destination.
-/// Only broadcast/multicast destinations are injected here, so a unicast `dst` — whose MAC
-/// we would have to resolve — is a [`DatagramError::UnicastDestination`].
+/// Only broadcast/multicast destinations are injected here, so a unicast `dst` (whose MAC
+/// we would have to resolve) is a [`DatagramError::UnicastDestination`].
 pub(super) fn ethernet_dst(dst: IpAddr) -> Result<MacAddr, DatagramError> {
     match dst {
         IpAddr::V4(v4) if v4.is_broadcast() => Ok(MacAddr::broadcast()),
@@ -134,7 +134,7 @@ mod tests {
         )
         .unwrap();
         // The IPv6 source address sits at bytes [22..38] of the frame (14 Ethernet + offset 8 into
-        // the v6 header). A site-local destination is sourced from the routable v6, not fe80::2.
+        // the v6 header).
         assert_eq!(
             &scratch[22..38],
             "2001:db8::2"
@@ -149,7 +149,6 @@ mod tests {
 
     #[test]
     fn ethernet_dst_maps_address_classes() {
-        // v4 limited broadcast -> all-ones; v4/v6 multicast -> the derived group MAC.
         assert_eq!(
             ethernet_dst(IpAddr::V4(Ipv4Addr::BROADCAST)),
             Ok(MacAddr::broadcast())
@@ -215,8 +214,8 @@ mod tests {
 
     #[test]
     fn build_udp_assembles_a_unicast_frame() {
-        // The unicast path the M-SEARCH 200-OK reply will use: an explicit dst MAC, a unicast dst
-        // (build_udp doesn't derive the MAC, so unicast is fine — unlike send_udp_group).
+        // The unicast path the M-SEARCH 200-OK reply will use: an explicit dst MAC and a unicast
+        // dst. build_udp doesn't derive the MAC, so unicast works here (unlike send_udp_group).
         let addrs = full_addrs();
         let searcher_mac = MacAddr::from([0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f]);
         let dst = SocketAddr::from((Ipv4Addr::new(192, 168, 0, 5), 9));
@@ -291,7 +290,7 @@ mod tests {
 
     #[test]
     fn build_udp_surfaces_a_frame_error() {
-        // A scratch too small for the frame is a typed DatagramError::Frame, not a panic — the
+        // A scratch too small for the frame is a typed DatagramError::Frame, not a panic. The
         // `#[from] FrameError` conversion send_udp then maps onto io::Error.
         let dst = SocketAddr::from((Ipv4Addr::BROADCAST, 9));
         let mut tiny = [0u8; 16];
@@ -310,7 +309,7 @@ mod tests {
         ));
     }
 
-    // DLT_NULL (BSD loopback) carries no L2 header, so a MAC-less egress still builds — the frame
+    // DLT_NULL (BSD loopback) carries no L2 header, so a MAC-less egress still builds. The frame
     // opens with the 4-byte host-order address family, not a MAC, and the supplied dst MAC is
     // ignored (there is no L2 header to place it in).
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]

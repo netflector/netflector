@@ -9,8 +9,7 @@ use libc::c_int;
 pub(crate) const IN6_IFF_UNUSABLE: c_int = 0x02 | 0x04 | 0x10; // TENTATIVE | DUPLICATED | DEPRECATED
 
 /// `in6_ifreq` for `SIOCGIFAFLAG_IN6`: an interface name plus a union holding the queried
-/// address (going in) and its flags (coming out). Hand-rolled — `libc` exposes it on
-/// macOS only, not FreeBSD.
+/// address (going in) and its flags (coming out).
 #[repr(C)]
 pub(crate) struct In6Ifreq {
     pub(crate) name: [libc::c_char; libc::IFNAMSIZ],
@@ -21,11 +20,11 @@ pub(crate) struct In6Ifreq {
 pub(crate) union In6Ifru {
     pub(crate) addr: libc::sockaddr_in6,
     pub(crate) flags6: c_int,
-    // The kernel's `in6_ifreq` union is sized by its largest member, `icmp6_ifstat` — 34
-    // `u_quad_t` on both macOS and FreeBSD. This pad makes the whole struct match — load-
-    // bearing: `_IOWR` bakes `sizeof(in6_ifreq)` into the request code and the kernel
-    // dispatches on the whole code, so a too-small struct yields a request the kernel
-    // rejects, and every v6 address would be silently dropped. See the size assertions.
+    // The kernel's `in6_ifreq` union is sized by its largest member `icmp6_ifstat`: 34
+    // `u_quad_t` on both macOS and FreeBSD. This pad matches that size. Load-bearing:
+    // `_IOWR` bakes `sizeof(in6_ifreq)` into the request code, the kernel dispatches on
+    // the whole code, and a too-small struct yields a request it rejects, silently
+    // dropping every v6 address. See the size assertions.
     _icmp6_ifstat: [u64; 34],
 }
 
@@ -36,8 +35,8 @@ const _: () = assert!(size_of::<In6Ifreq>() == size_of::<libc::in6_ifreq>());
 #[cfg(target_os = "freebsd")]
 const _: () = assert!(size_of::<In6Ifreq>() == 288);
 
-/// `_IOWR('i', 73, in6_ifreq)` — the BSD `ioctl` request code, derived from the (now
-/// kernel-accurate) struct size rather than hardcoded.
+/// `_IOWR('i', 73, in6_ifreq)`, the BSD `ioctl` request code. Derived from the
+/// (kernel-accurate) struct size rather than hardcoded.
 pub(crate) fn siocgifaflag_in6() -> libc::c_ulong {
     const IOC_INOUT: libc::c_ulong = 0xc000_0000;
     const IOCPARM_MASK: libc::c_ulong = 0x1fff;

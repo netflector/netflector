@@ -1,6 +1,6 @@
-//! The SSDP reflector: reflects Simple Service Discovery Protocol (`UPnP`) between the source and
+//! The SSDP reflector reflects Simple Service Discovery Protocol (`UPnP`) between the source and
 //! target interfaces so service discovery crosses the link. Advertisements (`NOTIFY`) reflect
-//! target → source as a plain multicast re-emit (a [`SimpleReflector`]); searches (`M-SEARCH`)
+//! target → source as a plain multicast re-emit (a [`SimpleReflector`]). Searches (`M-SEARCH`)
 //! reflect source → target and each searcher's unicast `200 OK` replies route back through a
 //! per-searcher session (the shared [`SearchReflector`]). Re-emits go to the same group at TTL 2,
 //! sourced from the egress interface. With `dial`, a target→source datagram's DIAL `LOCATION` is
@@ -28,8 +28,8 @@ use super::{
 
 /// What a DIAL-enabled SSDP reflector needs to rewrite a device's `LOCATION` to a source-side proxy: the
 /// target capture the device sits behind (for its address), that interface's egress-pin ifindex, and a
-/// reused scratch sink the rewritten datagram is built in. Owned per rewriting reflector — the
-/// advertisement direction, and one per M-SEARCH session's response reflector — so it isn't `Copy`.
+/// reused scratch sink the rewritten datagram is built in. Owned per rewriting reflector (the
+/// advertisement direction, and one per M-SEARCH session's response reflector), so it isn't `Copy`.
 struct DialRewrite {
     target: CaptureKey,
     target_ifindex: u32,
@@ -38,8 +38,7 @@ struct DialRewrite {
 }
 
 impl DialRewrite {
-    /// A rewriter for the device behind `target` (`target_ifindex` scopes the IPv6 reserved-port bind),
-    /// with a fresh scratch sink.
+    /// A rewriter for the device behind `target` (`target_ifindex` scopes the IPv6 reserved-port bind).
     fn new(target: CaptureKey, target_ifindex: u32) -> Self {
         Self {
             target,
@@ -52,8 +51,7 @@ impl DialRewrite {
 impl ReplyRewrite for DialRewrite {
     /// Rewrite a target→source SSDP datagram's DIAL `LOCATION` to a source-side description proxy, into
     /// the reused scratch. Returns the rewritten slice on success, else `payload` (forward verbatim).
-    /// `egress` is the source capture the datagram reflects onto. Used by both the advertisement
-    /// direction and each search session's response.
+    /// `egress` is the source capture the datagram reflects onto.
     fn rewrite<'a>(
         &'a mut self,
         payload: &'a [u8],
@@ -69,7 +67,7 @@ impl ReplyRewrite for DialRewrite {
                 .egress_addrs(self.target)
                 .and_then(InterfaceAddresses::v4),
         ) else {
-            return payload; // a family the proxy can't bridge yet — forward unchanged
+            return payload; // a family the proxy can't bridge yet
         };
         let placement = ProxyPlacement {
             source_capture: egress,
@@ -125,7 +123,7 @@ fn search_verdict(payload: &[u8]) -> Verdict {
 }
 
 /// A session outlives the searcher's MX window by this grace, since a device's 200-OK may lag the
-/// search (mirrors the C++).
+/// search.
 const SESSION_GRACE: Duration = Duration::from_secs(2);
 
 /// An `M-SEARCH`'s session window: its MX response window (clamped by [`parse_msearch_mx`]) plus the
@@ -140,7 +138,7 @@ fn search_window(payload: &[u8]) -> Duration {
     Duration::from_secs(u64::from(mx)) + SESSION_GRACE
 }
 
-/// Build the SSDP reflector for `reflector` and register both directions on `dispatcher` — a no-op
+/// Build the SSDP reflector for `reflector` and register both directions on `dispatcher`. A no-op
 /// when SSDP isn't enabled. For each address family in use it joins every group on BOTH interfaces and
 /// registers two handlers per group: advertisements target → source (a [`SimpleReflector`]),
 /// and searches source → target with their unicast 200-OK replies (the shared [`SearchReflector`]). A
@@ -175,7 +173,7 @@ pub(crate) fn build(
     // the ifindex the capture already cached (the single source of truth the joiners bake too).
     let target_ifindex = dispatcher.capture_ifindex(target).unwrap_or(0);
 
-    // Advertisements are captured on target, searches on source — join every group on both. A family
+    // Advertisements are captured on target, searches on source; join every group on both. A family
     // with no address yet is recorded and re-attempted on the next address change.
     let groups = used_groups(reflector.address_family);
     for group in &groups {
@@ -213,7 +211,7 @@ pub(crate) fn build(
         },
         Box::new(advertisement),
     );
-    // source -> target: searches (unfiltered — any source client may search); each searcher's unicast
+    // source -> target: searches (unfiltered, any source client may search); each searcher's unicast
     // 200-OK replies route back through a per-searcher session. With `dial`, each session's reply
     // rewrites the device's DIAL `LOCATION` (a fresh DialRewrite per session); else it passes through.
     let make_reply: Box<dyn Fn() -> Box<dyn ReplyRewrite>> = if ssdp.dial {
@@ -253,8 +251,8 @@ pub(crate) fn build(
     Ok(())
 }
 
-/// The SSDP groups `family` re-emits to: one IPv4 group, and — unlike mDNS — BOTH IPv6 scopes
-/// (link-local `ff02::c` and site-local `ff05::c`).
+/// The SSDP groups `family` re-emits to: one IPv4 group, and (unlike mDNS) BOTH IPv6 scopes,
+/// link-local `ff02::c` and site-local `ff05::c`.
 fn used_groups(family: AddressFamily) -> Vec<SocketAddr> {
     let mut groups = Vec::with_capacity(3);
     if family.uses_ipv4() {

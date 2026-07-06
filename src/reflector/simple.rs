@@ -2,7 +2,7 @@
 //!
 //! mDNS (both directions), the WSD Hello/Bye announcements, and SSDP's `NOTIFY` advertisements are the
 //! same operation: classify the payload and, if it's a message for this direction, re-emit it to its
-//! own group on the egress interface — verbatim, or through an optional [`ReplyRewrite`] (SSDP's
+//! own group on the egress interface, verbatim or through an optional [`ReplyRewrite`] (SSDP's
 //! advertisement direction rewrites the DIAL `LOCATION`). The search directions are stateful
 //! (per-searcher sessions), so they use the shared `SearchReflector` instead.
 
@@ -22,7 +22,8 @@ pub(crate) struct SimpleReflector {
     name: &'static str,
     /// The message kind/direction this reflector handles, for logs, e.g. `"query"`.
     kind: &'static str,
-    /// The UDP source port to emit from (a protocol's well-known port; `dst` carries the dest port).
+    /// The UDP source port to emit from: a protocol's well-known port. The destination comes from
+    /// `packet.dest`.
     src_port: u16,
     ttl: u8,
     classify: fn(&[u8]) -> Verdict,
@@ -81,7 +82,7 @@ impl PacketHandler for SimpleReflector {
         };
 
         // A family the egress can't currently source is a quiet, transient drop (address
-        // loss) — a Stalled, not a genuine send failure.
+        // loss): a Stalled, not a genuine send failure.
         if !egress_sources(dispatcher, self.egress, packet.dest) {
             log::debug!(
                 "{}: egress has no source for {} yet; dropping {} from {}",

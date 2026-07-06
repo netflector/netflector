@@ -1,6 +1,6 @@
-//! Multicast group membership for the capture interfaces: the kernel admits a group's frames to the
-//! raw capture only once the interface joins it (which also drives the IGMP/MLD join upstream). One
-//! unbound `SOCK_DGRAM` socket per family, **per interface** — sharding by interface caps each socket
+//! Multicast group membership for the capture interfaces. The kernel admits a group's frames to the
+//! raw capture only once the interface joins it, which also drives the IGMP/MLD join upstream. One
+//! unbound `SOCK_DGRAM` socket per family, per interface. Sharding by interface caps each socket
 //! at the few reflected protocols (mDNS + SSDP), so Linux's `net.ipv4.igmp_max_memberships` (default
 //! 20, unraisable on a locked-down router) is never reached. Unbound so the kernel queues it no
 //! datagrams (UDP demux is by bound port); dropping the socket drops its memberships.
@@ -40,7 +40,7 @@ impl MulticastJoiner {
     ///
     /// # Errors
     /// The OS error if the socket can't open or the membership can't be added. `EADDRNOTAVAIL` (no
-    /// address of that family yet) is deferrable — the group is recorded and [`rejoin`](Self::rejoin)
+    /// address of that family yet) is deferrable: the group is recorded and [`rejoin`](Self::rejoin)
     /// retries it on the next address-up event.
     pub(crate) fn join(&mut self, group: IpAddr) -> io::Result<()> {
         if !self.desired.contains(&group) {
@@ -49,7 +49,7 @@ impl MulticastJoiner {
         self.apply(group)
     }
 
-    /// Re-attempt every recorded membership after the interface re-resolves — a group not joinable
+    /// Re-attempt every recorded membership after the interface re-resolves. A group not joinable
     /// before its address existed succeeds now; an already-held one is a no-op. Best-effort: a
     /// still-unavailable family logs and waits for the next change.
     pub(crate) fn rejoin(&mut self) {
@@ -94,7 +94,7 @@ impl MulticastJoiner {
         };
         if rc != 0 {
             let err = io::Error::last_os_error();
-            // Already a member is success — the idempotent re-attempt depends on it.
+            // Already a member is success: the idempotent re-attempt depends on it.
             if !already_member(&err) {
                 return Err(err);
             }
@@ -103,13 +103,13 @@ impl MulticastJoiner {
     }
 }
 
-/// Whether a join error means the membership is already held — a benign duplicate. The errno isn't
+/// Whether a join error means the membership is already held, a benign duplicate. The errno isn't
 /// uniform: Linux and the BSDs' IPv4 path return `EADDRINUSE`, FreeBSD's IPv6 path `EINVAL`.
 fn already_member(err: &io::Error) -> bool {
     matches!(err.raw_os_error(), Some(libc::EADDRINUSE | libc::EINVAL))
 }
 
-/// Whether a join error means the environment can't perform the join at all (vs a real rejection) —
+/// Whether a join error means the environment can't perform the join at all (vs a real rejection),
 /// the cue for the join tests to self-skip. QEMU user-mode emulation doesn't implement the
 /// `MCAST_JOIN_GROUP` setsockopt (returns `ENOPROTOOPT`). Test seam only: at runtime these stay fatal.
 #[cfg(test)]
@@ -131,7 +131,7 @@ mod tests {
         let of = io::Error::from_raw_os_error;
         assert!(already_member(&of(libc::EADDRINUSE))); // Linux / BSD IPv4 duplicate
         assert!(already_member(&of(libc::EINVAL))); // FreeBSD IPv6 duplicate
-        assert!(!already_member(&of(libc::ENOBUFS))); // membership cap — a real failure
+        assert!(!already_member(&of(libc::ENOBUFS))); // membership cap, a real failure
         assert!(!already_member(&of(libc::EADDRNOTAVAIL))); // interface transiently down
     }
 

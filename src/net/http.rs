@@ -16,9 +16,9 @@ pub(crate) struct Authority {
 }
 
 /// Parse an authority from `value`. `bare` (a `Host` header) treats the whole value as the authority;
-/// else `value` must be an `http://host[:port]...` URL (no `https`). Host must be an IPv4 literal
-/// (hostname/IPv6 rejected — DIAL is IPv4-only); port defaults to 80, else must parse in `1..=65535`.
-/// `offset`/`len` are relative to `value`.
+/// else `value` must be an `http://host[:port]...` URL (no `https`). Host must be an IPv4 literal;
+/// hostname and IPv6 are rejected (DIAL is IPv4-only). Port defaults to 80, else must parse in
+/// `1..=65535`. `offset`/`len` are relative to `value`.
 pub(crate) fn parse_authority(value: &[u8], bare: bool) -> Option<Authority> {
     let (rest, auth_offset) = if bare {
         (value, 0)
@@ -67,14 +67,12 @@ mod tests {
 
     #[test]
     fn parses_an_http_url_authority() {
-        // Default port (80) with the host:port span relative to `value`.
         let a = parse_authority(b"http://10.0.0.7/dd.xml", false).unwrap();
         assert_eq!(a.endpoint, "10.0.0.7:80".parse().unwrap());
         assert_eq!(
             &b"http://10.0.0.7/dd.xml"[a.offset..a.offset + a.len],
             b"10.0.0.7"
         );
-        // Explicit port.
         let a = parse_authority(b"http://192.168.1.50:8080/x", false).unwrap();
         assert_eq!(a.endpoint, "192.168.1.50:8080".parse().unwrap());
     }

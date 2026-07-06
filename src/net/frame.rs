@@ -3,7 +3,7 @@
 //! The public builders write a full frame into a caller-provided buffer (no
 //! data-path allocation) and return the byte count, filling checksums via
 //! [`super::checksum`]. Ethernet builders prefix destination/source MACs and an
-//! ethertype; the BSD `DLT_NULL` builders (macOS/FreeBSD) prefix a 4-byte
+//! ethertype. The BSD `DLT_NULL` builders (macOS/FreeBSD) prefix a 4-byte
 //! host-order address family instead, matching the capture-side framing.
 
 use std::net::{SocketAddrV4, SocketAddrV6};
@@ -125,8 +125,7 @@ pub(crate) fn dlt_null_ipv6_udp(
 }
 
 /// Write an IPv4 + UDP datagram (headers and `payload`, with the IPv4-header and
-/// UDP checksums filled) into `out`, returning the number of bytes written. The
-/// internal datagram writer the Ethernet builders wrap.
+/// UDP checksums filled) into `out`, returning the number of bytes written.
 fn ipv4_udp(
     src: SocketAddrV4,
     dst: SocketAddrV4,
@@ -165,8 +164,7 @@ fn ipv4_udp(
 
 /// Write an IPv6 + UDP datagram (headers and `payload`, with the UDP checksum
 /// filled) into `out`, returning the number of bytes written. The IPv6 header
-/// carries no checksum of its own. The internal datagram writer the Ethernet
-/// builders wrap.
+/// carries no checksum of its own.
 fn ipv6_udp(
     src: SocketAddrV6,
     dst: SocketAddrV6,
@@ -277,7 +275,7 @@ mod tests {
         let frame = &buf[..n];
         let udp = IPV4_HEADER_SIZE;
 
-        // IPv4 header — every byte.
+        // IPv4 header: every byte.
         assert_eq!(frame[0], 0x45); // version 4, IHL 5
         assert_eq!(frame[1], 0); // DSCP / ECN
         assert_eq!(
@@ -295,7 +293,7 @@ mod tests {
         assert_eq!(&frame[12..16], src.ip().octets().as_slice());
         assert_eq!(&frame[16..20], dst.ip().octets().as_slice());
 
-        // UDP header + payload — every byte.
+        // UDP header + payload: every byte.
         assert_eq!(u16::from_be_bytes([frame[udp], frame[udp + 1]]), src.port());
         assert_eq!(
             u16::from_be_bytes([frame[udp + 2], frame[udp + 3]]),
@@ -324,7 +322,7 @@ mod tests {
         let frame = &buf[..n];
         let udp = IPV6_HEADER_SIZE;
 
-        // IPv6 header — every byte.
+        // IPv6 header: every byte.
         assert_eq!(frame[0], 0x60); // version 6
         assert_eq!(&frame[1..4], [0u8; 3].as_slice()); // traffic class + flow label
         assert_eq!(
@@ -336,7 +334,7 @@ mod tests {
         assert_eq!(&frame[8..24], src.ip().octets().as_slice());
         assert_eq!(&frame[24..40], dst.ip().octets().as_slice());
 
-        // UDP header + payload — every byte.
+        // UDP header + payload: every byte.
         assert_eq!(u16::from_be_bytes([frame[udp], frame[udp + 1]]), src.port());
         assert_eq!(
             u16::from_be_bytes([frame[udp + 2], frame[udp + 3]]),

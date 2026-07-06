@@ -1,6 +1,6 @@
 //! Interface address resolution: the source MAC / IPv4 / IPv6 an interface currently has.
 //! A reflector re-emits from these, so they must be read fresh (the address monitor keeps
-//! them current). Any may be absent — a loopback / `DLT_NULL` link has no MAC, and a link
+//! them current). Any may be absent: a loopback / `DLT_NULL` link has no MAC, and a link
 //! may be v4-only or v6-only.
 //!
 //! Resolution lives on [`Interface`] (built by [`open`](Interface::open), kept current by
@@ -41,16 +41,15 @@ impl InterfaceAddresses {
         self.mac
     }
 
-    /// The IPv4 source address, if any. IPv4 is scopeless, so — unlike
-    /// [`v6`](Self::v6) — it needs no destination argument.
+    /// The IPv4 source address, if any. IPv4 is scopeless, so unlike
+    /// [`v6`](Self::v6) it needs no destination argument.
     pub(crate) fn v4(&self) -> Option<Ipv4Addr> {
         self.v4
     }
 
     /// The best v6 source for a destination of `dest_scope`: a link-local source for a link-local
     /// destination, a routable (ULA/global) source for a wider one. Falls back to the other scope's
-    /// address when the matching one is absent — a scope mismatch, but better than dropping the send
-    /// (and what the single-address pick did before `v6_routable` existed).
+    /// address when the matching one is absent: a scope mismatch, but better than dropping the send.
     pub(crate) fn v6(&self, dest_scope: Ipv6Scope) -> Option<Ipv6Addr> {
         match dest_scope {
             Ipv6Scope::LinkLocal => self.v6,
@@ -58,7 +57,7 @@ impl InterfaceAddresses {
         }
     }
 
-    /// Whether the interface can currently source IPv4 — the per-family availability gate.
+    /// Whether the interface can currently source IPv4. The per-family availability gate.
     pub(crate) fn has_v4(&self) -> bool {
         self.v4.is_some()
     }
@@ -95,7 +94,7 @@ impl fmt::Display for InterfaceAddresses {
     }
 }
 
-/// Which source fields a [`refresh`](Interface::refresh) found changed — one flag per
+/// Which source fields a [`refresh`](Interface::refresh) found changed: one flag per
 /// [`InterfaceAddresses`] field, so a caller reacts only to the family it depends on (the DIAL proxies
 /// bind IPv4, so they re-mint only when `v4` moves, not on a routine v6 or MAC change).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -111,7 +110,7 @@ pub(crate) struct AddressChange {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Ipv6Scope {
     LinkLocal,
-    /// Site-local, ULA, or global — anything routed beyond the local link (not necessarily a GUA).
+    /// Site-local, ULA, or global: anything routed beyond the local link (not necessarily a GUA).
     Routable,
 }
 
@@ -138,7 +137,7 @@ pub(crate) struct Interface {
 }
 
 impl Interface {
-    /// Build an interface record: cache `name`'s kernel ifindex (0 if unknown — never matches
+    /// Build an interface record: cache `name`'s kernel ifindex (0 if unknown, never matching
     /// a real event), then [`refresh`](Self::refresh) its current source addresses.
     ///
     /// # Errors
@@ -154,8 +153,8 @@ impl Interface {
     }
 
     /// Re-resolve this interface's addresses in place (at open, and after an address-change
-    /// notification) via the platform backend. The cached `ifindex` — a stable identity for
-    /// the interface's lifetime — keys the Linux dump; the BSD `getifaddrs` walk matches by
+    /// notification) via the platform backend. The cached `ifindex`, a stable identity for
+    /// the interface's lifetime, keys the Linux dump; the BSD `getifaddrs` walk matches by
     /// name. The backend logs each address (and every v6's flag status) at `trace`. Returns which
     /// source fields changed from the previous resolution, so a caller can react to exactly the
     /// family it depends on.
@@ -197,9 +196,9 @@ pub(crate) fn if_index(name: &str) -> Option<u32> {
     (index != 0).then_some(index)
 }
 
-/// Log a single source field's transition at `info` — the address churn an operator (and the
-/// address-change e2e) wants visible — returning whether it changed at all, so the caller acts on
-/// exactly the families that moved. Nothing is logged when the field is unchanged.
+/// Log a single source field's transition at `info`, so the address churn is visible to an operator
+/// and the address-change e2e. Returns whether it changed at all, so the caller acts on exactly the
+/// families that moved. Nothing is logged when the field is unchanged.
 fn log_field_change<A: PartialEq + fmt::Display>(
     iface: &str,
     family: &str,
@@ -233,7 +232,7 @@ enum V6Rank {
 /// Rank an IPv6 source candidate by how good a source it is (see [`V6Rank`]).
 fn v6_rank(addr: Ipv6Addr) -> V6Rank {
     if addr.is_multicast() || addr.is_unspecified() || addr.is_loopback() {
-        V6Rank::NotASource // multicast / :: / ::1 — never a real source
+        V6Rank::NotASource
     } else if addr.is_unicast_link_local() {
         V6Rank::LinkLocal // fe80::/10
     } else if addr.is_unique_local() {
@@ -244,7 +243,7 @@ fn v6_rank(addr: Ipv6Addr) -> V6Rank {
 }
 
 /// Whether `addr` is a link-local-scoped multicast group (`ff02::`): a multicast address (`ff00::/8`)
-/// whose scope nibble is `2`. Hand-rolled because `Ipv6Addr::multicast_scope` — the natural fit — is
+/// whose scope nibble is `2`. Hand-rolled because `Ipv6Addr::multicast_scope`, the natural fit, is
 /// unstable (feature `ip`), unlike the unicast/ULA classifiers we take from std. The `is_multicast`
 /// check isn't a redundant guard: the scope nibble alone also matches unicasts like `fd02::` or `2012::`.
 fn is_multicast_link_local(addr: Ipv6Addr) -> bool {
@@ -266,7 +265,7 @@ impl V6Pick {
     pub(super) fn consider(&mut self, addrs: &mut InterfaceAddresses, addr: Ipv6Addr) {
         let rank = v6_rank(addr);
         if rank == V6Rank::NotASource {
-            return; // multicast / :: / ::1
+            return;
         }
         if addrs.v6.is_none() || rank > self.best_rank {
             addrs.v6 = Some(addr);
@@ -324,7 +323,7 @@ mod tests {
         let mut iface = Interface::open(LOOPBACK_IFACE).unwrap();
         // Re-resolving an interface whose addresses are already current reports nothing moved.
         assert_eq!(iface.refresh().unwrap(), AddressChange::default());
-        // With a stale v4 cached, the next resolve (back to the real 127.0.0.1) reports a v4 move — and
+        // With a stale v4 cached, the next resolve (back to the real 127.0.0.1) reports a v4 move, and
         // only v4. This is the flag the DIAL eviction gates on.
         iface.addrs.v4 = Some(Ipv4Addr::new(10, 0, 0, 1));
         assert_eq!(
@@ -334,7 +333,7 @@ mod tests {
                 ..AddressChange::default()
             },
         );
-        // A stale v6 is reported independently of v4 — so a routine v6 rotation can't masquerade as the
+        // A stale v6 is reported independently of v4, so a routine v6 rotation can't masquerade as the
         // v4 change that would evict a DIAL proxy.
         iface.addrs.v6 = Some("2001:db8::1".parse().unwrap());
         let change = iface.refresh().unwrap();
@@ -379,7 +378,7 @@ mod tests {
             Ipv6Scope::Routable
         );
         // A ULA whose second byte's low nibble is 2 (fd02::) must not be mistaken for a link-local
-        // multicast group — the `is_multicast` half of is_multicast_link_local guards exactly this.
+        // multicast group; the `is_multicast` half of is_multicast_link_local guards exactly this.
         assert_eq!(
             Ipv6Scope::of("fd02::1".parse().unwrap()),
             Ipv6Scope::Routable
@@ -410,8 +409,8 @@ mod tests {
         let mut addrs = InterfaceAddresses::default();
         let mut pick = V6Pick::default();
         pick.consider(&mut addrs, "2001:db8::1".parse().unwrap()); // global
-        pick.consider(&mut addrs, "fc00::1".parse().unwrap()); // ULA — outranks global
-        pick.consider(&mut addrs, "fe80::1".parse().unwrap()); // link-local — best overall
+        pick.consider(&mut addrs, "fc00::1".parse().unwrap()); // ULA, outranks global
+        pick.consider(&mut addrs, "fe80::1".parse().unwrap()); // link-local, best overall
         assert_eq!(
             addrs.v6,
             Some("fe80::1".parse::<Ipv6Addr>().unwrap()),

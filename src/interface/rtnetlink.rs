@@ -1,7 +1,7 @@
 //! Linux address resolution over rtnetlink (`NETLINK_ROUTE`): one `RTM_GETADDR` dump for the
-//! v4/v6 addresses (each carrying its `IFA_FLAGS`, so tentative / deprecated / dadfailed are
+//! v4/v6 addresses (each carrying its `IFA_FLAGS`, so tentative/deprecated/dadfailed are
 //! filtered inline) and one `RTM_GETLINK` dump for the MAC. The netlink message framing is
-//! hand-rolled — `libc` exposes it for Android only, not glibc/musl.
+//! hand-rolled: `libc` exposes it for Android only, not glibc/musl.
 
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -17,11 +17,11 @@ use crate::libcex::{
 };
 use crate::net::mac::MacAddr;
 
-/// `IFA_F_*` bits that disqualify a v6 address as a source.
+/// `IFA_F_*` bits that disqualify an address as a source.
 const IFA_F_UNUSABLE: u32 = libc::IFA_F_TENTATIVE | libc::IFA_F_DEPRECATED | libc::IFA_F_DADFAILED;
 
-/// Iterator over the `rtattr` TLVs of a message: yields `(attr_type, value)` per attribute,
-/// stopping at the first malformed length (as the kernel's own walk does).
+/// Iterator over the `rtattr` TLVs of a message: yields `(attr_type, value)`, stopping at the
+/// first malformed length (as the kernel's own walk does).
 struct RtAttrs<'a> {
     msg: &'a [u8],
     at: usize,
@@ -48,8 +48,8 @@ impl<'a> Iterator for RtAttrs<'a> {
 }
 
 /// Read a `repr(C)` POD `T` at `off` in `buf`, or `None` if `buf` is too short (or `off`
-/// overflows). Tolerates any alignment. `T` must be a plain wire struct — no padding-sensitive
-/// invariants, no `Drop`; the netlink headers/bodies all qualify.
+/// overflows). Tolerates any alignment. `T` must be a plain wire struct: no padding-sensitive
+/// invariants, no `Drop`. The netlink headers/bodies all qualify.
 pub(super) fn read_at<T>(buf: &[u8], off: usize) -> Option<T> {
     if off.checked_add(size_of::<T>())? > buf.len() {
         return None;
@@ -68,7 +68,7 @@ pub(super) fn read_at<T>(buf: &[u8], off: usize) -> Option<T> {
 /// Returns an error if a netlink socket, request, or reply fails.
 pub(super) fn resolve(if_name: &str, ifindex: u32) -> io::Result<InterfaceAddresses> {
     if ifindex == 0 {
-        return Ok(InterfaceAddresses::default()); // unknown interface — nothing to dump
+        return Ok(InterfaceAddresses::default());
     }
 
     let sock = netlink_socket()?;
@@ -152,8 +152,8 @@ fn dump<B>(
     let mut buf: Vec<u8> = Vec::new();
     loop {
         // Size the next datagram before reading it: MSG_PEEK leaves it queued while MSG_TRUNC
-        // reports its true length, so we read into a zero-length buffer purely to learn the
-        // size — an oversized message then grows `buf` rather than being silently truncated.
+        // reports its true length. Reading into a zero-length buffer learns the size; an
+        // oversized message then grows `buf` rather than being silently truncated.
         // SAFETY: a zero-length read dereferences nothing, so the null pointer is never read.
         let size = unsafe {
             libc::recv(
@@ -239,7 +239,7 @@ fn scan_addr(
         return;
     };
     if family == libc::AF_INET {
-        // First usable address wins: skip a tentative/deprecated/secondary v4 (the same
+        // First usable address wins: skip a tentative/deprecated/DAD-failed v4 (the same
         // IFA_F_UNUSABLE mask the v6 branch applies) so it is never chosen as the reflection source.
         if addrs.v4.is_none()
             && flags & IFA_F_UNUSABLE == 0

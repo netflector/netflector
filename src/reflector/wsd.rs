@@ -47,7 +47,7 @@ fn search_verdict(payload: &[u8]) -> Verdict {
     }
 }
 
-/// A `Probe` / `Resolve` carries no MX field, so its reply window is a fixed span — long enough for a
+/// A `Probe` / `Resolve` carries no MX field, so the reply window is fixed: long enough for a
 /// device's unicast match (WS-Discovery caps the reply delay at ~500 ms) plus network slack.
 const SESSION_WINDOW: Duration = Duration::from_secs(5);
 
@@ -55,7 +55,7 @@ fn window(_: &[u8]) -> Duration {
     SESSION_WINDOW
 }
 
-/// Build the WSD reflector for `reflector` and register both directions on `dispatcher` — a no-op when
+/// Build the WSD reflector for `reflector` and register both directions on `dispatcher`. A no-op when
 /// WSD isn't enabled. For each address family in use it joins the group on BOTH interfaces and
 /// registers two handlers: `Hello` / `Bye` announcements target → source (a [`SimpleReflector`]), and
 /// `Probe` / `Resolve` searches source → target with their unicast replies (the shared
@@ -87,10 +87,10 @@ pub(crate) fn build(
     )?;
 
     // The reserved-port bind for an IPv6 link-local target source needs the target's scope id; use the
-    // ifindex the capture already cached (the single source of truth the joiners bake too).
+    // ifindex the capture already cached (the same value the joiners use).
     let target_ifindex = dispatcher.capture_ifindex(target).unwrap_or(0);
 
-    // Announcements are captured on target, searches on source — join the group on both. A family with
+    // Announcements are captured on target, searches on source, so join the group on both. A family with
     // no address yet is recorded and re-attempted on the next address change.
     let groups = used_groups(reflector.address_family);
     for group in &groups {
@@ -121,7 +121,7 @@ pub(crate) fn build(
             announcement_verdict,
         )),
     );
-    // source -> target: Probe/Resolve searches (unfiltered — any source client may search); each
+    // source -> target: Probe/Resolve searches (unfiltered, any source client may search); each
     // searcher's unicast matches route back through a per-searcher session.
     dispatcher.register(
         source,

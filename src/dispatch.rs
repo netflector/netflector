@@ -1,18 +1,18 @@
 //! Packet dispatch: the routing layer between captures and reflectors.
 //!
-//! [`PacketDispatcher`] is the single owner of every interface [`Capture`] — each linked
-//! to its interface and addressed by a `Copy` [`CaptureKey`] — and of the routing
+//! [`PacketDispatcher`] is the single owner of every interface [`Capture`] (each linked
+//! to its interface and addressed by a `Copy` [`CaptureKey`]) and of the routing
 //! registrations. When an interface's fd is readable, [`drain_and_route`] takes that
 //! capture *out* of the table, drains it, parses each frame into a [`Packet`], and
-//! offers it to every registration whose [`Filter`] matches; a matching reflector
+//! offers it to every registration whose [`Filter`] matches. A matching reflector
 //! re-emits on the opposite interface via [`send`], keyed.
 //!
 //! Taking the ingress capture out is load-bearing: the parsed `Packet` then borrows a
-//! local, not `self`, so `&mut PacketDispatcher` is free to hand to a reflector — which
-//! can send on the *other* captures still in the table, and register further work. The
+//! local, not `self`, so `&mut PacketDispatcher` is free to hand to a reflector, which
+//! can send on the *other* captures still in the table and register further work. The
 //! reflector never owns an fd; the fd lives in exactly one `Capture`, reached by key.
-//! (`egress == ingress` can't arise — reflectors bridge A→B, never A→A; if it did, the
-//! key resolves to the taken-out `None` slot and the send is a logged drop, not UB.)
+//! `egress == ingress` can't arise: reflectors bridge A→B, never A→A. If it did, the
+//! key resolves to the taken-out `None` slot and the send is a logged drop, not UB.
 //!
 //! [`drain_and_route`]: PacketDispatcher::drain_and_route
 //! [`send`]: PacketDispatcher::send
@@ -53,14 +53,14 @@ const MAX_FRAMES_PER_EVENT: u32 = 64;
 /// (via [`to_u64`](CaptureKey::to_u64)), so `u64::MAX` never collides with a real capture.
 const MONITOR_TAG: u64 = u64::MAX;
 
-/// The dispatcher's reused send-buffer size — a standard-MTU datagram fits. One buffer serves
+/// The dispatcher's reused send-buffer size. A standard-MTU datagram fits. One buffer serves
 /// every reflector: the single-threaded loop runs one [`send_udp_group`](PacketDispatcher::send_udp_group)
 /// at a time. An oversized payload is a `BufferTooSmall` error, not a truncation. It also caps a
 /// forwardable datagram, so the DIAL rewrite scratch ([`REWRITE_BUF_LEN`](crate::reflector::dial::REWRITE_BUF_LEN)) anchors to it.
 pub(crate) const SCRATCH_LEN: usize = 2048;
 
 /// A `Copy` handle to a capture the dispatcher owns: an index into the interface table's
-/// captures. A newtype, not a bare alias — so it can't be passed where an [`InterfaceKey`](interface_table::InterfaceKey)
+/// captures. A newtype, not a bare alias, so it can't be passed where an [`InterfaceKey`](interface_table::InterfaceKey)
 /// or a reactor key is expected, where it would silently miss instead of failing to
 /// compile. Captures are insert-only, so the index is a stable identity (no generation).
 /// Reflectors hold these for the interface(s) they egress on and send by key, never
@@ -86,14 +86,14 @@ impl CaptureKey {
     }
 }
 
-/// A `Copy` handle to a routing registration — the generational arena [`Key`] of its slot, newtyped
+/// A `Copy` handle to a routing registration: the generational arena [`Key`] of its slot, newtyped
 /// so it can't be confused with a reactor key or a [`CaptureKey`]. Returned by
 /// [`register`](PacketDispatcher::register); the SSDP search reflector will hold it to
 /// [`unregister`](PacketDispatcher::unregister) a per-searcher capture when its session ends.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct RegistrationKey(Key);
 
-/// A non-empty set of one filter field's accepted values, so a single registration can span several —
+/// A non-empty set of one filter field's accepted values, so a single registration can span several:
 /// mDNS's two multicast groups (`dst_ip`), or `WoL`'s ports (`dst_port`). A one-element set pins a
 /// single value.
 #[derive(Clone)]
@@ -107,14 +107,12 @@ impl<T> Deref for FilterSet<T> {
     }
 }
 
-/// A single value is a valid one-element set.
 impl<T> From<T> for FilterSet<T> {
     fn from(value: T) -> Self {
         FilterSet(Box::new([value]))
     }
 }
 
-/// A fixed array of values (a known set of groups or ports) converts directly.
 impl<T, const N: usize> From<[T; N]> for FilterSet<T> {
     fn from(values: [T; N]) -> Self {
         FilterSet(Box::from(values))
@@ -180,7 +178,7 @@ pub(crate) trait PacketHandler {
 
     /// The earliest instant this handler wants [`on_deadline`](Self::on_deadline) called, or `None`
     /// (the default) if it keeps no timer. The dispatcher reports the soonest of these to the reactor,
-    /// which waits within it — so a handler tracking timed state (e.g. expiring sessions) is swept on
+    /// which waits within it, so a handler tracking timed state (e.g. expiring sessions) is swept on
     /// time without polling.
     fn next_deadline(&self) -> Option<Instant> {
         None
@@ -199,7 +197,7 @@ pub(crate) trait PacketHandler {
 
 /// One routing registration: the ingress it applies to, its filter, and the reflector
 /// it gates. The handler is taken out of its slot for its call (so the dispatcher is
-/// free to pass `&mut self`) — the reactor's take-out, one level down.
+/// free to pass `&mut self`), mirroring the reactor's take-out one level down.
 struct Registration {
     ingress: CaptureKey,
     filter: Filter,
@@ -207,7 +205,7 @@ struct Registration {
 }
 
 /// The periodic counter-summary schedule: log every capture's tallies every `interval`. Held as an
-/// `Option` on the dispatcher — `None` disables reporting, and the counters accrue regardless.
+/// `Option` on the dispatcher; `None` disables reporting, and the counters accrue regardless.
 struct CounterReport {
     interval: Duration,
     next: Instant,
@@ -219,7 +217,7 @@ pub(crate) struct PacketDispatcher {
     table: InterfaceTable,
     registrations: Arena<Registration>,
     /// Reused scratch for [`route`](Self::route)'s per-packet snapshot of the live registration
-    /// keys — taken once at the start of a route so a mid-route registration isn't fed the
+    /// keys, taken once at the start of a route so a mid-route registration isn't fed the
     /// in-flight frame, and kept allocated across calls so the data path doesn't allocate per packet.
     route_keys: Vec<RegistrationKey>,
     /// The address-change monitor, opened best-effort in [`new`](Self::new). `None` is a
@@ -235,8 +233,8 @@ pub(crate) struct PacketDispatcher {
 }
 
 impl PacketDispatcher {
-    /// A dispatcher with no captures yet. Opens the address monitor up front — before the
-    /// first [`add_capture`](Self::add_capture) resolve — so a change during startup is
+    /// A dispatcher with no captures yet. Opens the address monitor up front, before the
+    /// first [`add_capture`](Self::add_capture) resolve, so a change during startup is
     /// already queued rather than missed.
     pub(crate) fn new() -> Self {
         Self {
@@ -260,7 +258,7 @@ impl PacketDispatcher {
         });
     }
 
-    /// Open the address-change monitor. Best-effort: a failure logs and yields `None` — the
+    /// Open the address-change monitor. Best-effort: a failure logs and yields `None`, and the
     /// daemon then runs on its startup-resolved addresses (no live updates), never aborting.
     fn open_monitor() -> Option<AddressMonitor> {
         match AddressMonitor::open() {
@@ -303,7 +301,7 @@ impl PacketDispatcher {
     }
 
     /// Register `handler`, gated by `filter`, for packets captured on `ingress`. The returned
-    /// [`Key`] removes it again via [`unregister`](Self::unregister) — for the per-searcher response
+    /// [`Key`] removes it again via [`unregister`](Self::unregister), for the per-searcher response
     /// captures the SSDP search reflector creates dynamically; a static reflector ignores it.
     pub(crate) fn register(
         &mut self,
@@ -329,7 +327,7 @@ impl PacketDispatcher {
     /// addresses next change. A reflector calls this at build, once per group per interface.
     ///
     /// # Errors
-    /// Propagates the join's OS error. A family with no address yet is *not* an error — it's
+    /// Propagates the join's OS error. A family with no address yet is *not* an error: it's
     /// recorded and retried on the next address-up event; only a hard failure surfaces here.
     pub(crate) fn join_group(&mut self, capture: CaptureKey, group: IpAddr) -> io::Result<()> {
         let Some(interface) = self.table.interface_of(capture) else {
@@ -366,7 +364,7 @@ impl PacketDispatcher {
         &mut self.dial
     }
 
-    /// The kernel ifindex of the interface behind `capture` — its stable identity (the address
+    /// The kernel ifindex of the interface behind `capture`, its stable identity (the address
     /// resolver caches it at open, and the joiners bake it too). The SSDP search reflector bakes the
     /// target's for its IPv6 link-local reserved-port binds. `None` if the key is unknown.
     pub(crate) fn capture_ifindex(&self, capture: CaptureKey) -> Option<u32> {
@@ -380,7 +378,7 @@ impl PacketDispatcher {
         self.table.capture(egress).map(Capture::link_type)
     }
 
-    /// Build a UDP datagram — sourced from the egress's own address — with `dst_mac` as the L2
+    /// Build a UDP datagram, sourced from the egress's own address, with `dst_mac` as the L2
     /// destination, and inject it on `egress`. The caller supplies the L2 MAC, so this serves
     /// unicast, multicast, and broadcast alike; the link framing (Ethernet vs `DLT_NULL`) follows
     /// the egress's link type, and the source port, `ttl`, and `payload` are carried verbatim.
@@ -389,7 +387,7 @@ impl PacketDispatcher {
     ///
     /// # Errors
     /// Propagates a send failure, and reports a frame that can't be built from the egress's
-    /// current state — no source address/MAC for the datagram, or a payload that overflows
+    /// current state: no source address/MAC for the datagram, or a payload that overflows
     /// the scratch buffer or the datagram length fields.
     pub(crate) fn send_udp(
         &mut self,
@@ -424,7 +422,7 @@ impl PacketDispatcher {
 
     /// Inject a broadcast/multicast UDP datagram on `egress`, deriving the L2 destination MAC from
     /// `dst`'s address class (all-ones for the IPv4 limited broadcast, the RFC-derived group MAC
-    /// for multicast) — a thin wrapper over [`send_udp`](Self::send_udp). A unicast `dst` has no
+    /// for multicast). A thin wrapper over [`send_udp`](Self::send_udp). A unicast `dst` has no
     /// derivable group MAC, so it is a [`DatagramError::UnicastDestination`](datagram::DatagramError::UnicastDestination); use `send_udp` with an
     /// explicit MAC for unicast.
     ///
@@ -447,7 +445,7 @@ impl PacketDispatcher {
     /// exception is via `has_buffered`); a read error abandons the batch and logs.
     fn drain_and_route(&mut self, ingress: CaptureKey, reactor: &mut Reactor) {
         // Take the ingress capture OUT: the parsed Packet then borrows the owned local, not
-        // `self`, so `&mut self` is free for routing — and a reflector can send on the OTHER
+        // `self`, so `&mut self` is free for routing, and a reflector can send on the OTHER
         // captures still in the table.
         let Some(mut capture) = self.table.take(ingress) else {
             if self.table.contains(ingress) {
@@ -502,10 +500,10 @@ impl PacketDispatcher {
     /// Offer `packet` (captured on `ingress`) to every matching registration, in order.
     fn route(&mut self, ingress: CaptureKey, packet: &Packet, reactor: &mut Reactor) {
         // Snapshot the live registration keys into the reused buffer. Taking them once means a
-        // reflector registering mid-route isn't fed the in-flight frame — its key isn't in the
-        // snapshot whether it appended or reused a freed slot — and a generational key keeps the
+        // reflector registering mid-route isn't fed the in-flight frame (its key isn't in the
+        // snapshot whether it appended or reused a freed slot), and a generational key keeps the
         // put-back safe even if a registration is removed during its own call (the key goes stale
-        // and the restore is a no-op). `route` never nests — a handler sends but never re-drains —
+        // and the restore is a no-op). `route` never nests: a handler sends but never re-drains,
         // so one shared buffer suffices.
         self.route_keys.clear();
         self.route_keys.extend(
@@ -526,7 +524,7 @@ impl PacketDispatcher {
             // Take the matched reflector out so `&mut self` is free for the call, then restore it
             // by key. `take` never misses: a `handler` is `None` only transiently while out
             // mid-call, and `route` doesn't re-enter the same registration in one pass. A `get_mut`
-            // miss on the put-back means the call removed this registration — drop it, don't revive.
+            // miss on the put-back means the call removed this registration: drop it, don't revive.
             let mut handler = self
                 .registrations
                 .get_mut(key.0)
@@ -546,8 +544,8 @@ impl PacketDispatcher {
                     let (merged, anomalies) = prev.combine(outcome);
                     if anomalies.double_reflect {
                         log::error!(
-                            "two handlers reflected one packet on {ingress:?} ({prev:?} + {outcome:?}) \
-                             — a duplicate-direction config the conflict check should have caught"
+                            "two handlers reflected one packet on {ingress:?} ({prev:?} + {outcome:?}), \
+                             a duplicate-direction config the conflict check should have caught"
                         );
                     }
                     if anomalies.type_mismatch {
@@ -561,7 +559,7 @@ impl PacketDispatcher {
             });
         }
         // One packet, one tally: record the folded outcome on the ingress capture's row. The row
-        // always exists — `route` is reached only via the drain, whose take-out guard admits only a
+        // always exists: `route` is reached only via the drain, whose take-out guard admits only a
         // real, in-range ingress key.
         if let Some(outcome) = final_outcome {
             self.table.record(ingress, outcome);
@@ -571,7 +569,7 @@ impl PacketDispatcher {
     /// Drain the address monitor and re-resolve each interface a notification names,
     /// coalescing duplicates so one interface re-resolves at most once per wakeup. A `0`
     /// (the overflow signal) re-resolves every interface. Best-effort: a read or resolution
-    /// failure logs and is dropped — the daemon keeps its last-known addresses.
+    /// failure logs and is dropped, and the daemon keeps its last-known addresses.
     fn refresh_changed_interfaces(&mut self, reactor: &mut Reactor) {
         let Some(monitor) = self.monitor.as_mut() else {
             return;
@@ -585,7 +583,7 @@ impl PacketDispatcher {
             log::warn!("address monitor read failed; skipping refresh: {e}");
             return;
         }
-        // The DIAL proxies bind IPv4 only, so collect the interfaces whose v4 address actually moved — a
+        // The DIAL proxies bind IPv4 only, so collect the interfaces whose v4 address actually moved. A
         // routine v6 or MAC change must not churn a proxy whose v4 (and cached LOCATION) is unchanged.
         let mut v4_moved: Vec<u32> = Vec::new();
         if changed.contains(&0) {
@@ -597,7 +595,7 @@ impl PacketDispatcher {
                     Ok(_) => {}
                     Err(e) => {
                         // The overflow already means notifications were dropped, so this is the one
-                        // chance to catch a move whose event was lost — and we can't confirm the v4
+                        // chance to catch a move whose event was lost, and we can't confirm the v4
                         // survived. Treat it as moved so any DIAL proxy on it re-mints rather than
                         // keeping listeners bound to (and advertising) a possibly-vanished address.
                         log::warn!(
@@ -642,7 +640,7 @@ impl PacketDispatcher {
 impl Handler for PacketDispatcher {
     /// [`MONITOR_TAG`] routes to an address-monitor drain; otherwise `event.user_data` is the
     /// ready capture's [`CaptureKey`] (tagged at registration), so drain that capture
-    /// directly — no fd lookup. A bad capture value resolves to a stale key and is a logged
+    /// directly, no fd lookup. A bad capture value resolves to a stale key and is a logged
     /// drop in [`drain_and_route`](Self::drain_and_route).
     fn on_readable(&mut self, event: ReadyEvent, reactor: &mut Reactor) {
         if event.user_data == MONITOR_TAG {
@@ -652,10 +650,10 @@ impl Handler for PacketDispatcher {
         }
     }
 
-    /// The soonest deadline any registered handler keeps — the reactor waits within it.
+    /// The soonest deadline any registered handler keeps; the reactor waits within it.
     fn next_deadline(&self) -> Option<Instant> {
-        // O(registrations) every run-loop iteration. n stays small — a few base handlers plus the
-        // live SSDP sessions (≤32) — so the scan beats a min-heap, whose O(1) peek isn't worth the
+        // O(registrations) every run-loop iteration. n stays small (a few base handlers plus the
+        // live SSDP sessions, ≤32), so the scan beats a min-heap, whose O(1) peek isn't worth the
         // entry invalidation a cancelled or moved deadline would force. Revisit if timers grow.
         self.registrations
             .iter()
@@ -727,7 +725,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     impl PacketDispatcher {
-        /// The number of live routing registrations — a seam for the SSDP session lifecycle tests.
+        /// The number of live routing registrations, a seam for the SSDP session lifecycle tests.
         pub(crate) fn registration_count(&self) -> usize {
             self.registrations.iter().count()
         }
@@ -750,7 +748,7 @@ mod tests {
     }
 
     /// A loopback probe rig: a bound `receiver` (its port reserved so the probe has a real
-    /// destination — the probe is captured off `lo`, never recv'd), the `target` to send to,
+    /// destination; the probe is captured off `lo`, never recv'd), the `target` to send to,
     /// and a `sender`. The caller holds the receiver alive for the test's duration.
     fn probe_rig() -> io::Result<(UdpSocket, SocketAddr, UdpSocket)> {
         let receiver = UdpSocket::bind("127.0.0.1:0")?;
@@ -759,7 +757,7 @@ mod tests {
         Ok((receiver, target, sender))
     }
 
-    /// Call `step`, then sleep 20 ms, until `done` is true or `secs` elapse — the drive loop
+    /// Call `step`, then sleep 20 ms, until `done` is true or `secs` elapse: the drive loop
     /// for a non-blocking driver like `drain_and_route`. (The reactor test's `poll_once` loop
     /// blocks on its own timeout instead, so it isn't routed through here.)
     fn pump_until(secs: u64, mut done: impl FnMut() -> bool, mut step: impl FnMut()) {
@@ -893,15 +891,15 @@ mod tests {
     }
 
     const PROBE: &[u8] = b"reflector-dispatch-probe";
-    /// The echo re-emits to this port — distinct from the filter's, so the looped-back
+    /// The echo re-emits to this port, distinct from the filter's, so the looped-back
     /// echo can't re-match and amplify.
     const ECHO_DST_PORT: u16 = 1;
 
     /// Each entry: the payload a reflector saw, and whether its keyed egress succeeded.
     type Seen = Rc<RefCell<Vec<(Vec<u8>, bool)>>>;
 
-    /// A reflector that re-emits each matched packet on its egress capture — by key,
-    /// through the dispatcher — and records what it saw. The seam `WoL` et al. will fill.
+    /// A reflector that re-emits each matched packet on its egress capture (by key,
+    /// through the dispatcher) and records what it saw. The seam `WoL` et al. will fill.
     struct Echo {
         egress: CaptureKey,
         seen: Seen,
@@ -953,7 +951,7 @@ mod tests {
         let mut dispatcher = PacketDispatcher::new();
         let ingress = dispatcher.add_capture(ingress_cap)?;
         let egress = dispatcher.add_capture(egress_cap)?;
-        // The egress capture resolves to its interface's address — the seam reflectors read.
+        // The egress capture resolves to its interface's address, the seam reflectors read.
         assert_eq!(
             dispatcher
                 .egress_addrs(egress)
@@ -988,7 +986,7 @@ mod tests {
         Ok(())
     }
 
-    /// A reflector that records each matched packet's payload — for routing/registration tests
+    /// A reflector that records each matched packet's payload, for routing/registration tests
     /// that need no real egress (no capture, no send).
     struct Recorder {
         seen: Rc<RefCell<Vec<Vec<u8>>>>,
@@ -1043,7 +1041,7 @@ mod tests {
         Ok(())
     }
 
-    /// A reflector that returns a preset [`Outcome`] — drives `route`'s outcome fold and per-capture
+    /// A reflector that returns a preset [`Outcome`], driving `route`'s outcome fold and per-capture
     /// recording without a real egress.
     struct Outcomer(Outcome);
 
@@ -1133,7 +1131,7 @@ mod tests {
         Ok(())
     }
 
-    /// A reflector carrying only a timer: reports `deadline` and counts each `on_deadline` sweep —
+    /// A reflector carrying only a timer: reports `deadline` and counts each `on_deadline` sweep,
     /// for the dispatcher's deadline aggregation/dispatch, with no packets involved.
     struct Ticker {
         deadline: Option<Instant>,
@@ -1187,7 +1185,7 @@ mod tests {
         Ok(())
     }
 
-    /// Registers a second recorder once, from inside its own call — the mid-route registration.
+    /// Registers a second recorder once, from inside its own call: the mid-route registration.
     struct Registrar {
         ingress: CaptureKey,
         late: Rc<RefCell<Vec<Vec<u8>>>>,
@@ -1215,7 +1213,7 @@ mod tests {
     }
 
     // route snapshots the live registration keys at the start, so a registration created during the
-    // call isn't in the snapshot and doesn't receive the in-flight frame — true whether it appends
+    // call isn't in the snapshot and doesn't receive the in-flight frame. True whether it appends
     // or reuses a freed slot (a key snapshot, unlike the old length bound, doesn't depend on index).
     #[test]
     fn a_mid_route_registration_is_not_fed_the_in_flight_frame() -> io::Result<()> {
@@ -1247,7 +1245,7 @@ mod tests {
     /// A reflector that re-enters the drain on its *own* ingress from inside the call.
     /// The upstream take-out makes that nested drain return at its guard; were the
     /// take-out removed, the nested drain would pull the next buffered frame and
-    /// re-route into this handler — which is taken out for the call — panicking the
+    /// re-route into this handler (which is taken out for the call), panicking the
     /// `expect` in `route`.
     struct Reentrant {
         ingress: CaptureKey,
@@ -1370,7 +1368,7 @@ mod tests {
 
     // Privilege-free: a fresh dispatcher has no captures, so an out-of-range key stands in
     // for a forged reactor `user_data`. The drain guard, `egress_addrs`, `link_type`, `send`,
-    // and `send_udp_group` must each be a safe no-op (log-drop / `None` / `Ok`), never a panic —
+    // and `send_udp_group` must each be a safe no-op (log-drop / `None` / `Ok`), never a panic:
     // the new behavior the capture-gated e2e tests above skip without `CAP_NET_RAW`.
     #[test]
     fn unknown_capture_key_is_a_safe_no_op() -> io::Result<()> {
@@ -1416,7 +1414,7 @@ mod tests {
     }
 
     // The wrapper design's headline invariant: the take-out clears only the inner capture,
-    // leaving the interface link resident — so `egress_addrs(ingress)` still resolves while
+    // leaving the interface link resident, so `egress_addrs(ingress)` still resolves while
     // the capture is drained, and `send(ingress)` drops (`Ok`) rather than panicking. Both
     // are checked from inside the reflector's call, when the ingress entry's capture is
     // `None`. Skips without capture access (no CAP_NET_RAW).
@@ -1484,7 +1482,7 @@ mod tests {
         );
     }
 
-    // A join_group on an unknown capture is logged and skipped — not an error or a panic.
+    // A join_group on an unknown capture is logged and skipped, not an error or a panic.
     #[test]
     fn join_group_ignores_an_unknown_capture() {
         let mut dispatcher = PacketDispatcher::new();

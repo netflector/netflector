@@ -1,6 +1,6 @@
 //! Linux: an rtnetlink (`NETLINK_ROUTE`) socket subscribed to the address and link change
 //! multicast groups. The message layer (header walk, `ifaddrmsg`/`ifinfomsg` bodies) is the
-//! resolver's — reused from [`super::super::rtnetlink`] rather than duplicated.
+//! resolver's, reused from [`super::super::rtnetlink`].
 
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -10,7 +10,7 @@ use libc::socklen_t;
 use super::super::rtnetlink::read_at;
 use crate::libcex::{IfAddrMsg, NETLINK_ROUTE, NlMsgHdr, SockAddrNl, nl_align};
 
-/// Holds one notification — multicast delivers one message per datagram, never a coalesced
+/// Holds one notification. Multicast delivers one message per datagram, never a coalesced
 /// dump. Sized for the largest: an `RTM_NEWLINK` carries the interface's whole attribute set
 /// (stats, `IFLA_AF_SPEC`, VF info) at ~1 KB; addresses are far smaller. 8 KiB is roomy.
 pub(super) const READ_BUF: usize = 8192;
@@ -58,8 +58,8 @@ pub(super) fn for_each_change(buf: &[u8], on_change: &mut impl FnMut(u32)) {
     while let Some(hdr) = read_at::<NlMsgHdr>(buf, offset) {
         let len = hdr.len as usize;
         if len < size_of::<NlMsgHdr>() || offset + len > buf.len() {
-            // Not a normal end (that's the `while` running out): a message claims a length
-            // that's impossible — truncated datagram or corruption — so a change is dropped.
+            // Not a normal end (that's the `while` running out): a message claims an
+            // impossible length (truncated datagram or corruption), so a change is dropped.
             log::warn!(
                 "netlink message walk stopped at offset {offset}: len {len}, buffer {} B \
                  (truncated or malformed); a change may be missed",
@@ -89,7 +89,7 @@ pub(super) fn for_each_change(buf: &[u8], on_change: &mut impl FnMut(u32)) {
     }
 }
 
-/// Forward a change for `index`, unless `index` is 0 — which names no interface (kernel
+/// Forward a change for `index`, unless `index` is 0. Zero names no interface (kernel
 /// indices are >= 1) and is the parent's "re-resolve everything" overflow signal, so a stray
 /// 0 must never be forwarded.
 fn report(index: u32, on_change: &mut impl FnMut(u32)) {

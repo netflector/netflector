@@ -2,8 +2,7 @@
 //!
 //! TOML deserializes into [`RawConfig`]/[`RawReflector`]; the environment layer
 //! produces the same shape. [`RawConfig::merge_env`] overlays the environment
-//! layer onto the file layer before the whole thing is validated into the typed
-//! model.
+//! layer onto the file layer before validation into the typed model.
 
 use std::collections::BTreeMap;
 

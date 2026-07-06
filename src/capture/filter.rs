@@ -12,8 +12,7 @@ const fn insn(code: u16, jt: u8, jf: u8, k: u32) -> BpfInsn {
 
 /// Accept IPv4 UDP or IPv6 UDP on an Ethernet link, drop everything else
 /// in-kernel (no VLAN tags, no IPv6 extension headers). Direction filtering
-/// (loop prevention) is layered on per-backend (`BIOCSSEESENT` on BPF), not
-/// encoded here.
+/// (loop prevention) is per-backend (`BIOCSSEESENT` on BPF), not here.
 ///
 /// ```text
 /// ldh [12]                 load ethertype
@@ -39,8 +38,8 @@ pub(crate) const ETHERNET_UDP_FILTER: [BpfInsn; 9] = [
 ];
 
 /// Prepended to [`ETHERNET_UDP_FILTER`] on Linux kernels without
-/// `PACKET_IGNORE_OUTGOING`: the `SKF_AD_PKTTYPE` ancillary load reads
-/// `skb->pkt_type`, and frames we sent (`PACKET_OUTGOING`) are dropped — so the
+/// `PACKET_IGNORE_OUTGOING`. The `SKF_AD_PKTTYPE` ancillary load reads
+/// `skb->pkt_type`; frames we sent (`PACKET_OUTGOING`) are dropped, so the
 /// capture socket never re-receives its own injections.
 ///
 /// ```text
@@ -65,8 +64,8 @@ pub(crate) const DROP_OUTGOING_PROLOGUE: [BpfInsn; 3] = [
 
 /// Convert a host-order address family to the value a `BPF_LD|BPF_W|BPF_ABS` load
 /// compares against. The classic-BPF VM assembles a loaded word big-endian
-/// regardless of host, but a `DLT_NULL` frame stores the family in host order — so
-/// on a little-endian host the `jeq` constant is the byte-swapped family, and on a
+/// regardless of host, but a `DLT_NULL` frame stores the family in host order.
+/// So on a little-endian host the `jeq` constant is the byte-swapped family; on a
 /// big-endian host it is the family unchanged (load and data already agree).
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 const fn host_af_to_bpf_be(af: libc::c_int) -> u32 {
@@ -75,7 +74,7 @@ const fn host_af_to_bpf_be(af: libc::c_int) -> u32 {
 
 /// Accept IPv4 UDP or IPv6 UDP on a `DLT_NULL` link (BSD `lo0`), drop
 /// everything else in-kernel. The link header is a 4-byte host-order address
-/// family, then the IP packet — so the field offsets differ from Ethernet's.
+/// family followed by the IP packet, so the field offsets differ from Ethernet's.
 ///
 /// ```text
 /// ld  [0]                  load the 4-byte address family

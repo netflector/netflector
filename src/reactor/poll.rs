@@ -5,7 +5,6 @@
 
 use super::{Key, Readiness};
 
-// Exactly one backend compiles per target; the reactor drives the selected `Poller`.
 #[cfg(target_os = "linux")]
 mod epoll;
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
@@ -25,8 +24,8 @@ pub(crate) struct PollEvent {
 }
 
 // Tests of the uniform `Poller` contract, run against whichever backend compiles
-// (kqueue on macOS/FreeBSD, epoll on Linux). Backend-specific behavior that the two
-// can't share — re-adding an fd — is tested in each backend module instead.
+// (kqueue on macOS/FreeBSD, epoll on Linux). Backend-specific behavior the two
+// can't share, like re-adding an fd, is tested in each backend module instead.
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};

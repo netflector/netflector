@@ -1,12 +1,12 @@
-//! A write-only, fixed-capacity byte sink over uninitialized storage: filled front-to-back through
-//! [`io::Write`], then read back as the written prefix via [`filled`](UninitBuf::filled). Backed by a
-//! `Box<[MaybeUninit<u8>]>` allocated on first write and never zero-filled — only the written
-//! `storage[..filled]` region is ever read. A write past the capacity is a short write (so
-//! [`write_all`](io::Write::write_all) returns `WriteZero`), letting the caller treat "didn't fit" as a
-//! signal rather than silently truncating. Reuse across messages with [`clear`](UninitBuf::clear).
+//! Write-only, fixed-capacity byte sink over uninitialized storage: filled front-to-back through
+//! [`io::Write`], read back as the written prefix via [`filled`](UninitBuf::filled). Backed by a
+//! `Box<[MaybeUninit<u8>]>` allocated on first write and never zero-filled; only the written
+//! `storage[..filled]` region is ever read. A write past capacity is a short write (so
+//! [`write_all`](io::Write::write_all) returns `WriteZero`), so the caller can treat "didn't fit" as a
+//! signal instead of silently truncating. Reuse across messages with [`clear`](UninitBuf::clear).
 //!
-//! All of the `unsafe` uninitialized-memory handling lives here, behind a safe interface — callers only
-//! see `io::Write`, `clear`, and `filled`.
+//! All `unsafe` uninitialized-memory handling lives here behind a safe interface: callers see only
+//! `io::Write`, `clear`, and `filled`.
 
 use std::io;
 use std::mem::MaybeUninit;
@@ -22,8 +22,8 @@ pub(crate) struct UninitBuf {
 }
 
 impl UninitBuf {
-    /// Holds at most `cap` bytes. The backing store is allocated — uninitialized, never zero-filled —
-    /// on the first write, so an unused buffer costs nothing.
+    /// Holds at most `cap` bytes. The backing store is allocated (uninitialized, never zero-filled) on
+    /// the first write, so an unused buffer costs nothing.
     pub(crate) fn with_capacity(cap: usize) -> Self {
         Self {
             storage: None,
@@ -108,7 +108,7 @@ mod tests {
     #[test]
     fn write_past_capacity_is_a_short_write() {
         let mut b = UninitBuf::with_capacity(4);
-        // The 4 fit-able bytes land before the overflow makes `write_all` fail rather than truncate.
+        // The 4 fit-able bytes are written even though the overflow makes `write_all` fail.
         assert!(b.write_all(b"abcde").is_err());
         assert_eq!(b.filled(), b"abcd");
     }

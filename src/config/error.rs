@@ -1,8 +1,8 @@
 //! Configuration error types.
 //!
-//! [`ConfigError`] is the module's public failure surface. [`ParseValueError`]
+//! [`ConfigError`] is the module's failure surface. [`ParseValueError`]
 //! aggregates the per-value parse errors so a bad environment value stays
-//! matchable while still naming the variable that carried it.
+//! matchable while naming the variable that carried it.
 
 use std::fmt;
 
@@ -139,7 +139,7 @@ impl fmt::Display for Protocol {
 /// Any value-level parse failure an environment variable can carry.
 ///
 /// Aggregating the per-type errors keeps [`ConfigError::EnvBadValue`] structured
-/// (matchable in tests) while still attaching the originating variable name.
+/// (matchable in tests) while attaching the originating variable name.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub(crate) enum ParseValueError {
     /// `LOG_LEVEL`.

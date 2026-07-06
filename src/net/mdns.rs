@@ -1,20 +1,20 @@
-//! mDNS wire constants and the query/response classifier — the reflector's directional gate.
+//! mDNS wire constants and the query/response classifier that acts as the reflector's directional gate.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 /// RFC 6762.
 pub(crate) const MDNS_PORT: u16 = 5353;
-/// mDNS messages carry IP TTL 255 so a receiver can verify the message originated on the local
-/// link — a lower TTL means it was routed, and is rejected (RFC 6762 §11). The reflector re-emits a
-/// fresh link-local message, so it sets 255 rather than preserving the captured TTL.
+/// mDNS uses IP TTL 255 so receivers can verify a message originated on the local link; a lower TTL
+/// means it was routed and is rejected (RFC 6762 §11). The reflector re-emits a fresh link-local
+/// message, so it sets 255 rather than preserving the captured TTL.
 pub(crate) const MDNS_TTL: u8 = 255;
 pub(crate) const MDNS_GROUP_V4: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
 /// Link-local scope (`ff02::`), not site-local.
 pub(crate) const MDNS_GROUP_V6: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb);
 
 /// An mDNS message is a query or a response, per the QR bit of its DNS header. Unsolicited
-/// announcements are responses too (RFC 6762 §8.3), so this split is exactly the reflector's
-/// directional gate: queries reflect source → target, responses target → source.
+/// announcements count as responses (RFC 6762 §8.3). This split is the reflector's directional
+/// gate: queries reflect source → target, responses target → source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MdnsKind {
     Query,
@@ -28,8 +28,8 @@ const FLAGS_HIGH: usize = 2;
 const QR_BIT: u8 = 0x80;
 
 /// Classify a payload by the QR bit of its fixed 12-byte DNS header. `None` when the payload is too
-/// short to hold that header — anomalous on the dedicated mDNS group, so the caller surfaces it.
-/// Header-only: no question or record parsing.
+/// short to hold that header; that is anomalous on the dedicated mDNS group, so the caller surfaces
+/// it. Header-only: no question or record parsing.
 pub(crate) fn classify(payload: &[u8]) -> Option<MdnsKind> {
     if payload.len() < DNS_HEADER_LEN {
         return None;
@@ -65,15 +65,15 @@ mod tests {
     #[test]
     fn rejects_a_payload_too_short_for_a_dns_header() {
         assert_eq!(classify(b""), None);
-        assert_eq!(classify(&[0u8; DNS_HEADER_LEN - 1]), None); // one byte short
+        assert_eq!(classify(&[0u8; DNS_HEADER_LEN - 1]), None);
         // Exactly the header length suffices (an all-zero header is a query).
         assert_eq!(classify(&[0u8; DNS_HEADER_LEN]), Some(MdnsKind::Query));
     }
 
-    // --- Real on-the-wire packets, verbatim from captures (see each provenance) ---
+    // --- Real on-the-wire packets, verbatim from captures ---
 
     /// Real mDNS reverse-PTR query for a link-local IPv6 address (Wireshark `test/captures/
-    /// dns-mdns.pcap`, frame 22). QR=0 -> a query.
+    /// dns-mdns.pcap`, frame 22). QR=0.
     const MDNS_QUERY_PTR_LINKLOCAL: [u8; 90] = [
         0x5f, 0x1d, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x35, 0x01,
         0x65, 0x01, 0x63, 0x01, 0x31, 0x01, 0x34, 0x01, 0x39, 0x01, 0x65, 0x01, 0x66, 0x01, 0x66,

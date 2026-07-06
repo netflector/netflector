@@ -122,7 +122,7 @@ fn read_mac(addr: *const libc::sockaddr) -> Option<MacAddr> {
     // Read only the fixed `sockaddr_dl` header fields, not the whole `libc` struct: its
     // `sdl_data` is larger than the kernel's variable tail (46 bytes on FreeBSD), so
     // copying it whole would over-read a short sockaddr. `sdl_len` is the sockaddr's own
-    // byte count — getifaddrs sizes the allocation to it — so it bounds every read.
+    // byte count that getifaddrs sizes the allocation to, so it bounds every read.
     // SAFETY: an `AF_LINK` sockaddr_dl always carries its 8-byte header, so these three
     // bytes (offsets 0/5/6) are within the allocation.
     let (sdl_len, nlen, alen) = unsafe {
@@ -133,7 +133,7 @@ fn read_mac(addr: *const libc::sockaddr) -> Option<MacAddr> {
         )
     };
     // The address sits after the `nlen`-byte name. Bail on no link address (e.g. loopback)
-    // or a length that would run past the sockaddr — *this* is the bound check.
+    // or a length that would run past the sockaddr. This is the bound check.
     let offset = offset_of!(libc::sockaddr_dl, sdl_data) + nlen;
     if alen != 6 || offset + 6 > sdl_len {
         return None;

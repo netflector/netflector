@@ -2,8 +2,7 @@
 //!
 //! Every fallible operation returns [`Result<T>`] and `?` propagates failures up
 //! to [`crate::run`]. [`struct@Error`] is opaque: `main` prints its `Display` text to
-//! stderr, and tests assert on the subsystems' structured errors directly rather
-//! than reaching through it.
+//! stderr, and tests assert on the subsystems' structured errors directly.
 
 use std::fmt;
 use std::io;
@@ -19,8 +18,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Anything that can go wrong while configuring or running the reflector.
 ///
 /// Opaque on purpose: callers only print it (`Display`). The structured cause
-/// stays crate-internal — each subsystem keeps its own matchable error type, and
-/// `?` lifts those in through `From`.
+/// stays crate-internal. Each subsystem keeps its own matchable error type; `?`
+/// lifts those in through `From`.
 #[derive(Debug)]
 pub struct Error(ErrorKind);
 
@@ -30,9 +29,9 @@ enum ErrorKind {
     /// Configuration could not be loaded or failed validation.
     #[error("config: {0}")]
     Config(#[from] ConfigError),
-    /// A capture could not be opened (no `CAP_NET_RAW`, or the interface is absent) or its
-    /// interface could not be resolved. Built explicitly — not via the blanket `From` below —
-    /// so capture setup reads as such, not as a reactor failure.
+    /// A capture could not be opened (no `CAP_NET_RAW`, or the interface is absent), or its
+    /// interface could not be resolved. Built explicitly rather than via the blanket `From`
+    /// below, so setup failures read as capture errors, not reactor ones.
     #[error("cannot capture on {iface}: {source}")]
     Capture { iface: String, source: io::Error },
     /// A reflector could not be built from its config (an unknown interface, or a target that

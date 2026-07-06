@@ -1,4 +1,4 @@
-//! SSDP wire constants and the search/advertisement classifier — the reflector's directional gate.
+//! SSDP wire constants and the search/advertisement classifier: the reflector's directional gate.
 
 pub(crate) mod dial;
 
@@ -18,13 +18,13 @@ pub(crate) const SSDP_GROUP_V6_LINK_LOCAL: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0
 /// The IPv6 site-local SSDP multicast group (`ff05::c`); SSDP joins both v6 scopes.
 pub(crate) const SSDP_GROUP_V6_SITE_LOCAL: Ipv6Addr = Ipv6Addr::new(0xff05, 0, 0, 0, 0, 0, 0, 0x0c);
 /// The fallback M-SEARCH response window (seconds) the caller applies when [`parse_msearch_mx`]
-/// finds no usable MX. A multicast M-SEARCH MUST carry MX (`UPnP` Device Architecture 2.0), so an
-/// absent or unparseable one is a non-conformant searcher — reflected anyway with this window.
+/// finds no usable MX. A multicast M-SEARCH MUST carry MX (`UPnP` Device Architecture 2.0). An
+/// absent or unparseable one is a non-conformant searcher, reflected anyway with this window.
 pub(crate) const MSEARCH_MX_DEFAULT: u8 = 3;
 
 /// An SSDP message is a search or an advertisement, per its HTTPU request line. This split is the
 /// reflector's directional gate: searches (`M-SEARCH`) reflect source → target, advertisements
-/// (`NOTIFY` — both `ssdp:alive` and `ssdp:byebye`) reflect target → source.
+/// (`NOTIFY`, both `ssdp:alive` and `ssdp:byebye`) reflect target → source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SsdpKind {
     Search,
@@ -36,8 +36,8 @@ const MSEARCH_PREFIX: &[u8] = b"M-SEARCH ";
 const NOTIFY_PREFIX: &[u8] = b"NOTIFY ";
 
 /// Classify a payload by its leading HTTPU request line: an `M-SEARCH` is a search, a `NOTIFY` an
-/// advertisement. `None` for anything else — a unicast `HTTP/1.1 200 OK` search response (handled
-/// off this multicast path) or junk on the group — which the caller drops. Only the method token is
+/// advertisement. `None` for anything else, which the caller drops: a unicast `HTTP/1.1 200 OK`
+/// search response (handled off this multicast path) or junk on the group. Only the method token is
 /// read; the trailing space pins it so a longer word (`NOTIFYING`) is not a match. No header parsing.
 pub(crate) fn classify(payload: &[u8]) -> Option<SsdpKind> {
     if payload.starts_with(MSEARCH_PREFIX) {
@@ -53,7 +53,7 @@ pub(crate) fn classify(payload: &[u8]) -> Option<SsdpKind> {
 const MX_MIN: u8 = 1;
 const MX_MAX: u8 = 5;
 
-/// Parse an M-SEARCH's `MX:` header — the searcher's maximum response wait, in seconds — clamped to
+/// Parse an M-SEARCH's `MX:` header (the searcher's maximum response wait, in seconds), clamped to
 /// `[1, 5]`. Scans the payload's CRLF-delimited lines for the first `MX:` field (case-insensitive
 /// name; an M-SEARCH carries no body, so there is no header/body boundary to stop at) and reads its
 /// leading integer. The first `MX:` line is decisive. Returns `None` when MX is absent or its value
@@ -65,8 +65,8 @@ pub(crate) fn parse_msearch_mx(payload: &[u8]) -> Option<u8> {
         let Some(value) = strip_prefix_ignore_ascii_case(line, b"MX:") else {
             continue;
         };
-        // Skip leading spaces, then the leading run of digits — a trailing non-digit doesn't void a
-        // valid leading number. Empty or out-of-`u32`-range reads as "present but unparseable".
+        // Skip leading spaces, then take the leading run of digits. A trailing non-digit doesn't
+        // void a valid leading number. Empty or out-of-`u32`-range reads as "present but unparseable".
         let value = value.trim_ascii_start();
         let end = value
             .iter()

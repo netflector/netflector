@@ -2,7 +2,7 @@
 //!
 //! Level-triggered: read and write interest are toggled per registration (independent kqueue
 //! filters). The reactor [`Key`] travels in each event's `udata`, so a wakeup carries its own
-//! routing — no fd-to-handler side table.
+//! routing; no fd-to-handler side table.
 
 use std::io;
 use std::mem;
@@ -16,7 +16,7 @@ use crate::reactor::{Key, Readiness};
 
 // The Key rides in kevent's pointer-sized `udata`; a sub-64-bit pointer would
 // truncate the generation half and silently alias slots. Our kqueue targets
-// (macOS, FreeBSD amd64/arm64) are 64-bit — fail the build loudly otherwise.
+// (macOS, FreeBSD amd64/arm64) are 64-bit, so fail the build loudly otherwise.
 const _: () = assert!(
     mem::size_of::<*mut libc::c_void>() >= mem::size_of::<u64>(),
     "kqueue backend needs a 64-bit udata to carry the full Key",
@@ -129,7 +129,7 @@ impl Poller {
             return Err(err);
         }
         self.ready = usize::try_from(count).expect("kevent count is non-negative");
-        self.next = 0; // start draining the new batch from the front
+        self.next = 0;
         log::trace!("kqueue: {} ready", self.ready);
         Ok(self.ready)
     }
@@ -187,7 +187,7 @@ impl Poller {
 }
 
 /// A relative `timeout` as the `timespec` kqueue expects, clamping an
-/// astronomically long duration rather than overflowing.
+/// out-of-range duration rather than overflowing.
 fn to_timespec(timeout: Duration) -> libc::timespec {
     // SAFETY: an all-zero timespec is valid; the meaningful fields are set below.
     let mut ts: libc::timespec = unsafe { mem::zeroed() };
@@ -212,7 +212,7 @@ mod tests {
         let key = Key::from_u64(1);
         poller.add(a.as_raw_fd(), key).unwrap();
         // kqueue's EV_ADD modifies in place on re-add (it can't report EEXIST),
-        // so a second add succeeds — unlike epoll, which surfaces it.
+        // so a second add succeeds. epoll surfaces it instead.
         poller.add(a.as_raw_fd(), key).unwrap();
     }
 }

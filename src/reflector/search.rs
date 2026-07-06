@@ -7,8 +7,8 @@
 //! reflects searches; a per-session [`ResponseReflector`] routes each reply back.
 //!
 //! Protocol specifics enter as parameters: the [`Verdict`] classifier (is this payload a search?), the
-//! session-window policy, the re-emit TTL, and a [`ReplyRewrite`] factory — SSDP injects its DIAL
-//! `LOCATION` rewrite, WSD uses the [`NoRewrite`](super::NoRewrite) no-op.
+//! session-window policy, the re-emit TTL, and a [`ReplyRewrite`] factory. SSDP injects its DIAL
+//! `LOCATION` rewrite; WSD uses the [`NoRewrite`](super::NoRewrite) no-op.
 
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
@@ -39,8 +39,8 @@ struct Session {
     response_key: RegistrationKey,
 }
 
-/// One search session's reply path: a standalone leaf that re-emits each unicast reply — captured at
-/// the session's reserved port on the target — onto `egress` (the source), back to the single
+/// One search session's reply path: a standalone leaf that re-emits each unicast reply (captured at
+/// the session's reserved port on the target) onto `egress` (the source), back to the single
 /// `searcher` that searched. It carries everything a reply needs, so no session lookup is required: the
 /// reply goes to the searcher's captured frame MAC (no ARP/ND) and is sourced from the responding
 /// device's own reply port. [`SearchReflector`] creates one per session and drops it on expiry.
@@ -64,8 +64,8 @@ impl PacketHandler for ResponseReflector {
         reactor: &mut Reactor,
     ) -> Outcome {
         // The dispatcher's filter already pinned this capture to the reserved port, so every packet
-        // here is a unicast reply for this searcher — nothing to classify. A family the source can't
-        // currently send is a quiet, transient drop (address loss) — Stalled, not a failure.
+        // here is a unicast reply for this searcher; nothing to classify. A family the source can't
+        // currently send is a transient drop (address loss), returned as Stalled rather than a failure.
         if !egress_sources(dispatcher, self.egress, self.searcher) {
             log::debug!(
                 "{}: egress has no source for searcher {} yet; dropping response from {}",
@@ -110,8 +110,8 @@ impl PacketHandler for ResponseReflector {
 /// Reflects searches source → target and routes each unicast reply back to its searcher. Registered
 /// per group on the source and owns the sessions for searches to that group. On a search it dedups
 /// against live sessions (a retransmit refreshes the window and re-reflects from the same reserved
-/// port), else opens a session — reserve an ephemeral port on the target, register a
-/// [`ResponseReflector`] for its replies — and reflects the search from that port. The deadline timer
+/// port), else opens a session (reserve an ephemeral port on the target, register a
+/// [`ResponseReflector`] for its replies) and reflects the search from that port. The deadline timer
 /// sweeps expired sessions.
 ///
 /// Protocol-specific behaviour is injected: `classify` gates the ingress ([`Verdict::Reflect`] = a
@@ -171,11 +171,11 @@ impl SearchReflector {
     }
 
     /// Open a session for a new searcher: reserve an ephemeral port on the target's own address of the
-    /// search's family and register the reply capture there — before the caller reflects, so a fast
+    /// search's family and register the reply capture there, before the caller reflects, so a fast
     /// responder can't beat the capture. `message_type` is the search's own type, carried on the
-    /// failure outcomes. `Err` (logged): the target has no source address of the search's family yet —
-    /// [`Outcome::Stalled`] (transient / best-effort v6) — or a real inability to open the session
-    /// (session cap, no source MAC to reply to, reservation failure) — [`Outcome::Dropped`].
+    /// failure outcomes. `Err` (logged) is either [`Outcome::Stalled`] (the target has no source
+    /// address of the search's family yet; transient / best-effort v6) or [`Outcome::Dropped`] (a real
+    /// inability to open the session: session cap, no source MAC to reply to, reservation failure).
     fn make_session(
         &self,
         packet: &Packet,
@@ -199,7 +199,7 @@ impl SearchReflector {
             );
             return Err(Outcome::Dropped(message_type));
         };
-        // The replies come to the address the reflected search is sourced from, at the reserved port —
+        // The replies come to the address the reflected search is sourced from, at the reserved port,
         // so this must be the same scope-matched pick `build_udp` makes for `packet.dest`, or the
         // device replies to a source the response capture below isn't watching.
         let our_addr = match packet.dest.ip() {
@@ -517,7 +517,7 @@ mod tests {
         let mut dispatcher = PacketDispatcher::new();
         let mut reactor = Reactor::new().unwrap();
         // A synthetic target: send_udp_group on an unknown egress drops the datagram and returns Ok,
-        // so the re-reflect "succeeds" with no real capture — this exercises only the bookkeeping.
+        // so the re-reflect "succeeds" with no real capture; this exercises only the bookkeeping.
         let mut reflector = test_reflector();
         let base = Instant::now();
         push_session(&mut reflector, &mut dispatcher, "10.0.0.7:50000", base);

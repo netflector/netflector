@@ -1,10 +1,10 @@
 //! Interface address-change monitoring: a routing socket whose readiness means some
 //! interface's addresses (or MAC) changed, so the dispatcher should re-resolve it.
-//! `NETLINK_ROUTE` on Linux, `PF_ROUTE` on the BSDs — one uniform [`AddressMonitor`] over a
+//! `NETLINK_ROUTE` on Linux, `PF_ROUTE` on the BSDs. One [`AddressMonitor`] over a
 //! per-platform backend, mirroring the resolver's rtnetlink/getifaddrs split.
 //!
-//! Best-effort: the monitor only keeps already-resolved addresses fresh. Failing to open it
-//! (or a read error) degrades to the startup-resolved addresses; it never aborts the daemon.
+//! Best-effort: only keeps already-resolved addresses fresh. A failed open (or a read error)
+//! degrades to the startup-resolved addresses; it never aborts the daemon.
 
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -21,18 +21,18 @@ use self::route as backend;
 #[cfg(target_os = "linux")]
 use self::rtnetlink as backend;
 
-/// Bound on consecutive `ENOBUFS` overflows in a single drain. The kernel clears the overflow flag
-/// on the next recv, so a long unbroken run of them means the socket is wedged — stop rather than
-/// spin the single-threaded loop forever (a level-triggered wait re-fires to try again later).
+/// Bound on consecutive `ENOBUFS` overflows in a single drain. The kernel clears the overflow
+/// flag on the next recv, so an unbroken run of them means the socket is wedged. Stop rather
+/// than spin the single-threaded loop forever; a level-triggered wait re-fires to try later.
 const MAX_CONSECUTIVE_OVERFLOWS: u32 = 16;
 
 /// A routing-socket monitor for interface address and link changes. The dispatcher watches
 /// its fd and calls [`drain`](Self::drain) on readiness.
 pub(crate) struct AddressMonitor {
     sock: OwnedFd,
-    /// Reused across drains, sized once at open and never grown — each notification is a
-    /// single bounded message (not a coalesced dump), so a fixed buffer fits with headroom.
-    /// No data-path allocation.
+    /// Reused across drains, sized once at open and never grown. Each notification is a single
+    /// bounded message (not a coalesced dump), so a fixed buffer fits with headroom. No
+    /// data-path allocation.
     buf: Box<[u8]>,
 }
 
@@ -54,10 +54,10 @@ impl AddressMonitor {
         self.sock.as_raw_fd()
     }
 
-    /// Drain every queued notification, calling `on_change(ifindex)` per affected interface —
-    /// and `on_change(0)` after an overflow, meaning "re-resolve everything" (kernel indices
-    /// are >= 1, so 0 is an unambiguous signal). Reads to `EAGAIN` so a level-triggered wait
-    /// won't immediately re-fire.
+    /// Drain every queued notification, calling `on_change(ifindex)` per affected interface.
+    /// After an overflow it calls `on_change(0)`, meaning "re-resolve everything" (kernel
+    /// indices are >= 1, so 0 is an unambiguous signal). Reads to `EAGAIN` so a level-triggered
+    /// wait won't immediately re-fire.
     ///
     /// # Errors
     /// The first non-recoverable recv failure. Recoverable: `EAGAIN`/`EWOULDBLOCK` end the
@@ -79,9 +79,10 @@ impl AddressMonitor {
             if n < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ENOBUFS) {
                 overflows += 1;
                 if overflows == 1 {
-                    // A dropped-notification overflow is abnormal (kernel buffer pressure or an event
-                    // storm) — warn, not just the dispatcher's debug. Signal re-resolve-all once per
-                    // burst; the dispatcher coalesces the 0, so repeating it per ENOBUFS is redundant.
+                    // A dropped-notification overflow is abnormal (kernel buffer pressure or an
+                    // event storm): warn here, not just the dispatcher's debug. Signal
+                    // re-resolve-all once per burst; the dispatcher coalesces the 0, so repeating
+                    // it per ENOBUFS is redundant.
                     log::warn!(
                         "address monitor overflowed; notifications were dropped, re-resolving every interface"
                     );
@@ -96,7 +97,7 @@ impl AddressMonitor {
             }
             overflows = 0; // a successful recv breaks the overflow streak
             match IoStatus::from_syscall(n)? {
-                // No more queued notifications (or a defensive empty read — routing sockets
+                // No more queued notifications (or a defensive empty read; routing sockets
                 // don't EOF).
                 IoStatus::WouldBlock | IoStatus::Ready(0) => return Ok(()),
                 IoStatus::Ready(len) => {
@@ -113,7 +114,7 @@ mod tests {
 
     // A freshly-opened monitor drains at once (the socket is non-blocking) without blocking
     // or erroring. Best-effort: some sandboxes deny the routing socket, where the monitor
-    // degrades to no live updates — nothing to drain, so skip.
+    // degrades to no live updates, so there's nothing to drain and we skip.
     #[test]
     fn opens_and_drains_without_blocking() {
         let mut monitor = match AddressMonitor::open() {

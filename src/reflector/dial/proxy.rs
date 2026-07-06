@@ -2,9 +2,9 @@
 //!
 //! [`DialDeviceProxy`] owns a source-side description listener and a REST listener plus a pool of live
 //! [`Connection`]s. It accepts on either listener, opens an egress-pinned connection to the device on
-//! the target subnet, and dispatches each readable/writable edge to the matching connection. The proxy's
-//! own eviction (once the device's advertisement grace lapses) is owned by the
-//! [`DialContext`](crate::dispatch::DialContext) registry — the proxy never sees advertisements; it only
+//! the target subnet, and dispatches each readable/writable edge to the matching connection. Its own
+//! eviction (once the device's advertisement grace lapses) belongs to the
+//! [`DialContext`](crate::dispatch::DialContext) registry. The proxy never sees advertisements; it only
 //! sweeps its own connections past their connect/idle deadlines.
 
 use std::fmt;
@@ -20,7 +20,7 @@ use super::connection::{Connection, Outcome};
 /// Cap on concurrent proxied connections (drop-new past it).
 const MAX_CONNECTIONS: usize = 64;
 
-/// A `Copy` handle into the proxy's connection [`Arena`] — a newtype over the arena [`Key`] so it
+/// A `Copy` handle into the proxy's connection [`Arena`]: a newtype over the arena [`Key`] so it
 /// can't be confused with the reactor's keys. Round-trips through a watched fd's `user_data`: the
 /// reactor echoes it back on every event, and dispatch decodes it to find the flow.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -38,7 +38,7 @@ impl ConnectionKey {
     }
 }
 
-/// Which of a proxy's two source-side listeners — names it in a log message.
+/// Which of a proxy's two source-side listeners. Names it in a log message.
 #[derive(Clone, Copy)]
 pub(super) enum Listener {
     Description,
@@ -54,7 +54,7 @@ impl fmt::Display for Listener {
     }
 }
 
-/// A per-device DIAL proxy — a reactor `Handler` owning a description listener and its connections.
+/// A per-device DIAL proxy: a reactor `Handler` owning a description listener and its connections.
 pub(super) struct DialDeviceProxy {
     /// This handler's own key, learned via [`adopt_key`](Handler::adopt_key); used to watch fds it
     /// opens.
@@ -66,7 +66,7 @@ pub(super) struct DialDeviceProxy {
     target_ifindex: u32,
     /// The description listener (source side); its connections proxy to `desc_endpoint`.
     desc: TcpSocket,
-    /// The device's description endpoint (`device-ip:desc_port`) — the proxy's identity.
+    /// The proxy's identity: the device's description endpoint (`device-ip:desc_port`).
     desc_endpoint: SocketAddrV4,
     /// The REST listener (source side); its connections proxy to the device's REST endpoint. Eager-minted
     /// so its address is fixed and available to rewrite a description response's `Application-URL` to.
@@ -99,7 +99,7 @@ impl DialDeviceProxy {
         }
     }
 
-    /// This handler's own key. `adopt_key` sets it at registration, before any dispatch — its absence
+    /// This handler's own key. `adopt_key` sets it at registration, before any dispatch; its absence
     /// would be a reactor-contract violation.
     fn own_key(&self) -> HandlerKey {
         self.key
@@ -107,8 +107,8 @@ impl DialDeviceProxy {
     }
 
     /// Accept one pending client on `listener` if there is connection capacity, else `None`. An accept
-    /// is always taken — draining the readiness — even at the shared connection cap, where the client
-    /// is then dropped.
+    /// is always taken (draining the readiness) even at the shared connection cap, where the client is
+    /// then dropped.
     fn accept_client(&self, listener: &TcpSocket, what: Listener) -> Option<TcpSocket> {
         let client = match listener.accept() {
             Ok(Some(client)) => client,
@@ -240,7 +240,7 @@ impl DialDeviceProxy {
         let outcome = {
             let Some(conn) = self.conns.get_mut(conn_key.0) else {
                 // The reactor filters stale registrations, so a live write event should map to a live
-                // connection; a miss means the generational key out-lived its slot — fail safe.
+                // connection; a miss means the generational key out-lived its slot. Fail safe.
                 log::trace!("dial: writable event for an unknown connection; ignoring");
                 return;
             };
@@ -323,7 +323,7 @@ mod tests {
     use super::*;
     use crate::sys::IoStatus;
 
-    /// A do-nothing handler — only needed so the reactor will hand out registrations and a key for the
+    /// A do-nothing handler, needed only so the reactor will hand out registrations and a key for the
     /// proxy tests below (they drive the proxy directly, never through dispatch).
     struct NoopHandler;
     impl Handler for NoopHandler {
@@ -389,7 +389,7 @@ mod tests {
         let client = TcpSocket::connect(rest_addr, Ipv4Addr::LOCALHOST, 0).expect("client connect");
 
         // accept_rest accepts the client (draining the listener) but, with no learned endpoint, drops
-        // it — so the client observes EOF and no connection is recorded.
+        // it. The client observes EOF and no connection is recorded.
         let mut buf = [0u8; 1];
         let mut closed = false;
         for _ in 0..2000 {

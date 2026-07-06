@@ -11,10 +11,10 @@ use libc::{c_int, c_void};
 
 use crate::sys::{IoStatus, open_socket, sockaddr_for, socklen_of, would_block};
 
-/// The listen backlog — a DIAL listener fields a few short-lived client fetches, so this is ample.
+/// Listen backlog. A DIAL listener fields a few short-lived client fetches, so this is ample.
 const LISTEN_BACKLOG: c_int = 16;
 
-/// A non-blocking IPv4 TCP socket — a listener, an accepted connection, or an outbound connection that
+/// A non-blocking IPv4 TCP socket: a listener, an accepted connection, or an outbound connection that
 /// may still be completing its non-blocking `connect`. Owns its fd; `Drop` closes it.
 pub(crate) struct TcpSocket {
     fd: OwnedFd,
@@ -25,7 +25,7 @@ pub(crate) struct TcpSocket {
 }
 
 impl TcpSocket {
-    /// Listen on `addr:0` — an ephemeral port on the source interface's address (not `0.0.0.0`, so only
+    /// Listen on `addr:0`: an ephemeral port on the source interface's address (not `0.0.0.0`, so only
     /// that subnet reaches it). Read the assigned port back with [`local_addr`](Self::local_addr).
     ///
     /// # Errors
@@ -45,8 +45,7 @@ impl TcpSocket {
         })
     }
 
-    /// The bound IPv4 address — for a listener, the ephemeral port to advertise. A
-    /// field read of the address captured at construction, not a `getsockname`.
+    /// The bound IPv4 address. For a listener, the ephemeral port to advertise.
     pub(crate) fn local_addr(&self) -> SocketAddrV4 {
         self.local_addr
     }
@@ -60,7 +59,7 @@ impl TcpSocket {
     pub(crate) fn accept(&self) -> io::Result<Option<Self>> {
         Ok(accept_fd(self.fd.as_raw_fd())?.map(|fd| Self {
             fd,
-            // shares the listener's local address — inherit rather than re-query
+            // inherit the listener's local address rather than re-query it
             local_addr: self.local_addr,
             connecting: false,
         }))
@@ -108,7 +107,7 @@ impl TcpSocket {
         self.connecting
     }
 
-    /// Read into `buf`, which may be uninitialized — `recv` only ever writes the bytes it returns, so on
+    /// Read into `buf`, which may be uninitialized. `recv` only ever writes the bytes it returns, so on
     /// [`IoStatus::Ready(n)`](IoStatus) the first `n` bytes of `buf` are now initialized. `buf` must be
     /// non-empty: a `recv` into a zero-length buffer also returns 0, aliasing the `Ready(0)` clean-EOF
     /// signal (the `std::io::Read::read` caveat). The peer closing its write side is then the only
@@ -135,8 +134,8 @@ impl TcpSocket {
         IoStatus::from_syscall(n)
     }
 
-    /// Send as much of `buf` as the socket takes now — [`IoStatus::Ready(n)`](IoStatus) for `n` bytes
-    /// taken, or `WouldBlock`. A write to a peer that has reset surfaces as an error, not `SIGPIPE` —
+    /// Send as much of `buf` as the socket takes now: [`IoStatus::Ready(n)`](IoStatus) for `n` bytes
+    /// taken, or `WouldBlock`. A write to a peer that has reset surfaces as an error, not `SIGPIPE`:
     /// Rust ignores `SIGPIPE` process-wide, so the `send` returns `EPIPE`.
     ///
     /// # Errors
@@ -154,7 +153,7 @@ impl TcpSocket {
         IoStatus::from_syscall(n)
     }
 
-    /// Send from several buffers in one `writev` (scatter-gather) — [`IoStatus::Ready(n)`](IoStatus)
+    /// Send from several buffers in one `writev` (scatter-gather): [`IoStatus::Ready(n)`](IoStatus)
     /// for `n` bytes taken, or `WouldBlock`. The proxy forwards a rewritten header and a zero-copy body
     /// slice in one syscall this way, without coalescing them. Like [`send`](Self::send), a write to a
     /// reset peer surfaces as `EPIPE`, not a signal.
@@ -175,14 +174,14 @@ impl TcpSocket {
         IoStatus::from_syscall(n)
     }
 
-    /// Best-effort `shutdown(SHUT_RDWR)` — FIN both directions now rather than waiting for `Drop`, so a
+    /// Best-effort `shutdown(SHUT_RDWR)`: FIN both directions now rather than waiting for `Drop`, so a
     /// proxied peer isn't left hanging. An error (e.g. already disconnected) is ignored.
     pub(crate) fn shutdown(&self) {
         // SAFETY: `fd` is a valid socket; shutdown of an already-closed peer is a harmless error.
         unsafe { libc::shutdown(self.fd.as_raw_fd(), libc::SHUT_RDWR) };
     }
 
-    /// Best-effort `shutdown(SHUT_WR)` — FIN our write half while leaving the read half open. The DIAL
+    /// Best-effort `shutdown(SHUT_WR)`: FIN our write half while leaving the read half open. The DIAL
     /// proxy uses this to signal one direction's end (a half-close) without tearing down the reverse
     /// direction, which keeps delivering to the half-closing peer. An error is ignored.
     pub(crate) fn shutdown_write(&self) {
@@ -229,11 +228,11 @@ fn local_addr_v4(fd: RawFd) -> io::Result<SocketAddrV4> {
     Ok(SocketAddrV4::new(addr, u16::from_be(sin.sin_port)))
 }
 
-/// Accept a pending connection on listener `fd` — close-on-exec + non-blocking — or `None` on
+/// Accept a pending connection on listener `fd` (close-on-exec + non-blocking), or `None` on
 /// `WouldBlock` (nothing pending).
 fn accept_fd(fd: RawFd) -> io::Result<Option<OwnedFd>> {
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-    // SAFETY: null addr/len out-pointers are valid — we don't want the peer address.
+    // SAFETY: null addr/len out-pointers are valid; we don't want the peer address.
     let raw = unsafe {
         libc::accept4(
             fd,
@@ -357,8 +356,8 @@ mod tests {
     use super::*;
 
     impl TcpSocket {
-        /// Ergonomic recv into an initialized `[u8]` buffer — a thin wrapper over
-        /// [`recv`](TcpSocket::recv) for tests that read into plain byte buffers.
+        /// recv into an initialized `[u8]` buffer: a thin wrapper over
+        /// [`recv`](TcpSocket::recv) for tests reading into plain byte buffers.
         pub(crate) fn recv_bytes(&self, buf: &mut [u8]) -> io::Result<IoStatus> {
             // SAFETY: a `&mut [u8]` is a valid `&mut [MaybeUninit<u8>]` (an initialized byte is a valid
             // `MaybeUninit`, same layout); `recv` only writes into it.

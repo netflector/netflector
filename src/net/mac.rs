@@ -51,8 +51,8 @@ impl MacAddr {
     }
 }
 
-/// The six bytes, in transmission order, *are* the address — mirroring `Ipv4Addr`'s
-/// `From<[u8; 4]>`; used to read a MAC off the wire.
+/// The six bytes, in transmission order, *are* the address, mirroring `Ipv4Addr`'s
+/// `From<[u8; 4]>`. Used to read a MAC off the wire.
 impl From<[u8; 6]> for MacAddr {
     fn from(octets: [u8; 6]) -> Self {
         MacAddr(octets)
@@ -197,7 +197,7 @@ mod tests {
     #[test]
     fn mac_rejects_sign_prefixed_octets() {
         // u8::from_str_radix accepts a leading '+', so without an explicit hex-digit guard each "+x"
-        // octet would parse and a fully sign-prefixed MAC would be admitted. It must be rejected.
+        // octet would parse and a fully sign-prefixed MAC would be admitted.
         assert_eq!(
             "+a:+b:+c:+d:+e:+f".parse::<MacAddr>(),
             Err(ParseMacAddrError)

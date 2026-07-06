@@ -1,6 +1,6 @@
 //! Small platform/syscall helpers shared across subsystems. Some are unconditional (fd
-//! ownership); others are `cfg`-gated to the platforms that need them — macOS lacks `pipe2`
-//! and the `SOCK_*` type flags, so it applies close-on-exec / non-blocking by `fcntl`.
+//! ownership); others are `cfg`-gated to the platforms that need them. macOS lacks `pipe2`
+//! and the `SOCK_*` type flags, so it applies close-on-exec and non-blocking by `fcntl`.
 
 use std::io;
 use std::net::IpAddr;
@@ -25,7 +25,7 @@ pub(crate) fn owned_fd_from(raw: RawFd) -> io::Result<OwnedFd> {
 
 /// The status of a non-blocking read/write syscall, from [`from_syscall`](IoStatus::from_syscall).
 pub(crate) enum IoStatus {
-    /// `n` bytes were transferred (read or written) — possibly 0; the caller decides what 0 means.
+    /// `n` bytes transferred (read or written), possibly 0. The caller decides what 0 means.
     Ready(usize),
     /// `EAGAIN`/`EWOULDBLOCK`: nothing transferred on a non-blocking fd.
     WouldBlock,
@@ -55,10 +55,9 @@ impl IoStatus {
 }
 
 /// Whether `err` is the non-blocking "nothing right now" signal (`EAGAIN`/`EWOULDBLOCK`). The two are
-/// equal on our targets, but matched as a pair — via a guard, not an or-pattern whose second arm would
-/// be unreachable — for portability. Single-sources the would-block errno set for
-/// [`from_syscall`](IoStatus::from_syscall) (every read/write) and the TCP `accept` path, an OS
-/// contract rather than a per-caller detail.
+/// equal on our targets, so they're matched with a guard, not an or-pattern whose second arm would be
+/// unreachable, for portability. Single-sources the would-block errno set for
+/// [`from_syscall`](IoStatus::from_syscall) and the TCP `accept` path.
 pub(crate) fn would_block(err: &io::Error) -> bool {
     matches!(err.raw_os_error(), Some(e) if e == libc::EAGAIN || e == libc::EWOULDBLOCK)
 }
@@ -69,7 +68,7 @@ pub(crate) fn socklen_of<T>() -> socklen_t {
 }
 
 /// Open a socket of `family` and `base_type` (e.g. `SOCK_DGRAM`/`SOCK_STREAM`), close-on-exec and
-/// non-blocking — non-blocking keeps a stray read from freezing the single-threaded reactor. Linux and
+/// non-blocking. Non-blocking keeps a stray read from freezing the single-threaded reactor. Linux and
 /// FreeBSD set both flags in the socket type; macOS lacks them and applies them by `fcntl`.
 ///
 /// # Errors
@@ -88,7 +87,7 @@ pub(crate) fn open_socket(family: c_int, base_type: c_int) -> io::Result<OwnedFd
 
 /// Marshal `addr`:`port` into a zeroed `sockaddr_storage` as a `sockaddr_in`/`sockaddr_in6`,
 /// returning it with the family-specific length for a `bind`/option argument. `scope_id` (an
-/// interface index) goes into `sin6_scope_id` for IPv6 — required to bind a link-local address —
+/// interface index) goes into `sin6_scope_id` for IPv6, required to bind a link-local address,
 /// and is ignored for IPv4. On the BSDs the `sin*_len` byte is set, which the kernel requires.
 pub(crate) fn sockaddr_for(
     addr: IpAddr,

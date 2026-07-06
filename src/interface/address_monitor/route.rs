@@ -1,8 +1,8 @@
 //! macOS/FreeBSD: a `PF_ROUTE` socket delivers routing messages; the address and link ones
 //! carry the affected interface's index. We read only that index, at its fixed offset in the
-//! message — the same "trust the offset, not the whole libc struct" approach as
-//! [`super::super::getifaddrs`]'s MAC read, since the `ifa_msghdr`/`if_msghdr` tails diverge
-//! across the BSDs.
+//! message. Same "trust the offset, not the whole libc struct" approach as
+//! [`super::super::getifaddrs`]'s MAC read: the `ifa_msghdr`/`if_msghdr` tails diverge across
+//! the BSDs.
 
 use std::io;
 #[cfg(target_os = "macos")]
@@ -12,8 +12,8 @@ use std::os::fd::OwnedFd;
 use libc::c_int;
 
 /// Holds one routing message: a fixed header plus a few small sockaddrs (the `RTAX_*` slots),
-/// a few hundred bytes — none of Linux rtnetlink's attribute lists, so smaller than the
-/// `rtnetlink` backend's 8 KiB suffices.
+/// a few hundred bytes. No rtnetlink-style attribute lists, so smaller than the `rtnetlink`
+/// backend's 8 KiB suffices.
 pub(super) const READ_BUF: usize = 2048;
 
 /// `ifam_index` (in `ifa_msghdr`) and `ifm_index` (in `if_msghdr`) are both a `u16` at this
@@ -31,7 +31,6 @@ pub(super) fn open() -> io::Result<OwnedFd> {
     let socktype = libc::SOCK_RAW;
     // SAFETY: `socket` returns a fresh fd or -1.
     let sock = crate::sys::owned_fd_from(unsafe { libc::socket(libc::PF_ROUTE, socktype, 0) })?;
-    // macOS lacks the `SOCK_*` type-arg flags, so apply close-on-exec + non-blocking by fcntl.
     #[cfg(target_os = "macos")]
     crate::sys::set_cloexec_nonblock(sock.as_raw_fd())?;
     Ok(sock)
@@ -46,8 +45,8 @@ pub(super) fn for_each_change(buf: &[u8], on_change: &mut impl FnMut(u32)) {
         let msglen = usize::from(u16::from_ne_bytes([buf[offset], buf[offset + 1]]));
         let msg_type = c_int::from(buf[offset + 3]);
         if msglen < 4 || offset + msglen > buf.len() {
-            // Not a normal end (that's the `while` running out): a message claims a length
-            // that's impossible — truncated datagram or corruption — so a change is dropped.
+            // Not the normal end (the `while` running out): a message claims an impossible
+            // length, so a change may be dropped.
             log::warn!(
                 "routing message walk stopped at offset {offset}: msglen {msglen}, buffer {} B \
                  (truncated or malformed); a change may be missed",

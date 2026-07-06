@@ -5,10 +5,10 @@
 //! each prefixed by a variable-length `bpf_hdr` and padded so the next record
 //! starts on a `BPF_ALIGNMENT` boundary; [`Capture::next_frame`] walks that batch.
 //!
-//! Init order matters: bind (`BIOCSETIF`) happens *before* the filter
-//! (`BIOCSETF`), which is safe only because `BIOCSETF` flushes the kernel buffer
-//! — so the brief pre-filter window leaves nothing behind. (Linux's
-//! `SO_ATTACH_FILTER` does not flush, so its backend filters before bind instead.)
+//! Init order matters: bind (`BIOCSETIF`) happens before the filter (`BIOCSETF`).
+//! That's safe only because `BIOCSETF` flushes the kernel buffer, so the brief
+//! pre-filter window leaves nothing behind. (Linux's `SO_ATTACH_FILTER` does not
+//! flush, so its backend filters before bind instead.)
 
 use std::io;
 use std::ops::Range;
@@ -41,9 +41,9 @@ impl Capture {
     pub(crate) fn open(if_name: &str) -> io::Result<Self> {
         let fd = open_bpf_device()?;
 
-        // Bind to the interface. Capture begins here; the filter installed below
-        // flushes the buffer, so nothing slips through unfiltered.
-        // SAFETY: all-zero is a valid `ifreq` — `ifr_name` is a byte array and the
+        // Bind to the interface. Capture starts here; the filter below flushes the
+        // buffer, so nothing slips through unfiltered.
+        // SAFETY: all-zero is a valid `ifreq`: `ifr_name` is a byte array and the
         // `ifr_ifru` union holds only integers/pointers/sockaddr, none with an
         // invalid zero bit pattern.
         let mut ifr: libc::ifreq = unsafe { core::mem::zeroed() };
@@ -84,10 +84,10 @@ impl Capture {
         ioctl(&fd, libc::BIOCIMMEDIATE, (&raw mut immediate).cast())?;
 
         // Loop prevention on Ethernet: don't hand us our own egress, so two mirrored
-        // reflector entries don't ping-pong each other's frames. Skip it on DLT_NULL links
-        // — the BSD lo driver taps each frame once (and tags it outbound), so default
-        // BPF already delivers it; clearing see-sent (= receive-only) would instead
-        // silence the interface entirely.
+        // reflector entries don't ping-pong each other's frames. Skip it on DLT_NULL
+        // links: the BSD lo driver taps each frame once (and tags it outbound), so
+        // default BPF already delivers it; clearing see-sent (= receive-only) would
+        // instead silence the interface entirely.
         if link_type == LinkType::Ethernet {
             let mut see_sent: c_uint = 0;
             ioctl(&fd, libc::BIOCSSEESENT, (&raw mut see_sent).cast())?;
@@ -159,8 +159,8 @@ impl Capture {
             match record {
                 Record::Frame(frame) => break (start + frame.start)..(start + frame.end),
                 // trace, not warn: this runs in the per-frame drain loop, and a remote peer can flood
-                // oversized frames — a per-frame warn would both break data-path-quiet and let it spam
-                // the operator's log. The frame is still correctly dropped.
+                // oversized frames. A per-frame warn would both break data-path-quiet and spam the
+                // operator's log. The frame is still correctly dropped.
                 Record::Oversized { datalen } => log::trace!(
                     "dropping oversized frame: {datalen} bytes exceeds the {}-byte capture buffer",
                     self.buf.len()
@@ -170,7 +170,7 @@ impl Capture {
         Ok(Some(&self.buf[range]))
     }
 
-    /// Whether the current batch still holds unread records — the cue to keep
+    /// Whether the current batch still holds unread records: the cue to keep
     /// draining, since a level-triggered wait won't re-fire until new kernel data.
     pub(crate) fn has_buffered(&self) -> bool {
         self.offset < self.filled
@@ -224,16 +224,16 @@ impl AsRawFd for Capture {
 }
 
 /// Outcome of parsing one BPF record: a good frame's byte range, or an oversized
-/// capture to drop (carrying its original length, for the warning).
+/// capture to drop (carrying its original length, for the trace log).
 enum Record {
     Frame(Range<usize>),
     Oversized { datalen: u32 },
 }
 
-/// Parse the BPF record at the front of `record` — the still-unread slice of the
-/// current batch — returning it plus how many bytes to advance past it (its
+/// Parse the BPF record at the front of `record` (the still-unread slice of the
+/// current batch), returning it plus how many bytes to advance past it (its
 /// `libc::bpf_hdr` + frame, padded to `BPF_ALIGNMENT`). The frame range is
-/// relative to `record`. Pure (no I/O) so the batch walk — the fiddliest part —
+/// relative to `record`. Pure (no I/O) so the batch walk, the fiddliest part,
 /// is unit-testable against synthetic buffers.
 fn parse_record(record: &[u8]) -> io::Result<(Record, usize)> {
     if size_of::<libc::bpf_hdr>() > record.len() {
@@ -323,9 +323,9 @@ mod tests {
     #[test]
     fn walks_a_multi_frame_batch() {
         let mut batch = Vec::new();
-        push_record(&mut batch, 3, 3, 0xaa); // frame 1: 3 bytes of 0xaa
-        push_record(&mut batch, 5, 5, 0xbb); // frame 2: 5 bytes of 0xbb (after padding)
-        push_record(&mut batch, 1, 1, 0xcc); // frame 3: 1 byte of 0xcc
+        push_record(&mut batch, 3, 3, 0xaa);
+        push_record(&mut batch, 5, 5, 0xbb);
+        push_record(&mut batch, 1, 1, 0xcc);
 
         let mut offset = 0;
         let mut frames: Vec<Vec<u8>> = Vec::new();
@@ -402,7 +402,7 @@ mod tests {
         let sender = std::net::UdpSocket::bind(bind).unwrap();
 
         // The capture is armed before the send and BIOCIMMEDIATE delivers the looped
-        // frame at once, where it waits until read — so one send then polling captures it.
+        // frame at once, where it waits until read, so one send then polling captures it.
         sender.send_to(PROBE, target).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while std::time::Instant::now() < deadline {
@@ -423,7 +423,7 @@ mod tests {
     // Live loopback capture: `lo0` reports DLT_NULL, so this exercises `link_type()`,
     // both branches of the DLT_NULL filter (the per-OS AF_INET/AF_INET6 constants and
     // their host-order byte-swap, at different header offsets), and the see-sent skip.
-    // Traffic to 127.0.0.1 / ::1 is deterministic — no env var needed. Dynamically
+    // Traffic to 127.0.0.1 / ::1 is deterministic, no env var needed. Dynamically
     // skips when BPF (or IPv6 loopback) is unavailable; fails on real errors.
     #[test]
     fn loopback_capture_decodes_known_frames() -> io::Result<()> {
@@ -461,7 +461,7 @@ mod tests {
     // implementation, so this builds valid DLT_NULL IPv4 and IPv6 UDP datagrams,
     // injects each on lo0, and asserts a bound UDP socket receives it. FreeBSD-only;
     // skips without BPF access (and IPv6 when ::1 is unavailable). A failure here
-    // means FreeBSD behaves like macOS — loopback send isn't observable this way.
+    // means FreeBSD behaves like macOS: loopback send isn't observable this way.
     #[cfg(target_os = "freebsd")]
     #[test]
     fn loopback_send_reaches_a_local_socket() -> io::Result<()> {
@@ -499,7 +499,7 @@ mod tests {
     }
 
     /// Inject `frame` on `cap`'s interface and assert the bound `receiver` gets
-    /// `probe` within a short window — the shared half of the IPv4 and IPv6 probes.
+    /// `probe` within a short window. Shared by both the IPv4 and IPv6 probes.
     #[cfg(target_os = "freebsd")]
     fn expect_send_delivered(
         cap: &Capture,

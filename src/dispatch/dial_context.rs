@@ -1,5 +1,5 @@
-//! The registry of minted DIAL proxies — one proxy per device, shared across the SSDP advertisement
-//! and search-response paths.
+//! Registry of minted DIAL proxies, one per device, shared by the SSDP advertisement and
+//! search-response paths.
 
 use std::net::SocketAddrV4;
 use std::time::Instant;
@@ -8,16 +8,16 @@ use crate::reactor::{HandlerKey, Reactor};
 
 use super::CaptureKey;
 
-/// Cap on concurrent minted DIAL proxies — a burst of advertised devices can't exhaust source-side
+/// Cap on concurrent minted DIAL proxies, so a burst of advertised devices can't exhaust source-side
 /// listeners or reactor slots. At the cap a new device's `LOCATION` is reflected unchanged (visible but
 /// unproxied) rather than evicting a live proxy.
 const MAX_DIAL_PROXIES: usize = 32;
 
 /// One minted DIAL description proxy, keyed by `(source, endpoint)`:
-/// - `target` — capture the device connections egress on; a change on either interface evicts the proxy.
-/// - `handler` — the proxy's reactor key; goes stale once the proxy is evicted.
-/// - `desc_addr` — source-side description-listener spliced into the device's `LOCATION`.
-/// - `desc_grace` — eviction deadline, refreshed to each advertisement's `max-age` so a cached
+/// - `target`: capture the device connections egress on; a change on either interface evicts the proxy.
+/// - `handler`: the proxy's reactor key; goes stale once the proxy is evicted.
+/// - `desc_addr`: source-side description-listener spliced into the device's `LOCATION`.
+/// - `desc_grace`: eviction deadline, refreshed to each advertisement's `max-age` so a cached
 ///   `LOCATION` keeps resolving while the device is advertised.
 struct DialEntry {
     source: CaptureKey,
@@ -28,10 +28,10 @@ struct DialEntry {
     desc_grace: Instant,
 }
 
-/// The registry of minted DIAL proxies, owned by the [`PacketDispatcher`](super::PacketDispatcher) so the
-/// SSDP advertisement and search-response paths — separate handlers — share one proxy per device. The
+/// Registry of minted DIAL proxies, owned by the [`PacketDispatcher`](super::PacketDispatcher) so the
+/// SSDP advertisement and search-response paths (separate handlers) share one proxy per device. The
 /// DIAL hook (`reflector::dial::rewrite_location`) reuses a live proxy found here (refreshing its grace)
-/// or records a freshly-minted one; an evicted proxy's entry is pruned on the next lookup or capacity check.
+/// or records a freshly-minted one. An evicted proxy's entry is pruned on the next lookup or capacity check.
 pub(crate) struct DialContext {
     proxies: Vec<DialEntry>,
 }
@@ -44,9 +44,9 @@ impl DialContext {
     }
 
     /// The live proxy's description-listener address for `(source, endpoint)`, refreshing its grace to
-    /// `desc_grace` (a re-advertisement extends the device's validity). `None` if none is registered; a
-    /// stale entry — its proxy evicted, so its [`HandlerKey`] no longer resolves — is pruned and treated
-    /// as absent.
+    /// `desc_grace` (a re-advertisement extends the device's validity). `None` if none is registered. A
+    /// stale entry, whose proxy was evicted so its [`HandlerKey`] no longer resolves, is pruned and
+    /// treated as absent.
     pub(crate) fn lookup(
         &mut self,
         source: CaptureKey,
@@ -75,7 +75,7 @@ impl DialContext {
     }
 
     /// Record a freshly-minted proxy and its grace, replacing any prior entry for `(source, endpoint)`
-    /// — a re-mint after the old proxy was evicted.
+    /// (a re-mint after the old proxy was evicted).
     pub(crate) fn insert(
         &mut self,
         source: CaptureKey,
@@ -106,14 +106,14 @@ impl DialContext {
         }
     }
 
-    /// The soonest grace deadline across recorded proxies — when [`sweep`](Self::sweep) next has work,
+    /// The soonest grace deadline across recorded proxies: when [`sweep`](Self::sweep) next has work,
     /// folded into the dispatcher's [`next_deadline`](super::PacketHandler::next_deadline). `None` when empty.
     pub(crate) fn next_grace(&self) -> Option<Instant> {
         self.proxies.iter().map(|p| p.desc_grace).min()
     }
 
-    /// Evict every proxy `evict` selects: unregister it from the reactor — tearing down its listeners and
-    /// connections — and drop its entry. `reason` names why, for the log. A surviving entry whose proxy is
+    /// Evict every proxy `evict` selects: unregister it from the reactor (tearing down its listeners and
+    /// connections) and drop its entry. `reason` names why, for the log. A surviving entry whose proxy is
     /// already gone is pruned too, so a stale [`HandlerKey`] never lingers.
     fn evict_where(
         &mut self,
@@ -132,7 +132,7 @@ impl DialContext {
                         );
                     }
                 }
-                false // drop the entry whether or not the teardown cleanly succeeded
+                false // drop the entry even if the teardown failed
             } else {
                 reactor.is_registered(p.handler) // drop an already-evicted entry
             }
@@ -163,17 +163,17 @@ mod tests {
     use super::*;
 
     impl DialContext {
-        /// The number of recorded proxies — a seam for the DIAL hook's tests in `reflector::dial`.
+        /// The number of recorded proxies: a seam for the DIAL hook's tests in `reflector::dial`.
         pub(crate) fn proxy_count(&self) -> usize {
             self.proxies.len()
         }
 
-        /// The recorded proxies' handler keys — a seam to simulate an eviction.
+        /// The recorded proxies' handler keys: a seam to simulate an eviction.
         pub(crate) fn handler_keys(&self) -> Vec<HandlerKey> {
             self.proxies.iter().map(|p| p.handler).collect()
         }
 
-        /// The recorded grace for `(source, endpoint)` — a seam to assert a re-advertisement refreshed it.
+        /// The recorded grace for `(source, endpoint)`: a seam to assert a re-advertisement refreshed it.
         pub(crate) fn grace_of(
             &self,
             source: CaptureKey,

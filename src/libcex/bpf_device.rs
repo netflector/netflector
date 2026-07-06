@@ -5,9 +5,9 @@ use libc::c_uint;
 
 use super::bpf::BpfInsn;
 
-// DLT_EN10MB (Ethernet, 1) and DLT_NULL (0) are stable BPF link types,
-// but libc exposes them only on apple — define them locally, anchored to libc's
-// values where available.
+// DLT_EN10MB (Ethernet, 1) and DLT_NULL (0) are stable BPF link types, but libc
+// exposes them only on apple. Define them locally, anchored to libc's values
+// where available.
 pub(crate) const DLT_EN10MB: c_uint = 1;
 pub(crate) const DLT_NULL: c_uint = 0;
 #[cfg(target_os = "macos")]
@@ -15,7 +15,7 @@ const _: () = assert!(DLT_EN10MB == libc::DLT_EN10MB);
 #[cfg(target_os = "macos")]
 const _: () = assert!(DLT_NULL == libc::DLT_NULL);
 
-/// `struct bpf_program` — the filter handed to `BIOCSETF`. libc provides this
+/// `struct bpf_program`: the filter handed to `BIOCSETF`. libc provides this
 /// (and `bpf_insn`) on FreeBSD but not apple, so define it for both; the asserts
 /// anchor the layout to libc where it exists. The per-frame header is read as
 /// `libc::bpf_hdr` (apple + FreeBSD both have it, with the right per-OS timestamp).

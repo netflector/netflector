@@ -76,14 +76,14 @@ impl AddressFamily {
     }
 
     /// A v4 source must be present at startup, else the reflector fails to build. Same set as
-    /// `uses_ipv4` — v4 is the baseline — but distinct: `Default` requires v4 while treating v6
-    /// as best-effort.
+    /// `uses_ipv4`, but distinct in meaning: `Default` requires v4 while treating v6 as
+    /// best-effort.
     #[must_use]
     pub(crate) fn requires_ipv4(self) -> bool {
         matches!(self, Self::Default | Self::Dual | Self::Ipv4)
     }
 
-    /// A v6 source must be present at startup, else the reflector fails to build — only `Dual`
+    /// A v6 source must be present at startup, else the reflector fails to build: only `Dual`
     /// and `Ipv6`. Unlike `uses_ipv6`, `Default` reflects v6 when available but starts without it.
     #[must_use]
     pub(crate) fn requires_ipv6(self) -> bool {
