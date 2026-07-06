@@ -86,7 +86,9 @@ pub(crate) enum ConfigError {
     )]
     EnvInvalidTag { var: String, tag: String },
 
-    #[error("environment variable \"{var}\" uses a reserved tag (log and debug are globals)")]
+    #[error(
+        "environment variable \"{var}\" uses a reserved tag (log, debug, and counters are globals)"
+    )]
     EnvReservedTag { var: String },
 
     #[error("environment variable \"{var}\" sets unknown parameter \"{param}\"")]
