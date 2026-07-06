@@ -266,7 +266,8 @@ mod tests {
             ("REFLECTOR_TV_NAME", "Living Room"),
         ])
         .unwrap();
-        assert_eq!(cfg.reflectors[0].name.as_str(), "Living Room");
+        // NAME sets the display name (canonicalized lowercase), overriding the `TV` tag.
+        assert_eq!(cfg.reflectors[0].name.as_str(), "living room");
     }
 
     #[test]
@@ -520,7 +521,7 @@ mod tests {
     }
 
     #[test]
-    fn env_name_is_trimmed() {
+    fn env_name_is_trimmed_and_lowercased() {
         let cfg = from_env(&[
             ("REFLECTOR_TV_SOURCE_IF", "a"),
             ("REFLECTOR_TV_TARGET_IF", "b"),
@@ -528,7 +529,7 @@ mod tests {
             ("REFLECTOR_TV_NAME", "  Living Room  "),
         ])
         .unwrap();
-        assert_eq!(cfg.reflectors[0].name.as_str(), "Living Room");
+        assert_eq!(cfg.reflectors[0].name.as_str(), "living room");
     }
 
     #[test]

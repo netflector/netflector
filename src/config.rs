@@ -201,8 +201,8 @@ impl TryFrom<RawConfig> for Config {
 
     fn try_from(raw: RawConfig) -> Result<Self, ConfigError> {
         let mut reflectors = Vec::with_capacity(raw.reflectors.len());
-        for (name, raw_reflector) in raw.reflectors {
-            let reflector = Reflector::try_from((name, raw_reflector))?;
+        for (key, raw_reflector) in raw.reflectors {
+            let reflector = Reflector::try_from((key, raw_reflector))?;
             log::debug!(
                 "reflector {}: {} -> {} [{}] family={:?}",
                 reflector.name,
@@ -334,10 +334,17 @@ fn families_overlap(a: AddressFamily, b: AddressFamily) -> bool {
     (a.uses_ipv4() && b.uses_ipv4()) || (a.uses_ipv6() && b.uses_ipv6())
 }
 
-/// Reject any pair of reflectors that would reflect the same packet twice.
+/// Reject any pair of reflectors that share a name or would reflect the same packet twice. Names are the
+/// canonical (lowercased) identity, so `==` catches keys that only differ in case or whitespace — which
+/// `merge_env` folds env-vs-file but the file table cannot.
 fn check_conflicts(reflectors: &[Reflector]) -> Result<(), ConfigError> {
     for (i, a) in reflectors.iter().enumerate() {
         for b in &reflectors[i + 1..] {
+            if a.name == b.name {
+                return Err(ConfigError::DuplicateReflectorName {
+                    name: a.name.clone(),
+                });
+            }
             if let Some(protocol) = a.conflicts_with(b) {
                 return Err(ConfigError::ConflictingReflectors {
                     protocol,
@@ -550,6 +557,34 @@ mod tests {
             at_cap.counter_interval,
             Some(Duration::from_secs(MAX_INTERVAL_SECS))
         );
+    }
+
+    #[test]
+    fn two_file_reflectors_cannot_share_a_folded_name() {
+        // Table keys differing only in case or surrounding whitespace resolve to one display name;
+        // reject rather than silently produce two reflectors sharing it (env-vs-file already folds).
+        let cfg = |k1: &str, k2: &str| {
+            format!(
+                r#"
+                [reflectors.{k1}]
+                source_if = "a"
+                target_if = "b"
+                mdns = true
+                [reflectors.{k2}]
+                source_if = "c"
+                target_if = "d"
+                mdns = true
+                "#
+            )
+        };
+        assert!(matches!(
+            from_toml(&cfg("TV", "tv")),
+            Err(ConfigError::DuplicateReflectorName { name }) if name.as_str() == "tv"
+        ));
+        assert!(matches!(
+            from_toml(&cfg("\"  tv  \"", "tv")),
+            Err(ConfigError::DuplicateReflectorName { name }) if name.as_str() == "tv"
+        ));
     }
 
     #[test]
