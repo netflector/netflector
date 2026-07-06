@@ -81,6 +81,10 @@ impl SignalGuard {
         {
             return Err(io::Error::other("signal handlers already installed"));
         }
+        // Clear any flag a signal set during a previous guard's teardown window, so it can't leak into
+        // this run and turn the first wakeup into a spurious shutdown. No handler is installed yet.
+        SHUTDOWN_REQUESTED.store(false, Ordering::Relaxed);
+        DUMP_REQUESTED.store(false, Ordering::Relaxed);
         let saved = match install_handlers() {
             Ok(saved) => saved,
             Err(e) => {
@@ -209,7 +213,13 @@ fn restore_handlers(saved: &[libc::sigaction]) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
+
+    /// Serializes the tests that call [`SignalGuard::install`]: both touch the process-global
+    /// `WRITE_FD` and signal flags, and the harness runs tests on parallel threads.
+    static SIGNAL_STATE: Mutex<()> = Mutex::new(());
 
     #[test]
     fn self_pipe_is_cloexec_and_nonblocking() {
@@ -233,10 +243,13 @@ mod tests {
         }
     }
 
-    // The one test that touches process-global signal state, so it cannot race a
-    // sibling: nothing else here installs handlers.
+    // Installs process-global signal handlers, so it is serialized with the other install test via
+    // `SIGNAL_STATE`.
     #[test]
     fn installed_handler_flags_shutdown_and_dump() {
+        let _serialized = SIGNAL_STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (guard, pipe) = SignalGuard::install().unwrap();
 
         // Our handlers must catch these (set a flag, wake the pipe), not terminate the process:
@@ -264,5 +277,26 @@ mod tests {
         assert!(SignalGuard::install().is_err());
 
         drop(guard); // restores the previous dispositions
+    }
+
+    #[test]
+    fn install_clears_a_stale_signal_flag() {
+        let _serialized = SIGNAL_STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A flag a signal set during a prior run's teardown window must not survive into the next
+        // install, or the first wakeup would act on it (e.g. a spurious shutdown).
+        SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
+        DUMP_REQUESTED.store(true, Ordering::Relaxed);
+        let (guard, _pipe) = SignalGuard::install().unwrap();
+        assert!(
+            !SHUTDOWN_REQUESTED.load(Ordering::Relaxed),
+            "install clears a stale shutdown flag"
+        );
+        assert!(
+            !DUMP_REQUESTED.load(Ordering::Relaxed),
+            "install clears a stale dump flag"
+        );
+        drop(guard);
     }
 }
