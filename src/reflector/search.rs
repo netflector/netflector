@@ -401,6 +401,7 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use super::*;
+    use crate::capture::Capture;
     use crate::reflector::NoRewrite;
 
     const TEST_TTL: u8 = 2;
@@ -605,5 +606,127 @@ mod tests {
         let site_local: SocketAddr = "[ff05::c]:1900".parse().unwrap();
         assert!(session_for(&mut reflector.sessions, searcher, link_local).is_some());
         assert!(session_for(&mut reflector.sessions, searcher, site_local).is_none());
+    }
+
+    #[test]
+    fn make_session_drops_a_search_with_no_source_mac() {
+        // No source MAC means no L2 address to reply to, so make_session drops the search rather than
+        // open a session it could never answer.
+        let mut dispatcher = PacketDispatcher::new();
+        let reflector = test_reflector();
+        let packet = Packet {
+            source: "10.0.0.1:5".parse().unwrap(),
+            dest: "239.255.255.250:1900".parse().unwrap(),
+            ttl: TEST_TTL,
+            dst_mac: None,
+            src_mac: None,
+            payload: b"search",
+        };
+        let outcome = reflector.make_session(
+            &packet,
+            &mut dispatcher,
+            Instant::now(),
+            MessageType::SsdpSearch,
+        );
+        assert!(matches!(
+            outcome,
+            Err(Outcome::Dropped(MessageType::SsdpSearch))
+        ));
+    }
+
+    #[test]
+    fn make_session_drops_at_the_session_cap() {
+        // At MAX_SESSIONS in flight a new searcher is dropped; no live session is evicted early.
+        let mut dispatcher = PacketDispatcher::new();
+        let mut reflector = test_reflector();
+        for _ in 0..MAX_SESSIONS {
+            push_session(
+                &mut reflector,
+                &mut dispatcher,
+                "10.0.0.1:5",
+                "239.255.255.250:1900",
+                Instant::now(),
+            );
+        }
+        assert_eq!(reflector.sessions.len(), MAX_SESSIONS);
+        let packet = Packet {
+            source: "10.0.0.9:5".parse().unwrap(),
+            dest: "239.255.255.250:1900".parse().unwrap(),
+            ttl: TEST_TTL,
+            dst_mac: None,
+            src_mac: Some(MacAddr::from([0x02, 0, 0, 0, 0, 1])),
+            payload: b"search",
+        };
+        let outcome = reflector.make_session(
+            &packet,
+            &mut dispatcher,
+            Instant::now(),
+            MessageType::SsdpSearch,
+        );
+        assert!(matches!(
+            outcome,
+            Err(Outcome::Dropped(MessageType::SsdpSearch))
+        ));
+    }
+
+    /// Open a loopback capture, or `None` (skip) without `CAP_NET_RAW`. A real capture gives the target
+    /// a resolvable address, so `make_session` can succeed.
+    fn open_loopback_or_skip() -> Option<Capture> {
+        match Capture::open(crate::interface::LOOPBACK_IFACE) {
+            Ok(cap) => Some(cap),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skip: no CAP_NET_RAW to open a loopback capture ({e})");
+                None
+            }
+            Err(e) => panic!("unexpected loopback capture open failure: {e}"),
+        }
+    }
+
+    #[test]
+    fn a_failed_reflect_rolls_back_the_session_registration() {
+        // make_session registers the response capture before reflecting; if the reflect then fails, that
+        // registration must be rolled back, not leaked. A real loopback target lets make_session succeed;
+        // an oversized payload then makes build_udp reject the reflect deterministically.
+        let Some(target_cap) = open_loopback_or_skip() else {
+            return;
+        };
+        let mut dispatcher = PacketDispatcher::new();
+        let target = dispatcher
+            .add_capture(target_cap)
+            .expect("add the loopback capture");
+        let mut reactor = Reactor::new().expect("reactor");
+        let mut reflector = SearchReflector::new(
+            CaptureKey::from_u64(999), // synthetic source: no reply comes back in this test
+            target,
+            0,
+            None,
+            "TEST",
+            MessageType::SsdpResponse,
+            TEST_TTL,
+            always_reflect,
+            fixed_window,
+            Box::new(|| Box::new(NoRewrite) as Box<dyn ReplyRewrite>),
+        );
+        let before = dispatcher.registration_count();
+        let packet = Packet {
+            source: "10.0.0.1:5".parse().unwrap(),
+            dest: "239.255.255.250:1900".parse().unwrap(),
+            ttl: TEST_TTL,
+            dst_mac: None,
+            src_mac: Some(MacAddr::from([0x02, 0, 0, 0, 0, 1])),
+            payload: &[0u8; 4096], // too large to build, so the reflect fails and rolls back
+        };
+        let outcome = reflector.on_packet(&packet, &mut dispatcher, &mut reactor);
+        assert!(matches!(outcome, Outcome::Dropped(_)));
+        assert_eq!(
+            reflector.sessions.len(),
+            0,
+            "no session survives a failed reflect"
+        );
+        assert_eq!(
+            dispatcher.registration_count(),
+            before,
+            "make_session's response capture was rolled back"
+        );
     }
 }
