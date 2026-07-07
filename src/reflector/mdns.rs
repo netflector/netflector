@@ -11,7 +11,10 @@ use crate::config::{AddressFamily, Reflector};
 use crate::dispatch::{Filter, IpSet, MessageType, PacketDispatcher};
 use crate::net::mdns::{MDNS_GROUP_V4, MDNS_GROUP_V6, MDNS_PORT, MDNS_TTL, MdnsKind, classify};
 
-use super::{BuildError, InterfaceMap, SimpleReflector, Verdict, require_bidirectional_families};
+use super::{
+    BuildError, InterfaceMap, SimpleReflector, Verdict, join_group_logged,
+    require_bidirectional_families,
+};
 
 /// mDNS's classifier kind *is* its message type: `Query`/`Response` map straight across.
 impl From<MdnsKind> for MessageType {
@@ -78,10 +81,8 @@ pub(crate) fn build(
     // on the next address change, so a deferred join logs rather than fails the build.
     let groups = used_groups(reflector.address_family);
     for group in &groups {
-        for capture in [source, target] {
-            if let Err(e) = dispatcher.join_group(capture, group.ip()) {
-                log::debug!("mDNS: join {} deferred: {e}", group.ip());
-            }
+        for (capture, side) in [(source, "source"), (target, "target")] {
+            join_group_logged(dispatcher, capture, group.ip(), "mDNS", side);
         }
     }
     // One handler per direction spans every group; its filter matches the group set at the mDNS port.
