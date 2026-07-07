@@ -793,10 +793,10 @@ ADDRESS_CHANGE_CASES = [
         name="mdns_address_change",
         config="config-addrchange.toml",
         phases=(
-            # source IPv4: knocking out the source's v4 invalidates its kernel multicast membership,
-            # so the source capture stops seeing v4 queries -- reflection stops at the ingress; the
-            # monitor rejoins on restore. target IPv6: the target is the egress, so the per-packet
-            # source-address gate drops the v6 re-emit; the monitor refreshes egress addrs on restore.
+            # source IPv4: the source is the egress for mDNS responses, so knocking out its v4 makes the
+            # per-packet source-address gate drop the v4 response re-emit -- reflection stops at the
+            # egress; the monitor refreshes source addrs on restore. target IPv6: the target is the
+            # egress for queries, so the gate drops the v6 re-emit; the monitor refreshes egress addrs.
             Phase(label="source IPv4", protocol="mdns", family=4, interface="source"),
             Phase(label="target IPv6", protocol="mdns", family=6, interface="target"),
         ),

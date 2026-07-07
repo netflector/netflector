@@ -4,6 +4,11 @@
 //! capture's own-egress drop, this breaks the reflection loop. Each re-emits to the same group at
 //! TTL 255 (RFC 6762 §11), sourced from the egress interface. The dispatcher's filter pins the
 //! group, so the reflector only gates on the query/response classifier.
+//!
+//! Limitation: this is a multicast-only relay. A one-shot / legacy querier — one that asks from an
+//! ephemeral source port, or sets the unicast-response (QU) bit — is answered *unicast* to that port,
+//! off the group, so its answer is never captured or reflected across the link. (SSDP and WSD instead
+//! proxy each searcher's unicast reply through a per-searcher session; mDNS does not.)
 
 use std::net::SocketAddr;
 

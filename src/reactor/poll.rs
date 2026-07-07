@@ -1,7 +1,7 @@
 //! Readiness backend: an OS-uniform [`Poller`] over the platform's readiness
 //! syscalls. A wait reports which registered fds are ready, each tagged with the
 //! reactor [`Key`] handed to the kernel, so dispatch needs no fd-to-handler side
-//! table. kqueue backend (macOS/FreeBSD) implemented; epoll (Linux) follows.
+//! table. Backends: kqueue (macOS/FreeBSD) and epoll (Linux).
 
 use super::{Key, Readiness};
 

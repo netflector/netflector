@@ -18,8 +18,8 @@ use super::{
     UDP_HEADER_SIZE,
 };
 
-/// A parsed UDP datagram: the endpoints, the TTL/hop-limit to preserve on re-emit, the
-/// L2 addresses (for filtering), and the payload borrowed from the capture buffer.
+/// A parsed UDP datagram: the endpoints, the captured TTL/hop-limit, the L2 addresses
+/// (for filtering), and the payload borrowed from the capture buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Packet<'a> {
     pub(crate) source: SocketAddr,

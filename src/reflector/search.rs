@@ -1,4 +1,4 @@
-//! The shared search direction for the unicast-reply discovery protocols (SSDP, and next WSD).
+//! The shared search direction for the unicast-reply discovery protocols (SSDP and WSD).
 //!
 //! A search (SSDP `M-SEARCH`, WSD `Probe` / `Resolve`) is reflected source → target, and each
 //! searcher's *unicast* reply (SSDP `200 OK`, WSD `ProbeMatches` / `ResolveMatches`) is routed back

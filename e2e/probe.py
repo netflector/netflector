@@ -9,8 +9,8 @@
 # The send/receive verbs cover WoL and the verbatim-relay protocols (mDNS, one-way SSDP). The
 # respond/search verbs drive the SSDP M-SEARCH round trip: a `respond` device unicasts a 200 OK back to
 # whoever searched, and a `search` searcher awaits that reply proxied across segments by the reflector.
-# The DIAL probe verbs (dial-device/dial-client) from the C++ harness are intentionally absent: DIAL is
-# unimplemented in this project.
+# The DIAL probe verbs (dial-device/dial-client) from the C++ harness are absent because the DIAL cases
+# (see DIAL_CASES in run.py) drive a dedicated HTTP emulator rather than this prober.
 
 from __future__ import annotations
 
