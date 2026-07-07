@@ -162,7 +162,10 @@ jobs:
       - name: Install lld + QEMU user-mode
         if: matrix.target.triple != ''
         run: |
-          sudo apt-get update
+          # A failing third-party repo (packages.microsoft.com flakes) must not kill the step:
+          # the packages come from the Ubuntu archive, and a broken archive still fails the
+          # install below loudly.
+          sudo apt-get update || true
           sudo apt-get install -y --no-install-recommends lld qemu-user-static
       - name: Add the Rust target
         if: matrix.target.triple != ''
@@ -314,7 +317,10 @@ jobs:
       - name: Install lld + QEMU user-mode
         if: matrix.target.triple != ''
         run: |
-          sudo apt-get update
+          # A failing third-party repo (packages.microsoft.com flakes) must not kill the step:
+          # the packages come from the Ubuntu archive, and a broken archive still fails the
+          # install below loudly.
+          sudo apt-get update || true
           sudo apt-get install -y --no-install-recommends lld qemu-user-static
       - name: Add the Rust target
         if: matrix.target.triple != ''
