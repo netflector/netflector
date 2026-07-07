@@ -46,8 +46,9 @@ a standalone **static** binary for `amd64` and `arm64`, built on FreeBSD 14.
 
 CI runs the unit suite on Ubuntu 24.04 (x64 and arm64), macOS 15, and FreeBSD 14 (amd64, in a VM),
 plus the cross-compiled `linux/arm/v7` and `linux/arm/v5` builds whose suites run under QEMU, each in
-both debug and release. `clippy` and the rustdoc link gate run per target, the Docker e2e suite runs
-the data path across two bridges, and a Valgrind e2e job runs the daemon under memcheck.
+both debug and release. `clippy` and the rustdoc link gate run per target. The e2e suite runs on the
+Docker backend (two bridges, plus a Valgrind memcheck job) and natively on linux amd64/arm64,
+armv7/armv5 (daemon under qemu-user), and FreeBSD.
 
 ## Build
 
@@ -421,9 +422,10 @@ a macOS/FreeBSD dev box (e.g. `./docker_test.sh test`).
 
 ### End-to-end tests
 
-The end-to-end suite drives the real data path: it runs the reflector image across two Docker bridges
-and verifies traffic is reflected, multi-protocol. It's opt-in (it builds/runs containers and creates
-temporary Docker networks):
+The end-to-end suite drives the real data path: the reflector straddles two isolated network segments
+and the suite verifies traffic is reflected, multi-protocol. It runs on two backends. The default
+`docker` backend uses bridge networks and containers; it's opt-in (it builds/runs containers and
+creates temporary Docker networks):
 
 ```sh
 python3 e2e/run.py                # build the image and run the full suite
@@ -434,7 +436,19 @@ python3 e2e/run.py --case reflects_matching_magic_packet   # one case
 `--valgrind` runs the reflector under memcheck (the `runtime-valgrind` image: a glibc release binary
 with debug symbols) and fails the run on any leak, leaked fd, or memcheck error. The runner builds
 `reflector:e2e` by default, uses `python:3.13-alpine` for UDP-probe containers, can print reflector logs
-with `--show-reflector-logs`, and leaves Docker resources behind on failure with `--keep-on-failure`.
+with `--show-reflector-logs`, and leaves resources behind on failure with `--keep-on-failure`.
+
+The `native` backend runs the same cases without Docker, as root: network namespaces + veth pairs on
+Linux, vnet jails + epair(4) on FreeBSD (the daemon on the host stack, probes jailed). Build the
+binary first; the harness never runs cargo as root:
+
+```sh
+cargo build --release --locked
+sudo python3 e2e/run.py --backend native --binary target/release/reflector
+```
+
+CI runs the native suite on linux amd64/arm64 natively, on armv7/armv5 with the daemon under
+qemu-user, and on FreeBSD in the CI VM.
 
 ## Release
 
