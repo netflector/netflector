@@ -26,6 +26,7 @@ use std::path::Path;
 use self::capture::Capture;
 use self::config::Config;
 use self::dispatch::PacketDispatcher;
+use self::error::TooManyArgs;
 use self::reactor::Reactor;
 use self::reflector::InterfaceMap;
 
@@ -39,7 +40,7 @@ use self::reflector::InterfaceMap;
 /// Returns [`Error`] if configuration loading or validation fails, or if the
 /// reactor cannot be created or its event loop fails.
 pub fn run(args: &[OsString]) -> Result<()> {
-    let path = args.first().map(Path::new);
+    let path = config_path(args)?;
     let toml_text = path.map(config::read_config_file).transpose()?;
     let env: Vec<(String, String)> = std::env::vars().collect();
 
@@ -110,6 +111,19 @@ pub fn run(args: &[OsString]) -> Result<()> {
     Ok(())
 }
 
+/// The config-file path from the CLI args, or `None` for env-only configuration. The reflector takes at
+/// most one positional argument; reject extras rather than silently ignoring them (a likely typo).
+///
+/// # Errors
+/// [`TooManyArgs`] when more than one argument is given (lifted into [`Error`] by `?` in [`run`]).
+fn config_path(args: &[OsString]) -> std::result::Result<Option<&Path>, TooManyArgs> {
+    match args {
+        [] => Ok(None),
+        [path] => Ok(Some(Path::new(path))),
+        [_path, extra, ..] => Err(TooManyArgs(extra.to_string_lossy().into_owned())),
+    }
+}
+
 /// Open one capture per distinct interface: the `source ∪ target` of every reflector, in
 /// first-seen order. Records each in an [`InterfaceMap`] for the per-protocol builders.
 /// Fail-closed: a capture that can't open (missing `CAP_NET_RAW`, an absent interface) aborts
@@ -129,4 +143,22 @@ fn open_captures(config: &Config, dispatcher: &mut PacketDispatcher) -> Result<I
         }
     }
     Ok(interfaces)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_path_takes_at_most_one_arg() {
+        assert_eq!(config_path(&[]).unwrap(), None);
+        let one = [OsString::from("reflector.toml")];
+        assert_eq!(
+            config_path(&one).unwrap(),
+            Some(Path::new("reflector.toml"))
+        );
+        // A second positional argument is rejected, not ignored.
+        let two = [OsString::from("reflector.toml"), OsString::from("extra")];
+        assert!(matches!(config_path(&two), Err(TooManyArgs(_))));
+    }
 }
