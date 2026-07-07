@@ -28,12 +28,17 @@ use super::{ReplyRewrite, Verdict, egress_sources};
 /// the cap a new search is dropped (no live session is evicted early).
 const MAX_SESSIONS: usize = 64;
 
-/// One in-flight search. The searcher (`ip:port`) is the dedup key; `expiry` is when the session
-/// lapses; `reservation` holds the ephemeral target port the replies arrive on for the session's life
-/// (dropping it frees the port); `response_key` is the per-session response capture. A
+/// One in-flight search, keyed by `(searcher, dest)`. The searcher (`ip:port`) plus the group it
+/// searched: each group's replies arrive at a different scope-matched target address (link-local for
+/// `ff02::c`, routable for `ff05::c`), so one searcher's searches to two scopes need separate sessions.
+/// `expiry` is when the session lapses; `reservation` holds the ephemeral target reply port for the
+/// session's life (dropping it frees the port); `response_key` is the per-session response capture. A
 /// `RegistrationKey` is not a RAII guard, so eviction and rollback `unregister` it by hand.
 struct Session {
     searcher: SocketAddr,
+    /// The multicast group searched; part of the dedup key, since its scope picks the reserved reply
+    /// address — a different group is a new session, not a retransmit.
+    dest: SocketAddr,
     expiry: Instant,
     reservation: PortReservation,
     response_key: RegistrationKey,
@@ -253,11 +258,27 @@ impl SearchReflector {
         );
         Ok(Session {
             searcher: packet.source,
+            dest: packet.dest,
             expiry,
             reservation,
             response_key,
         })
     }
+}
+
+/// The live session a search belongs to: same searcher *and* same group. The group is part of the key
+/// because its scope picks the reserved reply address, so a search to a different group is a new session,
+/// not a retransmit. A free fn over `&mut [Session]`, not a `&mut self` method: a `&mut self` return
+/// would lock all of `self`, but the caller reads other fields (`target`, `ttl`) while holding the
+/// session.
+fn session_for(
+    sessions: &mut [Session],
+    source: SocketAddr,
+    dest: SocketAddr,
+) -> Option<&mut Session> {
+    sessions
+        .iter_mut()
+        .find(|s| s.searcher == source && s.dest == dest)
 }
 
 impl PacketHandler for SearchReflector {
@@ -283,13 +304,10 @@ impl PacketHandler for SearchReflector {
         };
         let expiry = Instant::now() + (self.window)(packet.payload);
 
-        // A retransmit from a known searcher reuses its session: refresh the window and re-reflect from
-        // the same reserved port. A new searcher opens a fresh session.
-        if let Some(session) = self
-            .sessions
-            .iter_mut()
-            .find(|s| s.searcher == packet.source)
-        {
+        // A retransmit from a known searcher to the same group reuses its session: refresh the window and
+        // re-reflect from the same reserved port. A new searcher, or the same searcher to a different
+        // group (a different reply scope), opens a fresh session.
+        if let Some(session) = session_for(&mut self.sessions, packet.source, packet.dest) {
             let port = session.reservation.port();
             return match dispatcher.send_udp_group(
                 self.target,
@@ -420,9 +438,11 @@ mod tests {
         reflector: &mut SearchReflector,
         dispatcher: &mut PacketDispatcher,
         searcher: &str,
+        dest: &str,
         expiry: Instant,
     ) {
         let searcher: SocketAddr = searcher.parse().unwrap();
+        let dest: SocketAddr = dest.parse().unwrap();
         let (target, source) = (reflector.target, reflector.source);
         let reservation = PortReservation::create(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
             .expect("reserve a loopback port");
@@ -441,6 +461,7 @@ mod tests {
         );
         reflector.sessions.push(Session {
             searcher,
+            dest,
             expiry,
             reservation,
             response_key,
@@ -461,12 +482,14 @@ mod tests {
             &mut reflector,
             &mut dispatcher,
             "10.0.0.1:5",
+            "239.255.255.250:1900",
             base + Duration::from_secs(5),
         );
         push_session(
             &mut reflector,
             &mut dispatcher,
             "10.0.0.2:5",
+            "239.255.255.250:1900",
             base + Duration::from_secs(2),
         );
         assert_eq!(
@@ -481,11 +504,18 @@ mod tests {
         let mut reactor = Reactor::new().unwrap();
         let mut reflector = test_reflector();
         let base = Instant::now();
-        push_session(&mut reflector, &mut dispatcher, "10.0.0.1:5", base); // already due
+        push_session(
+            &mut reflector,
+            &mut dispatcher,
+            "10.0.0.1:5",
+            "239.255.255.250:1900",
+            base,
+        ); // already due
         push_session(
             &mut reflector,
             &mut dispatcher,
             "10.0.0.2:5",
+            "239.255.255.250:1900",
             base + Duration::from_secs(10),
         ); // live
         assert_eq!(dispatcher.registration_count(), 2);
@@ -520,7 +550,13 @@ mod tests {
         // so the re-reflect "succeeds" with no real capture; this exercises only the bookkeeping.
         let mut reflector = test_reflector();
         let base = Instant::now();
-        push_session(&mut reflector, &mut dispatcher, "10.0.0.7:50000", base);
+        push_session(
+            &mut reflector,
+            &mut dispatcher,
+            "10.0.0.7:50000",
+            "239.255.255.250:1900",
+            base,
+        );
         assert_eq!(dispatcher.registration_count(), 1);
 
         let packet = Packet {
@@ -547,5 +583,27 @@ mod tests {
             reflector.sessions[0].expiry > base,
             "the session's window is refreshed"
         );
+    }
+
+    #[test]
+    fn a_session_is_keyed_by_searcher_and_group() {
+        // The dedup key is (searcher, group). One live session for a searcher's link-local search: a
+        // retransmit (same searcher, same group) finds it, but the same searcher's site-local search does
+        // not — its replies come to a different scope-matched address, so it needs its own session. The
+        // bug keyed on the searcher alone, so the site-local search wrongly reused the link-local session.
+        let mut dispatcher = PacketDispatcher::new();
+        let mut reflector = test_reflector();
+        push_session(
+            &mut reflector,
+            &mut dispatcher,
+            "[fe80::1]:50000",
+            "[ff02::c]:1900",
+            Instant::now(),
+        );
+        let searcher: SocketAddr = "[fe80::1]:50000".parse().unwrap();
+        let link_local: SocketAddr = "[ff02::c]:1900".parse().unwrap();
+        let site_local: SocketAddr = "[ff05::c]:1900".parse().unwrap();
+        assert!(session_for(&mut reflector.sessions, searcher, link_local).is_some());
+        assert!(session_for(&mut reflector.sessions, searcher, site_local).is_none());
     }
 }
