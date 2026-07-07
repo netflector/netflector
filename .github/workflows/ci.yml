@@ -67,7 +67,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       - name: rustfmt
         run: cargo fmt --check
 
@@ -97,9 +97,9 @@ jobs:
           - aarch64-apple-darwin
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       - name: Cache cargo build
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -141,9 +141,9 @@ jobs:
           - { name: macos-arm64, runner: macos-15 }
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       - name: Cache cargo build
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -179,7 +179,7 @@ jobs:
           - { name: linux-armv5, triple: armv5te-unknown-linux-musleabi }
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       - name: Install lld + QEMU user-mode
         run: |
           sudo apt-get update
@@ -187,7 +187,7 @@ jobs:
       - name: Add the Rust target
         run: rustup target add ${{ matrix.target.triple }}
       - name: Cache cargo build
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -239,9 +239,9 @@ jobs:
           - { name: release, flags: '--release --target x86_64-unknown-freebsd', rustflags: '-C target-feature=+crt-static' }
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       - name: Build and test in a FreeBSD VM
-        uses: vmactions/freebsd-vm@v1
+        uses: vmactions/freebsd-vm@5a72679103d223925653750faa878a143340fbd0 # v1
         with:
           release: '14.2'
           usesh: true
@@ -267,11 +267,11 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
       - name: Build reflector image
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           tags: reflector:e2e
@@ -293,11 +293,11 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
       - name: Build runtime-valgrind image
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           target: runtime-valgrind
