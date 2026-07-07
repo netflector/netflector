@@ -439,7 +439,7 @@ with debug symbols) and fails the run on any leak, leaked fd, or memcheck error.
 with `--show-reflector-logs`, and leaves resources behind on failure with `--keep-on-failure`.
 
 The `native` backend runs the same cases without Docker, as root: network namespaces + veth pairs on
-Linux, vnet jails + epair(4) on FreeBSD (the daemon on the host stack, probes jailed). Build the
+Linux, vnet jails + epair(4) on FreeBSD -- one namespace/jail per participant either way. Build the
 binary first; the harness never runs cargo as root:
 
 ```sh
