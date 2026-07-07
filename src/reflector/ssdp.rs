@@ -23,7 +23,7 @@ use crate::reactor::Reactor;
 use super::dial::{ProxyPlacement, REWRITE_BUF_LEN, rewrite_location};
 use super::{
     BuildError, InterfaceMap, NoRewrite, ReplyRewrite, SearchReflector, SimpleReflector, Verdict,
-    require_bidirectional_families,
+    join_group_logged, require_bidirectional_families,
 };
 
 /// What a DIAL-enabled SSDP reflector needs to rewrite a device's `LOCATION` to a source-side proxy: the
@@ -177,12 +177,8 @@ pub(crate) fn build(
     // with no address yet is recorded and re-attempted on the next address change.
     let groups = used_groups(reflector.address_family);
     for group in &groups {
-        if let Err(e) = dispatcher.join_group(target, group.ip()) {
-            log::debug!("SSDP: join {} on target deferred: {e}", group.ip());
-        }
-        if let Err(e) = dispatcher.join_group(source, group.ip()) {
-            log::debug!("SSDP: join {} on source deferred: {e}", group.ip());
-        }
+        join_group_logged(dispatcher, target, group.ip(), "SSDP", "target");
+        join_group_logged(dispatcher, source, group.ip(), "SSDP", "source");
     }
     // One handler per direction spans every group; its filter matches the group set at the SSDP port.
     let group_ips: IpSet = groups.iter().map(SocketAddr::ip).collect();
