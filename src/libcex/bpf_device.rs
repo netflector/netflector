@@ -15,10 +15,10 @@ const _: () = assert!(DLT_EN10MB == libc::DLT_EN10MB);
 #[cfg(target_os = "macos")]
 const _: () = assert!(DLT_NULL == libc::DLT_NULL);
 
-/// `struct bpf_program`: the filter handed to `BIOCSETF`. libc provides this
-/// (and `bpf_insn`) on FreeBSD but not apple, so define it for both; the asserts
-/// anchor the layout to libc where it exists. The per-frame header is read as
-/// `libc::bpf_hdr` (apple + FreeBSD both have it, with the right per-OS timestamp).
+/// `struct bpf_program`: the filter handed to `BIOCSETF`. libc provides it on FreeBSD but not apple, so
+/// define it for both; the FreeBSD assert anchors the layout to libc, the macOS one pins the size. The
+/// per-frame header is read as `libc::bpf_hdr` (apple + FreeBSD both have it, with the right per-OS
+/// timestamp).
 #[repr(C)]
 pub(crate) struct BpfProgram {
     pub(crate) bf_len: c_uint,
@@ -26,8 +26,9 @@ pub(crate) struct BpfProgram {
 }
 #[cfg(target_os = "freebsd")]
 const _: () = assert!(size_of::<BpfProgram>() == size_of::<libc::bpf_program>());
-#[cfg(target_os = "freebsd")]
-const _: () = assert!(size_of::<BpfInsn>() == size_of::<libc::bpf_insn>());
+// apple has no libc `bpf_program` to anchor to; pin the size (u_int + pointer = 16 on 64-bit macOS).
+#[cfg(target_os = "macos")]
+const _: () = assert!(size_of::<BpfProgram>() == 16);
 
 // `BPF_ALIGNMENT` as a usize. libc types it differently per platform (`c_int` on
 // apple, `usize` on FreeBSD), so normalize it once here.
