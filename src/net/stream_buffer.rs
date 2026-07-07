@@ -105,7 +105,12 @@ impl StreamBuffer {
     }
 
     /// Mark `n` bytes received into [`free_tail_mut`](Self::free_tail_mut) as filled.
-    pub(crate) fn commit(&mut self, n: usize) {
+    ///
+    /// # Safety
+    /// The first `n` bytes of the most recent [`free_tail_mut`](Self::free_tail_mut) must have been
+    /// initialized (written) before this call. [`pending`](Self::pending) then reads `[consumed..filled]`
+    /// as initialized `u8`, so committing bytes that were never written is undefined behavior.
+    pub(crate) unsafe fn commit(&mut self, n: usize) {
         debug_assert!(self.filled + n <= self.capacity, "commit past the capacity");
         self.filled += n;
     }
@@ -239,7 +244,8 @@ mod tests {
         let tail = b.free_tail_mut();
         assert_eq!(tail.len(), 6);
         fill(tail, b"xyz");
-        b.commit(3);
+        // SAFETY: `fill` wrote 3 bytes into the free_tail_mut region above.
+        unsafe { b.commit(3) };
         assert_eq!(b.pending(), b"abxyz");
     }
 
@@ -251,7 +257,8 @@ mod tests {
         let tail = b.free_tail_mut(); // compacts: "cd" slides to the front
         assert_eq!(tail.len(), 2);
         fill(tail, b"ef");
-        b.commit(2);
+        // SAFETY: `fill` wrote 2 bytes into the free_tail_mut region above.
+        unsafe { b.commit(2) };
         assert_eq!(b.pending(), b"cdef");
     }
 
