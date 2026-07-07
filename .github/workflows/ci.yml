@@ -117,10 +117,14 @@ jobs:
       - name: rustdoc (intra-doc link gate)
         run: cargo doc --locked --target ${{ matrix.target }} --no-deps --document-private-items
 
-  # The unit suite, run natively per OS/arch in both profiles. macOS exercises the cfg(macos) BSD path; the
-  # two Linux arches exercise cfg(linux) on 64-bit (cross-test runs the 32-bit arm targets under QEMU).
-  # Privileged tests (raw-socket capture) self-skip without CAP_NET_RAW, as they do on the dev host -- no
-  # sudo needed.
+  # The unit suite in both profiles, per OS/arch. macOS exercises the cfg(macos) BSD path; the two
+  # Linux arches exercise cfg(linux) on 64-bit. armv7/armv5 have no native runner, but 32-bit ARM is
+  # a deployment target (MikroTik), so those lanes (triple != '') run the suite under QEMU rather
+  # than only cross-building it -- catching pointer-width / alignment / cast bugs the 64-bit lanes
+  # can't. The static musl test binary needs no target sysroot under qemu-user: lld cross-links it
+  # (the same config the Dockerfile uses, no per-arch gcc) and the cargo target runner executes it
+  # via qemu-arm-static (armv7 = armhf, hard-float; armv5 = armel, soft-float, the EN7562 boxes).
+  # Privileged tests (raw-socket capture) self-skip without CAP_NET_RAW, as they do on the dev host.
   test:
     name: Test (${{ matrix.target.name }}, ${{ matrix.profile.name }})
     needs: gate
@@ -135,10 +139,13 @@ jobs:
         profile:
           - { name: debug, flags: '' }
           - { name: release, flags: '--release' }
+        # triple '' = the runner's native toolchain; otherwise that static musl target under QEMU.
         target:
-          - { name: linux-amd64, runner: ubuntu-24.04 }
-          - { name: linux-arm64, runner: ubuntu-24.04-arm }
-          - { name: macos-arm64, runner: macos-15 }
+          - { name: linux-amd64, runner: ubuntu-24.04, triple: '' }
+          - { name: linux-arm64, runner: ubuntu-24.04-arm, triple: '' }
+          - { name: macos-arm64, runner: macos-15, triple: '' }
+          - { name: linux-armv7, runner: ubuntu-24.04, triple: armv7-unknown-linux-musleabihf }
+          - { name: linux-armv5, runner: ubuntu-24.04, triple: armv5te-unknown-linux-musleabi }
     steps:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -152,54 +159,19 @@ jobs:
             target
           key: cargo-${{ matrix.target.name }}-${{ matrix.profile.name }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-${{ matrix.target.name }}-${{ matrix.profile.name }}-
-      - name: Show toolchain
-        run: rustc -V && cargo -V
-      - name: cargo test
-        run: cargo test --locked ${{ matrix.profile.flags }}
-
-  # armv7/armv5 have no native runner, but 32-bit ARM is a deployment target (MikroTik), so run the suite
-  # under QEMU rather than only cross-building it -- this catches pointer-width / alignment / cast bugs the
-  # 64-bit lanes can't. The static musl test binary needs no target sysroot under qemu-user: lld cross-links
-  # it (the same config the Dockerfile uses, no per-arch gcc), and the cargo target runner executes it via
-  # qemu-arm-static. armv7 = armhf (hard-float, musleabihf); armv5 = armel (soft-float, the EN7562 boxes).
-  cross-test:
-    name: Test (${{ matrix.target.name }}, ${{ matrix.profile.name }})
-    needs: gate
-    if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        profile:
-          - { name: debug, flags: '' }
-          - { name: release, flags: '--release' }
-        target:
-          - { name: linux-armv7, triple: armv7-unknown-linux-musleabihf }
-          - { name: linux-armv5, triple: armv5te-unknown-linux-musleabi }
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       - name: Install lld + QEMU user-mode
+        if: matrix.target.triple != ''
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends lld qemu-user-static
       - name: Add the Rust target
+        if: matrix.target.triple != ''
         run: rustup target add ${{ matrix.target.triple }}
-      - name: Cache cargo build
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: cargo-${{ matrix.target.triple }}-${{ matrix.profile.name }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-${{ matrix.target.triple }}-${{ matrix.profile.name }}-
       # Link the musl target with lld (cross-capable, unlike the host gcc) and run the test binary under
-      # QEMU -- the same lld config the Dockerfile writes, plus a per-target qemu-arm-static runner. The
-      # cfg(target_env = "musl") scope leaves host build-scripts/proc-macros on the default linker.
+      # QEMU -- the same lld config the Dockerfile writes, plus a qemu-arm-static runner for the target.
+      # The cfg(target_env = "musl") scope leaves host build-scripts/proc-macros on the default linker.
       - name: Configure the cross linker and QEMU runner
+        if: matrix.target.triple != ''
         run: |
           mkdir -p .cargo
           cat > .cargo/config.toml <<'EOF'
@@ -207,24 +179,21 @@ jobs:
           linker = "ld.lld"
           rustflags = ["-C", "linker-flavor=ld.lld"]
 
-          [target.armv7-unknown-linux-musleabihf]
-          runner = "qemu-arm-static"
-
-          [target.armv5te-unknown-linux-musleabi]
+          [target.${{ matrix.target.triple }}]
           runner = "qemu-arm-static"
           EOF
       - name: Show toolchain
         run: rustc -V && cargo -V
-      - name: cargo test (under QEMU)
-        run: cargo test --locked --target ${{ matrix.target.triple }} ${{ matrix.profile.flags }}
+      - name: cargo test
+        run: cargo test --locked ${{ matrix.target.triple != '' && format('--target {0}', matrix.target.triple) || '' }} ${{ matrix.profile.flags }}
 
   # FreeBSD shares its BSD platform path (kqueue, BPF, route sockets, getifaddrs) with macOS but needs a real
   # FreeBSD kernel to build and run -- Docker can't provide one. vmactions boots a FreeBSD VM (KVM on the
   # amd64 runner) and runs the suite there. The VM runs as root, so privileged tests run instead of skipping;
   # each self-skips where its operation isn't available. One profile per VM boot, in parallel lanes -- the
-  # same debug/release split as the native test lanes. (Arm release IMAGES aren't built here; cross-test
-  # cross-compiles the arm code, docker-e2e exercises the Dockerfile on amd64, and release.yml builds the
-  # multi-arch images -- so a separate arm image-build gate adds little.)
+  # same debug/release split as the native test lanes. (Arm release IMAGES aren't built here; the QEMU
+  # test lanes cross-compile the arm code, docker-e2e exercises the Dockerfile on amd64, and release.yml
+  # builds the multi-arch images -- so a separate arm image-build gate adds little.)
   freebsd:
     name: Test (freebsd-amd64, ${{ matrix.profile.name }})
     needs: gate
@@ -379,7 +348,7 @@ jobs:
   success:
     name: Success
     if: ${{ !cancelled() }}
-    needs: [gate, fmt, lint, test, cross-test, freebsd, docker-e2e, native-e2e, valgrind-e2e]
+    needs: [gate, fmt, lint, test, freebsd, docker-e2e, native-e2e, valgrind-e2e]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
