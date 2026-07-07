@@ -21,8 +21,8 @@ pub(crate) struct PortReservation {
 
 impl PortReservation {
     /// Reserve an ephemeral port on `addr`, the egress interface's own address that the reflector
-    /// sends from and devices reply to. `ifindex` is required to bind an IPv6 link-local `addr`
-    /// (ignored for IPv4).
+    /// sends from and devices reply to. `ifindex` disambiguates an IPv6 link-local `addr` and is
+    /// used only for one.
     ///
     /// # Errors
     /// Propagates the socket / filter / bind / `getsockname` syscall failure.
@@ -34,7 +34,15 @@ impl PortReservation {
         let fd = open_socket(family, libc::SOCK_DGRAM)?;
         #[cfg(target_os = "linux")]
         attach_drop_all_filter(fd.as_raw_fd())?;
-        let (storage, len) = sockaddr_for(addr, 0, ifindex);
+        // A zone id belongs to link-local addresses only. FreeBSD rejects binding a routable
+        // address paired with a non-zero sin6_scope_id (its ifa lookup byte-compares the whole
+        // sockaddr -> EADDRNOTAVAIL); Linux reads the field only for link-local binds, and macOS
+        // zeroes it before its lookup.
+        let scope_id = match addr {
+            IpAddr::V6(v6) if v6.is_unicast_link_local() => ifindex,
+            _ => 0,
+        };
+        let (storage, len) = sockaddr_for(addr, 0, scope_id);
         // SAFETY: `storage` is a valid `sockaddr_in`/`sockaddr_in6` of length `len` for `fd`'s family.
         let rc = unsafe {
             libc::bind(
@@ -113,7 +121,7 @@ fn attach_drop_all_filter(fd: RawFd) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     use super::*;
 
@@ -122,6 +130,16 @@ mod tests {
         let r = PortReservation::create(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
             .expect("bind an ephemeral port on loopback");
         assert_ne!(r.port(), 0, "getsockname should report the assigned port");
+    }
+
+    // A routable (non-link-local) v6 bind must not carry the ifindex as a zone id. Only FreeBSD
+    // rejects the pairing (Linux never reads it, macOS zeroes it), so this has teeth on the
+    // FreeBSD lane and pins the contract elsewhere.
+    #[test]
+    fn routable_v6_reservation_ignores_the_ifindex() {
+        let r = PortReservation::create(IpAddr::V6(Ipv6Addr::LOCALHOST), u32::MAX)
+            .expect("bind an ephemeral port on v6 loopback without a zone id");
+        assert_ne!(r.port(), 0);
     }
 
     #[test]
