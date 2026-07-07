@@ -281,6 +281,33 @@ jobs:
       - name: Run e2e
         run: python3 e2e/run.py --skip-build --image reflector:e2e
 
+  # The same e2e suite without Docker: netns + veth segments and plain processes, driving a release
+  # binary built directly on the runner. Covers the harness path the future FreeBSD/ARM e2e lanes
+  # reuse, and exercises the glibc (non-musl) build end to end.
+  native-e2e:
+    name: Native e2e
+    needs: gate
+    if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+      - name: Cache cargo build
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-native-e2e-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-native-e2e-
+      - name: Build release binary
+        run: cargo build --release --locked
+      - name: Run e2e natively
+        run: sudo python3 e2e/run.py --backend native --binary target/release/reflector
+
   # The e2e suite with the reflector under Valgrind memcheck (the runtime-valgrind image: a glibc release
   # binary with debug symbols). run.py --valgrind SIGTERMs the daemon per case so Valgrind runs its leak
   # analysis at a clean exit; --error-exitcode=1 fails on any leak, leaked fd, or memcheck error.
@@ -317,7 +344,7 @@ jobs:
   success:
     name: Success
     if: ${{ !cancelled() }}
-    needs: [gate, fmt, lint, test, cross-test, freebsd, docker-e2e, valgrind-e2e]
+    needs: [gate, fmt, lint, test, cross-test, freebsd, docker-e2e, native-e2e, valgrind-e2e]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
