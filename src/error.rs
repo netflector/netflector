@@ -26,6 +26,9 @@ pub struct Error(ErrorKind);
 /// The private cause behind an [`struct@Error`]: one variant per subsystem.
 #[derive(Debug, Error)]
 enum ErrorKind {
+    /// The command line was misused (see [`TooManyArgs`]).
+    #[error(transparent)]
+    Usage(#[from] TooManyArgs),
     /// Configuration could not be loaded or failed validation.
     #[error("config: {0}")]
     Config(#[from] ConfigError),
@@ -84,3 +87,15 @@ impl From<io::Error> for Error {
         Self(ErrorKind::Reactor(source))
     }
 }
+
+impl From<TooManyArgs> for Error {
+    fn from(source: TooManyArgs) -> Self {
+        Self(ErrorKind::Usage(source))
+    }
+}
+
+/// More than the single optional config-path argument was passed on the command line; the payload is the
+/// first unexpected argument. The CLI's own matchable error, lifted into [`struct@Error`] by `?`.
+#[derive(Debug, Error)]
+#[error("unexpected extra argument \"{0}\"; usage: reflector [CONFIG_PATH]")]
+pub(crate) struct TooManyArgs(pub(crate) String);
