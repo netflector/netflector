@@ -7,8 +7,8 @@
 # one segment and a receiver prober on the other and asserts the traffic is (or is not) reflected
 # across. The default docker backend realizes segments as bridge networks and participants as
 # containers (reflector image built from ./Dockerfile, CAP_NET_RAW on that container only; probers
-# run unprivileged). The native backend (Linux, root) uses netns + veth pairs and plain processes
-# instead -- same cases, no Docker:
+# run unprivileged). The native backend (root; Linux or FreeBSD) uses plain processes over netns +
+# veth pairs (Linux) or vnet jails + epairs (FreeBSD) instead -- same cases, no Docker:
 #
 #   python3 e2e/run.py
 #   python3 e2e/run.py --case reflects_matching_magic_packet
@@ -921,6 +921,38 @@ class Backend:
         # Run a shell script inside the reflector's network view (addr/route/sysctl mutation).
         raise NotImplementedError
 
+    def set_address(self, ifname: str, family: int, *, up: bool, cidr: str | None = None) -> str | None:
+        # Bring one (interface, family) source address down or back up in the reflector's
+        # network view. IPv6 drops every v6 address and, on re-enable, has the kernel regenerate
+        # a usable link-local; v4 deletes and later re-adds the exact CIDR (returned on removal
+        # so the caller can restore it). This base implementation speaks Linux (ip + /proc
+        # sysctls), shared by the docker and native Linux backends; FreeBSD overrides it with
+        # ifconfig verbs.
+        if family == 6:
+            self.admin(f"echo {0 if up else 1} > /proc/sys/net/ipv6/conf/{ifname}/disable_ipv6")
+            return None
+        if up:
+            if cidr is None:
+                raise RuntimeError("restoring an IPv4 address requires the CIDR captured on removal")
+            self.admin(f"ip addr add {cidr} dev {ifname}")
+            return cidr
+        captured = self.admin(
+            f"ip -o -4 addr show dev {ifname} | awk '/inet /{{print $4; exit}}'", capture=True
+        )
+        if not captured:
+            raise RuntimeError(f"no IPv4 address on {ifname} to remove")
+        self.admin(f"ip addr del {captured} dev {ifname}")
+        return captured
+
+    def add_decoy_route(self, dest_ip: str, ifname: str) -> bool:
+        # Plant a host route to `dest_ip` via the (wrong) `ifname` in the reflector's network
+        # view; returns whether it was armed. Linux-shaped: the DIAL egress pin there is
+        # SO_BINDTODEVICE, which constrains the route lookup and so defeats the decoy. FreeBSD
+        # has no pin primitive (net/tcp.rs relies on the source-address bind alone), so an armed
+        # decoy would legitimately break the flow -- its backend skips this.
+        self.admin(f"ip route add {dest_ip}/32 dev {ifname}")
+        return True
+
     def reflector_ip(self, segment: str) -> str:
         raise NotImplementedError
 
@@ -1104,16 +1136,12 @@ NATIVE_REFLECTOR_HOST = 1
 NATIVE_HELPER_HOST = 2
 
 
-class NativeLinuxBackend(Backend):
-    # Segments as veth pairs between per-participant network namespaces: a dut namespace holds
-    # wol_src + wol_dst (so the checked-in configs work unchanged), and one persistent far
-    # namespace per segment holds the peer end, always named probe0. Every participant gets its
-    # own namespace for the same reasons Docker gave them one: wildcard binds and --expect-none
-    # windows must only see the segment's traffic, unicast to the reflector must cross the wire
-    # rather than short-circuit via lo, and the host's daemons (systemd-resolved speaks mDNS)
-    # must not reach the test wires. Successive probe processes for a case run inside the same
-    # far namespace: the reflector caches its ifindexes at startup, so the veth ends on its side
-    # must never be recreated -- probes respawn, namespaces persist.
+class NativeBackend(Backend):
+    # Shared mechanics for the native fabrics (Linux netns, FreeBSD vnet jails): participants
+    # are plain processes with stdout/stderr teed to per-role files in a case tmpdir (the
+    # docker-logs replacement), and addressing follows the fixed plan above instead of IPAM
+    # discovery. Subclasses provide the fabric: segment construction/teardown, the exec prefix
+    # that places a probe in a segment's stack, and the reflector's launch.
     #
     # Fidelity gap vs the docker backend: the reflector runs here with the harness's full root
     # privileges, not the CAP_NET_RAW-only confinement of the scratch container -- a change that
@@ -1123,22 +1151,158 @@ class NativeLinuxBackend(Backend):
 
     def __init__(self, args: argparse.Namespace, prefix: str) -> None:
         super().__init__(args, prefix)
-        self.ns = {"dut": f"{prefix}-dut", "source": f"{prefix}-src", "target": f"{prefix}-dst"}
         self.procs: dict[str, subprocess.Popen[bytes]] = {}
         self.logdir = Path(tempfile.mkdtemp(prefix=f"{prefix}-"))
 
     @staticmethod
     def require_available() -> None:
-        if sys.platform != "linux":
-            raise RuntimeError("--backend native currently requires Linux (netns + veth)")
-        require_command("ip")
+        raise NotImplementedError
+
+    @staticmethod
+    def _require_native_basics() -> None:
         if os.geteuid() != 0:
-            raise RuntimeError("--backend native requires root (netns/veth setup, CAP_NET_RAW)")
+            raise RuntimeError("--backend native requires root (fabric setup, raw sockets)")
         # probe.py catches socket timeouts as TimeoutError, which socket.timeout only aliases
         # from 3.10 on; the docker backend pins python:3.13 but here probes run on this
         # interpreter.
         if sys.version_info < (3, 10):
             raise RuntimeError("--backend native requires Python >= 3.10")
+
+    def _probe_exec(self, segment: str) -> list[str]:
+        # The command prefix that places a probe process in `segment`'s network stack.
+        raise NotImplementedError
+
+    def _reflector_command(self, config_path: Path) -> list[str]:
+        raise NotImplementedError
+
+    def _teardown_fabric(self) -> None:
+        raise NotImplementedError
+
+    def _print_fabric_diagnostics(self) -> None:
+        raise NotImplementedError
+
+    def _kill_procs(self) -> None:
+        for proc in self.procs.values():
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        self.procs.clear()
+
+    def cleanup(self) -> None:
+        self._kill_procs()
+        self._teardown_fabric()
+        shutil.rmtree(self.logdir, ignore_errors=True)
+
+    def abandon(self) -> None:
+        # Keep the fabric and logs, but don't leave root daemons running unwatched.
+        self._kill_procs()
+
+    def _spawn(self, role: str, command: list[str]) -> None:
+        self.remove(role)
+        print(f"+ {format_command(command)}", flush=True)
+        # Scrub REFLECTOR_* so the daemon sees only its config file, as it would in the docker
+        # backend's clean container env -- a stray host REFLECTOR_LOG_LEVEL (or worse, an env
+        # reflector entry) must not alter the system under test.
+        env = {key: value for key, value in os.environ.items() if not key.startswith("REFLECTOR_")}
+        out = open(self.logdir / f"{role}.out", "wb")
+        err = open(self.logdir / f"{role}.err", "wb")
+        try:
+            self.procs[role] = subprocess.Popen(command, cwd=REPO_ROOT, stdout=out, stderr=err, env=env)
+        finally:
+            out.close()
+            err.close()
+
+    def start_reflector(self, config_path: Path) -> None:
+        self._spawn("reflector", self._reflector_command(config_path))
+
+    def start_probe(
+        self, role: str, segment: str, ifname: str, probe_args: list[str], *, detach: bool = True
+    ) -> None:
+        del ifname  # the far end is always probe0; the caller got that from helper_ifname()
+        command = [*self._probe_exec(segment), sys.executable, str(E2E_DIR / "probe.py"), *probe_args]
+        self._spawn(role, command)
+        if not detach:
+            code = self.procs[role].wait()
+            if code != 0:
+                out, err = self.logs(role)
+                raise RuntimeError(f"{role} failed with exit code {code}\n{out}{err}")
+
+    def helper_ifname(self, requested: str) -> str:
+        del requested
+        return RECEIVER_IFNAME
+
+    def wait(self, role: str) -> int:
+        return self.procs[role].wait()
+
+    def logs(self, role: str) -> tuple[str, str]:
+        def read(suffix: str) -> str:
+            path = self.logdir / f"{role}.{suffix}"
+            return path.read_text(errors="replace") if path.exists() else ""
+
+        return read("out"), read("err")
+
+    def status(self, role: str) -> tuple[bool, str]:
+        proc = self.procs.get(role)
+        if proc is None:
+            return True, "unknown"
+        if proc.poll() is None:
+            return True, "running"
+        return False, f"exited {proc.returncode}"
+
+    def remove(self, role: str) -> None:
+        proc = self.procs.pop(role, None)
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+    def stop_reflector(self, grace_seconds: int) -> int:
+        proc = self.procs["reflector"]
+        if proc.poll() is None:
+            proc.send_signal(signal.SIGTERM)
+            try:
+                proc.wait(timeout=grace_seconds)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        return proc.returncode
+
+    def reflector_ip(self, segment: str) -> str:
+        return f"{NATIVE_V4_SUBNET[segment]}.{NATIVE_REFLECTOR_HOST}"
+
+    def probe_ip(self, role: str, segment: str) -> str:
+        del role  # one helper per segment; the plan gives them all the same host number
+        return f"{NATIVE_V4_SUBNET[segment]}.{NATIVE_HELPER_HOST}"
+
+    def print_diagnostics(self) -> None:
+        for logfile in sorted(self.logdir.iterdir()):
+            text = logfile.read_text(errors="replace")
+            if text:
+                print(f"--- logs: {logfile.name} ---", file=sys.stderr, flush=True)
+                print(text, end="", file=sys.stderr, flush=True)
+        self._print_fabric_diagnostics()
+
+
+class NativeLinuxBackend(NativeBackend):
+    # Segments as veth pairs between per-participant network namespaces: a dut namespace holds
+    # wol_src + wol_dst (so the checked-in configs work unchanged), and one persistent far
+    # namespace per segment holds the peer end, always named probe0. Every participant gets its
+    # own namespace for the same reasons Docker gave them one: wildcard binds and --expect-none
+    # windows must only see the segment's traffic, unicast to the reflector must cross the wire
+    # rather than short-circuit via lo, and the host's daemons (systemd-resolved speaks mDNS)
+    # must not reach the test wires. Successive probe processes for a case run inside the same
+    # far namespace: the reflector caches its ifindexes at startup, so the veth ends on its side
+    # must never be recreated -- probes respawn, namespaces persist.
+
+    def __init__(self, args: argparse.Namespace, prefix: str) -> None:
+        super().__init__(args, prefix)
+        self.ns = {"dut": f"{prefix}-dut", "source": f"{prefix}-src", "target": f"{prefix}-dst"}
+
+    @staticmethod
+    def require_available() -> None:
+        if sys.platform != "linux":
+            raise RuntimeError("the Linux native backend requires Linux (netns + veth)")
+        require_command("ip")
+        NativeBackend._require_native_basics()
 
     def _ip(self, args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         return run_command(["ip", *args], **kwargs)  # type: ignore[arg-type]
@@ -1194,101 +1358,18 @@ class NativeLinuxBackend(Backend):
                     raise RuntimeError(f"{ns}/{ifname} never reached operstate up (last: {state})")
                 time.sleep(0.05)
 
-    def cleanup(self) -> None:
-        for proc in self.procs.values():
-            if proc.poll() is None:
-                proc.kill()
-                proc.wait()
-        self.procs.clear()
+    def _teardown_fabric(self) -> None:
         for ns in self.ns.values():
             run_command(["ip", "netns", "del", ns], check=False, echo=False)
-        shutil.rmtree(self.logdir, ignore_errors=True)
 
     def keep_artifacts(self) -> str:
         return f"namespaces {', '.join(self.ns.values())} and logs in {self.logdir}"
 
-    def abandon(self) -> None:
-        # Keep the namespaces and logs, but don't leave root daemons running unwatched.
-        for proc in self.procs.values():
-            if proc.poll() is None:
-                proc.kill()
-                proc.wait()
-        self.procs.clear()
+    def _probe_exec(self, segment: str) -> list[str]:
+        return ["ip", "netns", "exec", self.ns[segment]]
 
-    def _spawn(self, role: str, command: list[str]) -> None:
-        self.remove(role)
-        print(f"+ {format_command(command)}", flush=True)
-        # Scrub REFLECTOR_* so the daemon sees only its config file, as it would in the docker
-        # backend's clean container env -- a stray host REFLECTOR_LOG_LEVEL (or worse, an env
-        # reflector entry) must not alter the system under test.
-        env = {key: value for key, value in os.environ.items() if not key.startswith("REFLECTOR_")}
-        out = open(self.logdir / f"{role}.out", "wb")
-        err = open(self.logdir / f"{role}.err", "wb")
-        try:
-            self.procs[role] = subprocess.Popen(command, cwd=REPO_ROOT, stdout=out, stderr=err, env=env)
-        finally:
-            out.close()
-            err.close()
-
-    def start_reflector(self, config_path: Path) -> None:
-        self._spawn(
-            "reflector",
-            ["ip", "netns", "exec", self.ns["dut"], str(self.args.binary), str(config_path)],
-        )
-
-    def start_probe(
-        self, role: str, segment: str, ifname: str, probe_args: list[str], *, detach: bool = True
-    ) -> None:
-        del ifname  # the far end is always probe0; the caller got that from helper_ifname()
-        command = [
-            "ip", "netns", "exec", self.ns[segment],
-            sys.executable, str(E2E_DIR / "probe.py"), *probe_args,
-        ]
-        self._spawn(role, command)
-        if not detach:
-            code = self.procs[role].wait()
-            if code != 0:
-                out, err = self.logs(role)
-                raise RuntimeError(f"{role} failed with exit code {code}\n{out}{err}")
-
-    def helper_ifname(self, requested: str) -> str:
-        del requested
-        return RECEIVER_IFNAME
-
-    def wait(self, role: str) -> int:
-        return self.procs[role].wait()
-
-    def logs(self, role: str) -> tuple[str, str]:
-        def read(suffix: str) -> str:
-            path = self.logdir / f"{role}.{suffix}"
-            return path.read_text(errors="replace") if path.exists() else ""
-
-        return read("out"), read("err")
-
-    def status(self, role: str) -> tuple[bool, str]:
-        proc = self.procs.get(role)
-        if proc is None:
-            return True, "unknown"
-        if proc.poll() is None:
-            return True, "running"
-        return False, f"exited {proc.returncode}"
-
-    def remove(self, role: str) -> None:
-        proc = self.procs.pop(role, None)
-        if proc is not None and proc.poll() is None:
-            proc.kill()
-            proc.wait()
-
-    def stop_reflector(self, grace_seconds: int) -> int:
-        proc = self.procs["reflector"]
-        if proc.poll() is None:
-            proc.send_signal(signal.SIGTERM)
-            try:
-                proc.wait(timeout=grace_seconds)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
-        return proc.returncode
+    def _reflector_command(self, config_path: Path) -> list[str]:
+        return ["ip", "netns", "exec", self.ns["dut"], str(self.args.binary), str(config_path)]
 
     def admin(self, script: str, *, capture: bool = False) -> str:
         # The harness already runs as root, so the reflector's network view is one netns exec
@@ -1296,19 +1377,7 @@ class NativeLinuxBackend(Backend):
         result = run_command(["ip", "netns", "exec", self.ns["dut"], "sh", "-ec", script])
         return result.stdout.strip() if capture else ""
 
-    def reflector_ip(self, segment: str) -> str:
-        return f"{NATIVE_V4_SUBNET[segment]}.{NATIVE_REFLECTOR_HOST}"
-
-    def probe_ip(self, role: str, segment: str) -> str:
-        del role  # one helper per segment; the plan gives them all the same host number
-        return f"{NATIVE_V4_SUBNET[segment]}.{NATIVE_HELPER_HOST}"
-
-    def print_diagnostics(self) -> None:
-        for logfile in sorted(self.logdir.iterdir()):
-            text = logfile.read_text(errors="replace")
-            if text:
-                print(f"--- logs: {logfile.name} ---", file=sys.stderr, flush=True)
-                print(text, end="", file=sys.stderr, flush=True)
+    def _print_fabric_diagnostics(self) -> None:
         for ns in self.ns.values():
             result = run_command(["ip", "-n", ns, "addr", "show"], check=False, echo=False)
             if result.returncode == 0 and result.stdout:
@@ -1316,9 +1385,147 @@ class NativeLinuxBackend(Backend):
                 print(result.stdout, end="", file=sys.stderr, flush=True)
 
 
+class NativeFreeBSDBackend(NativeBackend):
+    # Segments as epair(4) pairs -- FreeBSD's veth. The daemon runs on the host stack with BPF
+    # on the renamed a ends (wol_src/wol_dst); each probe runs in a persistent vnet jail owning
+    # the b end (renamed probe0). A vnet jail is FreeBSD's network namespace: its own stack,
+    # the host filesystem shared via path=/, the same shape FreeBSD's own network test suite
+    # builds with vnet_mkjail. Host-stack daemon + jailed probes keeps every probe packet on
+    # the wire: from a jail's stack the daemon's addresses are remote, so nothing
+    # short-circuits over lo0.
+
+    def __init__(self, args: argparse.Namespace, prefix: str) -> None:
+        super().__init__(args, prefix)
+        # Jail names: play safe with the allowed character set.
+        base = prefix.replace("-", "_")
+        self.jails = {"source": f"{base}_src", "target": f"{base}_dst"}
+
+    @staticmethod
+    def require_available() -> None:
+        if not sys.platform.startswith("freebsd"):
+            raise RuntimeError("the FreeBSD native backend requires FreeBSD (epair + vnet jails)")
+        for command in ("ifconfig", "jail", "jexec", "sysctl"):
+            require_command(command)
+        NativeBackend._require_native_basics()
+        vimage = run_command(["sysctl", "-n", "kern.features.vimage"], check=False, echo=False)
+        if vimage.returncode != 0 or vimage.stdout.strip() != "1":
+            raise RuntimeError("--backend native requires a VIMAGE kernel (vnet jails); "
+                               "stock GENERIC has it since FreeBSD 12")
+
+    def setup_segments(self) -> None:
+        # DAD off before any address, as on the other backends. The daemon's interfaces live on
+        # the host stack, so this is host-global (fine for the disposable CI VM).
+        run_command(["sysctl", "net.inet6.ip6.dad_count=0"])
+        for segment in SEGMENTS:
+            a_end = run_command(["ifconfig", "epair", "create"]).stdout.strip()
+            if not a_end.endswith("a"):
+                raise RuntimeError(f"unexpected epair name: {a_end}")
+            b_end = f"{a_end[:-1]}b"
+            dut_ifname = self.REFLECTOR_IFNAMES[segment]
+            run_command(["ifconfig", a_end, "name", dut_ifname])
+            # persist keeps the (process-less) jail alive; vnet.interface moves the b end into
+            # its stack; path=/ shares the host filesystem, so the pkg python3 and probe.py are
+            # visible inside without building a jail root.
+            jail = self.jails[segment]
+            run_command([
+                "jail", "-c", f"name={jail}", "persist", "vnet", f"vnet.interface={b_end}", "path=/",
+            ])
+            jexec = ["jexec", jail]
+            run_command([*jexec, "sysctl", "net.inet6.ip6.dad_count=0"])
+            run_command([*jexec, "ifconfig", "lo0", "up"])
+            run_command([*jexec, "ifconfig", b_end, "name", RECEIVER_IFNAME])
+            v4, v6 = NATIVE_V4_SUBNET[segment], NATIVE_V6_PREFIX[segment]
+            run_command(["ifconfig", dut_ifname, "inet", f"{v4}.{NATIVE_REFLECTOR_HOST}/24"])
+            run_command(["ifconfig", dut_ifname, "inet6", f"{v6}::{NATIVE_REFLECTOR_HOST}/64"])
+            run_command(["ifconfig", dut_ifname, "up"])
+            run_command([*jexec, "ifconfig", RECEIVER_IFNAME, "inet", f"{v4}.{NATIVE_HELPER_HOST}/24"])
+            run_command([*jexec, "ifconfig", RECEIVER_IFNAME, "inet6", f"{v6}::{NATIVE_HELPER_HOST}/64"])
+            run_command([*jexec, "ifconfig", RECEIVER_IFNAME, "up"])
+            # The probe's 255.255.255.255 sends are routed, not interface-pinned; single-homed
+            # plus this default route pins them to the segment.
+            run_command([*jexec, "route", "add", "default", "-interface", RECEIVER_IFNAME])
+
+    def _teardown_fabric(self) -> None:
+        # Destroy the a ends first: killing one end tears down the whole pair, including the b
+        # end inside its jail -- so the two jails' probe0s never return to the host stack, where
+        # their names would collide.
+        for ifname in self.REFLECTOR_IFNAMES.values():
+            run_command(["ifconfig", ifname, "destroy"], check=False, echo=False)
+        for jail in self.jails.values():
+            run_command(["jail", "-r", jail], check=False, echo=False)
+
+    def keep_artifacts(self) -> str:
+        return f"jails {', '.join(self.jails.values())} (+ their epairs) and logs in {self.logdir}"
+
+    def _probe_exec(self, segment: str) -> list[str]:
+        return ["jexec", self.jails[segment]]
+
+    def _reflector_command(self, config_path: Path) -> list[str]:
+        # The daemon runs on the host stack; its interfaces are the renamed a ends.
+        return [str(self.args.binary), str(config_path)]
+
+    def admin(self, script: str, *, capture: bool = False) -> str:
+        # The reflector's network view IS the host stack.
+        result = run_command(["sh", "-ec", script])
+        return result.stdout.strip() if capture else ""
+
+    def set_address(self, ifname: str, family: int, *, up: bool, cidr: str | None = None) -> str | None:
+        # The base implementation's semantics in ifconfig verbs. v6 down deletes every address
+        # (the monitor sees RTM_DELADDR and the resolver a family with no source); v6 up
+        # regenerates the auto link-local by toggling ifdisabled.
+        if family == 6:
+            if up:
+                self.admin(f"ifconfig {ifname} inet6 ifdisabled; ifconfig {ifname} inet6 -ifdisabled")
+            else:
+                self.admin(
+                    f"for a in $(ifconfig {ifname} inet6 | awk '/inet6/{{print $2}}'); do "
+                    f"ifconfig {ifname} inet6 ${{a%%\\%*}} delete; done"
+                )
+            return None
+        if up:
+            if cidr is None:
+                raise RuntimeError("restoring an IPv4 address requires the CIDR captured on removal")
+            self.admin(f"ifconfig {ifname} inet {cidr}")
+            return cidr
+        captured = self.admin(
+            f"ifconfig -f inet:cidr {ifname} inet | awk '/inet /{{print $2; exit}}'", capture=True
+        )
+        if not captured:
+            raise RuntimeError(f"no IPv4 address on {ifname} to remove")
+        self.admin(f"ifconfig {ifname} inet {captured.split('/')[0]} -alias")
+        return captured
+
+    def add_decoy_route(self, dest_ip: str, ifname: str) -> bool:
+        # No egress-pin primitive on FreeBSD (see Backend.add_decoy_route): the pin under test
+        # there is the source-address bind, which the device-peer assertion validates on its own.
+        del dest_ip, ifname
+        return False
+
+    def _print_fabric_diagnostics(self) -> None:
+        result = run_command(["ifconfig", "-a"], check=False, echo=False)
+        if result.returncode == 0 and result.stdout:
+            print("--- host ifconfig -a ---", file=sys.stderr, flush=True)
+            print(result.stdout, end="", file=sys.stderr, flush=True)
+        for jail in self.jails.values():
+            result = run_command(["jexec", jail, "ifconfig", "-a"], check=False, echo=False)
+            if result.returncode == 0 and result.stdout:
+                print(f"--- jail {jail} ifconfig -a ---", file=sys.stderr, flush=True)
+                print(result.stdout, end="", file=sys.stderr, flush=True)
+
+
+def native_backend_class() -> type[NativeBackend]:
+    # "native" resolves to the platform's one possible fabric: a native backend is host-bound,
+    # so a per-OS flag value would only add ways to ask for the impossible.
+    if sys.platform == "linux":
+        return NativeLinuxBackend
+    if sys.platform.startswith("freebsd"):
+        return NativeFreeBSDBackend
+    raise RuntimeError(f"--backend native is not supported on {sys.platform} (Linux and FreeBSD are)")
+
+
 def make_backend(args: argparse.Namespace, prefix: str) -> Backend:
     if args.backend == "native":
-        return NativeLinuxBackend(args, prefix)
+        return native_backend_class()(args, prefix)
     return DockerBackend(args, prefix)
 
 
@@ -1484,26 +1691,10 @@ class CaseRunner:
     def _set_address(
         self, interface: str, family: int, *, up: bool, cidr: str | None = None
     ) -> str | None:
-        # Bring one (interface, family) source address down or back up. IPv6 toggles the
-        # disable_ipv6 sysctl (which drops every v6 address and, on re-enable, lets the kernel
-        # regenerate a usable link-local); v4 has no equivalent, so it deletes and later re-adds
-        # the exact CIDR. Returns the removed v4 CIDR so the caller can restore it.
+        # Bring one (interface, family) source address down or back up; the verbs live in the
+        # backend (Linux vs FreeBSD). Returns the removed v4 CIDR so the caller can restore it.
         ifname = REFLECTOR_SOURCE_IFNAME if interface == "source" else REFLECTOR_TARGET_IFNAME
-        if family == 6:
-            self.backend.admin(f"echo {0 if up else 1} > /proc/sys/net/ipv6/conf/{ifname}/disable_ipv6")
-            return None
-        if up:
-            if cidr is None:
-                raise RuntimeError("restoring an IPv4 address requires the CIDR captured on removal")
-            self.backend.admin(f"ip addr add {cidr} dev {ifname}")
-            return cidr
-        captured = self.backend.admin(
-            f"ip -o -4 addr show dev {ifname} | awk '/inet /{{print $4; exit}}'", capture=True
-        )
-        if not captured:
-            raise RuntimeError(f"no IPv4 address on {ifname} to remove")
-        self.backend.admin(f"ip addr del {captured} dev {ifname}")
-        return captured
+        return self.backend.set_address(ifname, family, up=up, cidr=cidr)
 
     def print_diagnostics(self) -> None:
         print(f"\n--- diagnostics for {self.case.name} ({self.prefix}) ---", file=sys.stderr, flush=True)
@@ -1692,8 +1883,11 @@ class DialRunner(CaseRunner):
         # connect now follows it, ARPs the device on the source segment (where it does not live)
         # and fails, so the whole DIAL flow breaks. Only the egress pin -- which constrains the
         # route lookup to target_if -- still reaches the device, so PASS now requires it.
+        # (FreeBSD declines: no pin primitive there, see Backend.add_decoy_route.)
         device_ip = self.backend.probe_ip("device", "target")
-        self.backend.admin(f"ip route add {device_ip}/32 dev {REFLECTOR_SOURCE_IFNAME}")
+        if not self.backend.add_decoy_route(device_ip, REFLECTOR_SOURCE_IFNAME):
+            print(f"{self.dial.name}: no egress-pin primitive on this backend; decoy route skipped",
+                  flush=True)
 
     def run(self) -> None:
         print(f"\n=== {self.dial.name} ===", flush=True)
@@ -2003,7 +2197,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     if args.backend == "native":
-        NativeLinuxBackend.require_available()
+        native_backend_class().require_available()
     else:
         DockerBackend.require_available()
         # --valgrind selects the valgrind image unless one was passed explicitly.
