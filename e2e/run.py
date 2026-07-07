@@ -1,29 +1,31 @@
 #!/usr/bin/env python3
 #
-# Docker-backed Wake-on-LAN end-to-end tests for the (Rust) reflector.
+# End-to-end tests for the (Rust) reflector, runnable on two backends.
 #
-# Each case stands up two dual-stack Docker bridge networks (a source segment and a target segment),
-# runs the reflector container straddling both with its in-container interface names pinned to wol_src /
-# wol_dst, then runs a sender prober on one segment and a receiver prober on the other and asserts the
-# magic packet is (or is not) reflected across. The reflector image is built from this repo's
-# ./Dockerfile (a fully static scratch image; binary at /usr/local/bin/reflector).
-#
-# The reflector container needs CAP_NET_RAW to open its AF_PACKET capture/inject sockets; this script
-# grants it on that container only. The prober containers send and receive plain UDP (broadcast /
-# multicast group membership), so they run unprivileged. Run the suite with Docker reachable, e.g.:
+# Each case stands up two isolated dual-stack segments (a source and a target), runs the reflector
+# straddling both with its interface names pinned to wol_src / wol_dst, then runs a sender prober on
+# one segment and a receiver prober on the other and asserts the traffic is (or is not) reflected
+# across. The default docker backend realizes segments as bridge networks and participants as
+# containers (reflector image built from ./Dockerfile, CAP_NET_RAW on that container only; probers
+# run unprivileged). The native backend (Linux, root) uses netns + veth pairs and plain processes
+# instead -- same cases, no Docker:
 #
 #   python3 e2e/run.py
 #   python3 e2e/run.py --case reflects_matching_magic_packet
 #   python3 e2e/run.py --skip-build --image reflector:e2e
+#   sudo python3 e2e/run.py --backend native --binary target/release/reflector
 
 from __future__ import annotations
 
 import argparse
 import ast
 import dataclasses
+import os
 import shutil
+import signal
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -850,36 +852,500 @@ def magic_packet_hex(mac: str) -> str:
     return (b"\xff" * 6 + octets * 16).hex()
 
 
-class DockerE2E:
+SEGMENTS = ("source", "target")
+
+
+class Backend:
+    # The execution environment for one case: two isolated dual-stack segments, the reflector
+    # straddling both, and single-homed probe helpers referenced by role name ("receiver",
+    # "sender", "device", ...). Docker realizes segments as bridge networks and participants as
+    # containers; native (Linux) as netns + veth pairs and plain processes. Runners hold case
+    # logic only and drive everything through this interface, so every case runs identically
+    # under both backends.
+
+    def __init__(self, args: argparse.Namespace, prefix: str) -> None:
+        self.args = args
+        self.prefix = prefix
+
+    def setup_segments(self) -> None:
+        raise NotImplementedError
+
+    def cleanup(self) -> None:
+        raise NotImplementedError
+
+    def keep_artifacts(self) -> str:
+        # What --keep-on-failure leaves behind, for the "keeping ..." message.
+        raise NotImplementedError
+
+    def abandon(self) -> None:
+        # Called instead of cleanup() on --keep-on-failure. Docker containers stay inspectable
+        # (and visible in `docker ps`) so the default keeps everything; the native backend kills
+        # its otherwise-invisible root processes -- the namespaces and log files hold the
+        # debuggable state.
+        pass
+
+    def start_reflector(self, config_path: Path) -> None:
+        raise NotImplementedError
+
+    def start_probe(
+        self, role: str, segment: str, ifname: str, probe_args: list[str], *, detach: bool = True
+    ) -> None:
+        # Run probe.py with `probe_args` single-homed on `segment`. detach=False blocks until
+        # exit and raises on a non-zero code.
+        raise NotImplementedError
+
+    def helper_ifname(self, requested: str) -> str:
+        # The interface name a helper on a segment actually sees (passed as probe --interface).
+        # Docker pins the requested name per container; native names every far end probe0.
+        raise NotImplementedError
+
+    def wait(self, role: str) -> int:
+        raise NotImplementedError
+
+    def logs(self, role: str) -> tuple[str, str]:
+        raise NotImplementedError
+
+    def status(self, role: str) -> tuple[bool, str]:
+        # (still running?, human-readable state) -- state is "unknown" when unavailable.
+        raise NotImplementedError
+
+    def remove(self, role: str) -> None:
+        raise NotImplementedError
+
+    def stop_reflector(self, grace_seconds: int) -> int:
+        # SIGTERM the reflector, allow `grace_seconds` for a clean exit (valgrind's leak
+        # analysis needs it), then kill; returns the exit code.
+        raise NotImplementedError
+
+    def admin(self, script: str, *, capture: bool = False) -> str:
+        # Run a shell script inside the reflector's network view (addr/route/sysctl mutation).
+        raise NotImplementedError
+
+    def reflector_ip(self, segment: str) -> str:
+        raise NotImplementedError
+
+    def probe_ip(self, role: str, segment: str) -> str:
+        raise NotImplementedError
+
+    def print_diagnostics(self) -> None:
+        raise NotImplementedError
+
+
+class DockerBackend(Backend):
+    def __init__(self, args: argparse.Namespace, prefix: str) -> None:
+        super().__init__(args, prefix)
+        self.networks = {segment: f"{prefix}-{segment}" for segment in SEGMENTS}
+        self.roles: dict[str, str] = {}  # role -> container name, in start order
+
+    @staticmethod
+    def require_available() -> None:
+        require_command("docker")
+
+    def setup_segments(self) -> None:
+        # Both networks are dual-stack: IPv4 cases are unaffected, and IPv6 cases need the
+        # bridges to carry IPv6 so the reflector can listen on / emit to ff02::1.
+        for segment in SEGMENTS:
+            docker(["network", "create", "--driver", "bridge", "--ipv6", self.networks[segment]])
+
+    def cleanup(self) -> None:
+        for container in reversed(self.roles.values()):
+            docker(["rm", "-f", container], check=False)
+        self.roles.clear()
+        for network in self.networks.values():
+            docker(["network", "rm", network], check=False)
+
+    def keep_artifacts(self) -> str:
+        return f"Docker resources {self.prefix}"
+
+    def start_reflector(self, config_path: Path) -> None:
+        container = f"{self.prefix}-reflector"
+        self.roles["reflector"] = container
+        # Pin in-container interface names per network. Without this, Docker's interface naming
+        # at start time is non-deterministic when multiple endpoints are attached, which made the
+        # reflector's SO_BINDTODEVICE land on the wrong bridge ~16% of runs. Using a non-"eth"
+        # prefix avoids the prefix-collision caveat in moby/moby#49155. Requires Docker 28.0+
+        # (the com.docker.network.endpoint.ifname driver-opt).
+        docker(
+            [
+                "create",
+                "--name",
+                container,
+                "--network",
+                f"name={self.networks['source']},driver-opt=com.docker.network.endpoint.ifname={REFLECTOR_SOURCE_IFNAME}",
+                "--network",
+                f"name={self.networks['target']},driver-opt=com.docker.network.endpoint.ifname={REFLECTOR_TARGET_IFNAME}",
+                # Skip Duplicate Address Detection on the link-local addresses. Without this the
+                # kernel's autogenerated fe80:: is tentative (unusable) when the reflector resolves
+                # at startup, so it falls back to the Docker-assigned ULA as its sole v6 source and
+                # never distinguishes link-local from routable -- masking the per-scope source
+                # selection. With DAD off the fe80:: is usable immediately, so v6 (link-local) and
+                # v6-routable (ULA) differ, as on a real interface.
+                "--sysctl",
+                "net.ipv6.conf.default.accept_dad=0",
+                "--cap-add",
+                "NET_RAW",
+                "--mount",
+                f"type=bind,source={config_path},target=/etc/reflector/config.toml,readonly",
+                self.args.image,
+                "/etc/reflector/config.toml",
+            ]
+        )
+        docker(["start", container])
+
+    def start_probe(
+        self, role: str, segment: str, ifname: str, probe_args: list[str], *, detach: bool = True
+    ) -> None:
+        container = f"{self.prefix}-{role}"
+        self.roles[role] = container
+        command = ["run"]
+        if detach:
+            command.append("-d")
+        command += [
+            "--name",
+            container,
+            # Pin the helper's interface name so the probe can scope multicast egress / group
+            # joins to it deterministically (see start_reflector for the rationale).
+            "--network",
+            f"name={self.networks[segment]},driver-opt=com.docker.network.endpoint.ifname={ifname}",
+            "--mount",
+            f"type=bind,source={E2E_DIR},target=/e2e,readonly",
+            self.args.helper_image,
+            "python3",
+            "/e2e/probe.py",
+            *probe_args,
+        ]
+        docker(command)
+
+    def helper_ifname(self, requested: str) -> str:
+        return requested
+
+    def wait(self, role: str) -> int:
+        return int(docker(["wait", self.roles[role]], echo=False).stdout.strip())
+
+    def logs(self, role: str) -> tuple[str, str]:
+        result = docker(["logs", self.roles[role]], check=False, echo=False)
+        return result.stdout, result.stderr
+
+    def status(self, role: str) -> tuple[bool, str]:
+        result = docker(
+            ["inspect", "-f", "{{.State.Running}} {{.State.ExitCode}}", self.roles[role]],
+            check=False,
+            echo=False,
+        )
+        if result.returncode != 0:
+            return True, "unknown"
+        state = result.stdout.strip()
+        return not state.startswith("false "), state
+
+    def remove(self, role: str) -> None:
+        container = self.roles.pop(role, None)
+        if container is not None:
+            docker(["rm", "-f", container], check=False, echo=False)
+
+    def stop_reflector(self, grace_seconds: int) -> int:
+        docker(["stop", "-t", str(grace_seconds), self.roles["reflector"]])
+        return self.wait("reflector")
+
+    def admin(self, script: str, *, capture: bool = False) -> str:
+        # Address/route changes need CAP_NET_ADMIN and a writable /proc/sys, which the reflector
+        # container (scratch image, NET_RAW only) has by neither. Run a throwaway privileged
+        # container in the reflector's network namespace, so `ip addr` / the disable_ipv6 sysctl
+        # act on the very interfaces the reflector watches -- without widening the reflector's
+        # own privileges.
+        result = docker([
+            "run", "--rm", "--privileged", "--network", f"container:{self.roles['reflector']}",
+            self.args.helper_image, "sh", "-ec", script,
+        ])
+        return result.stdout.strip() if capture else ""
+
+    def _container_ip(self, container: str, network: str) -> str:
+        fmt = '{{(index .NetworkSettings.Networks "' + network + '").IPAddress}}'
+        ip = docker(["inspect", "-f", fmt, container]).stdout.strip()
+        if not ip:
+            raise RuntimeError(f"no IPv4 address for {container} on {network}")
+        return ip
+
+    def reflector_ip(self, segment: str) -> str:
+        return self._container_ip(self.roles["reflector"], self.networks[segment])
+
+    def probe_ip(self, role: str, segment: str) -> str:
+        return self._container_ip(self.roles[role], self.networks[segment])
+
+    def print_diagnostics(self) -> None:
+        for role, container in self.roles.items():
+            inspect = docker(
+                ["inspect", "-f", "{{.State.Status}} {{.State.ExitCode}}", container], check=False
+            )
+            if inspect.returncode == 0:
+                print(f"{container}: {inspect.stdout.strip()}", file=sys.stderr, flush=True)
+
+            out, err = self.logs(role)
+            if out or err:
+                print(f"--- logs: {container} ---", file=sys.stderr, flush=True)
+                if out:
+                    print(out, end="", file=sys.stderr, flush=True)
+                if err:
+                    print(err, end="", file=sys.stderr, flush=True)
+
+        for network in self.networks.values():
+            inspect = docker(["network", "inspect", network], check=False)
+            if inspect.returncode == 0 and inspect.stdout:
+                print(f"--- network: {network} ---", file=sys.stderr, flush=True)
+                print(inspect.stdout, end="", file=sys.stderr, flush=True)
+
+
+# Native segment addressing: the RFC 5737 test networks for v4 and a ULA /64 per segment for
+# routable v6 (Docker's --ipv6 IPAM provided that implicitly; the kernel adds fe80:: itself).
+# The reflector is always host 1 and a segment's helper host 2, replacing Docker's IPAM
+# discovery with a fixed plan.
+NATIVE_V4_SUBNET = {"source": "192.0.2", "target": "198.51.100"}
+NATIVE_V6_PREFIX = {"source": "fd00:e2e0:1", "target": "fd00:e2e0:2"}
+NATIVE_REFLECTOR_HOST = 1
+NATIVE_HELPER_HOST = 2
+
+
+class NativeLinuxBackend(Backend):
+    # Segments as veth pairs between per-participant network namespaces: a dut namespace holds
+    # wol_src + wol_dst (so the checked-in configs work unchanged), and one persistent far
+    # namespace per segment holds the peer end, always named probe0. Every participant gets its
+    # own namespace for the same reasons Docker gave them one: wildcard binds and --expect-none
+    # windows must only see the segment's traffic, unicast to the reflector must cross the wire
+    # rather than short-circuit via lo, and the host's daemons (systemd-resolved speaks mDNS)
+    # must not reach the test wires. Successive probe processes for a case run inside the same
+    # far namespace: the reflector caches its ifindexes at startup, so the veth ends on its side
+    # must never be recreated -- probes respawn, namespaces persist.
+    #
+    # Fidelity gap vs the docker backend: the reflector runs here with the harness's full root
+    # privileges, not the CAP_NET_RAW-only confinement of the scratch container -- a change that
+    # grows a privilege requirement passes natively and only fails in the docker lane. CI runs
+    # both, so the docker lane stays the privilege-contract gate.
+    REFLECTOR_IFNAMES = {"source": REFLECTOR_SOURCE_IFNAME, "target": REFLECTOR_TARGET_IFNAME}
+
+    def __init__(self, args: argparse.Namespace, prefix: str) -> None:
+        super().__init__(args, prefix)
+        self.ns = {"dut": f"{prefix}-dut", "source": f"{prefix}-src", "target": f"{prefix}-dst"}
+        self.procs: dict[str, subprocess.Popen[bytes]] = {}
+        self.logdir = Path(tempfile.mkdtemp(prefix=f"{prefix}-"))
+
+    @staticmethod
+    def require_available() -> None:
+        if sys.platform != "linux":
+            raise RuntimeError("--backend native currently requires Linux (netns + veth)")
+        require_command("ip")
+        if os.geteuid() != 0:
+            raise RuntimeError("--backend native requires root (netns/veth setup, CAP_NET_RAW)")
+        # probe.py catches socket timeouts as TimeoutError, which socket.timeout only aliases
+        # from 3.10 on; the docker backend pins python:3.13 but here probes run on this
+        # interpreter.
+        if sys.version_info < (3, 10):
+            raise RuntimeError("--backend native requires Python >= 3.10")
+
+    def _ip(self, args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return run_command(["ip", *args], **kwargs)  # type: ignore[arg-type]
+
+    def setup_segments(self) -> None:
+        for ns in self.ns.values():
+            self._ip(["netns", "add", ns])
+            # DAD off before any interface exists, so both the fe80:: and the ULA are usable the
+            # moment they appear (the Docker backend does the same via --sysctl; here the probes
+            # get it too, removing the startup race for their v6 sends).
+            run_command([
+                "ip", "netns", "exec", ns, "sh", "-ec",
+                "echo 0 > /proc/sys/net/ipv6/conf/default/accept_dad; "
+                "echo 0 > /proc/sys/net/ipv6/conf/all/accept_dad",
+            ])
+            self._ip(["-n", ns, "link", "set", "lo", "up"])
+
+        for segment in SEGMENTS:
+            dut_ifname = self.REFLECTOR_IFNAMES[segment]
+            self._ip([
+                "link", "add", dut_ifname, "netns", self.ns["dut"],
+                "type", "veth", "peer", "name", RECEIVER_IFNAME, "netns", self.ns[segment],
+            ])
+            v4, v6 = NATIVE_V4_SUBNET[segment], NATIVE_V6_PREFIX[segment]
+            dut, far = self.ns["dut"], self.ns[segment]
+            self._ip(["-n", dut, "addr", "add", f"{v4}.{NATIVE_REFLECTOR_HOST}/24", "dev", dut_ifname])
+            self._ip(["-n", dut, "addr", "add", f"{v6}::{NATIVE_REFLECTOR_HOST}/64", "dev", dut_ifname])
+            self._ip(["-n", far, "addr", "add", f"{v4}.{NATIVE_HELPER_HOST}/24", "dev", RECEIVER_IFNAME])
+            self._ip(["-n", far, "addr", "add", f"{v6}::{NATIVE_HELPER_HOST}/64", "dev", RECEIVER_IFNAME])
+            self._ip(["-n", dut, "link", "set", dut_ifname, "up"])
+            self._ip(["-n", far, "link", "set", RECEIVER_IFNAME, "up"])
+            # The probe's 255.255.255.255 sends are routed, not interface-pinned; single-homed
+            # plus this default route pins them to the segment (Docker's IPAM gateway did this).
+            self._ip(["-n", far, "route", "add", "default", "dev", RECEIVER_IFNAME])
+
+        self._wait_carrier()
+
+    def _wait_carrier(self) -> None:
+        # A veth reports operstate "up" only once BOTH ends are up; don't start the reflector
+        # (or probes) on a link that hasn't settled.
+        pending = [(self.ns["dut"], ifname) for ifname in self.REFLECTOR_IFNAMES.values()]
+        pending += [(self.ns[segment], RECEIVER_IFNAME) for segment in SEGMENTS]
+        deadline = time.monotonic() + 5.0
+        for ns, ifname in pending:
+            while True:
+                state = run_command(
+                    ["ip", "netns", "exec", ns, "cat", f"/sys/class/net/{ifname}/operstate"],
+                    echo=False,
+                ).stdout.strip()
+                if state == "up":
+                    break
+                if time.monotonic() > deadline:
+                    raise RuntimeError(f"{ns}/{ifname} never reached operstate up (last: {state})")
+                time.sleep(0.05)
+
+    def cleanup(self) -> None:
+        for proc in self.procs.values():
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        self.procs.clear()
+        for ns in self.ns.values():
+            run_command(["ip", "netns", "del", ns], check=False, echo=False)
+        shutil.rmtree(self.logdir, ignore_errors=True)
+
+    def keep_artifacts(self) -> str:
+        return f"namespaces {', '.join(self.ns.values())} and logs in {self.logdir}"
+
+    def abandon(self) -> None:
+        # Keep the namespaces and logs, but don't leave root daemons running unwatched.
+        for proc in self.procs.values():
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        self.procs.clear()
+
+    def _spawn(self, role: str, command: list[str]) -> None:
+        self.remove(role)
+        print(f"+ {format_command(command)}", flush=True)
+        # Scrub REFLECTOR_* so the daemon sees only its config file, as it would in the docker
+        # backend's clean container env -- a stray host REFLECTOR_LOG_LEVEL (or worse, an env
+        # reflector entry) must not alter the system under test.
+        env = {key: value for key, value in os.environ.items() if not key.startswith("REFLECTOR_")}
+        out = open(self.logdir / f"{role}.out", "wb")
+        err = open(self.logdir / f"{role}.err", "wb")
+        try:
+            self.procs[role] = subprocess.Popen(command, cwd=REPO_ROOT, stdout=out, stderr=err, env=env)
+        finally:
+            out.close()
+            err.close()
+
+    def start_reflector(self, config_path: Path) -> None:
+        self._spawn(
+            "reflector",
+            ["ip", "netns", "exec", self.ns["dut"], str(self.args.binary), str(config_path)],
+        )
+
+    def start_probe(
+        self, role: str, segment: str, ifname: str, probe_args: list[str], *, detach: bool = True
+    ) -> None:
+        del ifname  # the far end is always probe0; the caller got that from helper_ifname()
+        command = [
+            "ip", "netns", "exec", self.ns[segment],
+            sys.executable, str(E2E_DIR / "probe.py"), *probe_args,
+        ]
+        self._spawn(role, command)
+        if not detach:
+            code = self.procs[role].wait()
+            if code != 0:
+                out, err = self.logs(role)
+                raise RuntimeError(f"{role} failed with exit code {code}\n{out}{err}")
+
+    def helper_ifname(self, requested: str) -> str:
+        del requested
+        return RECEIVER_IFNAME
+
+    def wait(self, role: str) -> int:
+        return self.procs[role].wait()
+
+    def logs(self, role: str) -> tuple[str, str]:
+        def read(suffix: str) -> str:
+            path = self.logdir / f"{role}.{suffix}"
+            return path.read_text(errors="replace") if path.exists() else ""
+
+        return read("out"), read("err")
+
+    def status(self, role: str) -> tuple[bool, str]:
+        proc = self.procs.get(role)
+        if proc is None:
+            return True, "unknown"
+        if proc.poll() is None:
+            return True, "running"
+        return False, f"exited {proc.returncode}"
+
+    def remove(self, role: str) -> None:
+        proc = self.procs.pop(role, None)
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+    def stop_reflector(self, grace_seconds: int) -> int:
+        proc = self.procs["reflector"]
+        if proc.poll() is None:
+            proc.send_signal(signal.SIGTERM)
+            try:
+                proc.wait(timeout=grace_seconds)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        return proc.returncode
+
+    def admin(self, script: str, *, capture: bool = False) -> str:
+        # The harness already runs as root, so the reflector's network view is one netns exec
+        # away -- no privileged sidecar needed.
+        result = run_command(["ip", "netns", "exec", self.ns["dut"], "sh", "-ec", script])
+        return result.stdout.strip() if capture else ""
+
+    def reflector_ip(self, segment: str) -> str:
+        return f"{NATIVE_V4_SUBNET[segment]}.{NATIVE_REFLECTOR_HOST}"
+
+    def probe_ip(self, role: str, segment: str) -> str:
+        del role  # one helper per segment; the plan gives them all the same host number
+        return f"{NATIVE_V4_SUBNET[segment]}.{NATIVE_HELPER_HOST}"
+
+    def print_diagnostics(self) -> None:
+        for logfile in sorted(self.logdir.iterdir()):
+            text = logfile.read_text(errors="replace")
+            if text:
+                print(f"--- logs: {logfile.name} ---", file=sys.stderr, flush=True)
+                print(text, end="", file=sys.stderr, flush=True)
+        for ns in self.ns.values():
+            result = run_command(["ip", "-n", ns, "addr", "show"], check=False, echo=False)
+            if result.returncode == 0 and result.stdout:
+                print(f"--- netns: {ns} ---", file=sys.stderr, flush=True)
+                print(result.stdout, end="", file=sys.stderr, flush=True)
+
+
+def make_backend(args: argparse.Namespace, prefix: str) -> Backend:
+    if args.backend == "native":
+        return NativeLinuxBackend(args, prefix)
+    return DockerBackend(args, prefix)
+
+
+class CaseRunner:
     def __init__(self, args: argparse.Namespace, case: TestCase) -> None:
         self.args = args
         self.case = case
         self.prefix = f"reflector-e2e-{case.name.replace('_', '-')}-{uuid.uuid4().hex[:8]}"
-        self.source_network = f"{self.prefix}-source"
-        self.target_network = f"{self.prefix}-target"
-        self.reflector_container = f"{self.prefix}-reflector"
-        self.receiver_container = f"{self.prefix}-receiver"
-        self.sender_container = f"{self.prefix}-sender"
-        self.containers = [self.sender_container, self.receiver_container, self.reflector_container]
-        self.networks = [self.source_network, self.target_network]
+        self.backend = make_backend(args, self.prefix)
         self.config_path = E2E_DIR / case.config
 
         self._select_direction(case.direction)
 
     def _select_direction(self, direction: str) -> None:
-        # The sender lives on the network the traffic originates from and the receiver on the other;
-        # "reverse" swaps which is which. The receiver's interface is pinned so the probe can join the
-        # multicast group on it. The address-change runner re-selects per phase (its phases differ in
-        # direction), so this stays a method rather than inline __init__ code.
+        # The sender lives on the segment the traffic originates from and the receiver on the
+        # other; "reverse" swaps which is which. The receiver's interface is pinned so the probe
+        # can join the multicast group on it. The address-change runner re-selects per phase (its
+        # phases differ in direction), so this stays a method rather than inline __init__ code.
         if direction == "reverse":
-            self.sender_network, self.sender_ifname = self.target_network, REFLECTOR_TARGET_IFNAME
-            self.receiver_network = self.source_network
+            self.sender_segment, self.sender_ifname = "target", REFLECTOR_TARGET_IFNAME
+            self.receiver_segment = "source"
         else:
-            self.sender_network, self.sender_ifname = self.source_network, REFLECTOR_SOURCE_IFNAME
-            self.receiver_network = self.target_network
+            self.sender_segment, self.sender_ifname = "source", REFLECTOR_SOURCE_IFNAME
+            self.receiver_segment = "target"
         self.receiver_ifname = RECEIVER_IFNAME
 
-    def __enter__(self) -> DockerE2E:
+    def __enter__(self) -> CaseRunner:
         return self
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> bool:
@@ -887,111 +1353,61 @@ class DockerE2E:
             self.print_diagnostics()
 
         if exc_type is not None and self.args.keep_on_failure:
-            print(f"keeping Docker resources for failed case {self.case.name}: {self.prefix}", flush=True)
+            self.backend.abandon()
+            print(
+                f"keeping resources for failed case {self.case.name}: {self.backend.keep_artifacts()}",
+                flush=True,
+            )
             return False
 
-        self.cleanup()
+        self.backend.cleanup()
         return False
 
-    def cleanup(self) -> None:
-        for container in self.containers:
-            docker(["rm", "-f", container], check=False)
-        for network in self.networks:
-            docker(["network", "rm", network], check=False)
-
     def check_reflector_valgrind(self) -> None:
-        # SIGTERM the reflector so it shuts down cleanly and valgrind runs its leak analysis, then read its
-        # exit code: the image's --error-exitcode=1 fires on any leak, leaked fd, or memcheck error.
-        docker(["stop", "-t", str(VALGRIND_STOP_GRACE_SECONDS), self.reflector_container])
-        exit_code = docker(["wait", self.reflector_container]).stdout.strip()
-        if exit_code != "0":
+        # SIGTERM the reflector so it shuts down cleanly and valgrind runs its leak analysis, then
+        # read its exit code: the image's --error-exitcode=1 fires on any leak, leaked fd, or
+        # memcheck error.
+        exit_code = self.backend.stop_reflector(VALGRIND_STOP_GRACE_SECONDS)
+        if exit_code != 0:
             print(f"\n--- valgrind report: {self.case.name} ---", file=sys.stderr, flush=True)
-            report = docker(["logs", self.reflector_container], check=False)
-            if report.stderr:
-                print(report.stderr, end="", file=sys.stderr, flush=True)
+            _, err = self.backend.logs("reflector")
+            if err:
+                print(err, end="", file=sys.stderr, flush=True)
             raise RuntimeError(
                 f"valgrind reported errors in case {self.case.name} (reflector exited {exit_code})"
             )
 
-    def setup_networks(self) -> None:
-        # Both networks are dual-stack: IPv4 cases are unaffected, and IPv6 cases need the bridges to
-        # carry IPv6 so the reflector can listen on / emit to ff02::1.
-        docker(["network", "create", "--driver", "bridge", "--ipv6", self.source_network])
-        docker(["network", "create", "--driver", "bridge", "--ipv6", self.target_network])
-
     def start_reflector(self) -> None:
-        # Pin in-container interface names per network. Without this, Docker's interface naming at start
-        # time is non-deterministic when multiple endpoints are attached, which made the reflector's
-        # SO_BINDTODEVICE land on the wrong bridge ~16% of runs. Using a non-"eth" prefix avoids the
-        # prefix-collision caveat in moby/moby#49155. Requires Docker 28.0+ (the
-        # com.docker.network.endpoint.ifname driver-opt).
-        docker(
-            [
-                "create",
-                "--name",
-                self.reflector_container,
-                "--network",
-                f"name={self.source_network},driver-opt=com.docker.network.endpoint.ifname={REFLECTOR_SOURCE_IFNAME}",
-                "--network",
-                f"name={self.target_network},driver-opt=com.docker.network.endpoint.ifname={REFLECTOR_TARGET_IFNAME}",
-                # Skip Duplicate Address Detection on the link-local addresses. Without this the
-                # kernel's autogenerated fe80:: is tentative (unusable) when the reflector resolves at
-                # startup, so it falls back to the Docker-assigned ULA as its sole v6 source and never
-                # distinguishes link-local from routable -- masking the per-scope source selection. With
-                # DAD off the fe80:: is usable immediately, so v6 (link-local) and v6-routable (ULA)
-                # differ, as on a real interface.
-                "--sysctl",
-                "net.ipv6.conf.default.accept_dad=0",
-                "--cap-add",
-                "NET_RAW",
-                "--mount",
-                f"type=bind,source={self.config_path},target=/etc/reflector/config.toml,readonly",
-                self.args.image,
-                "/etc/reflector/config.toml",
-            ]
-        )
-        docker(["start", self.reflector_container])
+        self.backend.start_reflector(self.config_path)
         self.wait_for_reflector()
 
-    def wait_for_container_log(self, container: str, marker: str, description: str) -> None:
+    def wait_for_log(self, role: str, marker: str, description: str) -> None:
         deadline = time.monotonic() + CONTAINER_READY_TIMEOUT_SECONDS
         last_state = "unknown"
         while time.monotonic() < deadline:
-            logs = docker(["logs", container], check=False, echo=False)
-            if marker in f"{logs.stdout}{logs.stderr}":
+            out, err = self.backend.logs(role)
+            if marker in f"{out}{err}":
                 return
 
-            result = docker(
-                ["inspect", "-f", "{{.State.Running}} {{.State.ExitCode}}", container],
-                check=False,
-                echo=False,
-            )
-            if result.returncode == 0:
-                last_state = result.stdout.strip()
-                if last_state.startswith("false "):
-                    raise RuntimeError(f"{description} exited before becoming ready: {last_state}")
+            running, state = self.backend.status(role)
+            if state != "unknown":
+                last_state = state
+            if not running:
+                raise RuntimeError(f"{description} exited before becoming ready: {last_state}")
 
             time.sleep(0.1)
 
-        raise RuntimeError(f"timed out waiting for {description} readiness marker ({marker}); last state: {last_state}")
+        raise RuntimeError(
+            f"timed out waiting for {description} readiness marker ({marker}); last state: {last_state}"
+        )
 
     def wait_for_reflector(self) -> None:
-        self.wait_for_container_log(self.reflector_container, REFLECTOR_READY_LOG, "reflector")
+        self.wait_for_log("reflector", REFLECTOR_READY_LOG, "reflector")
 
     def start_receiver(self, case: TestCase | None = None) -> None:
         case = case or self.case
-        command = [
-            "run",
-            "-d",
-            "--name",
-            self.receiver_container,
-            "--network",
-            f"name={self.receiver_network},driver-opt=com.docker.network.endpoint.ifname={self.receiver_ifname}",
-            "--mount",
-            f"type=bind,source={E2E_DIR},target=/e2e,readonly",
-            self.args.helper_image,
-            "python3",
-            "/e2e/probe.py",
+        ifname = self.backend.helper_ifname(self.receiver_ifname)
+        probe_args = [
             "receive",
             "--port",
             str(case.receive_port),
@@ -999,23 +1415,23 @@ class DockerE2E:
             str(case.timeout_seconds),
         ]
         if case.expect_payload_hex is not None:
-            command.extend(["--expect-payload-hex", case.expect_payload_hex])
+            probe_args.extend(["--expect-payload-hex", case.expect_payload_hex])
         elif case.expect_mac is not None:
-            command.extend(["--expect-mac", case.expect_mac])
+            probe_args.extend(["--expect-mac", case.expect_mac])
         else:
-            command.append("--expect-none")
+            probe_args.append("--expect-none")
 
-        command.extend(["--family", str(case.family)])
+        probe_args.extend(["--family", str(case.family)])
         if case.group is not None:
-            command.extend(["--join-group", case.group, "--interface", self.receiver_ifname])
+            probe_args.extend(["--join-group", case.group, "--interface", ifname])
         if case.expect_routable_source:
-            command.append("--expect-source-not-link-local")
+            probe_args.append("--expect-source-not-link-local")
 
-        docker(command)
+        self.backend.start_probe("receiver", self.receiver_segment, ifname, probe_args)
         self.wait_for_receiver()
 
     def wait_for_receiver(self) -> None:
-        self.wait_for_container_log(self.receiver_container, RECEIVER_READY_LOG, "receiver")
+        self.wait_for_log("receiver", RECEIVER_READY_LOG, "receiver")
 
     def run_sender(self, case: TestCase | None = None) -> None:
         case = case or self.case
@@ -1026,20 +1442,12 @@ class DockerE2E:
         else:
             raise RuntimeError(f"case {case.name} has no send payload")
 
-        docker(
+        ifname = self.backend.helper_ifname(self.sender_ifname)
+        self.backend.start_probe(
+            "sender",
+            self.sender_segment,
+            ifname,
             [
-                "run",
-                "--name",
-                self.sender_container,
-                # Pin the sender's interface name so the probe can scope multicast egress to it
-                # deterministically (see start_reflector for the rationale).
-                "--network",
-                f"name={self.sender_network},driver-opt=com.docker.network.endpoint.ifname={self.sender_ifname}",
-                "--mount",
-                f"type=bind,source={E2E_DIR},target=/e2e,readonly",
-                self.args.helper_image,
-                "python3",
-                "/e2e/probe.py",
                 "send",
                 *payload_args,
                 "--port",
@@ -1047,91 +1455,63 @@ class DockerE2E:
                 "--address",
                 case.send_address,
                 "--interface",
-                self.sender_ifname,
-            ]
+                ifname,
+            ],
+            detach=False,
         )
 
     def wait_for_result(self) -> None:
-        result = docker(["wait", self.receiver_container])
-        exit_code = result.stdout.strip()
-        logs = docker(["logs", self.receiver_container], check=False)
-        if logs.stdout:
-            print(logs.stdout, end="", flush=True)
-        if logs.stderr:
-            print(logs.stderr, end="", file=sys.stderr, flush=True)
+        exit_code = self.backend.wait("receiver")
+        out, err = self.backend.logs("receiver")
+        if out:
+            print(out, end="", flush=True)
+        if err:
+            print(err, end="", file=sys.stderr, flush=True)
 
-        if exit_code != "0":
+        if exit_code != 0:
             raise RuntimeError(f"receiver failed with exit code {exit_code}")
 
     def print_reflector_logs(self) -> None:
-        logs = docker(["logs", self.reflector_container], check=False)
+        out, err = self.backend.logs("reflector")
         print(f"--- reflector logs: {self.case.name} ---", flush=True)
-        if logs.stdout:
-            print(logs.stdout, end="", flush=True)
-        if logs.stderr:
-            print(logs.stderr, end="", file=sys.stderr, flush=True)
-        if not logs.stdout and not logs.stderr:
+        if out:
+            print(out, end="", flush=True)
+        if err:
+            print(err, end="", file=sys.stderr, flush=True)
+        if not out and not err:
             print("<empty>", flush=True)
-
-    def _sidecar(self, script: str, *, capture: bool = False) -> str:
-        # Address changes need CAP_NET_ADMIN and a writable /proc/sys, which the reflector container
-        # (scratch image, NET_RAW only) has by neither. Run a throwaway privileged container in the
-        # reflector's network namespace, so `ip addr` / the disable_ipv6 sysctl act on the very
-        # interfaces the reflector watches -- without widening the reflector's own privileges.
-        result = docker([
-            "run", "--rm", "--privileged", "--network", f"container:{self.reflector_container}",
-            self.args.helper_image, "sh", "-ec", script,
-        ])
-        return result.stdout.strip() if capture else ""
 
     def _set_address(
         self, interface: str, family: int, *, up: bool, cidr: str | None = None
     ) -> str | None:
-        # Bring one (interface, family) source address down or back up. IPv6 toggles the disable_ipv6
-        # sysctl (which drops every v6 address and, on re-enable, lets the kernel regenerate a usable
-        # link-local); v4 has no equivalent, so it deletes and later re-adds the exact CIDR. Returns
-        # the removed v4 CIDR so the caller can restore it.
+        # Bring one (interface, family) source address down or back up. IPv6 toggles the
+        # disable_ipv6 sysctl (which drops every v6 address and, on re-enable, lets the kernel
+        # regenerate a usable link-local); v4 has no equivalent, so it deletes and later re-adds
+        # the exact CIDR. Returns the removed v4 CIDR so the caller can restore it.
         ifname = REFLECTOR_SOURCE_IFNAME if interface == "source" else REFLECTOR_TARGET_IFNAME
         if family == 6:
-            self._sidecar(f"echo {0 if up else 1} > /proc/sys/net/ipv6/conf/{ifname}/disable_ipv6")
+            self.backend.admin(f"echo {0 if up else 1} > /proc/sys/net/ipv6/conf/{ifname}/disable_ipv6")
             return None
         if up:
             if cidr is None:
                 raise RuntimeError("restoring an IPv4 address requires the CIDR captured on removal")
-            self._sidecar(f"ip addr add {cidr} dev {ifname}")
+            self.backend.admin(f"ip addr add {cidr} dev {ifname}")
             return cidr
-        captured = self._sidecar(
+        captured = self.backend.admin(
             f"ip -o -4 addr show dev {ifname} | awk '/inet /{{print $4; exit}}'", capture=True
         )
         if not captured:
             raise RuntimeError(f"no IPv4 address on {ifname} to remove")
-        self._sidecar(f"ip addr del {captured} dev {ifname}")
+        self.backend.admin(f"ip addr del {captured} dev {ifname}")
         return captured
 
     def print_diagnostics(self) -> None:
         print(f"\n--- diagnostics for {self.case.name} ({self.prefix}) ---", file=sys.stderr, flush=True)
-        for container in self.containers:
-            inspect = docker(["inspect", "-f", "{{.State.Status}} {{.State.ExitCode}}", container], check=False)
-            if inspect.returncode == 0:
-                print(f"{container}: {inspect.stdout.strip()}", file=sys.stderr, flush=True)
-
-            logs = docker(["logs", container], check=False)
-            if logs.stdout or logs.stderr:
-                print(f"--- logs: {container} ---", file=sys.stderr, flush=True)
-                if logs.stdout:
-                    print(logs.stdout, end="", file=sys.stderr, flush=True)
-                if logs.stderr:
-                    print(logs.stderr, end="", file=sys.stderr, flush=True)
-
-        for network in self.networks:
-            inspect = docker(["network", "inspect", network], check=False)
-            if inspect.returncode == 0 and inspect.stdout:
-                print(f"--- network: {network} ---", file=sys.stderr, flush=True)
-                print(inspect.stdout, end="", file=sys.stderr, flush=True)
+        self.backend.print_diagnostics()
 
     def run(self) -> None:
         print(f"\n=== {self.case.name} ===", flush=True)
-        self.setup_networks()
+        self.backend.setup_segments()
         self.start_reflector()
         self.start_receiver()
         self.run_sender()
@@ -1142,71 +1522,65 @@ class DockerE2E:
             self.print_reflector_logs()
 
 
-class DockerRoundTrip(DockerE2E):
-    # The SSDP M-SEARCH round trip: a searcher on the source segment sends an M-SEARCH; the reflector
-    # relays it to the group on the target from a reserved port; a responder (device) on the target
-    # unicasts a 200 OK back to that reserved port; the reflector proxies the reply to the searcher. The
-    # negative case (expect_reply=False) starts no responder and asserts the searcher hears nothing -- the
-    # reflector must not fabricate a reply.
+class RoundTripRunner(CaseRunner):
+    # The SSDP M-SEARCH round trip: a searcher on the source segment sends an M-SEARCH; the
+    # reflector relays it to the group on the target from a reserved port; a responder (device)
+    # on the target unicasts a 200 OK back to that reserved port; the reflector proxies the reply
+    # to the searcher. The negative case (expect_reply=False) starts no responder and asserts the
+    # searcher hears nothing -- the reflector must not fabricate a reply.
     def __init__(self, args: argparse.Namespace, case: RoundTripCase) -> None:
-        # The base __init__ only reads case.name and case.direction; a TestCase shim reuses all its
-        # network/reflector setup + cleanup with no duplication.
+        # The base __init__ only reads case.name and case.direction; a TestCase shim reuses all
+        # its segment/reflector setup + cleanup with no duplication.
         shim = TestCase(name=case.name, send_port=case.port, receive_port=case.port,
             expect_mac=None, timeout_seconds=case.timeout_seconds, family=case.family,
             group=case.group, direction="forward", config=case.config)
         super().__init__(args, shim)
         self.rt = case
-        self.responder_container = f"{self.prefix}-responder"
-        self.searcher_container = f"{self.prefix}-searcher"
-        self.containers = [self.searcher_container, self.responder_container, self.reflector_container]
 
     def start_responder(self) -> None:
-        docker([
-            "run", "-d", "--name", self.responder_container,
-            "--network", f"name={self.target_network},driver-opt=com.docker.network.endpoint.ifname={RECEIVER_IFNAME}",
-            "--mount", f"type=bind,source={E2E_DIR},target=/e2e,readonly",
-            self.args.helper_image, "python3", "/e2e/probe.py", "respond",
+        ifname = self.backend.helper_ifname(RECEIVER_IFNAME)
+        self.backend.start_probe("responder", "target", ifname, [
+            "respond",
             "--port", str(self.rt.port), "--timeout", str(self.rt.timeout_seconds),
             "--family", str(self.rt.family), "--join-group", self.rt.group,
-            "--interface", RECEIVER_IFNAME, "--reply-hex", self.rt.reply_hex,
+            "--interface", ifname, "--reply-hex", self.rt.reply_hex,
         ])
-        self.wait_for_container_log(self.responder_container, "responder ready", "responder")
+        self.wait_for_log("responder", "responder ready", "responder")
 
     def run_searcher(self) -> None:
         expectation = ["--expect-payload-hex", self.rt.reply_hex] if self.rt.expect_reply else ["--expect-none"]
-        docker([
-            "run", "-d", "--name", self.searcher_container,
-            "--network", f"name={self.source_network},driver-opt=com.docker.network.endpoint.ifname={REFLECTOR_SOURCE_IFNAME}",
-            "--mount", f"type=bind,source={E2E_DIR},target=/e2e,readonly",
-            self.args.helper_image, "python3", "/e2e/probe.py", "search",
+        ifname = self.backend.helper_ifname(REFLECTOR_SOURCE_IFNAME)
+        self.backend.start_probe("searcher", "source", ifname, [
+            "search",
             "--source-port", str(SEARCHER_SOURCE_PORT), "--port", str(self.rt.port),
-            "--address", self.rt.group, "--interface", REFLECTOR_SOURCE_IFNAME,
+            "--address", self.rt.group, "--interface", ifname,
             "--family", str(self.rt.family), "--payload-hex", self.rt.probe_hex,
             "--timeout", str(self.rt.timeout_seconds), *expectation,
         ])
 
     def wait_for_searcher(self) -> None:
-        exit_code = docker(["wait", self.searcher_container]).stdout.strip()
-        logs = docker(["logs", self.searcher_container], check=False)
-        if logs.stdout:
-            print(logs.stdout, end="", flush=True)
-        if logs.stderr:
-            print(logs.stderr, end="", file=sys.stderr, flush=True)
-        if exit_code != "0":
+        exit_code = self.backend.wait("searcher")
+        out, err = self.backend.logs("searcher")
+        if out:
+            print(out, end="", flush=True)
+        if err:
+            print(err, end="", file=sys.stderr, flush=True)
+        if exit_code != 0:
             raise RuntimeError(f"searcher failed with exit code {exit_code}")
 
     def run(self) -> None:
         print(f"\n=== {self.rt.name} ===", flush=True)
-        self.setup_networks()
+        self.backend.setup_segments()
         self.start_reflector()
         if self.rt.expect_reply:
             self.start_responder()  # must be listening before the search goes out
         self.run_searcher()
         self.wait_for_searcher()
-        # The per-searcher session must be torn down once it expires (SSDP: MX 2 + 2s grace ~= 4s; WSD:
-        # a fixed 5s window): the deadline timer sweeps it, drops its port reservation, and unregisters
-        # its response capture -- logged by the reflector. wait_for_container_log raises if it never fires.
-        self.wait_for_container_log(self.reflector_container, self.rt.evict_log, "session eviction")
+        # The per-searcher session must be torn down once it expires (SSDP: MX 2 + 2s grace ~= 4s;
+        # WSD: a fixed 5s window): the deadline timer sweeps it, drops its port reservation, and
+        # unregisters its response capture -- logged by the reflector. wait_for_log raises if it
+        # never fires.
+        self.wait_for_log("reflector", self.rt.evict_log, "session eviction")
         print(f"{self.rt.name}: session evicted after expiry", flush=True)
         print(f"PASS {self.rt.name}", flush=True)
         if self.args.show_reflector_logs:
@@ -1214,7 +1588,7 @@ class DockerRoundTrip(DockerE2E):
             self.print_reflector_logs()
 
 
-class DockerDial(DockerE2E):
+class DialRunner(CaseRunner):
     def __init__(self, args: argparse.Namespace, case: DialCase) -> None:
         shim = TestCase(name=case.name, send_port=SSDP_PORT, receive_port=SSDP_PORT,
             expect_mac=None, timeout_seconds=case.timeout_seconds, family=case.family,
@@ -1222,90 +1596,84 @@ class DockerDial(DockerE2E):
         super().__init__(args, shim)
         self.dial = case
         # The DIAL reflector loads a config with a single DIAL entry. The shared config's any-MAC
-        # [reflectors.discovery] entry also reflects SSDP, which would double-reflect the device's 200 OK
-        # (only one copy rewritten) -- so the DIAL case gets its own config to keep the relayed reply unambiguous.
+        # [reflectors.discovery] entry also reflects SSDP, which would double-reflect the device's
+        # 200 OK (only one copy rewritten) -- so the DIAL case gets its own config to keep the
+        # relayed reply unambiguous.
         self.config_path = E2E_DIR / "config-dial.toml"
-        self.device_container = f"{self.prefix}-device"
-        self.client_container = f"{self.prefix}-client"
-        self.containers = [self.client_container, self.device_container, self.reflector_container]
-
-    def container_ip(self, container: str, network: str) -> str:
-        fmt = '{{(index .NetworkSettings.Networks "' + network + '").IPAddress}}'
-        ip = docker(["inspect", "-f", fmt, container]).stdout.strip()
-        if not ip:
-            raise RuntimeError(f"no IPv4 address for {container} on {network}")
-        return ip
 
     def start_device(self) -> None:
-        # Single-homed on the target network: the device's HTTP endpoints are reachable only via the
-        # reflector's egress-pinned upstream connect, so the peer it records is the reflector's target_if
-        # address -- never the source-side client (which cannot route to the target subnet directly).
-        cmd = [
-            "run", "-d", "--name", self.device_container,
-            "--network", f"name={self.target_network},driver-opt=com.docker.network.endpoint.ifname={RECEIVER_IFNAME}",
-            "--mount", f"type=bind,source={E2E_DIR},target=/e2e,readonly",
-            self.args.helper_image, "python3", "/e2e/probe.py", "dial-device",
+        # Single-homed on the target segment: the device's HTTP endpoints are reachable only via
+        # the reflector's egress-pinned upstream connect, so the peer it records is the
+        # reflector's target_if address -- never the source-side client (which cannot route to the
+        # target subnet directly).
+        ifname = self.backend.helper_ifname(RECEIVER_IFNAME)
+        probe_args = [
+            "dial-device",
             "--port", str(SSDP_PORT), "--join-group", self.dial.group,
-            "--interface", RECEIVER_IFNAME, "--family", str(self.dial.family),
+            "--interface", ifname, "--family", str(self.dial.family),
             "--timeout", str(self.dial.timeout_seconds), "--serve-seconds", str(self.dial.serve_seconds),
         ]
         if self.dial.passive:
-            cmd.append("--notify")
+            probe_args.append("--notify")
         if self.dial.unreachable:
-            cmd.append("--unreachable")
-        docker(cmd)
-        self.wait_for_container_log(self.device_container, "dial-device ready", "dial-device")
+            probe_args.append("--unreachable")
+        self.backend.start_probe("device", "target", ifname, probe_args)
+        self.wait_for_log("device", "dial-device ready", "dial-device")
 
-    def run_client(self) -> None:
-        # The client is single-homed on the source network. It is told the reflector's source_if address
-        # (what the rewritten authorities must point at) and the device's true target_if address (which
-        # must never leak through a rewrite). Both are read after the containers attached to their nets.
-        device_target_ip = self.container_ip(self.device_container, self.target_network)
-        refl_source_ip = self.container_ip(self.reflector_container, self.source_network)
-        cmd = [
-            "run", "-d", "--name", self.client_container,
-            "--network", f"name={self.source_network},driver-opt=com.docker.network.endpoint.ifname={REFLECTOR_SOURCE_IFNAME}",
-            "--mount", f"type=bind,source={E2E_DIR},target=/e2e,readonly",
-            self.args.helper_image, "python3", "/e2e/probe.py", "dial-client",
-            "--port", str(SSDP_PORT), "--address", self.dial.group, "--interface", REFLECTOR_SOURCE_IFNAME,
+    def _client_args(self, reflector_authority: str, device_authority: str) -> list[str]:
+        # The client is single-homed on the source segment. It is told the reflector's source_if
+        # address (what the rewritten authorities must point at) and the device's true target_if
+        # address (which must never leak through a rewrite).
+        ifname = self.backend.helper_ifname(REFLECTOR_SOURCE_IFNAME)
+        probe_args = [
+            "dial-client",
+            "--port", str(SSDP_PORT), "--address", self.dial.group, "--interface", ifname,
             "--family", str(self.dial.family), "--timeout", str(self.dial.timeout_seconds),
-            "--reflector-authority", refl_source_ip, "--device-authority", device_target_ip,
+            "--reflector-authority", reflector_authority, "--device-authority", device_authority,
         ]
         if self.dial.passive:
-            cmd.append("--passive")  # listen for the relayed NOTIFY instead of sending an M-SEARCH
+            probe_args.append("--passive")  # listen for the relayed NOTIFY instead of sending an M-SEARCH
         else:
-            cmd += ["--source-port", str(DIAL_CLIENT_SOURCE_PORT), "--payload-hex", SSDP_DIAL_MSEARCH_HEX]
+            probe_args += ["--source-port", str(DIAL_CLIENT_SOURCE_PORT), "--payload-hex", SSDP_DIAL_MSEARCH_HEX]
         if self.dial.unreachable:
-            cmd.append("--expect-fetch-failure")  # the device's upstream is dead; the fetch must fail
-        docker(cmd)
+            probe_args.append("--expect-fetch-failure")  # the device's upstream is dead; the fetch must fail
+        return probe_args
+
+    def run_client(self) -> None:
+        device_target_ip = self.backend.probe_ip("device", "target")
+        refl_source_ip = self.backend.reflector_ip("source")
+        ifname = self.backend.helper_ifname(REFLECTOR_SOURCE_IFNAME)
+        self.backend.start_probe(
+            "client", "source", ifname, self._client_args(refl_source_ip, device_target_ip)
+        )
 
     def wait_for_client(self) -> None:
-        exit_code = docker(["wait", self.client_container]).stdout.strip()
-        logs = docker(["logs", self.client_container], check=False)
-        if logs.stdout:
-            print(logs.stdout, end="", flush=True)
-        if logs.stderr:
-            print(logs.stderr, end="", file=sys.stderr, flush=True)
-        if exit_code != "0":
+        exit_code = self.backend.wait("client")
+        out, err = self.backend.logs("client")
+        if out:
+            print(out, end="", flush=True)
+        if err:
+            print(err, end="", file=sys.stderr, flush=True)
+        if exit_code != 0:
             raise RuntimeError(f"dial-client failed with exit code {exit_code}")
 
     def assert_device_verdicts(self) -> None:
-        # Two device-side checks: (1) the device exits non-zero if any request reached it with a Host that
-        # was not rewritten to its own authority (the reflector must rewrite Host source->device); (2) the
-        # reflector's upstream connect is egress-pinned to target_if, so the only peer the device recorded
-        # must be exactly the reflector's target_if address.
-        refl_target_ip = self.container_ip(self.reflector_container, self.target_network)
-        exit_code = docker(["wait", self.device_container]).stdout.strip()
-        logs = docker(["logs", self.device_container], check=False)
-        if logs.stdout:
-            print(logs.stdout, end="", flush=True)
-        if logs.stderr:
-            print(logs.stderr, end="", file=sys.stderr, flush=True)
-        if exit_code != "0":
+        # Two device-side checks: (1) the device exits non-zero if any request reached it with a
+        # Host that was not rewritten to its own authority (the reflector must rewrite Host
+        # source->device); (2) the reflector's upstream connect is egress-pinned to target_if, so
+        # the only peer the device recorded must be exactly the reflector's target_if address.
+        refl_target_ip = self.backend.reflector_ip("target")
+        exit_code = self.backend.wait("device")
+        out, err = self.backend.logs("device")
+        if out:
+            print(out, end="", flush=True)
+        if err:
+            print(err, end="", file=sys.stderr, flush=True)
+        if exit_code != 0:
             raise RuntimeError(f"dial-device failed with exit code {exit_code} "
                                f"(a request reached it with an unrewritten Host)")
         marker = "dial-device upstream peers seen: "
-        line = next((ln for ln in logs.stdout.splitlines() if marker in ln), None)
+        line = next((ln for ln in out.splitlines() if marker in ln), None)
         if line is None:
             raise RuntimeError("dial-device did not report the upstream peers it saw")
         seen = ast.literal_eval(line.split(marker, 1)[1].strip())
@@ -1316,35 +1684,34 @@ class DockerDial(DockerE2E):
               f"from the reflector's target_if address {refl_target_ip}", flush=True)
 
     def _force_upstream_egress_ambiguity(self) -> None:
-        # Make the upstream egress pin load-bearing. The device is single-homed on the target net, so the
-        # reflector's connect reaches it via target_if by routing alone, and SO_BINDTODEVICE (TcpSocket
-        # PinEgress) would be untestable — assert_device_verdicts' "peer == reflector target_if address"
-        # passes even if the pin were dropped. Plant a more-specific host route to the device via the WRONG
-        # interface (source_if): an unpinned connect now follows it, ARPs the device on the source segment
-        # (where it does not live) and fails, so the whole DIAL flow breaks. Only the egress pin — which
-        # constrains the route lookup to target_if — still reaches the device, so PASS now requires it.
-        device_ip = self.container_ip(self.device_container, self.target_network)
-        docker([
-            "run", "--rm", "--privileged", "--network", f"container:{self.reflector_container}",
-            self.args.helper_image, "ip", "route", "add", f"{device_ip}/32", "dev", REFLECTOR_SOURCE_IFNAME,
-        ])
+        # Make the upstream egress pin load-bearing. The device is single-homed on the target
+        # segment, so the reflector's connect reaches it via target_if by routing alone, and
+        # SO_BINDTODEVICE (TcpSocket PinEgress) would be untestable -- assert_device_verdicts'
+        # "peer == reflector target_if address" passes even if the pin were dropped. Plant a
+        # more-specific host route to the device via the WRONG interface (source_if): an unpinned
+        # connect now follows it, ARPs the device on the source segment (where it does not live)
+        # and fails, so the whole DIAL flow breaks. Only the egress pin -- which constrains the
+        # route lookup to target_if -- still reaches the device, so PASS now requires it.
+        device_ip = self.backend.probe_ip("device", "target")
+        self.backend.admin(f"ip route add {device_ip}/32 dev {REFLECTOR_SOURCE_IFNAME}")
 
     def run(self) -> None:
         print(f"\n=== {self.dial.name} ===", flush=True)
-        self.setup_networks()
+        self.backend.setup_segments()
         self.start_reflector()
         self.start_device()      # must be serving before the client searches
         if not self.dial.unreachable:
-            # The unreachable case asserts a PROMPT connect failure; a decoy route would change the
-            # failure mode (ARP timeout vs refused), so only arm the ambiguity where we assert success.
+            # The unreachable case asserts a PROMPT connect failure; a decoy route would change
+            # the failure mode (ARP timeout vs refused), so only arm the ambiguity where we
+            # assert success.
             self._force_upstream_egress_ambiguity()
         self.run_client()
         self.wait_for_client()        # client-side verdict: rewrites (or, for unreachable, the expected fail)
         if self.dial.unreachable:
-            docker(["wait", self.device_container])  # no HTTP server in this mode: nothing to assert
-            logs = docker(["logs", self.device_container], check=False)
-            if logs.stdout:
-                print(logs.stdout, end="", flush=True)
+            self.backend.wait("device")  # no HTTP server in this mode: nothing to assert
+            out, _ = self.backend.logs("device")
+            if out:
+                print(out, end="", flush=True)
         else:
             self.assert_device_verdicts()  # device-side verdict: Host rewrite + egress-pinned upstream
         print(f"PASS {self.dial.name}", flush=True)
@@ -1353,68 +1720,62 @@ class DockerDial(DockerE2E):
             self.print_reflector_logs()
 
 
-class DockerDialAddressChange(DockerDial):
-    # A DIAL pass, then the same pass after the reflector's source IPv4 changes, then after its target
-    # IPv4 changes -- each to a different same-subnet address. The device stays up (passive NOTIFY +
-    # HTTP) across all three; a fresh client runs each pass. _set_address (base) does the change via the
-    # privileged sidecar in the reflector's netns; the reflector reacts on its own event loop, so each
+class DialAddressChangeRunner(DialRunner):
+    # A DIAL pass, then the same pass after the reflector's source IPv4 changes, then after its
+    # target IPv4 changes -- each to a different same-subnet address. The device stays up (passive
+    # NOTIFY + HTTP) across all three; a fresh client runs each pass. _set_address (base) does the
+    # change in the reflector's network view; the reflector reacts on its own event loop, so each
     # change waits for the "gained IPv4 <new>" log before the next pass.
     def _different_cidr(self, cidr: str) -> str:
-        # A different host on the same subnet: Docker hands out low addresses (.2, .3, ...), so .222 is
-        # free (and .221 if the interface somehow already holds .222).
+        # A different host on the same subnet: both backends hand out low addresses (Docker IPAM
+        # .2, .3, ...; the native plan .1/.2), so .222 is free (and .221 if the interface somehow
+        # already holds .222).
         host, prefix = cidr.split("/")
         octets = host.split(".")
         octets[-1] = "222" if octets[-1] != "222" else "221"
         return f"{'.'.join(octets)}/{prefix}"
 
     def _change_v4(self, interface: str) -> str:
-        # Replace the reflector's IPv4 on `interface` with a different same-subnet address, then wait for
-        # the reflector to observe it -- which is when 7d evicts the now-stale proxy. Returns the new host.
+        # Replace the reflector's IPv4 on `interface` with a different same-subnet address, then
+        # wait for the reflector to observe it -- which is when 7d evicts the now-stale proxy.
+        # Returns the new host.
         old_cidr = self._set_address(interface, 4, up=False)        # del old, capture its CIDR
         new_cidr = self._different_cidr(old_cidr)
         self._set_address(interface, 4, up=True, cidr=new_cidr)     # add the different one
         new_host = new_cidr.split("/")[0]
         print(f"{self.dial.name}: {interface} IPv4 {old_cidr} -> {new_cidr}", flush=True)
-        self.wait_for_container_log(
-            self.reflector_container, f"gained IPv4 {new_host}", f"{interface} IPv4 change"
-        )
+        self.wait_for_log("reflector", f"gained IPv4 {new_host}", f"{interface} IPv4 change")
         return new_host
 
     def _dial_pass(self, label: str, reflector_authority: str, device_authority: str) -> None:
-        # One full DIAL flow through the reflector from a fresh client, asserting every rewrite points at
-        # `reflector_authority` (the reflector's CURRENT source IPv4) and never leaks `device_authority`.
-        container = f"{self.client_container}-{label.replace(' ', '-')}"
-        self.containers.insert(0, container)  # cleaned up by the base teardown
-        docker([
-            "run", "-d", "--name", container,
-            "--network", f"name={self.source_network},driver-opt=com.docker.network.endpoint.ifname={REFLECTOR_SOURCE_IFNAME}",
-            "--mount", f"type=bind,source={E2E_DIR},target=/e2e,readonly",
-            self.args.helper_image, "python3", "/e2e/probe.py", "dial-client",
-            "--port", str(SSDP_PORT), "--address", self.dial.group, "--interface", REFLECTOR_SOURCE_IFNAME,
-            "--family", str(self.dial.family), "--timeout", str(self.dial.timeout_seconds),
-            "--reflector-authority", reflector_authority, "--device-authority", device_authority,
-            "--passive",
-        ])
-        exit_code = docker(["wait", container]).stdout.strip()
-        logs = docker(["logs", container], check=False)
-        if logs.stdout:
-            print(logs.stdout, end="", flush=True)
-        if logs.stderr:
-            print(logs.stderr, end="", file=sys.stderr, flush=True)
-        if exit_code != "0":
+        # One full DIAL flow through the reflector from a fresh client, asserting every rewrite
+        # points at `reflector_authority` (the reflector's CURRENT source IPv4) and never leaks
+        # `device_authority`.
+        role = f"client-{label.replace(' ', '-')}"
+        ifname = self.backend.helper_ifname(REFLECTOR_SOURCE_IFNAME)
+        self.backend.start_probe(
+            role, "source", ifname, self._client_args(reflector_authority, device_authority)
+        )
+        exit_code = self.backend.wait(role)
+        out, err = self.backend.logs(role)
+        if out:
+            print(out, end="", flush=True)
+        if err:
+            print(err, end="", file=sys.stderr, flush=True)
+        if exit_code != 0:
             raise RuntimeError(f"{self.dial.name}: DIAL pass '{label}' failed with exit code {exit_code}")
         print(f"{self.dial.name}: DIAL pass '{label}' succeeded (rewrites -> {reflector_authority})", flush=True)
 
     def run(self) -> None:
         print(f"\n=== {self.dial.name} ===", flush=True)
-        self.setup_networks()
+        self.backend.setup_segments()
         self.start_reflector()
         self.start_device()  # passive: advertises NOTIFY + serves HTTP for serve_seconds
-        device_ip = self.container_ip(self.device_container, self.target_network)
-        source_ip = self.container_ip(self.reflector_container, self.source_network)
+        device_ip = self.backend.probe_ip("device", "target")
+        source_ip = self.backend.reflector_ip("source")
 
-        # Baseline, then re-run after each interface's IPv4 moves to a different address. A passing
-        # re-run requires 7d to have evicted the proxy bound to the vanished address.
+        # Baseline, then re-run after each interface's IPv4 moves to a different address. A
+        # passing re-run requires 7d to have evicted the proxy bound to the vanished address.
         self._dial_pass("baseline", source_ip, device_ip)
         source_ip = self._change_v4("source")
         self._dial_pass("after source IPv4 change", source_ip, device_ip)
@@ -1427,12 +1788,12 @@ class DockerDialAddressChange(DockerDial):
             self.print_reflector_logs()
 
 
-class DockerAddressChange(DockerE2E):
-    # Proves the dynamic family bring-up/teardown end to end: with a dual-family reflector running,
-    # knock out one (interface, family) source address at a time and verify -- with real traffic, not
-    # logs -- that reflection of exactly that family stops, then resumes once the address returns. The
-    # reflector reacts on its own event loop after the netlink notification, so every check polls
-    # across that async window. All phases probe forward (source -> target).
+class AddressChangeRunner(CaseRunner):
+    # Proves the dynamic family bring-up/teardown end to end: with a dual-family reflector
+    # running, knock out one (interface, family) source address at a time and verify -- with real
+    # traffic, not logs -- that reflection of exactly that family stops, then resumes once the
+    # address returns. The reflector reacts on its own event loop after the netlink notification,
+    # so every check polls across that async window. All phases probe forward (source -> target).
     def __init__(self, args: argparse.Namespace, case: AddressChangeCase) -> None:
         shim = TestCase(
             name=case.name,
@@ -1450,11 +1811,12 @@ class DockerAddressChange(DockerE2E):
         spec = PROBE_SPECS[phase.protocol]
         is_wol = phase.protocol == "wol"
         # A direction stops when its re-emit (egress) interface loses the family -- the reliable,
-        # guaranteed mechanism (the per-packet egress send-gate). The target is the egress for forward
-        # queries (source->target); the source is the egress for reverse responses (target->source).
-        # So probe the direction whose egress is the knocked-out interface. (The ingress-membership
-        # path can't be exercised here: our raw AF_PACKET capture taps below the IP membership filter
-        # and the Docker bridge floods multicast, so losing the ingress membership never blinds it.)
+        # guaranteed mechanism (the per-packet egress send-gate). The target is the egress for
+        # forward queries (source->target); the source is the egress for reverse responses
+        # (target->source). So probe the direction whose egress is the knocked-out interface.
+        # (The ingress-membership path can't be exercised here: our raw capture taps below the IP
+        # membership filter and both fabrics flood multicast, so losing the ingress membership
+        # never blinds it.)
         reverse = not is_wol and phase.interface == "source"
         direction = "reverse" if reverse else "forward"
         group = None if is_wol else (spec["group_v6"] if phase.family == 6 else spec["group_v4"])
@@ -1475,14 +1837,15 @@ class DockerAddressChange(DockerE2E):
         )
 
     def _probe(self, phase: Phase, *, expect: bool, timeout: float) -> bool:
-        # One round trip: (re)start a fresh receiver and sender for the phase's family/group, then
-        # report whether the receiver saw the expected packet within `timeout`.
-        docker(["rm", "-f", self.receiver_container, self.sender_container], check=False, echo=False)
+        # One round trip: (re)start a fresh receiver and sender for the phase's family/group,
+        # then report whether the receiver saw the expected packet within `timeout`.
+        self.backend.remove("receiver")
+        self.backend.remove("sender")
         case = self._phase_case(phase, expect=expect, timeout=timeout)
         self._select_direction(case.direction)
         self.start_receiver(case)
         self.run_sender(case)
-        return docker(["wait", self.receiver_container]).stdout.strip() == "0"
+        return self.backend.wait("receiver") == 0
 
     def _poll_reflected(self, phase: Phase) -> bool:
         deadline = time.monotonic() + ADDR_CHANGE_POLL_DEADLINE
@@ -1492,9 +1855,9 @@ class DockerAddressChange(DockerE2E):
         return False
 
     def _poll_not_reflected(self, phase: Phase) -> bool:
-        # Require consecutive silent windows: while reflection is still up the probe returns quickly
-        # (the reflected packet arrives, failing --expect-none), resetting the streak; only a genuine
-        # teardown yields an unbroken run of silences before the deadline.
+        # Require consecutive silent windows: while reflection is still up the probe returns
+        # quickly (the reflected packet arrives, failing --expect-none), resetting the streak;
+        # only a genuine teardown yields an unbroken run of silences before the deadline.
         deadline = time.monotonic() + ADDR_CHANGE_POLL_DEADLINE
         consecutive = 0
         while time.monotonic() < deadline:
@@ -1531,13 +1894,13 @@ class DockerAddressChange(DockerE2E):
         print(f"{desc}: reflection resumed after address restore", flush=True)
 
     def _assert_address_changes_logged(self) -> None:
-        # Full-parity log check (the Rust equivalent of the C++'s capability-down assertion): every
-        # phase removed then restored a source address, so the reflector's AddressMonitor must have
-        # logged both transitions -- with the monitor off it logs neither. And no reflect-failure WARN
-        # may appear: a send attempted on an addressless egress would mean the per-packet gate failed
-        # to catch the drop.
-        logs = docker(["logs", self.reflector_container], check=False)
-        text = f"{logs.stdout}\n{logs.stderr}"
+        # Full-parity log check (the Rust equivalent of the C++'s capability-down assertion):
+        # every phase removed then restored a source address, so the reflector's AddressMonitor
+        # must have logged both transitions -- with the monitor off it logs neither. And no
+        # reflect-failure WARN may appear: a send attempted on an addressless egress would mean
+        # the per-packet gate failed to catch the drop.
+        out, err = self.backend.logs("reflector")
+        text = f"{out}\n{err}"
         for phase in self.ac.phases:
             ifname = REFLECTOR_SOURCE_IFNAME if phase.interface == "source" else REFLECTOR_TARGET_IFNAME
             family = f"IPv{phase.family}"
@@ -1556,7 +1919,7 @@ class DockerAddressChange(DockerE2E):
 
     def run(self) -> None:
         print(f"\n=== {self.ac.name} ===", flush=True)
-        self.setup_networks()
+        self.backend.setup_segments()
         self.start_reflector()
         for phase in self.ac.phases:
             self._run_phase(phase)
@@ -1568,16 +1931,16 @@ class DockerAddressChange(DockerE2E):
 
 
 def make_runner(args: argparse.Namespace,
-        case: TestCase | RoundTripCase | DialCase | DialAddressChangeCase | AddressChangeCase) -> DockerE2E:
+        case: TestCase | RoundTripCase | DialCase | DialAddressChangeCase | AddressChangeCase) -> CaseRunner:
     if isinstance(case, RoundTripCase):
-        return DockerRoundTrip(args, case)
+        return RoundTripRunner(args, case)
     if isinstance(case, DialAddressChangeCase):
-        return DockerDialAddressChange(args, case)
+        return DialAddressChangeRunner(args, case)
     if isinstance(case, DialCase):
-        return DockerDial(args, case)
+        return DialRunner(args, case)
     if isinstance(case, AddressChangeCase):
-        return DockerAddressChange(args, case)
-    return DockerE2E(args, case)
+        return AddressChangeRunner(args, case)
+    return CaseRunner(args, case)
 
 
 def build_reflector_image(image: str, target: str | None = None) -> None:
@@ -1599,15 +1962,23 @@ def select_cases(case_names: list[str]) -> list[TestCase | RoundTripCase | DialC
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run Docker-backed reflector WoL e2e tests")
+    parser = argparse.ArgumentParser(description="Run reflector e2e tests (Docker or native backend)")
+    parser.add_argument("--backend", choices=["docker", "native"], default="docker",
+        help="execution environment: Docker bridge networks + containers, or (Linux, root) "
+             "netns + veth pairs + plain processes (default: docker)")
     parser.add_argument("--image", default=DEFAULT_REFLECTOR_IMAGE,
-        help="reflector image tag to run (default: reflector:e2e)")
-    parser.add_argument("--skip-build", action="store_true", help="use --image without building it first")
+        help="reflector image tag to run (default: reflector:e2e; docker backend only)")
+    parser.add_argument("--skip-build", action="store_true",
+        help="use --image without building it first (docker backend only)")
     parser.add_argument("--valgrind", action="store_true",
         help="run the reflector under Valgrind memcheck (the runtime-valgrind image; fails on any leak, fd leak, or memcheck error)")
-    parser.add_argument("--helper-image", default=DEFAULT_HELPER_IMAGE, help="Python image used for UDP probes")
-    parser.add_argument("--keep-on-failure", action="store_true", help="leave Docker resources behind after a failure")
-    parser.add_argument("--show-reflector-logs", action="store_true", help="print reflector container logs after each passing case")
+    parser.add_argument("--helper-image", default=DEFAULT_HELPER_IMAGE,
+        help="Python image used for UDP probes (docker backend only)")
+    parser.add_argument("--binary", type=Path, default=None,
+        help="reflector binary to run (native backend, required); build it unprivileged first, "
+             "e.g. cargo build --release --locked")
+    parser.add_argument("--keep-on-failure", action="store_true", help="leave resources behind after a failure")
+    parser.add_argument("--show-reflector-logs", action="store_true", help="print reflector logs after each passing case")
     parser.add_argument(
         "--case",
         action="append",
@@ -1615,21 +1986,40 @@ def parse_args() -> argparse.Namespace:
         choices=[case.name for case in ALL_CASES],
         help="e2e case to run; may be passed more than once",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    if args.backend == "native" and args.valgrind:
+        parser.error("--valgrind is not supported with --backend native yet")
+    if args.backend == "native" and args.binary is None:
+        # No implicit `cargo build` here: the native harness runs as root, so a build would leave
+        # root-owned target/ artifacts -- or die outright, since sudo's PATH lacks a rustup cargo.
+        parser.error("--backend native requires --binary; build unprivileged first "
+                     "(cargo build --release --locked)")
+    if args.backend == "docker" and args.binary is not None:
+        parser.error("--binary only applies to --backend native")
+    return args
 
 
 def main() -> int:
     args = parse_args()
-    require_command("docker")
-
-    # --valgrind selects the valgrind image unless one was passed explicitly.
-    if args.valgrind and args.image == DEFAULT_REFLECTOR_IMAGE:
-        args.image = VALGRIND_REFLECTOR_IMAGE
+    if args.backend == "native":
+        NativeLinuxBackend.require_available()
+    else:
+        DockerBackend.require_available()
+        # --valgrind selects the valgrind image unless one was passed explicitly.
+        if args.valgrind and args.image == DEFAULT_REFLECTOR_IMAGE:
+            args.image = VALGRIND_REFLECTOR_IMAGE
 
     cases = select_cases(args.case)
     print(f"expected magic payload: {magic_packet_hex(CONFIGURED_MAC)}", flush=True)
 
-    if not args.skip_build:
+    if args.backend == "native":
+        # Resolve now, against the invoker's cwd: the spawns run with cwd=REPO_ROOT, so a relative
+        # path that validated here would otherwise point somewhere else at exec time.
+        args.binary = args.binary.resolve()
+        if not args.binary.is_file():
+            raise RuntimeError(f"reflector binary not found: {args.binary}")
+    elif not args.skip_build:
         build_reflector_image(args.image, "runtime-valgrind" if args.valgrind else None)
 
     for case in cases:
