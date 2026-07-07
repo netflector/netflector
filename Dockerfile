@@ -5,7 +5,10 @@
 # images don't crawl under QEMU. The crate is pure Rust (libc FFI only), so LLVM's lld cross-links
 # it for any arch with no per-arch gcc toolchain — just the one lld package.
 
-FROM --platform=$BUILDPLATFORM docker.io/library/rust:slim AS builder
+# Pin the shared base image by digest: reproducible builds, no drift under the floating tag. Renovate
+# keeps it current. Referenced by both the builder and the valgrind runtime below so they stay in lockstep.
+ARG RUST_IMAGE=docker.io/library/rust:slim@sha256:31ee7fc65186be7e0e0ccb3f2ca305f14e4739e7642a1ae65753aa5d7b874523
+FROM --platform=$BUILDPLATFORM ${RUST_IMAGE} AS builder
 ARG TARGETARCH
 ARG TARGETVARIANT
 WORKDIR /src
@@ -48,7 +51,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # daemon so Valgrind reports leaks at a clean exit; --track-fds catches a leaked socket in the live daemon;
 # --error-exitcode=1 fails on any leak, leaked fd, or memcheck error. "reachable" is allowed (the logger and
 # other process-lifetime statics live to exit by design).
-FROM docker.io/library/rust:slim AS runtime-valgrind
+FROM ${RUST_IMAGE} AS runtime-valgrind
 RUN apt-get update \
     && apt-get install -y --no-install-recommends valgrind \
     && rm -rf /var/lib/apt/lists/*
