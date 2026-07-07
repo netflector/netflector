@@ -19,8 +19,12 @@ use crate::libcex::BpfInsn;
 use crate::net::LinkType;
 use crate::sys::{IoStatus, socklen_of};
 
-/// Receive buffer sized for one frame at a typical Ethernet MTU plus headers.
-const RECV_BUFFER_SIZE: usize = 4096;
+/// Receive buffer for one frame, matched to the dispatcher's send scratch
+/// ([`SCRATCH_LEN`](crate::dispatch::SCRATCH_LEN)) — the forwarding limit. Capturing no more than can be
+/// re-emitted means a jumbo frame beyond it drops here at trace (see [`next_frame`](Capture::next_frame)),
+/// instead of being captured and then warned per packet when the send scratch rejects it. 2048
+/// comfortably holds a standard ~1518-byte Ethernet frame.
+const RECV_BUFFER_SIZE: usize = 2048;
 
 /// The fallback filter length: the egress-drop prologue plus the UDP classifier.
 const DROP_OUTGOING_FILTER_LEN: usize = DROP_OUTGOING_PROLOGUE.len() + ETHERNET_UDP_FILTER.len();
