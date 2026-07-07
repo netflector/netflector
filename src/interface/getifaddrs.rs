@@ -183,3 +183,72 @@ fn v6_flags(sock: &OwnedFd, if_name: &str, addr: libc::sockaddr_in6) -> Option<c
     // SAFETY: a successful ioctl wrote `ifru_flags6` into the union.
     Some(unsafe { req.ifru.flags6 })
 }
+
+#[cfg(test)]
+mod tests {
+    use std::mem::offset_of;
+
+    use super::*;
+
+    #[test]
+    fn canonical_v6_strips_the_embedded_scope_from_link_local() {
+        // The BSDs embed the scope id (ifindex) in bytes 2-3 of a fe80::/10 address (the KAME
+        // convention); the canonical form zeroes them to recover the on-the-wire fe80::/64.
+        let embedded = [
+            0xfe, 0x80, 0x00, 0x07, 0, 0, 0, 0, 0, 0, 0, 0, 0x02, 0x11, 0x22, 0x33,
+        ];
+        assert_eq!(
+            canonical_v6(embedded),
+            Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0x0211, 0x2233)
+        );
+        // A non-link-local address is untouched.
+        let global = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        assert_eq!(canonical_v6(global), Ipv6Addr::from(global));
+    }
+
+    /// A raw `AF_LINK` `sockaddr_dl`: an `nlen`-byte name then `mac`, with `sdl_alen`/`sdl_len` set as
+    /// given so the bounds branches can be exercised. Laid out via `offset_of` so it matches the real
+    /// struct.
+    fn dl_bytes(name: &[u8], mac: &[u8], alen: u8, sdl_len: u8) -> [u8; 32] {
+        let mut buf = [0u8; 32];
+        buf[offset_of!(libc::sockaddr_dl, sdl_family)] = u8::try_from(libc::AF_LINK).unwrap();
+        buf[offset_of!(libc::sockaddr_dl, sdl_nlen)] = u8::try_from(name.len()).unwrap();
+        buf[offset_of!(libc::sockaddr_dl, sdl_alen)] = alen;
+        buf[offset_of!(libc::sockaddr_dl, sdl_len)] = sdl_len;
+        let data = offset_of!(libc::sockaddr_dl, sdl_data);
+        buf[data..data + name.len()].copy_from_slice(name);
+        buf[data + name.len()..data + name.len() + mac.len()].copy_from_slice(mac);
+        buf
+    }
+
+    #[test]
+    fn read_mac_extracts_the_address_after_the_name() {
+        let mac = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let data = offset_of!(libc::sockaddr_dl, sdl_data);
+        let len = u8::try_from(data + 3 + 6).unwrap(); // header + "en0" + 6-byte MAC
+        let buf = dl_bytes(b"en0", &mac, 6, len);
+        assert_eq!(
+            read_mac(buf.as_ptr().cast::<libc::sockaddr>()),
+            Some(MacAddr::from(mac))
+        );
+    }
+
+    #[test]
+    fn read_mac_is_none_without_a_link_address() {
+        // Loopback carries a name but no address (alen 0).
+        let data = offset_of!(libc::sockaddr_dl, sdl_data);
+        let len = u8::try_from(data + 3).unwrap();
+        let buf = dl_bytes(b"lo0", &[], 0, len);
+        assert_eq!(read_mac(buf.as_ptr().cast::<libc::sockaddr>()), None);
+    }
+
+    #[test]
+    fn read_mac_is_none_when_the_address_runs_past_the_sockaddr() {
+        // sdl_alen claims 6, but sdl_len stops short of the MAC: rejected, not over-read.
+        let mac = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let data = offset_of!(libc::sockaddr_dl, sdl_data);
+        let short = u8::try_from(data + 3 + 3).unwrap(); // 3 bytes short of the MAC
+        let buf = dl_bytes(b"en0", &mac, 6, short);
+        assert_eq!(read_mac(buf.as_ptr().cast::<libc::sockaddr>()), None);
+    }
+}
