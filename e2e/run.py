@@ -1386,19 +1386,20 @@ class NativeLinuxBackend(NativeBackend):
 
 
 class NativeFreeBSDBackend(NativeBackend):
-    # Segments as epair(4) pairs -- FreeBSD's veth. The daemon runs on the host stack with BPF
-    # on the renamed a ends (wol_src/wol_dst); each probe runs in a persistent vnet jail owning
-    # the b end (renamed probe0). A vnet jail is FreeBSD's network namespace: its own stack,
-    # the host filesystem shared via path=/, the same shape FreeBSD's own network test suite
-    # builds with vnet_mkjail. Host-stack daemon + jailed probes keeps every probe packet on
-    # the wire: from a jail's stack the daemon's addresses are remote, so nothing
-    # short-circuits over lo0.
+    # Segments as epair(4) pairs -- FreeBSD's veth -- between persistent vnet jails, one per
+    # participant, mirroring the Linux namespaces: a dut jail holds the renamed a ends
+    # (wol_src/wol_dst), each probe jail owns a b end (renamed probe0). A vnet jail is
+    # FreeBSD's network namespace: its own stack, with interfaces, routes, PF_ROUTE events,
+    # and /dev/bpf attachment all per-vnet, and the host filesystem shared via path=/. Per-jail
+    # stacks keep every probe packet on the wire (nothing short-circuits over lo0), and jailing
+    # the daemon too means its address monitor hears only test-interface events -- the same
+    # shape as the Linux dut namespace.
 
     def __init__(self, args: argparse.Namespace, prefix: str) -> None:
         super().__init__(args, prefix)
         # Jail names: play safe with the allowed character set.
         base = prefix.replace("-", "_")
-        self.jails = {"source": f"{base}_src", "target": f"{base}_dst"}
+        self.jails = {"dut": f"{base}_dut", "source": f"{base}_src", "target": f"{base}_dst"}
 
     @staticmethod
     def require_available() -> None:
@@ -1412,44 +1413,55 @@ class NativeFreeBSDBackend(NativeBackend):
             raise RuntimeError("--backend native requires a VIMAGE kernel (vnet jails); "
                                "stock GENERIC has it since FreeBSD 12")
 
+    def _make_jail(self, jail: str, *interfaces: str) -> None:
+        # persist keeps the (process-less) jail alive; each vnet.interface moves that interface
+        # into its stack; path=/ shares the host filesystem, so the pkg python3 and probe.py
+        # are visible inside without building a jail root. DAD off before any address, as on
+        # the other backends; a fresh vnet starts with lo0 down.
+        run_command([
+            "jail", "-c", f"name={jail}", "persist", "vnet",
+            *[f"vnet.interface={ifname}" for ifname in interfaces], "path=/",
+        ])
+        run_command(["jexec", jail, "sysctl", "net.inet6.ip6.dad_count=0"])
+        run_command(["jexec", jail, "ifconfig", "lo0", "up"])
+
     def setup_segments(self) -> None:
-        # DAD off before any address, as on the other backends. The daemon's interfaces live on
-        # the host stack, so this is host-global (fine for the disposable CI VM).
-        run_command(["sysctl", "net.inet6.ip6.dad_count=0"])
+        ends = {}
         for segment in SEGMENTS:
             a_end = run_command(["ifconfig", "epair", "create"]).stdout.strip()
             if not a_end.endswith("a"):
                 raise RuntimeError(f"unexpected epair name: {a_end}")
-            b_end = f"{a_end[:-1]}b"
+            ends[segment] = (a_end, f"{a_end[:-1]}b")
+
+        dut = self.jails["dut"]
+        self._make_jail(dut, *(a_end for a_end, _ in ends.values()))
+        for segment in SEGMENTS:
+            a_end, b_end = ends[segment]
             dut_ifname = self.REFLECTOR_IFNAMES[segment]
-            run_command(["ifconfig", a_end, "name", dut_ifname])
-            # persist keeps the (process-less) jail alive; vnet.interface moves the b end into
-            # its stack; path=/ shares the host filesystem, so the pkg python3 and probe.py are
-            # visible inside without building a jail root.
-            jail = self.jails[segment]
-            run_command([
-                "jail", "-c", f"name={jail}", "persist", "vnet", f"vnet.interface={b_end}", "path=/",
-            ])
-            jexec = ["jexec", jail]
-            run_command([*jexec, "sysctl", "net.inet6.ip6.dad_count=0"])
-            run_command([*jexec, "ifconfig", "lo0", "up"])
-            run_command([*jexec, "ifconfig", b_end, "name", RECEIVER_IFNAME])
+            self._make_jail(self.jails[segment], b_end)
+            jexec_dut = ["jexec", dut]
+            jexec_far = ["jexec", self.jails[segment]]
+            run_command([*jexec_dut, "ifconfig", a_end, "name", dut_ifname])
+            run_command([*jexec_far, "ifconfig", b_end, "name", RECEIVER_IFNAME])
             v4, v6 = NATIVE_V4_SUBNET[segment], NATIVE_V6_PREFIX[segment]
-            run_command(["ifconfig", dut_ifname, "inet", f"{v4}.{NATIVE_REFLECTOR_HOST}/24"])
-            run_command(["ifconfig", dut_ifname, "inet6", f"{v6}::{NATIVE_REFLECTOR_HOST}/64"])
-            run_command(["ifconfig", dut_ifname, "up"])
-            run_command([*jexec, "ifconfig", RECEIVER_IFNAME, "inet", f"{v4}.{NATIVE_HELPER_HOST}/24"])
-            run_command([*jexec, "ifconfig", RECEIVER_IFNAME, "inet6", f"{v6}::{NATIVE_HELPER_HOST}/64"])
-            run_command([*jexec, "ifconfig", RECEIVER_IFNAME, "up"])
+            run_command([*jexec_dut, "ifconfig", dut_ifname, "inet", f"{v4}.{NATIVE_REFLECTOR_HOST}/24"])
+            run_command([*jexec_dut, "ifconfig", dut_ifname, "inet6", f"{v6}::{NATIVE_REFLECTOR_HOST}/64"])
+            run_command([*jexec_dut, "ifconfig", dut_ifname, "up"])
+            run_command([*jexec_far, "ifconfig", RECEIVER_IFNAME, "inet", f"{v4}.{NATIVE_HELPER_HOST}/24"])
+            run_command([*jexec_far, "ifconfig", RECEIVER_IFNAME, "inet6", f"{v6}::{NATIVE_HELPER_HOST}/64"])
+            run_command([*jexec_far, "ifconfig", RECEIVER_IFNAME, "up"])
             # The probe's 255.255.255.255 sends are routed, not interface-pinned; single-homed
             # plus this default route pins them to the segment.
-            run_command([*jexec, "route", "add", "default", "-interface", RECEIVER_IFNAME])
+            run_command([*jexec_far, "route", "add", "default", "-interface", RECEIVER_IFNAME])
 
     def _teardown_fabric(self) -> None:
-        # Destroy the a ends first: killing one end tears down the whole pair, including the b
-        # end inside its jail -- so the two jails' probe0s never return to the host stack, where
-        # their names would collide.
+        # Destroy the a ends (from inside the dut jail) first: killing one end tears down the
+        # whole pair, including the b end inside its probe jail -- so no jail removal can return
+        # a probe0 to a stack where the other jail's probe0 already sits. The host-side destroy
+        # covers a setup that failed before the interfaces moved into the dut jail.
         for ifname in self.REFLECTOR_IFNAMES.values():
+            run_command(["jexec", self.jails["dut"], "ifconfig", ifname, "destroy"],
+                        check=False, echo=False)
             run_command(["ifconfig", ifname, "destroy"], check=False, echo=False)
         for jail in self.jails.values():
             run_command(["jail", "-r", jail], check=False, echo=False)
@@ -1461,12 +1473,10 @@ class NativeFreeBSDBackend(NativeBackend):
         return ["jexec", self.jails[segment]]
 
     def _reflector_command(self, config_path: Path) -> list[str]:
-        # The daemon runs on the host stack; its interfaces are the renamed a ends.
-        return [str(self.args.binary), str(config_path)]
+        return ["jexec", self.jails["dut"], str(self.args.binary), str(config_path)]
 
     def admin(self, script: str, *, capture: bool = False) -> str:
-        # The reflector's network view IS the host stack.
-        result = run_command(["sh", "-ec", script])
+        result = run_command(["jexec", self.jails["dut"], "sh", "-ec", script])
         return result.stdout.strip() if capture else ""
 
     def set_address(self, ifname: str, family: int, *, up: bool, cidr: str | None = None) -> str | None:
