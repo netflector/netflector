@@ -22,7 +22,7 @@ jobs:
       actions: read
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       # A version tag must match the [package] version in Cargo.toml, so the git tag, the published image,
       # and the GitHub release name can never disagree.
@@ -87,7 +87,7 @@ jobs:
             target: aarch64-apple-darwin
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Install lld (musl cross-link)
         if: runner.os == 'Linux'
@@ -128,7 +128,7 @@ jobs:
             || { echo "::error::binary is not statically/static-pie linked"; exit 1; }
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: reflector-${{ matrix.variant }}
           path: dist/reflector-${{ github.ref_name }}-${{ matrix.variant }}
@@ -153,10 +153,10 @@ jobs:
             vm_arch: aarch64
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Build the static release binary in a FreeBSD VM
-        uses: vmactions/freebsd-vm@v1
+        uses: vmactions/freebsd-vm@5a72679103d223925653750faa878a143340fbd0 # v1
         with:
           release: '14.2'
           arch: ${{ matrix.vm_arch }}
@@ -178,7 +178,7 @@ jobs:
             cp "$bin" "dist/reflector-${{ github.ref_name }}-freebsd-${{ matrix.arch }}"
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: reflector-freebsd-${{ matrix.arch }}
           path: dist/reflector-${{ github.ref_name }}-freebsd-${{ matrix.arch }}
@@ -197,13 +197,13 @@ jobs:
       packages: write
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
 
       - name: Log in to GHCR
-        uses: docker/login-action@v4
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -211,7 +211,7 @@ jobs:
 
       - name: Image metadata
         id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: ghcr.io/${{ github.repository_owner }}/reflector
           tags: |
@@ -220,7 +220,7 @@ jobs:
             type=raw,value=latest
 
       - name: Build and push the multi-arch image
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64,linux/arm/v7,linux/arm/v5
@@ -239,7 +239,7 @@ jobs:
       contents: write
     steps:
       - name: Download binary artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: dist
           pattern: reflector-*
@@ -251,7 +251,7 @@ jobs:
           sha256sum reflector-* | tee SHA256SUMS
 
       - name: Create release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3
         with:
           files: |
             dist/reflector-*
