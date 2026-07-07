@@ -1,4 +1,4 @@
-//! reflector: reflects link-local service traffic (Wake-on-LAN, mDNS, SSDP,
+//! reflector: reflects link-local service traffic (Wake-on-LAN, mDNS, SSDP, WS-Discovery,
 //! and an optional DIAL proxy) between two network interfaces.
 //!
 //! The behavior lives in this library crate so it stays testable in-process;

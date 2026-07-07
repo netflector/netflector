@@ -225,7 +225,7 @@ describing one `source_if` → `target_if` bridge that enables any combination o
 top-level settings are `log_level`, `debug_memory_interval_secs`, and `counters_interval_secs`:
 
 ```toml
-log_level = "info"                 # optional; one of debug | info | warning | error (default: info)
+log_level = "info"                 # optional; one of off | error | warning | info | debug | trace (default: info)
 debug_memory_interval_secs = 0     # optional; seconds between memory (RSS/peak) diagnostic reports; 0 disables (default 0)
 counters_interval_secs = 0         # optional; seconds between per-interface packet-counter summaries; 0 disables (default 0)
 
@@ -257,7 +257,7 @@ then optional; with none, the environment is the whole configuration. Variables 
 - `<TAG>` ties one entry's parameters together: any alphanumeric string (`1`, `2`, `TV`, …). It also
   becomes the entry's name (and thus its log label) unless a `NAME` parameter overrides it.
 - `<PARAM>` is `NAME` or any field from the entry table above (`SOURCE_IF`, `TARGET_IF`, `MACS`,
-  `WOL`, `MDNS`, `SSDP`, `DIAL`, `WOL_PORTS`, `ADDRESS_FAMILY`), case-insensitive.
+  `WOL`, `MDNS`, `SSDP`, `WSD`, `DIAL`, `WOL_PORTS`, `ADDRESS_FAMILY`), case-insensitive.
 
 The globals are `REFLECTOR_LOG_LEVEL`, `REFLECTOR_DEBUG_MEMORY_INTERVAL_SECS`, and
 `REFLECTOR_COUNTERS_INTERVAL_SECS`, so `LOG`, `DEBUG`, and `COUNTERS` are reserved tags. Booleans are
@@ -288,19 +288,19 @@ rejected at startup.
 ### The `macs` field
 
 `macs` is an optional list naming the device(s) an entry is scoped to, coherently across WoL, mDNS,
-and SSDP, because a device's NIC MAC is both the target of its Wake-on-LAN magic packet and the L2
-source of its mDNS/SSDP advertisements. A single device is just a one-entry list
+SSDP, and WSD, because a device's NIC MAC is both the target of its Wake-on-LAN magic packet and the L2
+source of its mDNS/SSDP/WSD advertisements. A single device is just a one-entry list
 (`macs = ["B0:37:95:C5:60:BE"]`); list several to scope one entry to a set of devices
 (`macs = ["B0:37:95:C5:60:BE", "C4:9D:8F:11:22:33"]`). Below, "the allow-set" means the configured
 devices:
 
 - **WoL** re-emits only magic packets whose payload targets a device in the allow-set.
-- **mDNS / SSDP** relay, in the target→source direction, only frames whose L2 source MAC is in the
+- **mDNS / SSDP / WSD** relay, in the target→source direction, only frames whose L2 source MAC is in the
   allow-set (exposing just those devices); the source→target direction is never MAC-filtered. For SSDP
-  the same filter scopes the proxied unicast `200 OK` replies: only the allow-set's responses are
+  and WSD the same filter scopes the proxied unicast replies: only the allow-set's responses are
   carried back to a searcher.
 
-Omit `macs` for a network-level entry: WoL proxies every valid magic packet, and mDNS/SSDP reflect all
+Omit `macs` for a network-level entry: WoL proxies every valid magic packet, and mDNS/SSDP/WSD reflect all
 traffic in both directions.
 
 ### `address_family`
