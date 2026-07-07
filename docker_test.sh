@@ -8,9 +8,11 @@
 #   ./docker_test.sh test epoll                            # filter to epoll tests
 #   ./docker_test.sh clippy --all-targets -- -D warnings   # Linux clippy/lints
 #
-# Named volumes hold the Linux target dir (so the macOS ./target is untouched)
-# and the crate registry, keeping re-runs fast. The capture layer will later need
-# raw-socket privileges — add `--cap-add=NET_RAW` here when those tests land.
+# Named volumes hold the Linux target dir (so the macOS ./target is untouched),
+# the crate registry, and the rustup home -- the last so the pinned toolchain's
+# rustfmt/clippy components (absent from rust:slim) download once, not every run.
+# The capture layer will later need raw-socket privileges -- add `--cap-add=NET_RAW`
+# here when those tests land.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -20,6 +22,7 @@ exec docker run --rm \
     -v "$PWD":/reflector \
     -v reflector-linux-target:/linux-target \
     -v reflector-cargo-registry:/usr/local/cargo/registry \
+    -v reflector-rustup:/usr/local/rustup \
     -e CARGO_TARGET_DIR=/linux-target \
     -w /reflector \
     rust:slim \
