@@ -1,5 +1,5 @@
-//! rtnetlink (`NETLINK_ROUTE`) message-framing FFI, hand-rolled because `libc` exposes it for Android
-//! only, not glibc/musl.
+//! rtnetlink (`NETLINK_ROUTE`) message-framing FFI, hand-rolled because `libc` does not expose it for
+//! glibc/musl.
 
 use libc::c_int;
 
@@ -19,6 +19,9 @@ pub(crate) struct NlMsgHdr {
     pub(crate) pid: u32,
 }
 
+// libc exposes no netlink structs to anchor against on glibc/musl, so pin the on-wire sizes directly.
+const _: () = assert!(size_of::<NlMsgHdr>() == 16);
+
 /// `struct ifaddrmsg`: the body of an `RTM_*ADDR` message. A zeroed value (family
 /// `AF_UNSPEC`) is the dump request body. The address monitor reads `index` from it.
 #[repr(C)]
@@ -31,12 +34,16 @@ pub(crate) struct IfAddrMsg {
     pub(crate) index: u32,
 }
 
+const _: () = assert!(size_of::<IfAddrMsg>() == 8);
+
 /// `struct rtattr`: a type-length-value attribute header within a message.
 #[repr(C)]
 pub(crate) struct RtAttr {
     pub(crate) len: u16,
     pub(crate) attr_type: u16,
 }
+
+const _: () = assert!(size_of::<RtAttr>() == 4);
 
 /// `struct sockaddr_nl`.
 #[repr(C)]
@@ -47,6 +54,8 @@ pub(crate) struct SockAddrNl {
     pub(crate) pid: u32,
     pub(crate) groups: u32,
 }
+
+const _: () = assert!(size_of::<SockAddrNl>() == 12);
 
 /// `NLMSG_ALIGN`: netlink's 4-byte alignment for message and attribute lengths.
 pub(crate) const fn nl_align(n: usize) -> usize {

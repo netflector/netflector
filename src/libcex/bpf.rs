@@ -12,7 +12,11 @@ pub(crate) struct BpfInsn {
     pub(crate) k: u32,
 }
 
-// On Linux this same struct installs as a `sock_filter` via `SO_ATTACH_FILTER`;
-// pin its layout to libc's.
+// This same struct installs as a `sock_filter` on Linux (`SO_ATTACH_FILTER`) and a `bpf_insn` on the
+// BSDs (`BIOCSETF`). Anchor to libc where it has the type; apple has neither, so pin the size directly.
 #[cfg(target_os = "linux")]
 const _: () = assert!(size_of::<BpfInsn>() == size_of::<libc::sock_filter>());
+#[cfg(target_os = "freebsd")]
+const _: () = assert!(size_of::<BpfInsn>() == size_of::<libc::bpf_insn>());
+#[cfg(target_os = "macos")]
+const _: () = assert!(size_of::<BpfInsn>() == 8);
