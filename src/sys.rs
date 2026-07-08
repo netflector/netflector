@@ -199,6 +199,47 @@ pub(crate) fn set_nonblock(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
+/// The process environment as UTF-8 key/value pairs; entries that are not
+/// valid UTF-8 (or lack a `=`) are skipped.
+///
+/// On FreeBSD this walks the CRT-provided `environ` table itself instead of
+/// calling `std::env::vars`: std resolves `environ` via
+/// `dlsym(RTLD_DEFAULT, ..)`, which returns null in a statically linked
+/// binary (no dynamic symbol table), and std dereferences the null -- the
+/// shipped static binary segfaulted on startup. An `extern` reference links
+/// against the crt1-provided symbol in any executable, static or dynamic.
+#[cfg(target_os = "freebsd")]
+pub(crate) fn process_env() -> Vec<(String, String)> {
+    unsafe extern "C" {
+        static mut environ: *mut *const libc::c_char;
+    }
+    let mut entries = Vec::new();
+    // SAFETY: crt1 points `environ` at the null-terminated environment before
+    // `main` and libc's setenv keeps it valid; the process is single-threaded
+    // (project invariant), so the table cannot change mid-walk; each entry is
+    // a valid C string.
+    unsafe {
+        let mut entry = environ;
+        while !entry.is_null() && !(*entry).is_null() {
+            let bytes = std::ffi::CStr::from_ptr(*entry).to_bytes();
+            if let Some((key, value)) = str::from_utf8(bytes).ok().and_then(|s| s.split_once('=')) {
+                entries.push((key.to_owned(), value.to_owned()));
+            }
+            entry = entry.add(1);
+        }
+    }
+    entries
+}
+
+/// The process environment as UTF-8 key/value pairs; entries that are not
+/// valid UTF-8 are skipped.
+#[cfg(not(target_os = "freebsd"))]
+pub(crate) fn process_env() -> Vec<(String, String)> {
+    std::env::vars_os()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
@@ -252,5 +293,17 @@ mod tests {
     #[test]
     fn owned_fd_from_rejects_a_negative_return() {
         assert!(owned_fd_from(-1).is_err());
+    }
+
+    #[test]
+    fn process_env_sees_a_set_variable() {
+        // SAFETY: nothing else in the test binary reads or writes the process
+        // environment concurrently (config tests take env as a parameter).
+        unsafe { std::env::set_var("REFLECTOR_SYS_ENV_PROBE", "probe-value") };
+        let env = process_env();
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "REFLECTOR_SYS_ENV_PROBE" && v == "probe-value")
+        );
     }
 }

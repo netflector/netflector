@@ -42,7 +42,9 @@ use self::reflector::InterfaceMap;
 pub fn run(args: &[OsString]) -> Result<()> {
     let path = config_path(args)?;
     let toml_text = path.map(config::read_config_file).transpose()?;
-    let env: Vec<(String, String)> = std::env::vars().collect();
+    // sys::process_env, not std::env::vars: vars() segfaults in statically
+    // linked FreeBSD binaries (see process_env).
+    let env = sys::process_env();
 
     // Resolve the log level first from a minimal read of env + file, so the full parse below
     // logs at the configured verbosity (see resolve_log_level).
