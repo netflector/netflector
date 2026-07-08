@@ -23,6 +23,9 @@ mod dial_context;
 mod interface_table;
 mod multicast;
 
+#[cfg(test)]
+mod pair_tests;
+
 pub(crate) use self::counters::{MessageType, Outcome};
 pub(crate) use self::dial_context::DialContext;
 
