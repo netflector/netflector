@@ -238,9 +238,9 @@ jobs:
             export RUSTFLAGS="${{ matrix.profile.rustflags }}"
             cargo test --locked ${{ matrix.profile.flags }}
 
-  # The native e2e suite on a real FreeBSD kernel: epair segments, probes in vnet jails, the daemon
-  # on the VM's host stack -- the BPF capture/inject and PF_ROUTE monitor paths end to end, which no
-  # Linux lane can reach. Same vmactions mechanics as the freebsd test job; python3 comes from pkg.
+  # The native e2e suite on a real FreeBSD kernel: epair segments, every participant in its own
+  # vnet jail -- the BPF capture/inject and PF_ROUTE monitor paths end to end, which no Linux lane
+  # can reach. Same vmactions mechanics as the freebsd test job; python3 comes from pkg.
   freebsd-native-e2e:
     name: Native e2e (freebsd-amd64)
     needs: gate
@@ -260,8 +260,15 @@ jobs:
           run: |
             rustc --version
             python3 --version
-            cargo build --release --locked
-            python3 e2e/run.py --backend native --binary target/release/reflector
+            # The shipped FreeBSD configuration exactly: static (+crt-static) on the LTO release
+            # profile, as release.yml publishes it -- runtime behavior differs there (the null
+            # environ that sys::process_env works around, the pair tests' spawn skip), and this
+            # lane is the only one that runs that artifact. --target (even ==host) keeps the
+            # flag off the host proc-macro graph, like the freebsd test job's release lane.
+            RUSTFLAGS="-C target-feature=+crt-static" \
+              cargo build --release --locked --target x86_64-unknown-freebsd
+            python3 e2e/run.py --backend native \
+              --binary target/x86_64-unknown-freebsd/release/reflector
 
   # Build the scratch image and drive the Docker-bridge e2e suite (the data path: capture -> reflect across
   # two bridges, multi-protocol). --skip-build reuses the image built here with the gha cache.
