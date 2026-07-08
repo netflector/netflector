@@ -78,6 +78,15 @@ impl InterfacePair {
     fn create() -> Option<Self> {
         use std::sync::atomic::{AtomicU8, Ordering};
         static NEXT_SUBNET: AtomicU8 = AtomicU8::new(1);
+        // The fixture is built on ifconfig shell-outs, and std::process::Command SIGSEGVs in a
+        // statically-linked LTO release binary on FreeBSD (the lto + crt-static + spawn class
+        // of rust-lang/rust#94564; deterministic in CI, fine dynamic and fine on static musl).
+        // FreeBSD coverage comes from the dynamic (debug) lane; the static lane keeps proving
+        // the +crt-static build for the rest of the suite.
+        if cfg!(all(target_os = "freebsd", target_feature = "crt-static")) {
+            eprintln!("skip pair test: process spawning crashes static LTO FreeBSD binaries");
+            return None;
+        }
         // SAFETY: geteuid takes no arguments and cannot fail.
         if unsafe { libc::geteuid() } != 0 {
             eprintln!("skip pair test: interface creation requires root");
