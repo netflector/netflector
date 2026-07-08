@@ -34,15 +34,7 @@ impl PortReservation {
         let fd = open_socket(family, libc::SOCK_DGRAM)?;
         #[cfg(target_os = "linux")]
         attach_drop_all_filter(fd.as_raw_fd())?;
-        // A zone id belongs to link-local addresses only. FreeBSD rejects binding a routable
-        // address paired with a non-zero sin6_scope_id (its ifa lookup byte-compares the whole
-        // sockaddr -> EADDRNOTAVAIL); Linux reads the field only for link-local binds, and macOS
-        // zeroes it before its lookup.
-        let scope_id = match addr {
-            IpAddr::V6(v6) if v6.is_unicast_link_local() => ifindex,
-            _ => 0,
-        };
-        let (storage, len) = sockaddr_for(addr, 0, scope_id);
+        let (storage, len) = sockaddr_for(addr, 0, ifindex);
         // SAFETY: `storage` is a valid `sockaddr_in`/`sockaddr_in6` of length `len` for `fd`'s family.
         let rc = unsafe {
             libc::bind(

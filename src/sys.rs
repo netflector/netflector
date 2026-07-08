@@ -3,7 +3,7 @@
 //! and the `SOCK_*` type flags, so it applies close-on-exec and non-blocking by `fcntl`.
 
 use std::io;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 #[cfg(target_os = "macos")]
 use std::os::fd::AsRawFd;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
@@ -113,6 +113,11 @@ pub(crate) fn open_socket(family: c_int, base_type: c_int) -> io::Result<OwnedFd
 /// returning it with the family-specific length for a `bind`/option argument. `scope_id` (an
 /// interface index) goes into `sin6_scope_id` for IPv6, required to bind a link-local address,
 /// and is ignored for IPv4. On the BSDs the `sin*_len` byte is set, which the kernel requires.
+///
+/// The scope is written only for addresses whose zone the kernel consults
+/// ([`needs_scope_id`]) and zeroed otherwise, so callers can pass their interface index
+/// unconditionally: FreeBSD rejects a bind with a nonzero `sin6_scope_id` on any other
+/// address (its lookup compares the whole sockaddr -> `EADDRNOTAVAIL`).
 pub(crate) fn sockaddr_for(
     addr: IpAddr,
     port: u16,
@@ -150,7 +155,7 @@ pub(crate) fn sockaddr_for(
                 (*sin6).sin6_addr = libc::in6_addr {
                     s6_addr: v6.octets(),
                 };
-                (*sin6).sin6_scope_id = scope_id;
+                (*sin6).sin6_scope_id = if needs_scope_id(v6) { scope_id } else { 0 };
                 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
                 {
                     (*sin6).sin6_len = u8::try_from(size_of::<libc::sockaddr_in6>())
@@ -161,6 +166,17 @@ pub(crate) fn sockaddr_for(
         }
     };
     (storage, len)
+}
+
+/// Whether the kernel consults `sin6_scope_id` for this address: link-local unicast, or
+/// multicast scoped to the interface (`ff01::`) or link (`ff02::`). For everything else,
+/// including site-scoped multicast, Linux ignores the field, macOS zeroes it before its
+/// lookup, and FreeBSD rejects binds that carry it.
+fn needs_scope_id(v6: Ipv6Addr) -> bool {
+    const INTERFACE_LOCAL: u16 = 1;
+    const LINK_LOCAL: u16 = 2;
+    v6.is_unicast_link_local()
+        || (v6.is_multicast() && matches!(v6.segments()[0] & 0xf, INTERFACE_LOCAL | LINK_LOCAL))
 }
 
 /// Set `FD_CLOEXEC` and `O_NONBLOCK` on `fd`, read-modify-write so any other flags survive.
@@ -273,6 +289,27 @@ mod tests {
         );
         assert_eq!(sin6.sin6_addr.s6_addr, v6.octets());
         assert_eq!(sin6.sin6_scope_id, 7);
+    }
+
+    fn scope_written_for(addr: &str) -> u32 {
+        let v6: Ipv6Addr = addr.parse().unwrap();
+        let (sa, _) = sockaddr_for(IpAddr::V6(v6), 0, 7);
+        // SAFETY: `sockaddr_for` wrote a `sockaddr_in6` into the storage for a V6 address.
+        unsafe { (*(&raw const sa).cast::<libc::sockaddr_in6>()).sin6_scope_id }
+    }
+
+    #[test]
+    fn sockaddr_for_keeps_the_scope_id_for_link_scoped_multicast() {
+        assert_eq!(scope_written_for("ff02::fb"), 7);
+        assert_eq!(scope_written_for("ff01::1"), 7);
+    }
+
+    #[test]
+    fn sockaddr_for_zeroes_the_scope_id_where_the_kernel_ignores_it() {
+        assert_eq!(scope_written_for("2001:db8::1"), 0);
+        assert_eq!(scope_written_for("fd00::1"), 0);
+        assert_eq!(scope_written_for("ff05::c"), 0);
+        assert_eq!(scope_written_for("::1"), 0);
     }
 
     #[test]
