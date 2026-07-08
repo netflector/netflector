@@ -39,7 +39,12 @@ EOF
 
 COPY Cargo.toml Cargo.lock ./
 COPY src/ ./src/
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
+# The cache mount is keyed per arch: multi-platform builds run the per-arch builder stages in
+# parallel, and cargo cannot coordinate concurrent registry unpacks across them (its lock file
+# is $CARGO_HOME/.package-cache, outside the mounted path) -- two arches racing to unpack the
+# same crate into a shared default-id mount fail with "File exists" whenever the mount is cold
+# (in CI it always is: RUN-mount contents are not part of the exported layer cache).
+RUN --mount=type=cache,id=cargo-registry-${TARGETARCH}${TARGETVARIANT},target=/usr/local/cargo/registry \
     triple="$(cat /triple)"; \
     cargo build --release --locked --target "${triple}"; \
     install -D "target/${triple}/release/reflector" /out/reflector
@@ -58,7 +63,8 @@ RUN apt-get update \
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src/ ./src/
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
+# Its own cache id: this stage is amd64-only, but the default id would alias the builder's mount.
+RUN --mount=type=cache,id=cargo-registry-valgrind,target=/usr/local/cargo/registry \
     CARGO_PROFILE_RELEASE_DEBUG=true CARGO_PROFILE_RELEASE_STRIP=false \
     cargo build --release --locked \
     && install -D target/release/reflector /usr/local/bin/reflector
