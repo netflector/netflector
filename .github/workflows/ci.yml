@@ -187,8 +187,17 @@ jobs:
           EOF
       - name: Show toolchain
         run: rustc -V && cargo -V
-      - name: cargo test
-        run: cargo test --locked ${{ matrix.target.triple != '' && format('--target {0}', matrix.target.triple) || '' }} ${{ matrix.profile.flags }}
+      # The native lanes run the whole suite as root so the privileged tests (interface pairs,
+      # BPF/AF_PACKET captures, joins) run instead of skipping -- like the FreeBSD VM suite, which
+      # is root already. The qemu lanes stay unprivileged: their datapath-under-emulation coverage
+      # lives in the native e2e lanes, and they double as the guard that the suite still runs (and
+      # skips its privileged tests) without root, the way contributors run it.
+      - name: cargo test (root)
+        if: matrix.target.triple == ''
+        run: sudo -E "$(command -v cargo)" test --locked ${{ matrix.profile.flags }}
+      - name: cargo test (under QEMU)
+        if: matrix.target.triple != ''
+        run: cargo test --locked --target ${{ matrix.target.triple }} ${{ matrix.profile.flags }}
 
   # FreeBSD shares its BSD platform path (kqueue, BPF, route sockets, getifaddrs) with macOS but needs a real
   # FreeBSD kernel to build and run -- Docker can't provide one. vmactions boots a FreeBSD VM (KVM on the
