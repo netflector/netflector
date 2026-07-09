@@ -441,10 +441,9 @@ fn rewritable_authority(line: &[u8]) -> Option<(usize, Authority, AuthorityHeade
             (rest, true, AuthorityHeader::Host)
         } else if let Some(rest) = strip_prefix_ignore_ascii_case(line, b"Application-URL:") {
             (rest, false, AuthorityHeader::ApplicationUrl)
-        } else if let Some(rest) = strip_prefix_ignore_ascii_case(line, b"Location:") {
-            (rest, false, AuthorityHeader::Location)
         } else {
-            return None;
+            let rest = strip_prefix_ignore_ascii_case(line, b"Location:")?;
+            (rest, false, AuthorityHeader::Location)
         };
     let trimmed = value.trim_ascii_start();
     let value_off = line.len() - trimmed.len();
