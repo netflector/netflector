@@ -63,10 +63,16 @@ pub(crate) fn parse_cache_control_max_age(payload: &[u8]) -> Option<u32> {
 }
 
 /// The `max-age` delta-seconds from a `CACHE-CONTROL` value, scanning its comma-separated directives.
+/// Whitespace around the `=` is tolerated: HTTP's grammar has none, but UDA 1.2.2's example reads
+/// `max-age = 1800` and devices copy it verbatim.
 fn max_age_seconds(value: &[u8]) -> Option<u32> {
     for directive in value.split(|&b| b == b',') {
-        if let Some(digits) = strip_prefix_ignore_ascii_case(directive.trim_ascii(), b"max-age=") {
-            return std::str::from_utf8(digits).ok()?.parse::<u32>().ok();
+        let Some(eq) = directive.iter().position(|&b| b == b'=') else {
+            continue;
+        };
+        let (name, digits) = (&directive[..eq], &directive[eq + 1..]);
+        if name.trim_ascii().eq_ignore_ascii_case(b"max-age") {
+            return std::str::from_utf8(digits.trim_ascii()).ok()?.parse().ok();
         }
     }
     None
@@ -154,6 +160,24 @@ mod tests {
         assert_eq!(
             parse_cache_control_max_age(b"CACHE-CONTROL:max-age=42\r\n"),
             Some(42)
+        );
+    }
+
+    #[test]
+    fn max_age_tolerates_whitespace_around_the_equals() {
+        // UDA 1.2.2's example writes the value this way, spaces and all.
+        assert_eq!(
+            parse_cache_control_max_age(b"CACHE-CONTROL: max-age = 1800\r\n"),
+            Some(1800)
+        );
+        assert_eq!(
+            parse_cache_control_max_age(b"CACHE-CONTROL: no-cache, max-age =600\r\n"),
+            Some(600)
+        );
+        // Only whole-name matches: s-maxage is a different directive.
+        assert_eq!(
+            parse_cache_control_max_age(b"CACHE-CONTROL: s-maxage = 60\r\n"),
+            None
         );
     }
 
