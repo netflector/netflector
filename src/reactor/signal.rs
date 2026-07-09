@@ -75,12 +75,9 @@ impl SignalGuard {
     pub(crate) fn install() -> io::Result<(Self, SignalPipe)> {
         let (read, write) = self_pipe()?;
         // Publish the write fd for the handler, refusing a second concurrent install.
-        if WRITE_FD
+        WRITE_FD
             .compare_exchange(-1, write.as_raw_fd(), Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return Err(io::Error::other("signal handlers already installed"));
-        }
+            .map_err(|_| io::Error::other("signal handlers already installed"))?;
         // Clear any flag a signal set during a previous guard's teardown window, so it can't leak into
         // this run and turn the first wakeup into a spurious shutdown. No handler is installed yet.
         SHUTDOWN_REQUESTED.store(false, Ordering::Relaxed);
