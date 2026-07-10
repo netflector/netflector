@@ -117,14 +117,17 @@ jobs:
       - name: rustdoc (intra-doc link gate)
         run: cargo doc --locked --target ${{ matrix.target }} --no-deps --document-private-items
 
-  # The unit suite in both profiles, per OS/arch. macOS exercises the cfg(macos) BSD path; the two
-  # Linux arches exercise cfg(linux) on 64-bit. armv7/armv5 have no native runner, but 32-bit ARM is
-  # a deployment target (MikroTik), so those lanes (triple != '') run the suite under QEMU rather
-  # than only cross-building it -- catching pointer-width / alignment / cast bugs the 64-bit lanes
-  # can't. The static musl test binary needs no target sysroot under qemu-user: lld cross-links it
-  # (the same config the Dockerfile uses, no per-arch gcc) and the cargo target runner executes it
-  # via qemu-arm-static (armv7 = armhf, hard-float; armv5 = armel, soft-float, the EN7562 boxes).
-  # Privileged tests (raw-socket capture) self-skip without CAP_NET_RAW, as they do on the dev host.
+  # The unit suite in both profiles, per OS/arch/libc. The glibc lanes (triple '') cover the
+  # from-source configuration -- what `cargo build` gives users and contributors, rustc's default
+  # toolchain included; macOS among them exercises the cfg(macos) BSD path. The 64-bit musl lanes
+  # run the shipped-binary configuration (static musl, rustc's default self-contained link, the
+  # same as release.yml's native rows) natively and as root, so the privileged tests also cover
+  # musl's std/libc. armv7/armv5 have no native runner, but 32-bit ARM is a deployment target
+  # (MikroTik), so those lanes run the shipped musl configuration under QEMU rather than only
+  # cross-building it -- catching pointer-width / alignment / cast bugs the 64-bit lanes can't.
+  # There lld cross-links (the same config the Dockerfile uses for cross layers, no per-arch gcc)
+  # and the cargo target runner executes via qemu-arm-static (armv7 = armhf, hard-float; armv5 =
+  # armel, soft-float, the EN7562 boxes).
   test:
     name: Test (${{ matrix.target.name }}, ${{ matrix.profile.name }})
     needs: gate
@@ -139,13 +142,16 @@ jobs:
         profile:
           - { name: debug, flags: '' }
           - { name: release, flags: '--release' }
-        # triple '' = the runner's native toolchain; otherwise that static musl target under QEMU.
+        # triple '' = the runner's native gnu toolchain; a triple without `emulated` is that musl
+        # target built and run natively; `emulated` lanes cross-link and run under qemu-arm-static.
         target:
-          - { name: linux-amd64, runner: ubuntu-24.04, triple: '' }
-          - { name: linux-arm64, runner: ubuntu-24.04-arm, triple: '' }
+          - { name: linux-amd64-glibc, runner: ubuntu-24.04, triple: '' }
+          - { name: linux-arm64-glibc, runner: ubuntu-24.04-arm, triple: '' }
+          - { name: linux-amd64-musl, runner: ubuntu-24.04, triple: x86_64-unknown-linux-musl }
+          - { name: linux-arm64-musl, runner: ubuntu-24.04-arm, triple: aarch64-unknown-linux-musl }
+          - { name: linux-armv7-musl, runner: ubuntu-24.04, triple: armv7-unknown-linux-musleabihf, emulated: true }
+          - { name: linux-armv5-musl, runner: ubuntu-24.04, triple: armv5te-unknown-linux-musleabi, emulated: true }
           - { name: macos-arm64, runner: macos-15, triple: '' }
-          - { name: linux-armv7, runner: ubuntu-24.04, triple: armv7-unknown-linux-musleabihf }
-          - { name: linux-armv5, runner: ubuntu-24.04, triple: armv5te-unknown-linux-musleabi }
     steps:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -160,7 +166,7 @@ jobs:
           key: cargo-${{ matrix.target.name }}-${{ matrix.profile.name }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-${{ matrix.target.name }}-${{ matrix.profile.name }}-
       - name: Install lld + QEMU user-mode
-        if: matrix.target.triple != ''
+        if: matrix.target.emulated
         run: |
           # A failing third-party repo (packages.microsoft.com flakes) must not kill the step:
           # the packages come from the Ubuntu archive, and a broken archive still fails the
@@ -170,11 +176,13 @@ jobs:
       - name: Add the Rust target
         if: matrix.target.triple != ''
         run: rustup target add ${{ matrix.target.triple }}
-      # Link the musl target with lld (cross-capable, unlike the host gcc) and run the test binary under
-      # QEMU -- the same lld config the Dockerfile writes, plus a qemu-arm-static runner for the target.
-      # The cfg(target_env = "musl") scope leaves host build-scripts/proc-macros on the default linker.
+      # Link the arm32 musl target with lld (cross-capable, unlike the host gcc) and run the test
+      # binary under QEMU -- the same lld config the Dockerfile writes for cross layers, plus a
+      # qemu-arm-static runner for the target. The cfg(target_env = "musl") scope leaves host
+      # build-scripts/proc-macros on the default linker. The native musl lanes write no config at
+      # all: rustc's default toolchain links them, exactly like the release rows.
       - name: Configure the cross linker and QEMU runner
-        if: matrix.target.triple != ''
+        if: matrix.target.emulated
         run: |
           mkdir -p .cargo
           cat > .cargo/config.toml <<'EOF'
@@ -193,10 +201,12 @@ jobs:
       # lives in the native e2e lanes, and they double as the guard that the suite still runs (and
       # skips its privileged tests) without root, the way contributors run it.
       - name: cargo test (root)
-        if: matrix.target.triple == ''
-        run: sudo -E "$(command -v cargo)" test --locked ${{ matrix.profile.flags }}
+        if: ${{ !matrix.target.emulated }}
+        run: |
+          triple='${{ matrix.target.triple }}'
+          sudo -E "$(command -v cargo)" test --locked ${{ matrix.profile.flags }} ${triple:+--target "$triple"}
       - name: cargo test (under QEMU)
-        if: matrix.target.triple != ''
+        if: matrix.target.emulated
         run: cargo test --locked --target ${{ matrix.target.triple }} ${{ matrix.profile.flags }}
 
   # FreeBSD shares its BSD platform path (kqueue, BPF, route sockets, getifaddrs) with macOS but needs a
