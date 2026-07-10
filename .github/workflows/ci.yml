@@ -497,6 +497,51 @@ jobs:
           triple='${{ matrix.target.triple }}'
           sudo python3 e2e/run.py --backend native --binary "target/${triple:+$triple/}release/reflector"
 
+  # The unit suite under Valgrind memcheck. The valgrind-e2e job below only ever sees the daemon's
+  # datapath; the unit suite is where the unsafe surface actually executes -- the netlink walk
+  # arithmetic, sockaddr conversions, StreamBuffer's unsafe commit, MaybeUninit buffers, the
+  # hostile-input parser tests -- and an invalid read there can pass natively (the byte over-read
+  # is usually still allocated) while memcheck flags it. glibc only: valgrind and static musl
+  # don't mix (the Dockerfile's valgrind stage records the same constraint). Debug profile for
+  # assertions and symbols; root so the privileged tests run under memcheck too; the target
+  # runner wraps every test binary. Flags differ from valgrind-e2e in one place: "possible" is
+  # not an error here, because libtest's mpmc machinery leaves the main thread's Thread handle
+  # possibly-lost in TLS at exit (std bookkeeping, verified by backtrace) -- the daemon has no
+  # harness, so the e2e lane keeps the stricter set. "reachable" stays allowed in both:
+  # process-lifetime statics live to exit by design.
+  valgrind-test:
+    name: Valgrind test
+    needs: gate
+    if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - name: Cache cargo build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-valgrind-test-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-valgrind-test-
+      - name: Install valgrind
+        run: |
+          # A failing third-party repo (packages.microsoft.com flakes) must not kill the step:
+          # the packages come from the Ubuntu archive, and a broken archive still fails the
+          # install below loudly.
+          sudo apt-get update || true
+          sudo apt-get install -y --no-install-recommends valgrind
+      - name: Show toolchain
+        run: rustc -V && cargo -V && valgrind --version
+      - name: cargo test (under memcheck)
+        run: |
+          export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-fds=yes --num-callers=30 --error-exitcode=1'
+          sudo -E "$(command -v cargo)" test --locked
+
   # The e2e suite with the reflector under Valgrind memcheck (the runtime-valgrind image: a glibc release
   # binary with debug symbols). run.py --valgrind SIGTERMs the daemon per case so Valgrind runs its leak
   # analysis at a clean exit; --error-exitcode=1 fails on any leak, leaked fd, or memcheck error.
@@ -533,7 +578,7 @@ jobs:
   success:
     name: Success
     if: ${{ !cancelled() }}
-    needs: [gate, fmt, lint, test, freebsd, docker-e2e, native-e2e, freebsd-native-e2e, valgrind-e2e]
+    needs: [gate, fmt, lint, test, freebsd, docker-e2e, native-e2e, freebsd-native-e2e, valgrind-test, valgrind-e2e]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
