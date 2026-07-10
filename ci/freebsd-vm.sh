@@ -14,17 +14,37 @@
 #   ci/freebsd-vm.sh console   dump the serial console (boot diagnostics)
 #
 # State (disk, seed, per-run ssh key, console log) lives in $FREEBSD_VM_DIR,
-# default ~/.freebsd-vm. The release + image hash pins live in ci/freebsd.env
-# (Renovate bumps the release, ci/freebsd-pin.sh refreshes the hashes).
+# default ~/.freebsd-vm. $FREEBSD_VM_ARCH (required, no default: a guessed
+# arch is a silently wrong VM) picks the guest: amd64 (KVM) or arm64 (TCG --
+# no GitHub runner has arm64 KVM, so the guest is emulated and gets a far
+# larger ssh-wait budget). The release + image hash pins live in
+# ci/freebsd.env (Renovate bumps the release, ci/freebsd-pin.sh refreshes
+# the hashes).
 set -euo pipefail
 
 . "$(dirname "$0")/freebsd.env"
-IMAGE="FreeBSD-${RELEASE}-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2"
-IMAGE_URL="https://download.freebsd.org/releases/VM-IMAGES/${RELEASE}-RELEASE/amd64/Latest/${IMAGE}.xz"
+ARCH=${FREEBSD_VM_ARCH:?set FREEBSD_VM_ARCH to amd64 or arm64}
+case "$ARCH" in
+amd64)
+    IMAGE_URL=$IMAGE_URL_AMD64
+    IMAGE_SHA=$IMAGE_SHA512_AMD64
+    WAIT_DEFAULT=300
+    ;;
+arm64)
+    IMAGE_URL=$IMAGE_URL_ARM64
+    IMAGE_SHA=$IMAGE_SHA512_ARM64
+    WAIT_DEFAULT=1200
+    ;;
+*)
+    echo "error: unknown FREEBSD_VM_ARCH '$ARCH' (amd64|arm64)" >&2
+    exit 64
+    ;;
+esac
+IMAGE=$(basename "$IMAGE_URL" .xz)
 
 VM_DIR=${FREEBSD_VM_DIR:-$HOME/.freebsd-vm}
 SSH_PORT=${FREEBSD_VM_SSH_PORT:-2222}
-SSH_WAIT_SECS=${FREEBSD_VM_SSH_WAIT_SECS:-300}
+SSH_WAIT_SECS=${FREEBSD_VM_SSH_WAIT_SECS:-$WAIT_DEFAULT}
 
 # No port here: ssh wants -p, scp wants -P; each call site adds its own.
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
@@ -66,7 +86,7 @@ EOF
 launch() {
     mkdir -p "$VM_DIR"
     curl -fsSL "$IMAGE_URL" -o "$VM_DIR/$IMAGE.xz"
-    echo "$IMAGE_SHA512  $VM_DIR/$IMAGE.xz" | sha512sum -c - || {
+    echo "$IMAGE_SHA  $VM_DIR/$IMAGE.xz" | sha512sum -c - || {
         echo "error: image hash mismatch; after a release bump, run ci/freebsd-pin.sh" >&2
         exit 1
     }
@@ -77,15 +97,36 @@ launch() {
     seed_iso
     # Slirp networking: sshd reachable only through the localhost hostfwd, so
     # the per-image world-readable-key exposure vmactions has cannot arise.
-    qemu-system-x86_64 \
-        -machine q35 -accel kvm -cpu host -smp "$(nproc)" -m 6144 \
-        -drive "file=$VM_DIR/$IMAGE,format=qcow2,if=virtio" \
-        -cdrom "$VM_DIR/seed.iso" \
-        -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${SSH_PORT}-:22" \
-        -device virtio-net-pci,netdev=net0 \
-        -display none -serial "file:$VM_DIR/console.log" \
+    # The empty romfile drops virtio-net's PXE option ROM: the ROM files ship
+    # in ipxe-qemu, which qemu-system-arm does not pull in, and these guests
+    # only ever boot from disk anyway.
+    common=(
+        -smp "$(nproc)" -m 6144
+        -drive "file=$VM_DIR/$IMAGE,format=qcow2,if=virtio"
+        -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${SSH_PORT}-:22"
+        -device virtio-net-pci,netdev=net0,romfile=
+        -display none -serial "file:$VM_DIR/console.log"
         -pidfile "$VM_DIR/qemu.pid" -daemonize
-    echo "FreeBSD $RELEASE VM started (qemu pid $(cat "$VM_DIR/qemu.pid"))"
+    )
+    if [ "$ARCH" = amd64 ]; then
+        qemu-system-x86_64 \
+            -machine q35 -accel kvm -cpu host \
+            -cdrom "$VM_DIR/seed.iso" \
+            "${common[@]}"
+    else
+        # TCG with one thread per vCPU; the virt machine boots via UEFI (a
+        # read-only AAVMF code image plus a writable per-VM vars copy) and
+        # has no CD controller, so the seed rides a read-only virtio disk --
+        # nuageinit finds it by filesystem label, not device type.
+        cp /usr/share/AAVMF/AAVMF_VARS.fd "$VM_DIR/AAVMF_VARS.fd"
+        qemu-system-aarch64 \
+            -machine virt -accel tcg,thread=multi -cpu max \
+            -drive "if=pflash,format=raw,readonly=on,file=/usr/share/AAVMF/AAVMF_CODE.fd" \
+            -drive "if=pflash,format=raw,file=$VM_DIR/AAVMF_VARS.fd" \
+            -drive "file=$VM_DIR/seed.iso,format=raw,if=virtio,readonly=on" \
+            "${common[@]}"
+    fi
+    echo "FreeBSD $RELEASE $ARCH VM started (qemu pid $(cat "$VM_DIR/qemu.pid"))"
 }
 
 wait_ssh() {
