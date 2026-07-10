@@ -334,13 +334,22 @@ jobs:
         run: ci/freebsd-vm.sh console
 
   # Build the scratch image and drive the Docker-bridge e2e suite (the data path: capture -> reflect across
-  # two bridges, multi-protocol). --skip-build reuses the image built here with the gha cache.
+  # two bridges, multi-protocol). One lane per shipped 64-bit image arch, each on its native runner, so
+  # both released layer sets are executed in exactly the configuration release.yml publishes (native =
+  # default-toolchain link, per the Dockerfile). The cache scopes match the release image jobs', so a
+  # release build reuses layers CI built for the same commit. --skip-build reuses the image built here.
   docker-e2e:
-    name: Docker e2e
+    name: Docker e2e (${{ matrix.arch.name }})
     needs: gate
     if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.arch.runner }}
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - { name: amd64, runner: ubuntu-24.04 }
+          - { name: arm64, runner: ubuntu-24.04-arm }
     steps:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -352,8 +361,8 @@ jobs:
           context: .
           tags: reflector:e2e
           load: true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ matrix.arch.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch.name }}
       - name: Run e2e
         run: python3 e2e/run.py --skip-build --image reflector:e2e
 
