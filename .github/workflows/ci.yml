@@ -376,14 +376,15 @@ jobs:
       - name: Run e2e
         run: python3 e2e/run.py --skip-build --image reflector:e2e
 
-  # The same e2e suite without Docker: netns + veth segments and plain processes. The native-arch
-  # lanes run a release binary built directly on the runner (amd64 exercises the glibc build,
-  # arm64 the deployment arch). The 32-bit ARM lanes run the release configuration -- the static
-  # musl binary, lld-cross-linked like the Dockerfile/release builds -- with the daemon executing
-  # under qemu-user via binfmt_misc: the harness, probes, and every kernel primitive (netns, veth,
-  # AF_PACKET, netlink) are native; only the reflector is emulated. That puts real 32-bit
-  # pointer-width traffic through the whole capture -> classify -> re-emit path, which the QEMU
-  # unit-test lanes can't (unit-only) and the docker-e2e lane can't (amd64 image).
+  # The same e2e suite without Docker: netns + veth segments and plain processes. The glibc lanes
+  # run a release binary built directly on the runner -- the from-source configuration. The 64-bit
+  # musl lanes run the shipped release-asset configuration: static musl, rustc's default
+  # toolchain, built and run natively. The 32-bit ARM lanes run that shipped configuration too,
+  # lld-cross-linked like the Dockerfile's cross layers, with the daemon executing under qemu-user
+  # via binfmt_misc: the harness, probes, and every kernel primitive (netns, veth, AF_PACKET,
+  # netlink) are native; only the reflector is emulated. That puts real 32-bit pointer-width
+  # traffic through the whole capture -> classify -> re-emit path, which the QEMU unit-test lanes
+  # can't (unit-only) and the docker-e2e lanes can't (64-bit images).
   native-e2e:
     name: Native e2e (${{ matrix.target.name }})
     needs: gate
@@ -393,12 +394,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # triple '' = the runner's native toolchain; otherwise that static musl target under QEMU.
+        # triple '' = the runner's native gnu toolchain; a triple without `emulated` is that musl
+        # target built and run natively; `emulated` lanes cross-link and run under qemu binfmt.
         target:
-          - { name: linux-amd64, runner: ubuntu-24.04, triple: '' }
-          - { name: linux-arm64, runner: ubuntu-24.04-arm, triple: '' }
-          - { name: linux-armv7, runner: ubuntu-24.04, triple: armv7-unknown-linux-musleabihf }
-          - { name: linux-armv5, runner: ubuntu-24.04, triple: armv5te-unknown-linux-musleabi }
+          - { name: linux-amd64-glibc, runner: ubuntu-24.04, triple: '' }
+          - { name: linux-arm64-glibc, runner: ubuntu-24.04-arm, triple: '' }
+          - { name: linux-amd64-musl, runner: ubuntu-24.04, triple: x86_64-unknown-linux-musl }
+          - { name: linux-arm64-musl, runner: ubuntu-24.04-arm, triple: aarch64-unknown-linux-musl }
+          - { name: linux-armv7-musl, runner: ubuntu-24.04, triple: armv7-unknown-linux-musleabihf, emulated: true }
+          - { name: linux-armv5-musl, runner: ubuntu-24.04, triple: armv5te-unknown-linux-musleabi, emulated: true }
     steps:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -413,7 +417,7 @@ jobs:
           key: cargo-native-e2e-${{ matrix.target.name }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-native-e2e-${{ matrix.target.name }}-
       - name: Install lld + QEMU user-mode
-        if: matrix.target.triple != ''
+        if: matrix.target.emulated
         run: |
           # A failing third-party repo (packages.microsoft.com flakes) must not kill the step:
           # the packages come from the Ubuntu archive, and a broken archive still fails the
@@ -423,10 +427,11 @@ jobs:
       - name: Add the Rust target
         if: matrix.target.triple != ''
         run: rustup target add ${{ matrix.target.triple }}
-      # The same lld cross-link config the Dockerfile and the QEMU test lanes write; binfmt_misc
-      # (from qemu-user-static) execs the ARM binary under qemu transparently, netns exec included.
-      - name: Configure the musl cross-linker
-        if: matrix.target.triple != ''
+      # The same lld cross-link config the Dockerfile writes for cross layers; binfmt_misc (from
+      # qemu-user-static) execs the ARM binary under qemu transparently, netns exec included. The
+      # native musl lanes write no config: rustc's default toolchain, like release.yml's rows.
+      - name: Configure the arm32 cross-linker
+        if: matrix.target.emulated
         run: |
           mkdir -p .cargo
           cat > .cargo/config.toml <<'EOF'
@@ -435,7 +440,9 @@ jobs:
           rustflags = ["-C", "linker-flavor=ld.lld"]
           EOF
       - name: Build release binary
-        run: cargo build --release --locked ${{ matrix.target.triple != '' && format('--target {0}', matrix.target.triple) || '' }}
+        run: |
+          triple='${{ matrix.target.triple }}'
+          cargo build --release --locked ${triple:+--target "$triple"}
       - name: Run e2e natively
         run: |
           triple='${{ matrix.target.triple }}'
