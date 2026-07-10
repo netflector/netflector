@@ -2,8 +2,9 @@
 # Build the reflector as a fully static musl binary and ship it on scratch — nothing else to carry
 # or to grow CVEs. Architecture-agnostic: buildx's TARGETARCH/TARGETVARIANT select the musl target,
 # and the builder runs on the native build host (BUILDPLATFORM) and cross-compiles, so the arm
-# images don't crawl under QEMU. The crate is pure Rust (libc FFI only), so LLVM's lld cross-links
-# it for any arch with no per-arch gcc toolchain — just the one lld package.
+# images don't crawl under QEMU. Cross layers link with LLVM's lld (any arch, no per-arch gcc);
+# a layer built on its own arch uses rustc's default toolchain, following upstream defaults
+# where one exists.
 
 # Pin the shared base image by digest: reproducible builds, no drift under the floating tag. Renovate
 # keeps it current. Referenced by both the builder and the valgrind runtime below so they stay in lockstep.
@@ -28,13 +29,24 @@ RUN set -eux; \
     echo "${triple}" > /triple; \
     rustup target add "${triple}"
 
-# Link the musl targets with LLVM's lld (cross-capable, unlike the host gcc). Scoped to musl via
-# cfg, so the host's build scripts and proc-macros still link with the default toolchain.
+# Cross-compiled layers link with LLVM's lld (cross-capable, unlike the host gcc), scoped to musl
+# via cfg so the host's build scripts and proc-macros keep the default toolchain. A layer built on
+# its own arch (TARGETPLATFORM == BUILDPLATFORM: amd64, and arm64 on an arm64 host) writes no
+# config: rustc's default toolchain, per the policy of following upstream defaults where one
+# exists. lld installs either way so the layer stays shared across platforms.
 RUN apt-get update && apt-get install -y --no-install-recommends lld && rm -rf /var/lib/apt/lists/*
-RUN mkdir -p .cargo && cat > .cargo/config.toml <<'EOF'
+ARG BUILDPLATFORM
+ARG TARGETPLATFORM
+RUN <<'EOF'
+set -eu
+if [ "${TARGETPLATFORM}" != "${BUILDPLATFORM}" ]; then
+    mkdir -p .cargo
+    cat > .cargo/config.toml <<'CFG'
 [target.'cfg(target_env = "musl")']
 linker = "ld.lld"
 rustflags = ["-C", "linker-flavor=ld.lld"]
+CFG
+fi
 EOF
 
 COPY Cargo.toml Cargo.lock ./
