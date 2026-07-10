@@ -58,11 +58,12 @@ jobs:
           [ -n "$ok" ] || { echo "::error::Timed out waiting for $wf on $sha"; exit 1; }
           echo "$wf passed on $sha."
 
-  # Downloadable binaries. The Linux targets are static musl, cross-compiled on the amd64 runner with lld
-  # (no QEMU, no per-arch gcc -- the same path the Dockerfile uses); FreeBSD amd64 cross-compiles the same
-  # way against a base.txz sysroot (ci/freebsd-sysroot.sh) -- the exact configuration CI's freebsd lanes
-  # build AND run on every PR; macOS builds natively and ships dynamic (no static libSystem). FreeBSD
-  # arm64 is separate (no rustup std until Rust 1.98; see binaries-freebsd).
+  # Downloadable binaries, built with rustc's default toolchain wherever one exists: amd64 and
+  # arm64 are static musl on their native runners (the self-contained default, gcc-driven link),
+  # macOS native dynamic (no static libSystem). armv7/armv5 have no native runner, so they
+  # cross-compile on the amd64 runner with lld; FreeBSD amd64 likewise (clang+lld against a
+  # base.txz sysroot -- the exact configuration CI's freebsd lanes build AND run on every PR).
+  # FreeBSD arm64 is separate (no rustup std until Rust 1.98; see binaries-freebsd).
   binaries:
     name: Binary (${{ matrix.variant }})
     needs: verify-ci
@@ -76,7 +77,7 @@ jobs:
             runner: ubuntu-24.04
             target: x86_64-unknown-linux-musl
           - variant: linux-arm64
-            runner: ubuntu-24.04
+            runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
           - variant: linux-armv7
             runner: ubuntu-24.04
@@ -97,8 +98,8 @@ jobs:
       # A failing third-party repo (packages.microsoft.com flakes) must not kill a release
       # build; the packages come from the Ubuntu archive, and a broken archive still fails
       # the installs below loudly.
-      - name: Install lld (musl linker)
-        if: contains(matrix.target, 'musl')
+      - name: Install lld (arm32 cross-linker)
+        if: contains(matrix.target, 'armv')
         run: |
           sudo apt-get update || true
           sudo apt-get install -y --no-install-recommends lld
@@ -112,10 +113,12 @@ jobs:
       - name: Add the Rust target
         run: rustup target add ${{ matrix.target }}
 
-      # Link the musl targets with lld (cross-capable, unlike the host gcc) -- the same config the Dockerfile
-      # writes. cfg(target_env = "musl") leaves host build-scripts/proc-macros on the default linker.
-      - name: Configure the musl linker
-        if: contains(matrix.target, 'musl')
+      # Link the arm32 musl targets with lld (cross-capable, unlike the host gcc) -- the same config
+      # the Dockerfile writes for its cross layers. cfg(target_env = "musl") leaves host
+      # build-scripts/proc-macros on the default linker; amd64/arm64 musl build natively with no
+      # config at all (rustc's default).
+      - name: Configure the arm32 cross-linker
+        if: contains(matrix.target, 'armv')
         run: |
           mkdir -p .cargo
           cat > .cargo/config.toml <<'EOF'
