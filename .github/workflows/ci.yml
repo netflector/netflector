@@ -211,22 +211,29 @@ jobs:
 
   # FreeBSD shares its BSD platform path (kqueue, BPF, route sockets, getifaddrs) with macOS but needs a
   # real FreeBSD kernel to run -- Docker can't provide one, and qemu-user translates architecture, not OS.
-  # So: cross-compile on the runner with the pinned toolchain (rustup tier-2 std; clang+lld against a
-  # sysroot from the official base.txz, ci/freebsd-sysroot.sh), boot the official FreeBSD image under
-  # QEMU/KVM (ci/freebsd-vm.sh), and run every test binary in it as root through cargo's target runner
-  # (ci/freebsd-ssh-runner.sh) -- privileged tests run instead of skipping. One VM per profile lane, same
-  # debug/release split as the native test lanes; the release lane tests the shipped +crt-static
-  # configuration (kept off host proc-macros by the target-scoped rustflags). Everything fetched is
-  # FreeBSD-project-official and hash-pinned, and the build obeys rust-toolchain.toml.
+  # So: cross-compile on the runner (rustup std; clang+lld against a sysroot from the official base.txz,
+  # ci/freebsd-sysroot.sh), boot the official FreeBSD image under QEMU (ci/freebsd-vm.sh), and run every
+  # test binary in it as root through cargo's target runner (ci/freebsd-ssh-runner.sh) -- privileged
+  # tests run instead of skipping. amd64 rides KVM; arm64 has no KVM on any GitHub runner, so its guest
+  # runs under TCG -- compilation stays native-speed on the runner, only test execution is emulated --
+  # and builds with the pinned nightly from ci/freebsd.env until stable 1.98 ships the target's std.
+  # One VM per lane, the same debug/release split as the native test lanes; the release lanes test the
+  # shipped +crt-static configuration (kept off host proc-macros by the target-scoped rustflags).
+  # Everything fetched is FreeBSD-project-official and hash-pinned.
   freebsd:
-    name: Test (freebsd-amd64, ${{ matrix.profile.name }})
+    name: Test (freebsd-${{ matrix.arch.name }}, ${{ matrix.profile.name }})
     needs: gate
     if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
+    env:
+      FREEBSD_VM_ARCH: ${{ matrix.arch.name }}
     strategy:
       fail-fast: false
       matrix:
+        arch:
+          - { name: amd64, triple: x86_64-unknown-freebsd, kvm: true, packages: qemu-system-x86 }
+          - { name: arm64, triple: aarch64-unknown-freebsd, kvm: false, packages: qemu-system-arm qemu-efi-aarch64 }
         profile:
           - { name: debug, flags: '', rustflags: '' }
           - { name: release, flags: '--release', rustflags: '-C target-feature=+crt-static' }
@@ -241,18 +248,19 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: cargo-freebsd-${{ matrix.profile.name }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-freebsd-${{ matrix.profile.name }}-
+          key: cargo-freebsd-${{ matrix.arch.name }}-${{ matrix.profile.name }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-freebsd-${{ matrix.arch.name }}-${{ matrix.profile.name }}-
       - name: Install clang, lld + QEMU
         run: |
           # A failing third-party repo (packages.microsoft.com flakes) must not kill the step:
           # the packages come from the Ubuntu archive, and a broken archive still fails the
           # install below loudly.
           sudo apt-get update || true
-          sudo apt-get install -y --no-install-recommends clang lld qemu-system-x86 qemu-utils genisoimage
+          sudo apt-get install -y --no-install-recommends clang lld qemu-utils genisoimage ${{ matrix.arch.packages }}
       # /dev/kvm exists on the runner but is root:kvm 0660; GitHub's documented udev recipe opens it
       # (a group add wouldn't apply to the already-running session).
       - name: Enable KVM
+        if: matrix.arch.kvm
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
@@ -260,20 +268,33 @@ jobs:
       # Launch first so the VM boots while the sysroot downloads and the build runs.
       - name: Launch the FreeBSD VM
         run: ci/freebsd-vm.sh launch
+      # aarch64-unknown-freebsd has no stable dist until 1.98: those lanes install the pinned
+      # dated nightly from ci/freebsd.env instead of the rust-toolchain.toml stable, and every
+      # later rustc/cargo call picks it up through the FREEBSD_TOOLCHAIN selector set here.
       - name: Add the Rust target
-        run: rustup target add x86_64-unknown-freebsd
+        run: |
+          . ci/freebsd.env
+          if [ '${{ matrix.arch.name }}' = arm64 ]; then
+            rustup toolchain install "nightly-${RUST_NIGHTLY}" --profile minimal
+            rustup target add --toolchain "nightly-${RUST_NIGHTLY}" aarch64-unknown-freebsd
+            echo "FREEBSD_TOOLCHAIN=+nightly-${RUST_NIGHTLY}" >> "$GITHUB_ENV"
+          else
+            rustup target add x86_64-unknown-freebsd
+          fi
       - name: FreeBSD link sysroot
-        run: ci/freebsd-sysroot.sh
+        run: ci/freebsd-sysroot.sh ${{ matrix.arch.name }}
       - name: Show toolchain
-        run: rustc -V && cargo -V
+        run: rustc ${FREEBSD_TOOLCHAIN:-} -V && cargo ${FREEBSD_TOOLCHAIN:-} -V
       - name: Wait for the VM
         run: ci/freebsd-vm.sh wait
       - name: cargo test
         run: |
-          export CARGO_TARGET_X86_64_UNKNOWN_FREEBSD_LINKER="$HOME/freebsd-sysroot/bin/freebsd-clang"
-          export CARGO_TARGET_X86_64_UNKNOWN_FREEBSD_RUNNER="$PWD/ci/freebsd-ssh-runner.sh"
-          export CARGO_TARGET_X86_64_UNKNOWN_FREEBSD_RUSTFLAGS='${{ matrix.profile.rustflags }}'
-          cargo test --locked --target x86_64-unknown-freebsd ${{ matrix.profile.flags }}
+          triple='${{ matrix.arch.triple }}'
+          prefix="CARGO_TARGET_$(echo "$triple" | tr 'a-z-' 'A-Z_')"
+          export "${prefix}_LINKER=$HOME/freebsd-sysroot/bin/freebsd-clang"
+          export "${prefix}_RUNNER=$PWD/ci/freebsd-ssh-runner.sh"
+          export "${prefix}_RUSTFLAGS=${{ matrix.profile.rustflags }}"
+          cargo ${FREEBSD_TOOLCHAIN:-} test --locked --target "$triple" ${{ matrix.profile.flags }}
       - name: VM console log
         if: failure()
         run: ci/freebsd-vm.sh console
@@ -282,13 +303,23 @@ jobs:
   # vnet jail -- the BPF capture/inject and PF_ROUTE monitor paths end to end, which no Linux lane
   # can reach. Same harness as the freebsd test job: cross-build on the runner, the VM only
   # executes; python3 comes from pkg (first-party FreeBSD infrastructure) over the VM's NATed
-  # network, and the suite + binary ride in over scp.
+  # network, and the suite + binary ride in over scp. The arm64 guest runs everything (daemon,
+  # jails, probes) under TCG; the suite's waits are wall-clock, so the emulation slowdown is
+  # bounded rather than multiplicative.
   freebsd-native-e2e:
-    name: Native e2e (freebsd-amd64)
+    name: Native e2e (freebsd-${{ matrix.arch.name }})
     needs: gate
     if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
+    env:
+      FREEBSD_VM_ARCH: ${{ matrix.arch.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - { name: amd64, triple: x86_64-unknown-freebsd, kvm: true, packages: qemu-system-x86 }
+          - { name: arm64, triple: aarch64-unknown-freebsd, kvm: false, packages: qemu-system-arm qemu-efi-aarch64 }
     steps:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -300,16 +331,17 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: cargo-freebsd-e2e-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-freebsd-e2e-
+          key: cargo-freebsd-e2e-${{ matrix.arch.name }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-freebsd-e2e-${{ matrix.arch.name }}-
       - name: Install clang, lld + QEMU
         run: |
           # A failing third-party repo (packages.microsoft.com flakes) must not kill the step:
           # the packages come from the Ubuntu archive, and a broken archive still fails the
           # install below loudly.
           sudo apt-get update || true
-          sudo apt-get install -y --no-install-recommends clang lld qemu-system-x86 qemu-utils genisoimage
+          sudo apt-get install -y --no-install-recommends clang lld qemu-utils genisoimage ${{ matrix.arch.packages }}
       - name: Enable KVM
+        if: matrix.arch.kvm
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
@@ -317,19 +349,34 @@ jobs:
       # Launch first so the VM boots while the sysroot downloads and the build runs.
       - name: Launch the FreeBSD VM
         run: ci/freebsd-vm.sh launch
+      # aarch64-unknown-freebsd has no stable dist until 1.98: that lane installs the pinned
+      # dated nightly from ci/freebsd.env instead of the rust-toolchain.toml stable, and every
+      # later cargo call picks it up through the FREEBSD_TOOLCHAIN selector set here.
       - name: Add the Rust target
-        run: rustup target add x86_64-unknown-freebsd
+        run: |
+          . ci/freebsd.env
+          if [ '${{ matrix.arch.name }}' = arm64 ]; then
+            rustup toolchain install "nightly-${RUST_NIGHTLY}" --profile minimal
+            rustup target add --toolchain "nightly-${RUST_NIGHTLY}" aarch64-unknown-freebsd
+            echo "FREEBSD_TOOLCHAIN=+nightly-${RUST_NIGHTLY}" >> "$GITHUB_ENV"
+          else
+            rustup target add x86_64-unknown-freebsd
+          fi
       - name: FreeBSD link sysroot
-        run: ci/freebsd-sysroot.sh
+        run: ci/freebsd-sysroot.sh ${{ matrix.arch.name }}
+      - name: Show toolchain
+        run: rustc ${FREEBSD_TOOLCHAIN:-} -V && cargo ${FREEBSD_TOOLCHAIN:-} -V
       # The shipped FreeBSD configuration exactly: static (+crt-static) on the LTO release
       # profile, as release.yml publishes it -- runtime behavior differs there (the null
-      # environ that sys::process_env works around, the pair tests' spawn skip), and this
-      # lane is the only one that runs that artifact.
+      # environ that sys::process_env works around, the pair tests' spawn skip), and these
+      # lanes are the only ones that run that artifact.
       - name: Build the static release binary
         run: |
-          export CARGO_TARGET_X86_64_UNKNOWN_FREEBSD_LINKER="$HOME/freebsd-sysroot/bin/freebsd-clang"
-          export CARGO_TARGET_X86_64_UNKNOWN_FREEBSD_RUSTFLAGS='-C target-feature=+crt-static'
-          cargo build --release --locked --target x86_64-unknown-freebsd
+          triple='${{ matrix.arch.triple }}'
+          prefix="CARGO_TARGET_$(echo "$triple" | tr 'a-z-' 'A-Z_')"
+          export "${prefix}_LINKER=$HOME/freebsd-sysroot/bin/freebsd-clang"
+          export "${prefix}_RUSTFLAGS=-C target-feature=+crt-static"
+          cargo ${FREEBSD_TOOLCHAIN:-} build --release --locked --target "$triple"
       - name: Wait for the VM
         run: ci/freebsd-vm.sh wait
       - name: Install python3 in the VM
@@ -337,7 +384,7 @@ jobs:
       - name: Run the e2e suite in the VM
         run: |
           ci/freebsd-vm.sh run 'mkdir -p /root/reflector'
-          ci/freebsd-vm.sh push e2e target/x86_64-unknown-freebsd/release/reflector /root/reflector/
+          ci/freebsd-vm.sh push e2e target/${{ matrix.arch.triple }}/release/reflector /root/reflector/
           ci/freebsd-vm.sh run 'cd /root/reflector && python3 e2e/run.py --backend native --binary ./reflector'
       - name: VM console log
         if: failure()
@@ -439,6 +486,8 @@ jobs:
           linker = "ld.lld"
           rustflags = ["-C", "linker-flavor=ld.lld"]
           EOF
+      - name: Show toolchain
+        run: rustc -V && cargo -V
       - name: Build release binary
         run: |
           triple='${{ matrix.target.triple }}'
