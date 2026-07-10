@@ -208,20 +208,91 @@ jobs:
           path: dist/reflector-${{ github.ref_name }}-freebsd-arm64
           if-no-files-found: error
 
-  # One buildx multi-platform build on the amd64 runner: the Dockerfile cross-compiles every arch with lld
-  # (no QEMU), so a native arm64 runner buys nothing, and buildx assembles the manifest itself -- no
-  # per-arch digests to stitch. Pushes the multi-arch image to GHCR, tagged from the git tag.
+  # Each image arch builds on its own runner and pushes by digest; the manifest job stitches the
+  # digests into one multi-arch tag (the same shape the C++ reflector releases with). Native
+  # runners for amd64/arm64 mean those layers link with rustc's default toolchain -- the
+  # Dockerfile writes its lld config only for cross builds, i.e. the arm32 pair, which have no
+  # native runner and cross-compile on the amd64 host (no QEMU).
   image:
-    name: Image -> GHCR
+    name: Image (${{ matrix.arch }})
     needs: verify-ci
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+          - arch: armv7
+            runner: ubuntu-24.04
+            platform: linux/arm/v7
+          - arch: armv5
+            runner: ubuntu-24.04
+            platform: linux/arm/v5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The cache scopes are shared with the docker-e2e lanes, so a release build reuses layers
+      # CI already built for this commit.
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/reflector,push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}.digest"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*.digest
+          if-no-files-found: error
+          retention-days: 1
+
+  manifest:
+    name: Image manifest -> GHCR
+    needs: image
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 10
     permissions:
       contents: read
       packages: write
     steps:
-      - name: Check out repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - name: Download digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
@@ -243,20 +314,27 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest
 
-      - name: Build and push the multi-arch image
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64,linux/arm/v7,linux/arm/v5
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Create and push the manifest list
+        working-directory: /tmp/digests
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/reflector
+          METADATA: ${{ steps.meta.outputs.json }}
+        run: |
+          mapfile -t tags < <(jq -r '.tags[]' <<< "$METADATA")
+          args=()
+          for tag in "${tags[@]}"; do args+=(--tag "$tag"); done
+          for f in *.digest; do args+=("${IMAGE}@sha256:${f%.digest}"); done
+          docker buildx imagetools create "${args[@]}"
+
+      - name: Inspect
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/reflector
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: docker buildx imagetools inspect "${IMAGE}:${VERSION}"
 
   release:
     name: GitHub release
-    needs: [binaries, binaries-freebsd, image]
+    needs: [binaries, binaries-freebsd, manifest]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
