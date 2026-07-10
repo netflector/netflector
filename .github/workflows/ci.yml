@@ -199,44 +199,74 @@ jobs:
         if: matrix.target.triple != ''
         run: cargo test --locked --target ${{ matrix.target.triple }} ${{ matrix.profile.flags }}
 
-  # FreeBSD shares its BSD platform path (kqueue, BPF, route sockets, getifaddrs) with macOS but needs a real
-  # FreeBSD kernel to build and run -- Docker can't provide one. vmactions boots a FreeBSD VM (KVM on the
-  # amd64 runner) and runs the suite there. The VM runs as root, so privileged tests run instead of skipping;
-  # each self-skips where its operation isn't available. One profile per VM boot, in parallel lanes -- the
-  # same debug/release split as the native test lanes. (Arm release IMAGES aren't built here; the QEMU
-  # test lanes cross-compile the arm code, docker-e2e exercises the Dockerfile on amd64, and release.yml
-  # builds the multi-arch images -- so a separate arm image-build gate adds little.)
+  # FreeBSD shares its BSD platform path (kqueue, BPF, route sockets, getifaddrs) with macOS but needs a
+  # real FreeBSD kernel to run -- Docker can't provide one, and qemu-user translates architecture, not OS.
+  # So: cross-compile on the runner with the pinned toolchain (rustup tier-2 std; clang+lld against a
+  # sysroot from the official base.txz, ci/freebsd-sysroot.sh), boot the official FreeBSD image under
+  # QEMU/KVM (ci/freebsd-vm.sh), and run every test binary in it as root through cargo's target runner
+  # (ci/freebsd-ssh-runner.sh) -- privileged tests run instead of skipping. One VM per profile lane, same
+  # debug/release split as the native test lanes; the release lane tests the shipped +crt-static
+  # configuration (kept off host proc-macros by the target-scoped rustflags). Everything fetched is
+  # FreeBSD-project-official and hash-pinned, and the build obeys rust-toolchain.toml.
   freebsd:
     name: Test (freebsd-amd64, ${{ matrix.profile.name }})
     needs: gate
     if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         profile:
           - { name: debug, flags: '', rustflags: '' }
-          - { name: release, flags: '--release --target x86_64-unknown-freebsd', rustflags: '-C target-feature=+crt-static' }
+          - { name: release, flags: '--release', rustflags: '-C target-feature=+crt-static' }
     steps:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - name: Build and test in a FreeBSD VM
-        uses: vmactions/freebsd-vm@5a72679103d223925653750faa878a143340fbd0 # v1
+      - name: Cache cargo build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
-          release: '14.2'
-          usesh: true
-          prepare: |
-            pkg install -y rust
-          run: |
-            rustc --version
-            cargo --version
-            # The release lane builds and tests static via the matrix (+crt-static rustflags, and the
-            # explicit --target flags so the flag stays off the host proc-macros), so a +crt-static build
-            # failure surfaces here. Like the Linux musl build, the binary's static linking itself is
-            # verified at release time (release.yml), not in CI. Debug ships nothing -> default-dynamic.
-            export RUSTFLAGS="${{ matrix.profile.rustflags }}"
-            cargo test --locked ${{ matrix.profile.flags }}
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-freebsd-${{ matrix.profile.name }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-freebsd-${{ matrix.profile.name }}-
+      - name: Install clang, lld + QEMU
+        run: |
+          # A failing third-party repo (packages.microsoft.com flakes) must not kill the step:
+          # the packages come from the Ubuntu archive, and a broken archive still fails the
+          # install below loudly.
+          sudo apt-get update || true
+          sudo apt-get install -y --no-install-recommends clang lld qemu-system-x86 qemu-utils genisoimage
+      # /dev/kvm exists on the runner but is root:kvm 0660; GitHub's documented udev recipe opens it
+      # (a group add wouldn't apply to the already-running session).
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      # Launch first so the VM boots while the sysroot downloads and the build runs.
+      - name: Launch the FreeBSD VM
+        run: ci/freebsd-vm.sh launch
+      - name: Add the Rust target
+        run: rustup target add x86_64-unknown-freebsd
+      - name: FreeBSD link sysroot
+        run: ci/freebsd-sysroot.sh
+      - name: Show toolchain
+        run: rustc -V && cargo -V
+      - name: Wait for the VM
+        run: ci/freebsd-vm.sh wait
+      - name: cargo test
+        run: |
+          export CARGO_TARGET_X86_64_UNKNOWN_FREEBSD_LINKER="$HOME/freebsd-sysroot/bin/freebsd-clang"
+          export CARGO_TARGET_X86_64_UNKNOWN_FREEBSD_RUNNER="$PWD/ci/freebsd-ssh-runner.sh"
+          export CARGO_TARGET_X86_64_UNKNOWN_FREEBSD_RUSTFLAGS='${{ matrix.profile.rustflags }}'
+          cargo test --locked --target x86_64-unknown-freebsd ${{ matrix.profile.flags }}
+      - name: VM console log
+        if: failure()
+        run: ci/freebsd-vm.sh console
 
   # The native e2e suite on a real FreeBSD kernel: epair segments, every participant in its own
   # vnet jail -- the BPF capture/inject and PF_ROUTE monitor paths end to end, which no Linux lane

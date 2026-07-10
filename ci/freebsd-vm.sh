@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# Boot the official FreeBSD VM image under QEMU on a Linux runner and drive it
+# over ssh. The FreeBSD lanes cross-compile on the runner; the VM exists only
+# to execute the results on a real FreeBSD kernel (kqueue, BPF, PF_ROUTE, vnet
+# jails -- qemu-user translates architecture, not OS, so nothing short of a
+# FreeBSD kernel serves these). Everything fetched is FreeBSD-project-official
+# and hash-pinned; no third-party code runs on the host.
+#
+#   ci/freebsd-vm.sh launch    fetch + verify the image, build the cloud-init
+#                              seed, start QEMU in the background
+#   ci/freebsd-vm.sh wait      block until root ssh answers
+#   ci/freebsd-vm.sh run CMD   run CMD in the VM as root
+#   ci/freebsd-vm.sh console   dump the serial console (boot diagnostics)
+#
+# State (disk, seed, per-run ssh key, console log) lives in $FREEBSD_VM_DIR,
+# default ~/.freebsd-vm. The release + image hash pins live in ci/freebsd.env
+# (Renovate bumps the release, ci/freebsd-pin.sh refreshes the hashes).
+set -euo pipefail
+
+. "$(dirname "$0")/freebsd.env"
+IMAGE="FreeBSD-${RELEASE}-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2"
+IMAGE_URL="https://download.freebsd.org/releases/VM-IMAGES/${RELEASE}-RELEASE/amd64/Latest/${IMAGE}.xz"
+
+VM_DIR=${FREEBSD_VM_DIR:-$HOME/.freebsd-vm}
+SSH_PORT=${FREEBSD_VM_SSH_PORT:-2222}
+SSH_WAIT_SECS=${FREEBSD_VM_SSH_WAIT_SECS:-300}
+
+SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+    -o LogLevel=ERROR -i "$VM_DIR/id_ed25519" -p "$SSH_PORT")
+
+# NoCloud seed for nuageinit(7), the in-base cloud-init shim the
+# BASIC-CLOUDINIT image enables. The root entry appends our key to the
+# existing root user; the sshd_config append permits key-only root login
+# before sshd first starts (FreeBSD's sshd defaults root login off, and sshd
+# takes the first uncommented value -- the stock file has none). The rc.conf.d
+# drop-in disables the image's first-boot freebsd-update, an unpinned fetch
+# plus reboot that cost 4 minutes per lane. It must be rc.conf.d, NOT
+# rc.conf.local: /etc/rc loads the rc.conf files once at boot start and every
+# rc.d script inherits that snapshot (rc.subr _rc_conf_loaded), so a same-boot
+# rc.conf.local write is never re-read; the per-service /etc/rc.conf.d/<name>
+# file is the one rc knob each script sources fresh.
+seed_iso() {
+    printf 'instance-id: reflector-ci\nlocal-hostname: reflector-freebsd\n' \
+        > "$VM_DIR/meta-data"
+    cat > "$VM_DIR/user-data" <<EOF
+#cloud-config
+users:
+  - name: root
+    ssh_authorized_keys:
+      - $(cat "$VM_DIR/id_ed25519.pub")
+write_files:
+  - path: /etc/ssh/sshd_config
+    append: true
+    content: |
+      PermitRootLogin prohibit-password
+  - path: /etc/rc.conf.d/firstboot_freebsd_update
+    content: |
+      firstboot_freebsd_update_enable="NO"
+EOF
+    genisoimage -quiet -output "$VM_DIR/seed.iso" -volid cidata -joliet -rock \
+        "$VM_DIR/user-data" "$VM_DIR/meta-data"
+}
+
+launch() {
+    mkdir -p "$VM_DIR"
+    curl -fsSL "$IMAGE_URL" -o "$VM_DIR/$IMAGE.xz"
+    echo "$IMAGE_SHA512  $VM_DIR/$IMAGE.xz" | sha512sum -c - || {
+        echo "error: image hash mismatch; after a release bump, run ci/freebsd-pin.sh" >&2
+        exit 1
+    }
+    xz -dT0 "$VM_DIR/$IMAGE.xz"
+    # Headroom over the image's ~1 GB free; the guest growfs's into it at boot.
+    qemu-img resize "$VM_DIR/$IMAGE" +4G
+    ssh-keygen -q -t ed25519 -N '' -f "$VM_DIR/id_ed25519"
+    seed_iso
+    # Slirp networking: sshd reachable only through the localhost hostfwd, so
+    # the per-image world-readable-key exposure vmactions has cannot arise.
+    qemu-system-x86_64 \
+        -machine q35 -accel kvm -cpu host -smp "$(nproc)" -m 6144 \
+        -drive "file=$VM_DIR/$IMAGE,format=qcow2,if=virtio" \
+        -cdrom "$VM_DIR/seed.iso" \
+        -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${SSH_PORT}-:22" \
+        -device virtio-net-pci,netdev=net0 \
+        -display none -serial "file:$VM_DIR/console.log" \
+        -pidfile "$VM_DIR/qemu.pid" -daemonize
+    echo "FreeBSD $RELEASE VM started (qemu pid $(cat "$VM_DIR/qemu.pid"))"
+}
+
+wait_ssh() {
+    local deadline=$((SECONDS + SSH_WAIT_SECS))
+    until ssh "${SSH_OPTS[@]}" root@127.0.0.1 true 2>/dev/null; do
+        if ((SECONDS >= deadline)); then
+            echo "error: no ssh answer after ${SSH_WAIT_SECS}s; console tail:" >&2
+            tail -n 50 "$VM_DIR/console.log" >&2
+            exit 1
+        fi
+        sleep 2
+    done
+    echo "ssh up after ${SECONDS}s"
+    run 'uname -a && freebsd-version'
+}
+
+# Root's login shell is csh; hand the command to sh on stdin instead of
+# fighting two shells' quoting.
+run() {
+    printf 'set -eu\n%s\n' "$*" | ssh "${SSH_OPTS[@]}" root@127.0.0.1 sh
+}
+
+case "${1:-}" in
+launch) launch ;;
+wait) wait_ssh ;;
+run)
+    shift
+    run "$@"
+    ;;
+console) cat "$VM_DIR/console.log" ;;
+*)
+    echo "usage: $0 launch|wait|run CMD|console" >&2
+    exit 64
+    ;;
+esac
