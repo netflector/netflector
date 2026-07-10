@@ -2,6 +2,6 @@
 # Pinned (not "stable") so every environment -- host, the rust:slim Docker builds, and the rustup CI
 # lanes -- compiles with one known rustc, and a new stable can't silently change codegen or fail a
 # release build on a fresh warn-by-default lint. Renovate's rust-toolchain manager bumps this via a
-# CI-gated PR. (The FreeBSD VM lanes install rust from pkg and don't read this file.)
+# CI-gated PR. (The FreeBSD release lane installs rust from pkg and doesn't read this file.)
 channel = "1.97.0"
 components = ["rustfmt", "clippy"]
