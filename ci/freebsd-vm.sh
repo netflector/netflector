@@ -95,8 +95,7 @@ launch() {
     qemu-img resize "$VM_DIR/$IMAGE" +4G
     ssh-keygen -q -t ed25519 -N '' -f "$VM_DIR/id_ed25519"
     seed_iso
-    # Slirp networking: sshd reachable only through the localhost hostfwd, so
-    # the per-image world-readable-key exposure vmactions has cannot arise.
+    # Slirp networking: sshd reachable only through the localhost hostfwd.
     # The empty romfile drops virtio-net's PXE option ROM: the ROM files ship
     # in ipxe-qemu, which qemu-system-arm does not pull in, and these guests
     # only ever boot from disk anyway.

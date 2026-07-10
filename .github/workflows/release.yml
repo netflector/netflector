@@ -61,9 +61,9 @@ jobs:
   # Downloadable binaries, built with rustc's default toolchain wherever one exists: amd64 and
   # arm64 are static musl on their native runners (the self-contained default, gcc-driven link),
   # macOS native dynamic (no static libSystem). armv7/armv5 have no native runner, so they
-  # cross-compile on the amd64 runner with lld; FreeBSD amd64 likewise (clang+lld against a
-  # base.txz sysroot -- the exact configuration CI's freebsd lanes build AND run on every PR).
-  # FreeBSD arm64 is separate (no rustup std until Rust 1.98; see binaries-freebsd).
+  # cross-compile on the amd64 runner with lld; both FreeBSD arches likewise (clang+lld against a
+  # base.txz sysroot -- the exact configurations CI's freebsd lanes build AND run on every PR;
+  # freebsd-arm64 on the pinned nightly from ci/freebsd.env until stable 1.98 ships its std).
   binaries:
     name: Binary (${{ matrix.variant }})
     needs: verify-ci
@@ -91,6 +91,11 @@ jobs:
           - variant: freebsd-amd64
             runner: ubuntu-24.04
             target: x86_64-unknown-freebsd
+            freebsd_arch: amd64
+          - variant: freebsd-arm64
+            runner: ubuntu-24.04
+            target: aarch64-unknown-freebsd
+            freebsd_arch: arm64
     steps:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -110,8 +115,18 @@ jobs:
           sudo apt-get update || true
           sudo apt-get install -y --no-install-recommends clang lld
 
+      # aarch64-unknown-freebsd has no stable dist until 1.98: that row installs the pinned dated
+      # nightly from ci/freebsd.env, and the build picks it up via the FREEBSD_TOOLCHAIN selector.
       - name: Add the Rust target
-        run: rustup target add ${{ matrix.target }}
+        run: |
+          if [ '${{ matrix.target }}' = aarch64-unknown-freebsd ]; then
+            . ci/freebsd.env
+            rustup toolchain install "nightly-${RUST_NIGHTLY}" --profile minimal
+            rustup target add --toolchain "nightly-${RUST_NIGHTLY}" aarch64-unknown-freebsd
+            echo "FREEBSD_TOOLCHAIN=+nightly-${RUST_NIGHTLY}" >> "$GITHUB_ENV"
+          else
+            rustup target add ${{ matrix.target }}
+          fi
 
       # Link the arm32 musl targets with lld (cross-capable, unlike the host gcc) -- the same config
       # the Dockerfile writes for its cross layers. cfg(target_env = "musl") leaves host
@@ -129,18 +144,22 @@ jobs:
 
       # Cross-link through the sysroot's clang wrapper, +crt-static scoped to the target (host
       # proc-macros stay on the default linker) -- handed to the later steps via GITHUB_ENV so
-      # only this row ever sees it.
+      # only these rows ever see it.
       - name: FreeBSD link sysroot
         if: contains(matrix.target, 'freebsd')
         run: |
-          ci/freebsd-sysroot.sh
+          ci/freebsd-sysroot.sh ${{ matrix.freebsd_arch }}
+          prefix="CARGO_TARGET_$(echo '${{ matrix.target }}' | tr 'a-z-' 'A-Z_')"
           {
-            echo "CARGO_TARGET_X86_64_UNKNOWN_FREEBSD_LINKER=$HOME/freebsd-sysroot/bin/freebsd-clang"
-            echo "CARGO_TARGET_X86_64_UNKNOWN_FREEBSD_RUSTFLAGS=-C target-feature=+crt-static"
+            echo "${prefix}_LINKER=$HOME/freebsd-sysroot/bin/freebsd-clang"
+            echo "${prefix}_RUSTFLAGS=-C target-feature=+crt-static"
           } >> "$GITHUB_ENV"
 
+      - name: Show toolchain
+        run: rustc ${FREEBSD_TOOLCHAIN:-} -V && cargo ${FREEBSD_TOOLCHAIN:-} -V
+
       - name: Build release binary
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo ${FREEBSD_TOOLCHAIN:-} build --release --locked --target ${{ matrix.target }}
 
       - name: Stage binary
         run: |
@@ -163,49 +182,6 @@ jobs:
         with:
           name: reflector-${{ matrix.variant }}
           path: dist/reflector-${{ github.ref_name }}-${{ matrix.variant }}
-          if-no-files-found: error
-
-  # FreeBSD arm64 is the one binary still built inside a VM: aarch64-unknown-freebsd has no rustup
-  # std until Rust 1.98 (the tier-2 promotion has landed upstream), so stable can't cross-compile
-  # it yet, and no GitHub-hosted runner has arm64 KVM, so the VM runs TCG-emulated on the amd64
-  # host. Once 1.98 ships, this job folds into the binaries matrix like freebsd-amd64 did. Static
-  # (+crt-static) so one binary runs across FreeBSD majors, like the embedded deployment needs.
-  binaries-freebsd:
-    name: Binary (freebsd-arm64)
-    needs: verify-ci
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-
-      - name: Build the static release binary in a FreeBSD VM
-        uses: vmactions/freebsd-vm@5a72679103d223925653750faa878a143340fbd0 # v1
-        with:
-          release: '14.2'
-          arch: aarch64
-          usesh: true
-          prepare: |
-            pkg install -y rust
-          run: |
-            # --target (even ==host) splits the host proc-macro/build-script graph from the target
-            # graph, so +crt-static lands only on the binary; without it the flag breaks proc-macros.
-            RUSTFLAGS="-C target-feature=+crt-static" \
-              cargo build --release --locked --target aarch64-unknown-freebsd
-            bin="target/aarch64-unknown-freebsd/release/reflector"
-            file "$bin"
-            # A static binary has no shared-library deps, so one binary runs across FreeBSD majors.
-            # FreeBSD is plain non-PIE static; accept a static-pie form too, for parity with Linux.
-            file "$bin" | grep -qE 'statically linked|static-pie linked' \
-              || { echo "::error::freebsd binary is not statically/static-pie linked"; exit 1; }
-            mkdir -p dist
-            cp "$bin" "dist/reflector-${{ github.ref_name }}-freebsd-arm64"
-
-      - name: Upload binary artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: reflector-freebsd-arm64
-          path: dist/reflector-${{ github.ref_name }}-freebsd-arm64
           if-no-files-found: error
 
   # Each image arch builds on its own runner and pushes by digest; the manifest job stitches the
@@ -334,7 +310,7 @@ jobs:
 
   release:
     name: GitHub release
-    needs: [binaries, binaries-freebsd, manifest]
+    needs: [binaries, manifest]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
