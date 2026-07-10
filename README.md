@@ -42,13 +42,15 @@ reflector runs on **Linux, macOS, and FreeBSD**.
 router that bridges the two segments.
 
 **FreeBSD** isn't a Docker target (Docker shares the host's Linux kernel), so each release also ships
-a standalone **static** binary for `amd64` and `arm64`, built on FreeBSD 14.
+a standalone **static** binary for `amd64` and `arm64`, cross-built against a FreeBSD 14.4 base and
+running on 14.4 or newer.
 
-CI runs the unit suite on Ubuntu 24.04 (x64 and arm64), macOS 15, and FreeBSD 14 (amd64, in a VM),
-plus the cross-compiled `linux/arm/v7` and `linux/arm/v5` builds whose suites run under QEMU, each in
-both debug and release. `clippy` and the rustdoc link gate run per target. The e2e suite runs on the
-Docker backend (two bridges, plus a Valgrind memcheck job) and natively on linux amd64/arm64,
-armv7/armv5 (daemon under qemu-user), and FreeBSD.
+CI runs the unit suite on Ubuntu 24.04 (amd64 and arm64, both glibc and the shipped static musl),
+macOS 15, FreeBSD 14.4 (amd64 and arm64, cross-compiled on the runner and executed in QEMU VMs), and
+the cross-compiled `linux/arm/v7` and `linux/arm/v5` builds whose suites run under QEMU, each in both
+debug and release. `clippy` and the rustdoc link gate run per target. The e2e suite runs on the
+Docker backend for both image arches (plus a Valgrind memcheck job) and natively on linux amd64/arm64
+(glibc and musl), armv7/armv5 (daemon under qemu-user), and FreeBSD amd64/arm64.
 
 ## Build
 
@@ -447,8 +449,8 @@ cargo build --release --locked
 sudo python3 e2e/run.py --backend native --binary target/release/reflector
 ```
 
-CI runs the native suite on linux amd64/arm64 natively, on armv7/armv5 with the daemon under
-qemu-user, and on FreeBSD in the CI VM.
+CI runs the native suite on linux amd64/arm64 (glibc and the shipped static musl), on armv7/armv5
+with the daemon under qemu-user, and on FreeBSD amd64/arm64 in QEMU VMs.
 
 ## Release
 
@@ -464,7 +466,8 @@ cut a release:
 the detected version and asks for confirmation, then tags `v<version>` and pushes it. Pushing the tag
 hands off to the `release.yml` workflow, which does everything else: it re-checks CI and that the tag
 matches `Cargo.toml`, builds the per-arch binaries (Linux amd64/arm64/armv7/armv5, macOS arm64, FreeBSD
-amd64/arm64), publishes the multi-arch image to GHCR in one buildx build, and creates the GitHub release
+amd64/arm64), publishes the multi-arch image to GHCR (each arch built on its own runner and stitched
+into one manifest), and creates the GitHub release
 with the binaries and their `SHA256SUMS` attached and generated notes. `release.sh` needs only the GitHub
 CLI (`gh`, authenticated) for its CI check; nothing else runs locally.
 
