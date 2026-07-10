@@ -59,8 +59,10 @@ jobs:
           echo "$wf passed on $sha."
 
   # Downloadable binaries. The Linux targets are static musl, cross-compiled on the amd64 runner with lld
-  # (no QEMU, no per-arch gcc -- the same path the Dockerfile uses); macOS builds natively and ships dynamic
-  # (no static libSystem). FreeBSD is separate (no native runner; see binaries-freebsd).
+  # (no QEMU, no per-arch gcc -- the same path the Dockerfile uses); FreeBSD amd64 cross-compiles the same
+  # way against a base.txz sysroot (ci/freebsd-sysroot.sh) -- the exact configuration CI's freebsd lanes
+  # build AND run on every PR; macOS builds natively and ships dynamic (no static libSystem). FreeBSD
+  # arm64 is separate (no rustup std until Rust 1.98; see binaries-freebsd).
   binaries:
     name: Binary (${{ matrix.variant }})
     needs: verify-ci
@@ -85,25 +87,35 @@ jobs:
           - variant: macos-arm64
             runner: macos-15
             target: aarch64-apple-darwin
+          - variant: freebsd-amd64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-freebsd
     steps:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
-      - name: Install lld (musl cross-link)
-        if: runner.os == 'Linux'
-        # A failing third-party repo (packages.microsoft.com flakes) must not kill a release
-        # build; lld comes from the Ubuntu archive, and a broken archive still fails the install.
+      # A failing third-party repo (packages.microsoft.com flakes) must not kill a release
+      # build; the packages come from the Ubuntu archive, and a broken archive still fails
+      # the installs below loudly.
+      - name: Install lld (musl linker)
+        if: contains(matrix.target, 'musl')
         run: |
           sudo apt-get update || true
           sudo apt-get install -y --no-install-recommends lld
+
+      - name: Install clang + lld (FreeBSD cross-link)
+        if: contains(matrix.target, 'freebsd')
+        run: |
+          sudo apt-get update || true
+          sudo apt-get install -y --no-install-recommends clang lld
 
       - name: Add the Rust target
         run: rustup target add ${{ matrix.target }}
 
       # Link the musl targets with lld (cross-capable, unlike the host gcc) -- the same config the Dockerfile
       # writes. cfg(target_env = "musl") leaves host build-scripts/proc-macros on the default linker.
-      - name: Configure the musl cross-linker
-        if: runner.os == 'Linux'
+      - name: Configure the musl linker
+        if: contains(matrix.target, 'musl')
         run: |
           mkdir -p .cargo
           cat > .cargo/config.toml <<'EOF'
@@ -111,6 +123,18 @@ jobs:
           linker = "ld.lld"
           rustflags = ["-C", "linker-flavor=ld.lld"]
           EOF
+
+      # Cross-link through the sysroot's clang wrapper, +crt-static scoped to the target (host
+      # proc-macros stay on the default linker) -- handed to the later steps via GITHUB_ENV so
+      # only this row ever sees it.
+      - name: FreeBSD link sysroot
+        if: contains(matrix.target, 'freebsd')
+        run: |
+          ci/freebsd-sysroot.sh
+          {
+            echo "CARGO_TARGET_X86_64_UNKNOWN_FREEBSD_LINKER=$HOME/freebsd-sysroot/bin/freebsd-clang"
+            echo "CARGO_TARGET_X86_64_UNKNOWN_FREEBSD_RUSTFLAGS=-C target-feature=+crt-static"
+          } >> "$GITHUB_ENV"
 
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
@@ -125,9 +149,9 @@ jobs:
         run: |
           bin="dist/reflector-${{ github.ref_name }}-${{ matrix.variant }}"
           file "$bin"
-          # The musl binary has no shared-library deps (the invariant that matters), but its PIE-ness
-          # varies by arch -- x86_64 is static-pie, the ARM targets are plain static -- so accept either
-          # "statically linked" or "static-pie linked"; only a dynamically-linked binary fails.
+          # The static binary has no shared-library deps (the invariant that matters), but PIE-ness
+          # varies -- musl x86_64 is static-pie, the ARM targets and FreeBSD are plain static -- so
+          # accept either "statically linked" or "static-pie linked"; only a dynamic binary fails.
           file "$bin" | grep -qE 'statically linked|static-pie linked' \
             || { echo "::error::binary is not statically/static-pie linked"; exit 1; }
 
@@ -138,23 +162,16 @@ jobs:
           path: dist/reflector-${{ github.ref_name }}-${{ matrix.variant }}
           if-no-files-found: error
 
-  # FreeBSD has no native runner and Docker can't run a FreeBSD kernel, so build in a VM (vmactions). amd64
-  # is KVM-accelerated; arm64 has no KVM on any GitHub-hosted runner, so it builds emulated on the (faster)
-  # amd64 host. Static (+crt-static) so one binary per arch runs across FreeBSD majors, like the embedded
-  # deployment needs.
+  # FreeBSD arm64 is the one binary still built inside a VM: aarch64-unknown-freebsd has no rustup
+  # std until Rust 1.98 (the tier-2 promotion has landed upstream), so stable can't cross-compile
+  # it yet, and no GitHub-hosted runner has arm64 KVM, so the VM runs TCG-emulated on the amd64
+  # host. Once 1.98 ships, this job folds into the binaries matrix like freebsd-amd64 did. Static
+  # (+crt-static) so one binary runs across FreeBSD majors, like the embedded deployment needs.
   binaries-freebsd:
-    name: Binary (freebsd-${{ matrix.arch }})
+    name: Binary (freebsd-arm64)
     needs: verify-ci
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            vm_arch: x86_64
-          - arch: arm64
-            vm_arch: aarch64
     steps:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -163,7 +180,7 @@ jobs:
         uses: vmactions/freebsd-vm@5a72679103d223925653750faa878a143340fbd0 # v1
         with:
           release: '14.2'
-          arch: ${{ matrix.vm_arch }}
+          arch: aarch64
           usesh: true
           prepare: |
             pkg install -y rust
@@ -171,21 +188,21 @@ jobs:
             # --target (even ==host) splits the host proc-macro/build-script graph from the target
             # graph, so +crt-static lands only on the binary; without it the flag breaks proc-macros.
             RUSTFLAGS="-C target-feature=+crt-static" \
-              cargo build --release --locked --target ${{ matrix.vm_arch }}-unknown-freebsd
-            bin="target/${{ matrix.vm_arch }}-unknown-freebsd/release/reflector"
+              cargo build --release --locked --target aarch64-unknown-freebsd
+            bin="target/aarch64-unknown-freebsd/release/reflector"
             file "$bin"
             # A static binary has no shared-library deps, so one binary runs across FreeBSD majors.
             # FreeBSD is plain non-PIE static; accept a static-pie form too, for parity with Linux.
             file "$bin" | grep -qE 'statically linked|static-pie linked' \
               || { echo "::error::freebsd binary is not statically/static-pie linked"; exit 1; }
             mkdir -p dist
-            cp "$bin" "dist/reflector-${{ github.ref_name }}-freebsd-${{ matrix.arch }}"
+            cp "$bin" "dist/reflector-${{ github.ref_name }}-freebsd-arm64"
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: reflector-freebsd-${{ matrix.arch }}
-          path: dist/reflector-${{ github.ref_name }}-freebsd-${{ matrix.arch }}
+          name: reflector-freebsd-arm64
+          path: dist/reflector-${{ github.ref_name }}-freebsd-arm64
           if-no-files-found: error
 
   # One buildx multi-platform build on the amd64 runner: the Dockerfile cross-compiles every arch with lld
