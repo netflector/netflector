@@ -10,6 +10,7 @@
 #                              seed, start QEMU in the background
 #   ci/freebsd-vm.sh wait      block until root ssh answers
 #   ci/freebsd-vm.sh run CMD   run CMD in the VM as root
+#   ci/freebsd-vm.sh push SRC... DEST   copy files/dirs to DEST in the VM
 #   ci/freebsd-vm.sh console   dump the serial console (boot diagnostics)
 #
 # State (disk, seed, per-run ssh key, console log) lives in $FREEBSD_VM_DIR,
@@ -25,8 +26,9 @@ VM_DIR=${FREEBSD_VM_DIR:-$HOME/.freebsd-vm}
 SSH_PORT=${FREEBSD_VM_SSH_PORT:-2222}
 SSH_WAIT_SECS=${FREEBSD_VM_SSH_WAIT_SECS:-300}
 
+# No port here: ssh wants -p, scp wants -P; each call site adds its own.
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
-    -o LogLevel=ERROR -i "$VM_DIR/id_ed25519" -p "$SSH_PORT")
+    -o LogLevel=ERROR -i "$VM_DIR/id_ed25519")
 
 # NoCloud seed for nuageinit(7), the in-base cloud-init shim the
 # BASIC-CLOUDINIT image enables. The root entry appends our key to the
@@ -88,7 +90,7 @@ launch() {
 
 wait_ssh() {
     local deadline=$((SECONDS + SSH_WAIT_SECS))
-    until ssh "${SSH_OPTS[@]}" root@127.0.0.1 true 2>/dev/null; do
+    until ssh "${SSH_OPTS[@]}" -p "$SSH_PORT" root@127.0.0.1 true 2>/dev/null; do
         if ((SECONDS >= deadline)); then
             echo "error: no ssh answer after ${SSH_WAIT_SECS}s; console tail:" >&2
             tail -n 50 "$VM_DIR/console.log" >&2
@@ -101,9 +103,16 @@ wait_ssh() {
 }
 
 # Root's login shell is csh; hand the command to sh on stdin instead of
-# fighting two shells' quoting.
+# fighting two shells' quoting. sshd's non-interactive PATH lacks /usr/local,
+# where everything pkg installs lives.
 run() {
-    printf 'set -eu\n%s\n' "$*" | ssh "${SSH_OPTS[@]}" root@127.0.0.1 sh
+    printf 'export PATH="$PATH:/usr/local/sbin:/usr/local/bin"\nset -eu\n%s\n' "$*" |
+        ssh "${SSH_OPTS[@]}" -p "$SSH_PORT" root@127.0.0.1 sh
+}
+
+# Copy files/directories into the VM; the last argument is the remote path.
+push() {
+    scp -qr "${SSH_OPTS[@]}" -P "$SSH_PORT" "${@:1:$#-1}" "root@127.0.0.1:${!#}"
 }
 
 case "${1:-}" in
@@ -113,9 +122,13 @@ run)
     shift
     run "$@"
     ;;
+push)
+    shift
+    push "$@"
+    ;;
 console) cat "$VM_DIR/console.log" ;;
 *)
-    echo "usage: $0 launch|wait|run CMD|console" >&2
+    echo "usage: $0 launch|wait|run CMD|push SRC... DEST|console" >&2
     exit 64
     ;;
 esac

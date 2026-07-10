@@ -270,35 +270,68 @@ jobs:
 
   # The native e2e suite on a real FreeBSD kernel: epair segments, every participant in its own
   # vnet jail -- the BPF capture/inject and PF_ROUTE monitor paths end to end, which no Linux lane
-  # can reach. Same vmactions mechanics as the freebsd test job; python3 comes from pkg.
+  # can reach. Same harness as the freebsd test job: cross-build on the runner, the VM only
+  # executes; python3 comes from pkg (first-party FreeBSD infrastructure) over the VM's NATed
+  # network, and the suite + binary ride in over scp.
   freebsd-native-e2e:
     name: Native e2e (freebsd-amd64)
     needs: gate
     if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - name: Build and run the e2e suite in a FreeBSD VM
-        uses: vmactions/freebsd-vm@5a72679103d223925653750faa878a143340fbd0 # v1
+      - name: Cache cargo build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
-          release: '14.2'
-          usesh: true
-          prepare: |
-            pkg install -y rust python3
-          run: |
-            rustc --version
-            python3 --version
-            # The shipped FreeBSD configuration exactly: static (+crt-static) on the LTO release
-            # profile, as release.yml publishes it -- runtime behavior differs there (the null
-            # environ that sys::process_env works around, the pair tests' spawn skip), and this
-            # lane is the only one that runs that artifact. --target (even ==host) keeps the
-            # flag off the host proc-macro graph, like the freebsd test job's release lane.
-            RUSTFLAGS="-C target-feature=+crt-static" \
-              cargo build --release --locked --target x86_64-unknown-freebsd
-            python3 e2e/run.py --backend native \
-              --binary target/x86_64-unknown-freebsd/release/reflector
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-freebsd-e2e-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-freebsd-e2e-
+      - name: Install clang, lld + QEMU
+        run: |
+          # A failing third-party repo (packages.microsoft.com flakes) must not kill the step:
+          # the packages come from the Ubuntu archive, and a broken archive still fails the
+          # install below loudly.
+          sudo apt-get update || true
+          sudo apt-get install -y --no-install-recommends clang lld qemu-system-x86 qemu-utils genisoimage
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      # Launch first so the VM boots while the sysroot downloads and the build runs.
+      - name: Launch the FreeBSD VM
+        run: ci/freebsd-vm.sh launch
+      - name: Add the Rust target
+        run: rustup target add x86_64-unknown-freebsd
+      - name: FreeBSD link sysroot
+        run: ci/freebsd-sysroot.sh
+      # The shipped FreeBSD configuration exactly: static (+crt-static) on the LTO release
+      # profile, as release.yml publishes it -- runtime behavior differs there (the null
+      # environ that sys::process_env works around, the pair tests' spawn skip), and this
+      # lane is the only one that runs that artifact.
+      - name: Build the static release binary
+        run: |
+          export CARGO_TARGET_X86_64_UNKNOWN_FREEBSD_LINKER="$HOME/freebsd-sysroot/bin/freebsd-clang"
+          export CARGO_TARGET_X86_64_UNKNOWN_FREEBSD_RUSTFLAGS='-C target-feature=+crt-static'
+          cargo build --release --locked --target x86_64-unknown-freebsd
+      - name: Wait for the VM
+        run: ci/freebsd-vm.sh wait
+      - name: Install python3 in the VM
+        run: ci/freebsd-vm.sh run 'pkg install -y python3 && python3 --version'
+      - name: Run the e2e suite in the VM
+        run: |
+          ci/freebsd-vm.sh run 'mkdir -p /root/reflector'
+          ci/freebsd-vm.sh push e2e target/x86_64-unknown-freebsd/release/reflector /root/reflector/
+          ci/freebsd-vm.sh run 'cd /root/reflector && python3 e2e/run.py --backend native --binary ./reflector'
+      - name: VM console log
+        if: failure()
+        run: ci/freebsd-vm.sh console
 
   # Build the scratch image and drive the Docker-bridge e2e suite (the data path: capture -> reflect across
   # two bridges, multi-protocol). --skip-build reuses the image built here with the gha cache.
