@@ -44,14 +44,7 @@ impl Capture {
     /// Returns an error if the interface is unknown, the socket can't be created,
     /// the filter can't be attached, or the bind fails.
     pub(crate) fn open(if_name: &str) -> io::Result<Self> {
-        let ifindex = if_index(if_name).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("interface {if_name} not found"),
-            )
-        })?;
-        let ifindex =
-            c_int::try_from(ifindex).map_err(|_| io::Error::other("interface index too large"))?;
+        let ifindex = resolve_ifindex(if_name)?;
 
         // Protocol 0: capture nothing until the filter + loop-prevention are in place.
         // SAFETY: a `socket` call with a valid domain/type/protocol returns a fresh fd or -1.
@@ -88,6 +81,61 @@ impl Capture {
             buf: vec![0u8; RECV_BUFFER_SIZE].into_boxed_slice(),
             name: if_name.into(),
         })
+    }
+
+    /// Re-bind the socket to the interface currently named at open, re-hooking delivery to its
+    /// (possibly recreated) kernel object. The fd, filter, and loop prevention all persist
+    /// across a `bind(2)`, so the filter-before-bind init invariant holds with no unfiltered
+    /// window, and the reactor's watch stays valid.
+    ///
+    /// # Errors
+    /// [`io::ErrorKind::NotFound`] while no interface bears the name; otherwise the `bind`
+    /// failure.
+    #[allow(dead_code)] // wired up by the interface reconcile
+    pub(crate) fn rebind(&mut self) -> io::Result<()> {
+        let ifindex = resolve_ifindex(&self.name)?;
+        bind_interface(&self.fd, link_addr(ifindex))?;
+        // The kernel parked ENETDOWN on the socket when the old interface died; consume it so
+        // the first post-rebind recv surfaces frames, not the stale failure.
+        match crate::sys::so_error(self.fd.as_raw_fd()) {
+            Ok(0) => {}
+            Ok(errno) => log::debug!(
+                "cleared a pending error on the re-bound capture for {}: {}",
+                self.name,
+                io::Error::from_raw_os_error(errno)
+            ),
+            // Can't happen (SO_ERROR is a generic socket option on a live fd); if it somehow
+            // does, the stale error was left unconsumed and the next read will surface it.
+            Err(e) => log::warn!(
+                "could not clear the pending error on the re-bound capture for {}: {e}",
+                self.name
+            ),
+        }
+        log::debug!(
+            "re-bound AF_PACKET capture to {} (ifindex {ifindex})",
+            self.name
+        );
+        Ok(())
+    }
+
+    /// Whether the socket is still hooked to the live interface with kernel index `ifindex`.
+    /// `getsockname` reports the bound index, which the kernel resets to -1 when the bound
+    /// interface is unregistered, so a destroyed (or destroyed-and-recreated) interface
+    /// compares unequal. A `getsockname` failure counts as detached.
+    #[allow(dead_code)] // wired up by the interface reconcile
+    pub(crate) fn attached(&self, ifindex: u32) -> bool {
+        // SAFETY: an all-zero sockaddr_ll is a valid out-param; the kernel fills it up to `len`.
+        let mut addr: libc::sockaddr_ll = unsafe { core::mem::zeroed() };
+        let mut len = socklen_of::<libc::sockaddr_ll>();
+        // SAFETY: `addr`/`len` are valid out-params for the socket's own address.
+        let rc = unsafe {
+            libc::getsockname(
+                self.fd.as_raw_fd(),
+                (&raw mut addr).cast::<libc::sockaddr>(),
+                &raw mut len,
+            )
+        };
+        rc == 0 && u32::try_from(addr.sll_ifindex).is_ok_and(|bound| bound == ifindex)
     }
 
     /// The link framing: always Ethernet on Linux, loopback included.
@@ -192,6 +240,18 @@ fn drop_outgoing_filter() -> [BpfInsn; DROP_OUTGOING_FILTER_LEN] {
         Some(&prologue_insn) => prologue_insn,
         None => ETHERNET_UDP_FILTER[i - DROP_OUTGOING_PROLOGUE.len()],
     })
+}
+
+/// Resolve `if_name` to its kernel index as the `c_int` a `sockaddr_ll` carries, with a clear
+/// error while no interface bears the name.
+fn resolve_ifindex(if_name: &str) -> io::Result<c_int> {
+    let ifindex = if_index(if_name).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("interface {if_name} not found"),
+        )
+    })?;
+    c_int::try_from(ifindex).map_err(|_| io::Error::other("interface index too large"))
 }
 
 /// A zeroed `sockaddr_ll` addressed to `ifindex` for the bind (family set, protocol left zero;
