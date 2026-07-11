@@ -8,7 +8,7 @@ use std::net::{IpAddr, Ipv6Addr};
 use std::os::fd::AsRawFd;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 
-use libc::{c_int, socklen_t};
+use libc::{c_int, c_void, socklen_t};
 
 /// Take ownership of a raw fd returned by a fd-returning syscall: a negative value is the
 /// POSIX error sentinel; a non-negative one is a fresh fd we own.
@@ -65,6 +65,28 @@ pub(crate) fn would_block(err: &io::Error) -> bool {
 /// `size_of::<T>()` as a `socklen_t`, for `setsockopt`/`bind` length arguments.
 pub(crate) fn socklen_of<T>() -> socklen_t {
     socklen_t::try_from(size_of::<T>()).expect("option/address size fits socklen_t")
+}
+
+/// Read (and thereby clear) the socket's pending error (`SO_ERROR`): a non-blocking connect's
+/// outcome after its writable edge, or an asynchronous error the kernel parked on the socket
+/// (e.g. `ENETDOWN` on a packet socket whose interface died).
+pub(crate) fn so_error(fd: RawFd) -> io::Result<c_int> {
+    let mut err: c_int = 0;
+    let mut len = socklen_of::<c_int>();
+    // SAFETY: `&err`/`&len` are a valid (value, length) out-pair of `c_int` size for `fd`.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_ERROR,
+            (&raw mut err).cast::<c_void>(),
+            &raw mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(err)
 }
 
 /// Best-effort: request a larger `SO_RCVBUF` so a burst can't overflow the kernel receive queue as

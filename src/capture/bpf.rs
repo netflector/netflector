@@ -41,68 +41,13 @@ impl Capture {
     pub(crate) fn open(if_name: &str) -> io::Result<Self> {
         let fd = open_bpf_device()?;
 
-        // Bind to the interface. Capture starts here; the filter below flushes the
-        // buffer, so nothing slips through unfiltered.
-        // SAFETY: all-zero is a valid `ifreq`: `ifr_name` is a byte array and the
-        // `ifr_ifru` union holds only integers/pointers/sockaddr, none with an
-        // invalid zero bit pattern.
-        let mut ifr: libc::ifreq = unsafe { core::mem::zeroed() };
-        let name = if_name.as_bytes();
-        if name.len() >= ifr.ifr_name.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "interface name too long",
-            ));
-        }
-        // SAFETY: `ifr_name` is a `[c_char; IFNAMSIZ]`; we checked `name` fits with
-        // room for the zero terminator the zeroed `ifr` already provides.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                name.as_ptr(),
-                ifr.ifr_name.as_mut_ptr().cast::<u8>(),
-                name.len(),
-            );
-        }
-        ioctl(&fd, libc::BIOCSETIF, (&raw mut ifr).cast())?;
-
-        // The link framing selects the filter and the see-sent handling below.
-        let mut dlt: c_uint = 0;
-        ioctl(&fd, libc::BIOCGDLT, (&raw mut dlt).cast())?;
-        let link_type = match dlt {
-            DLT_EN10MB => LinkType::Ethernet,
-            DLT_NULL => LinkType::DltNull,
-            other => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    format!("unsupported BPF link type {other} (need DLT_EN10MB or DLT_NULL)"),
-                ));
-            }
-        };
+        // Bind to the interface. Capture starts here; the filter installed by `attach`
+        // flushes the buffer, so nothing slips through unfiltered.
+        let link_type = attach(&fd, if_name)?;
 
         // Deliver each frame as it arrives instead of blocking until the buffer fills.
         let mut immediate: c_uint = 1;
         ioctl(&fd, libc::BIOCIMMEDIATE, (&raw mut immediate).cast())?;
-
-        // Loop prevention on Ethernet: don't hand us our own egress, so two mirrored
-        // reflector entries don't ping-pong each other's frames. Skip it on DLT_NULL
-        // links: the BSD lo driver taps each frame once (and tags it outbound), so
-        // default BPF already delivers it; clearing see-sent (= receive-only) would
-        // instead silence the interface entirely.
-        if link_type == LinkType::Ethernet {
-            let mut see_sent: c_uint = 0;
-            ioctl(&fd, libc::BIOCSSEESENT, (&raw mut see_sent).cast())?;
-        }
-
-        // Install the link-appropriate UDP filter (and flush whatever queued before it).
-        let filter: &[BpfInsn] = match link_type {
-            LinkType::Ethernet => &ETHERNET_UDP_FILTER,
-            LinkType::DltNull => &DLT_NULL_UDP_FILTER,
-        };
-        let mut program = BpfProgram {
-            bf_len: c_uint::try_from(filter.len()).expect("filter length fits c_uint"),
-            bf_insns: filter.as_ptr().cast_mut(),
-        };
-        ioctl(&fd, libc::BIOCSETF, (&raw mut program).cast())?;
 
         // Size the read buffer to the kernel's preferred BPF buffer length.
         let mut blen: c_uint = 0;
@@ -122,6 +67,42 @@ impl Capture {
             link_type,
             name: if_name.into(),
         })
+    }
+
+    /// Re-attach the descriptor to the interface currently named at open. The kernel detaches
+    /// it when its interface is destroyed and never re-attaches it on its own, so this is the
+    /// recovery path after a recreation: `BIOCSETIF` from the detached state is the same path
+    /// as the initial attach, and it resets the kernel buffer. The fd is unchanged, so the
+    /// reactor's watch stays valid; the framing (and with it the filter and see-sent policy)
+    /// is re-derived in case the interface came back different.
+    ///
+    /// # Errors
+    /// The attach ioctl failure while no interface bears the name, or an unsupported link type.
+    #[allow(dead_code)] // wired up by the interface reconcile
+    pub(crate) fn rebind(&mut self) -> io::Result<()> {
+        self.link_type = attach(&self.fd, &self.name)?;
+        // The kernel reset its buffer at the re-attach; drop the drained-batch state to
+        // match, discarding any stale frames from the old interface.
+        self.filled = 0;
+        self.offset = 0;
+        log::debug!(
+            "re-bound BPF capture to {} ({:?})",
+            self.name,
+            self.link_type
+        );
+        Ok(())
+    }
+
+    /// Whether the descriptor is still attached to a live interface. The kernel clears the
+    /// attachment when the interface is destroyed, after which per-attachment ioctls fail --
+    /// and a recreated interface (same name, even a reused index) never re-attaches the old
+    /// descriptor, so this probe catches recreation where index comparison can't. `ifindex`
+    /// is unused: BPF attachment is to the kernel object itself; the parameter keeps the
+    /// signature uniform with the `AF_PACKET` backend, which compares bound indexes.
+    #[allow(dead_code)] // wired up by the interface reconcile
+    pub(crate) fn attached(&self, _ifindex: u32) -> bool {
+        let mut dlt: c_uint = 0;
+        ioctl(&self.fd, libc::BIOCGDLT, (&raw mut dlt).cast()).is_ok()
     }
 
     /// The link-layer framing of the captured frames, so a consumer can strip the
@@ -266,6 +247,69 @@ fn parse_record(record: &[u8]) -> io::Result<(Record, usize)> {
         ));
     }
     Ok((Record::Frame(frame_start..frame_end), advance))
+}
+
+/// Attach `fd` to `if_name` and normalize the per-attachment state: read the link framing,
+/// set the see-sent policy for it, and install the matching UDP filter (`BIOCSETF` also
+/// flushes anything captured since the bind, so nothing slips through unfiltered). Shared by
+/// [`Capture::open`] and [`Capture::rebind`]; per-descriptor settings (immediate mode, buffer
+/// size) stay in `open`, since they survive re-attachment.
+fn attach(fd: &OwnedFd, if_name: &str) -> io::Result<LinkType> {
+    // SAFETY: all-zero is a valid `ifreq`: `ifr_name` is a byte array and the `ifr_ifru`
+    // union holds only integers/pointers/sockaddr, none with an invalid zero bit pattern.
+    let mut ifr: libc::ifreq = unsafe { core::mem::zeroed() };
+    let name = if_name.as_bytes();
+    if name.len() >= ifr.ifr_name.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "interface name too long",
+        ));
+    }
+    // SAFETY: `ifr_name` is a `[c_char; IFNAMSIZ]`; we checked `name` fits with
+    // room for the zero terminator the zeroed `ifr` already provides.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            ifr.ifr_name.as_mut_ptr().cast::<u8>(),
+            name.len(),
+        );
+    }
+    ioctl(fd, libc::BIOCSETIF, (&raw mut ifr).cast())?;
+
+    // The link framing selects the filter and the see-sent handling below.
+    let mut dlt: c_uint = 0;
+    ioctl(fd, libc::BIOCGDLT, (&raw mut dlt).cast())?;
+    let link_type = match dlt {
+        DLT_EN10MB => LinkType::Ethernet,
+        DLT_NULL => LinkType::DltNull,
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("unsupported BPF link type {other} (need DLT_EN10MB or DLT_NULL)"),
+            ));
+        }
+    };
+
+    // Loop prevention on Ethernet: don't hand us our own egress, so two mirrored
+    // reflector entries don't ping-pong each other's frames. On DLT_NULL links see-sent
+    // stays on: the BSD lo driver taps each frame once (and tags it outbound), so
+    // default BPF already delivers it; receive-only would instead silence the interface
+    // entirely. Set explicitly both ways so a rebind onto different framing restores the
+    // right mode.
+    let mut see_sent: c_uint = c_uint::from(link_type == LinkType::DltNull);
+    ioctl(fd, libc::BIOCSSEESENT, (&raw mut see_sent).cast())?;
+
+    // Install the link-appropriate UDP filter (and flush whatever queued before it).
+    let filter: &[BpfInsn] = match link_type {
+        LinkType::Ethernet => &ETHERNET_UDP_FILTER,
+        LinkType::DltNull => &DLT_NULL_UDP_FILTER,
+    };
+    let mut program = BpfProgram {
+        bf_len: c_uint::try_from(filter.len()).expect("filter length fits c_uint"),
+        bf_insns: filter.as_ptr().cast_mut(),
+    };
+    ioctl(fd, libc::BIOCSETF, (&raw mut program).cast())?;
+    Ok(link_type)
 }
 
 /// Open the first available `/dev/bpfN`.

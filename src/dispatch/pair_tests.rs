@@ -95,28 +95,31 @@ impl InterfacePair {
             return None;
         }
         let pair = Self::create_platform(NEXT_SUBNET.fetch_add(1, Ordering::Relaxed))?;
-        // A freshly-created pair drops frames until both ends finish coming up: the kernel
-        // accepts an injected frame, but the device discards it while the carrier settles, with
-        // no retransmit. A pair we just created as root not coming up is an anomaly, not a
-        // missing precondition -- it must fail the test (the panic unwinds through Drop, so the
-        // interfaces are still torn down), never skip it.
+        pair.settle();
+        Some(pair)
+    }
+
+    /// Wait until both ends are up+running with their address plans resolved. A pair we just
+    /// created as root not coming up is an anomaly, not a missing precondition -- it must fail
+    /// the test (the panic unwinds through Drop, so the interfaces are still torn down), never
+    /// skip it. Needed because a fresh pair drops frames until the carrier settles (with no
+    /// retransmit), and manually-assigned v6 addresses are tentative until DAD completes (the
+    /// resolver filters unusable ones). Tests can then open interfaces and use addresses
+    /// without per-test settling logic.
+    fn settle(&self) {
         let deadline = Instant::now() + WAIT_BUDGET;
-        while !(link_running(&pair.inject) && link_running(&pair.receive))
+        while !(link_running(&self.inject) && link_running(&self.receive))
             && Instant::now() < deadline
         {
             std::thread::sleep(POLL_SLICE);
         }
         assert!(
-            link_running(&pair.inject) && link_running(&pair.receive),
+            link_running(&self.inject) && link_running(&self.receive),
             "{}/{} not up+running after {WAIT_BUDGET:?}",
-            pair.inject,
-            pair.receive
+            self.inject,
+            self.receive
         );
-        // Likewise for the address plan: the manually-assigned v6 addresses are tentative until
-        // DAD completes (the resolver filters unusable ones), so wait until both ends resolve
-        // everything the tests rely on. Tests can then open interfaces and use addresses without
-        // per-test settling logic.
-        let mut inject = Interface::open(&pair.inject).expect("resolve the inject interface");
+        let mut inject = Interface::open(&self.inject).expect("resolve the inject interface");
         assert!(
             wait_for_source(&mut inject, |iface| {
                 iface.addrs.has_v4()
@@ -130,16 +133,27 @@ impl InterfacePair {
                         .is_some_and(|addr| !addr.is_unicast_link_local())
             }),
             "{} never resolved its v4 + link-local + routable v6 plan",
-            pair.inject
+            self.inject
         );
-        let mut receive = Interface::open(&pair.receive).expect("resolve the receive interface");
+        let mut receive = Interface::open(&self.receive).expect("resolve the receive interface");
         assert!(
             wait_for_source(&mut receive, |iface| iface.addrs.has_v4()
                 && iface.addrs.has_v6()),
             "{} never resolved its v4 + link-local plan",
-            pair.receive
+            self.receive
         );
-        Some(pair)
+    }
+
+    /// Destroy and recreate the pair's interfaces under the same names -- fresh kernel
+    /// identities, as an operator's `PPPoE` reconnect or bridge rebuild would produce -- then
+    /// reconfigure and settle. False (with a skip note) if the platform tooling refuses.
+    fn recreate(&self) -> bool {
+        if !(self.relink() && self.configure()) {
+            eprintln!("skip pair test: could not recreate the pair");
+            return false;
+        }
+        self.settle();
+        true
     }
 
     /// Linux: veth names are caller-chosen, so derive them from the pid and a counter -- unique
@@ -159,44 +173,60 @@ impl InterfacePair {
             receive,
             subnet,
         }; // Drop cleans up from here on
-        // Manual link-locals with nodad so both ends are usable immediately, no DAD wait.
-        let configured = run(&format!(
+        if !pair.configure() {
+            eprintln!("skip pair test: could not configure the veth pair");
+            return None;
+        }
+        Some(pair)
+    }
+
+    /// Assign the pair's address plan and bring both ends up. Manual link-locals with nodad so
+    /// both ends are usable immediately, no DAD wait.
+    #[cfg(target_os = "linux")]
+    fn configure(&self) -> bool {
+        run(&format!(
             "ip addr add {}/24 dev {}",
-            pair.inject_v4(),
-            pair.inject
+            self.inject_v4(),
+            self.inject
         )) && run(&format!(
             "ip -6 addr add fe80::1/64 dev {} nodad",
-            pair.inject
+            self.inject
         )) && run(&format!(
             "ip -6 addr add {}/64 dev {} nodad",
-            pair.inject_ula(),
-            pair.inject
+            self.inject_ula(),
+            self.inject
         )) && run(&format!(
             "ip addr add {}/24 dev {}",
-            pair.receive_v4(),
-            pair.receive
+            self.receive_v4(),
+            self.receive
         )) && run(&format!(
             "ip -6 addr add fe80::2/64 dev {} nodad",
-            pair.receive
-        )) && run(&format!("ip link set {} up", pair.inject))
-            && run(&format!("ip link set {} up", pair.receive))
+            self.receive
+        )) && run(&format!("ip link set {} up", self.inject))
+            && run(&format!("ip link set {} up", self.receive))
             // Both ends sit in one stack, so every wire-crossing v4 packet carries a local
             // source address, and Linux's fib_validate_source drops those as martians before
             // socket delivery (tcpdump still sees them below IP). accept_local admits them;
             // the BSDs have no such gate.
             && run(&format!(
                 "echo 1 > /proc/sys/net/ipv4/conf/{}/accept_local",
-                pair.inject
+                self.inject
             ))
             && run(&format!(
                 "echo 1 > /proc/sys/net/ipv4/conf/{}/accept_local",
-                pair.receive
-            ));
-        if !configured {
-            eprintln!("skip pair test: could not configure the veth pair");
-            return None;
-        }
-        Some(pair)
+                self.receive
+            ))
+    }
+
+    /// Destroy the pair and recreate it under the same names (deleting one veth end removes
+    /// both; the names are caller-chosen, so the re-add reuses them).
+    #[cfg(target_os = "linux")]
+    fn relink(&self) -> bool {
+        run(&format!("ip link del {}", self.inject))
+            && run(&format!(
+                "ip link add {} type veth peer name {}",
+                self.inject, self.receive
+            ))
     }
 
     /// macOS: feth units are kernel-assigned (`ifconfig feth create` prints the name), so two
@@ -214,37 +244,53 @@ impl InterfacePair {
             receive,
             subnet,
         }; // Drop cleans up from here on
-        // feth has no automatic IPv6 link-local, so assign one on each end explicitly.
-        let configured = run(&format!("ifconfig {} peer {}", pair.inject, pair.receive))
-            && run(&format!(
-                "ifconfig {} inet {}/24 up",
-                pair.inject,
-                pair.inject_v4()
-            ))
-            && run(&format!(
-                "ifconfig {} inet6 fe80::1 prefixlen 64",
-                pair.inject
-            ))
-            && run(&format!(
-                "ifconfig {} inet6 {} prefixlen 64",
-                pair.inject,
-                pair.inject_ula()
-            ))
-            && run(&format!("ifconfig {} up", pair.receive))
-            && run(&format!(
-                "ifconfig {} inet {}/24",
-                pair.receive,
-                pair.receive_v4()
-            ))
-            && run(&format!(
-                "ifconfig {} inet6 fe80::2 prefixlen 64",
-                pair.receive
-            ));
-        if !configured {
+        if !pair.configure() {
             eprintln!("skip pair test: could not configure the feth pair");
             return None;
         }
         Some(pair)
+    }
+
+    /// Peer the two feths, assign the pair's address plan, and bring both ends up. feth has no
+    /// automatic IPv6 link-local, so assign one on each end explicitly.
+    #[cfg(target_os = "macos")]
+    fn configure(&self) -> bool {
+        run(&format!("ifconfig {} peer {}", self.inject, self.receive))
+            && run(&format!(
+                "ifconfig {} inet {}/24 up",
+                self.inject,
+                self.inject_v4()
+            ))
+            && run(&format!(
+                "ifconfig {} inet6 fe80::1 prefixlen 64",
+                self.inject
+            ))
+            && run(&format!(
+                "ifconfig {} inet6 {} prefixlen 64",
+                self.inject,
+                self.inject_ula()
+            ))
+            && run(&format!("ifconfig {} up", self.receive))
+            && run(&format!(
+                "ifconfig {} inet {}/24",
+                self.receive,
+                self.receive_v4()
+            ))
+            && run(&format!(
+                "ifconfig {} inet6 fe80::2 prefixlen 64",
+                self.receive
+            ))
+    }
+
+    /// Destroy both feths and recreate them under the same names: a specific unit can be
+    /// created by naming it (`ifconfig fethN create`), unlike the first create, which lets
+    /// the kernel pick.
+    #[cfg(target_os = "macos")]
+    fn relink(&self) -> bool {
+        run(&format!("ifconfig {} destroy", self.inject))
+            && run(&format!("ifconfig {} destroy", self.receive))
+            && run(&format!("ifconfig {} create", self.inject))
+            && run(&format!("ifconfig {} create", self.receive))
     }
 
     /// FreeBSD: `ifconfig epair create` mints a connected pair and prints the `a` end; the peer
@@ -263,32 +309,46 @@ impl InterfacePair {
             receive,
             subnet,
         }; // Drop cleans up from here on
-        let configured = run(&format!(
-            "ifconfig {} inet {}/24 up",
-            pair.inject,
-            pair.inject_v4()
-        )) && run(&format!(
-            "ifconfig {} inet6 fe80::1 prefixlen 64",
-            pair.inject
-        )) && run(&format!(
-            "ifconfig {} inet6 {} prefixlen 64",
-            pair.inject,
-            pair.inject_ula()
-        )) && run(&format!("ifconfig {} up", pair.receive))
-            && run(&format!(
-                "ifconfig {} inet {}/24",
-                pair.receive,
-                pair.receive_v4()
-            ))
-            && run(&format!(
-                "ifconfig {} inet6 fe80::2 prefixlen 64",
-                pair.receive
-            ));
-        if !configured {
+        if !pair.configure() {
             eprintln!("skip pair test: could not configure the epair");
             return None;
         }
         Some(pair)
+    }
+
+    /// Assign the pair's address plan and bring both ends up.
+    #[cfg(target_os = "freebsd")]
+    fn configure(&self) -> bool {
+        run(&format!(
+            "ifconfig {} inet {}/24 up",
+            self.inject,
+            self.inject_v4()
+        )) && run(&format!(
+            "ifconfig {} inet6 fe80::1 prefixlen 64",
+            self.inject
+        )) && run(&format!(
+            "ifconfig {} inet6 {} prefixlen 64",
+            self.inject,
+            self.inject_ula()
+        )) && run(&format!("ifconfig {} up", self.receive))
+            && run(&format!(
+                "ifconfig {} inet {}/24",
+                self.receive,
+                self.receive_v4()
+            ))
+            && run(&format!(
+                "ifconfig {} inet6 fe80::2 prefixlen 64",
+                self.receive
+            ))
+    }
+
+    /// Destroy the epair (removing both ends) and recreate it under the same names: the
+    /// cloner accepts a specific unit (`ifconfig epairN create` mints `epairNa`+`epairNb`),
+    /// unlike the first create, which lets the kernel pick.
+    #[cfg(target_os = "freebsd")]
+    fn relink(&self) -> bool {
+        let base = &self.inject[..self.inject.len() - 1]; // "epairNa" -> "epairN"
+        run(&format!("ifconfig {} destroy", self.inject)) && run(&format!("ifconfig {base} create"))
     }
 }
 
@@ -430,6 +490,47 @@ fn pair_injected_broadcast_is_captured_on_the_peer() -> io::Result<()> {
     assert_eq!(captured.payload, payload);
     assert_eq!(captured.dest.port(), INJECT_DST_PORT);
     assert_eq!(captured.source.ip(), IpAddr::V4(pair.inject_v4()));
+    Ok(())
+}
+
+// Interface recreation gives the name a fresh kernel identity, stranding the old capture:
+// attached() flips false, rebind() re-attaches the same fd (Linux: bind(2) re-hooks the packet
+// socket from its unregistered state; BSD: BIOCSETIF re-attaches the detached descriptor), and
+// an injected broadcast proves delivery resumed end to end. This is the kernel-behavior
+// verification the interface hot-swap recovery rests on.
+#[test]
+fn pair_capture_rebinds_after_interface_recreation() -> io::Result<()> {
+    let Some(pair) = InterfacePair::create() else {
+        return Ok(());
+    };
+    let mut peer = Capture::open(&pair.receive)?;
+    let index = if_index(&pair.receive).expect("receive ifindex");
+    assert!(peer.attached(index), "a fresh capture reports attached");
+
+    if !pair.recreate() {
+        return Ok(()); // recreate printed the skip note
+    }
+    let index = if_index(&pair.receive).expect("recreated receive ifindex");
+    assert!(
+        !peer.attached(index),
+        "a capture on the destroyed interface reports detached"
+    );
+
+    peer.rebind()?;
+    assert!(
+        peer.attached(index),
+        "the re-bound capture reports attached"
+    );
+
+    // Delivery is live again: inject on the recreated far end, capture on the re-bound fd.
+    let iface = Interface::open(&pair.inject)?;
+    let injector = Capture::open(&pair.inject)?;
+    let payload = b"pair-rebind";
+    let dst = SocketAddr::from((Ipv4Addr::BROADCAST, INJECT_DST_PORT));
+    inject(&iface, &injector, dst, payload)?;
+    let captured =
+        capture_injected(&mut peer, dst.ip())?.expect("the re-bound capture sees the broadcast");
+    assert_eq!(captured.payload, payload);
     Ok(())
 }
 

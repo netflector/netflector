@@ -9,7 +9,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use libc::{c_int, c_void};
 
-use crate::sys::{IoStatus, open_socket, sockaddr_for, socklen_of, would_block};
+use crate::sys::{IoStatus, open_socket, so_error, sockaddr_for, socklen_of, would_block};
 
 /// Listen backlog. A DIAL listener fields a few short-lived client fetches, so this is ample.
 const LISTEN_BACKLOG: c_int = 16;
@@ -276,26 +276,6 @@ fn connect_v4(fd: RawFd, dst: SocketAddrV4) -> io::Result<bool> {
         return Ok(true);
     }
     Err(err)
-}
-
-/// Read the socket's pending error (`SO_ERROR`) after a non-blocking connect's writable edge.
-fn so_error(fd: RawFd) -> io::Result<c_int> {
-    let mut err: c_int = 0;
-    let mut len = socklen_of::<c_int>();
-    // SAFETY: `&err`/`&len` are a valid (value, length) out-pair of `c_int` size for `fd`.
-    let rc = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_ERROR,
-            (&raw mut err).cast::<c_void>(),
-            &raw mut len,
-        )
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(err)
 }
 
 /// Constrain `fd`'s egress to the interface named `iface` so a route lookup can't leak the connect
