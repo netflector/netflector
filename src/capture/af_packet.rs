@@ -91,7 +91,6 @@ impl Capture {
     /// # Errors
     /// [`io::ErrorKind::NotFound`] while no interface bears the name; otherwise the `bind`
     /// failure.
-    #[allow(dead_code)] // wired up by the interface reconcile
     pub(crate) fn rebind(&mut self) -> io::Result<()> {
         let ifindex = resolve_ifindex(&self.name)?;
         bind_interface(&self.fd, link_addr(ifindex))?;
@@ -122,7 +121,6 @@ impl Capture {
     /// `getsockname` reports the bound index, which the kernel resets to -1 when the bound
     /// interface is unregistered, so a destroyed (or destroyed-and-recreated) interface
     /// compares unequal. A `getsockname` failure counts as detached.
-    #[allow(dead_code)] // wired up by the interface reconcile
     pub(crate) fn attached(&self, ifindex: u32) -> bool {
         // SAFETY: an all-zero sockaddr_ll is a valid out-param; the kernel fills it up to `len`.
         let mut addr: libc::sockaddr_ll = unsafe { core::mem::zeroed() };

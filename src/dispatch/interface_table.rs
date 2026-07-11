@@ -6,7 +6,7 @@ use std::net::IpAddr;
 use std::os::fd::{AsRawFd, RawFd};
 
 use crate::capture::Capture;
-use crate::interface::{AddressChange, Interface, InterfaceAddresses};
+use crate::interface::{AddressChange, Interface, InterfaceAddresses, if_index};
 
 use super::CaptureKey;
 use super::counters::{CaptureCounters, Outcome};
@@ -206,6 +206,97 @@ impl InterfaceTable {
         Ok(Some(change))
     }
 
+    /// Every interface whose kernel identity no longer matches the cached state, paired with the
+    /// index its name currently resolves to (0 = the name resolves to nothing). Two disjoint
+    /// staleness modes: the identity moved (recreation with a new index, deletion, rename-away),
+    /// caught by the name lookup; or a capture's kernel binding died behind an unchanged
+    /// identity (a recreated interface reusing its index, or a half-completed earlier rebuild),
+    /// caught by the [`attached`](crate::capture::Capture::attached) probe. Cost: one name
+    /// lookup per interface plus one probe per capture; the dispatcher gates how often this
+    /// runs. Log-free, like the refresh methods.
+    #[allow(dead_code)] // wired up by the dispatcher's reconcile
+    pub(super) fn stale_interfaces(&self) -> Vec<(InterfaceKey, u32)> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                let key = InterfaceKey(u32::try_from(index).expect("interface count fits a u32"));
+                let cur = if_index(&entry.interface.name).unwrap_or(0);
+                let dead_capture = |c: &CaptureEntry| {
+                    c.interface == key && c.capture.as_ref().is_some_and(|cap| !cap.attached(cur))
+                };
+                (cur != entry.interface.ifindex || self.captures.iter().any(dead_capture))
+                    .then_some((key, cur))
+            })
+            .collect()
+    }
+
+    /// Re-point interface `key` at the interface currently bearing its name (kernel index
+    /// `cur`, from [`stale_interfaces`](Self::stale_interfaces)), re-resolve its addresses, and
+    /// re-join its groups on fresh sockets (see [`MulticastJoiner::reset`]) -- the join skipped
+    /// while absent (`cur == 0`): a join on index 0 would let the kernel pick an arbitrary
+    /// interface. The refresh still runs while absent -- no backend errors for a missing
+    /// interface (Linux short-circuits on index 0), and the all-absent result is the point:
+    /// addresses clear, so the egress gate closes and the lost-address logs fire. The ifindex
+    /// is updated first: the Linux resolver keys its dumps by it.
+    /// Captures are re-bound separately ([`rebind_capture`](Self::rebind_capture)), so the
+    /// caller can log and retry them per capture. Log-free.
+    ///
+    /// # Errors
+    /// Propagates a resolution syscall failure; the identity and joiner state are already
+    /// updated, and the probe re-flags the entry if captures never re-bind.
+    #[allow(dead_code)] // wired up by the dispatcher's reconcile
+    pub(super) fn rebind_interface(
+        &mut self,
+        key: InterfaceKey,
+        cur: u32,
+    ) -> io::Result<AddressChange> {
+        // Keys come from this table's own scan, so the index is always in range.
+        let entry = &mut self.entries[key.0 as usize];
+        entry.interface.ifindex = cur;
+        entry.joiner.reset();
+        let change = entry.interface.refresh()?;
+        if cur != 0 {
+            entry.joiner.rejoin(cur);
+        }
+        Ok(change)
+    }
+
+    /// The keys of the captures on `interface`, for a rebuild or eviction pass (the reverse of
+    /// [`interface_of`](Self::interface_of); the table keeps no interface->captures index, so
+    /// this is a linear scan over the few captures).
+    #[allow(dead_code)] // wired up by the dispatcher's reconcile
+    pub(super) fn captures_of(&self, interface: InterfaceKey) -> Vec<CaptureKey> {
+        self.captures
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.interface == interface)
+            .map(|(index, _)| CaptureKey(u32::try_from(index).expect("capture count fits a u32")))
+            .collect()
+    }
+
+    /// Re-bind the capture behind `key` to its (recreated) interface, in place -- same fd, same
+    /// slot, so every reflector-held key and the reactor's watch stay valid. `Ok(false)` means
+    /// no capture sat in the slot (out of range, or taken out mid-drain) -- unreachable when
+    /// `key` came from [`captures_of`](Self::captures_of) in the reconcile context, where no
+    /// drain is in flight, so the caller should log it rather than treat it as success (the
+    /// [`restore`](Self::restore) convention). Log-free; a failed re-bind retries via the
+    /// [`attached`](crate::capture::Capture::attached) probe re-flagging the entry.
+    ///
+    /// # Errors
+    /// Propagates the re-bind syscall failure.
+    #[allow(dead_code)] // wired up by the dispatcher's reconcile
+    pub(super) fn rebind_capture(&mut self, key: CaptureKey) -> io::Result<bool> {
+        match self
+            .captures
+            .get_mut(key.0 as usize)
+            .and_then(|entry| entry.capture.as_mut())
+        {
+            Some(capture) => capture.rebind().map(|()| true),
+            None => Ok(false),
+        }
+    }
+
     /// Re-resolve every interface in place. The response to an overflow signal, where dropped
     /// notifications mean any address could be stale. Returns each interface's ifindex paired with
     /// its refresh outcome (best-effort: a per-interface failure is reported, not fatal), so the
@@ -324,6 +415,64 @@ mod tests {
             "re-resolving every interface succeeds",
         );
         Ok(())
+    }
+
+    // stale_interfaces flags an entry whose cached index no longer matches its name's, and
+    // rebind_interface repairs it. Unprivileged: pure resolution, no captures, so the probe
+    // half of the predicate stays vacuous here (pair tests cover it against real interfaces).
+    #[test]
+    fn stale_interfaces_flags_and_rebind_repairs_a_moved_index() -> io::Result<()> {
+        let mut table = InterfaceTable::new();
+        let key = table.find_or_add_interface(LOOPBACK_IFACE)?;
+        assert!(
+            table.stale_interfaces().is_empty(),
+            "a fresh entry is healthy"
+        );
+        let real = if_index(LOOPBACK_IFACE).expect("loopback has an ifindex");
+        // Simulate a recreation: the kernel identity moved while the cache kept the old index.
+        table.entries[key.0 as usize].interface.ifindex = real + 1000;
+        assert_eq!(table.stale_interfaces(), [(key, real)]);
+        table.rebind_interface(key, real)?;
+        assert!(
+            table.stale_interfaces().is_empty(),
+            "the rebuild repaired the identity"
+        );
+        assert_eq!(table.entries[key.0 as usize].interface.ifindex, real);
+        Ok(())
+    }
+
+    // An entry whose name no longer resolves reports absent (0); rebinding to 0 parks it:
+    // identity 0, addresses cleared (the egress gate closes), no join attempted (a join on
+    // index 0 would let the kernel pick an arbitrary interface).
+    #[test]
+    fn rebind_to_absent_parks_the_entry() -> io::Result<()> {
+        let mut table = InterfaceTable::new();
+        let key = table.find_or_add_interface(LOOPBACK_IFACE)?;
+        table.entries[key.0 as usize].interface.name = "reflector-gone0".into();
+        assert_eq!(table.stale_interfaces(), [(key, 0)]);
+        let change = table.rebind_interface(key, 0)?;
+        assert!(
+            change.v4,
+            "loopback's v4 reads as lost when the entry parks"
+        );
+        assert!(
+            table.stale_interfaces().is_empty(),
+            "a parked entry matches its (absent) identity"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn captures_of_maps_the_reverse_link_and_empty_slots_rebind_as_noops() {
+        let mut table = InterfaceTable::new();
+        let a = table.add_test_capture(); // both link InterfaceKey(0)
+        let b = table.add_test_capture();
+        assert_eq!(table.captures_of(InterfaceKey(0)), [a, b]);
+        assert!(table.captures_of(InterfaceKey(1)).is_empty());
+        // Capture-less slots (drained, or test entries with no fd) and out-of-range keys
+        // report Ok(false) -- a signal for the caller to log, not an error and not a success.
+        assert!(matches!(table.rebind_capture(a), Ok(false)));
+        assert!(matches!(table.rebind_capture(CaptureKey(99)), Ok(false)));
     }
 
     #[test]

@@ -78,7 +78,6 @@ impl Capture {
     ///
     /// # Errors
     /// The attach ioctl failure while no interface bears the name, or an unsupported link type.
-    #[allow(dead_code)] // wired up by the interface reconcile
     pub(crate) fn rebind(&mut self) -> io::Result<()> {
         self.link_type = attach(&self.fd, &self.name)?;
         // The kernel reset its buffer at the re-attach; drop the drained-batch state to
@@ -99,7 +98,6 @@ impl Capture {
     /// descriptor, so this probe catches recreation where index comparison can't. `ifindex`
     /// is unused: BPF attachment is to the kernel object itself; the parameter keeps the
     /// signature uniform with the `AF_PACKET` backend, which compares bound indexes.
-    #[allow(dead_code)] // wired up by the interface reconcile
     pub(crate) fn attached(&self, _ifindex: u32) -> bool {
         let mut dlt: c_uint = 0;
         ioctl(&self.fd, libc::BIOCGDLT, (&raw mut dlt).cast()).is_ok()

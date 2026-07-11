@@ -48,6 +48,17 @@ impl MulticastJoiner {
         self.apply(group, ifindex)
     }
 
+    /// Drop the per-family sockets, so the next join starts from fresh ones. For an interface
+    /// that was destroyed: memberships keyed to the dead index are never scrubbed from a
+    /// surviving socket, and on Linux those zombies still count toward
+    /// `igmp_max_memberships` (default 20, unraisable on a locked-down router), so re-joining
+    /// on kept sockets would exhaust the cap after a handful of recreations. Dropping the fds
+    /// releases every membership at once; `desired` survives for the replay.
+    pub(crate) fn reset(&mut self) {
+        self.v4 = None;
+        self.v6 = None;
+    }
+
     /// Re-attempt every recorded membership after the interface re-resolves. A group not joinable
     /// before its address existed succeeds now; an already-held one is a no-op. Best-effort: a
     /// still-unavailable family logs and waits for the next change.
@@ -138,6 +149,31 @@ mod tests {
         let idx = unsafe { libc::if_nametoindex(name.as_ptr()) };
         assert_ne!(idx, 0, "loopback must resolve to an index");
         idx
+    }
+
+    // reset drops the per-family sockets while keeping the desired list, so the next rejoin
+    // replays every group on fresh fds (no zombie memberships from a destroyed interface).
+    #[test]
+    fn reset_keeps_desired_and_rejoin_replays_on_fresh_sockets() {
+        let mut joiner = MulticastJoiner::new();
+        let ifindex = loopback_ifindex();
+        match joiner.join(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)), ifindex) {
+            Ok(()) => {}
+            Err(e) if join_unsupported(&e) => {
+                eprintln!("skip reset_keeps_desired: MCAST_JOIN_GROUP unsupported here ({e})");
+                return;
+            }
+            Err(e) => panic!("kernel must accept the loopback join: {e}"),
+        }
+        assert!(joiner.v4.is_some());
+        joiner.reset();
+        assert!(joiner.v4.is_none(), "reset drops the family sockets");
+        assert_eq!(joiner.desired.len(), 1, "the desired list survives");
+        joiner.rejoin(ifindex);
+        assert!(
+            joiner.v4.is_some(),
+            "rejoin re-opens a fresh socket and re-joins"
+        );
     }
 
     #[test]
