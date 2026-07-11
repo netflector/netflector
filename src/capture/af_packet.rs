@@ -8,13 +8,13 @@
 //! (e.g. IGMP from a multicast join) queue. The BSD backend instead binds first
 //! and relies on `BIOCSETF` flushing the kernel buffer.
 
-use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
 use libc::{c_int, c_void};
 
 use super::filter::{DROP_OUTGOING_PROLOGUE, ETHERNET_UDP_FILTER};
+use crate::interface::if_index;
 use crate::libcex::BpfInsn;
 use crate::net::LinkType;
 use crate::sys::{IoStatus, socklen_of};
@@ -44,7 +44,14 @@ impl Capture {
     /// Returns an error if the interface is unknown, the socket can't be created,
     /// the filter can't be attached, or the bind fails.
     pub(crate) fn open(if_name: &str) -> io::Result<Self> {
-        let ifindex = if_index(if_name)?;
+        let ifindex = if_index(if_name).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("interface {if_name} not found"),
+            )
+        })?;
+        let ifindex =
+            c_int::try_from(ifindex).map_err(|_| io::Error::other("interface index too large"))?;
 
         // Protocol 0: capture nothing until the filter + loop-prevention are in place.
         // SAFETY: a `socket` call with a valid domain/type/protocol returns a fresh fd or -1.
@@ -195,20 +202,6 @@ fn link_addr(ifindex: c_int) -> libc::sockaddr_ll {
     addr.sll_family = u16::try_from(libc::AF_PACKET).expect("AF_PACKET fits u16");
     addr.sll_ifindex = ifindex;
     addr
-}
-
-/// Resolve an interface name to its kernel index.
-fn if_index(if_name: &str) -> io::Result<c_int> {
-    let cname = CString::new(if_name).map_err(|_| {
-        io::Error::new(io::ErrorKind::InvalidInput, "interface name contains a NUL")
-    })?;
-    // SAFETY: `cname` is a valid NUL-terminated C string for the call's duration.
-    let index = unsafe { libc::if_nametoindex(cname.as_ptr()) };
-    if index == 0 {
-        // POSIX: 0 is never a valid index; `if_nametoindex` set errno.
-        return Err(io::Error::last_os_error());
-    }
-    c_int::try_from(index).map_err(|_| io::Error::other("interface index too large"))
 }
 
 /// Ask the kernel to drop locally-sent frames on this socket (`PACKET_IGNORE_OUTGOING`).
