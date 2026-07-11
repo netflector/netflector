@@ -109,7 +109,7 @@ pub(super) fn sender_ok(src: &libc::sockaddr_storage, len: socklen_t) -> bool {
 /// 0 must never be forwarded.
 fn report(index: u32, on_change: &mut impl FnMut(u32)) {
     if index != 0 {
-        log::trace!("address monitor: change for ifindex {index}");
+        log::trace!("interface monitor: change for ifindex {index}");
         on_change(index);
     }
 }
