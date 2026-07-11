@@ -91,7 +91,7 @@ pub(super) fn for_each_change(buf: &[u8], on_change: &mut impl FnMut(u32)) {
             // 0 names no interface (kernel indices are >= 1) and is the parent's "re-resolve
             // everything" overflow signal, so a stray 0 must never be forwarded.
             if index != 0 {
-                log::trace!("address monitor: change for ifindex {index}");
+                log::trace!("interface monitor: change for ifindex {index}");
                 on_change(u32::from(index));
             }
         }

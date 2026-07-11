@@ -1,5 +1,5 @@
 //! Interface address resolution: the source MAC / IPv4 / IPv6 an interface currently has.
-//! A reflector re-emits from these, so they must be read fresh (the address monitor keeps
+//! A reflector re-emits from these, so they must be read fresh (the interface monitor keeps
 //! them current). Any may be absent: a loopback / `DLT_NULL` link has no MAC, and a link
 //! may be v4-only or v6-only.
 //!
@@ -15,13 +15,13 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use crate::net::mac::MacAddr;
 
-mod address_monitor;
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 mod getifaddrs;
+mod interface_monitor;
 #[cfg(target_os = "linux")]
 mod rtnetlink;
 
-pub(crate) use self::address_monitor::AddressMonitor;
+pub(crate) use self::interface_monitor::InterfaceMonitor;
 
 /// An interface's current source addresses; any may be absent. The fields are private so a sender
 /// reaches a v6 source only through [`v6`](Self::v6), naming the destination's scope: the stored

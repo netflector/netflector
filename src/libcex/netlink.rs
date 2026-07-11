@@ -9,7 +9,7 @@ pub(crate) const NLM_F_DUMP: u16 = 0x0300; // NLM_F_ROOT | NLM_F_MATCH
 pub(crate) const NLMSG_DONE: u16 = 0x03;
 pub(crate) const NLMSG_ERROR: u16 = 0x02;
 
-/// `struct nlmsghdr`. Shared with the address monitor (`len`/`msg_type` drive its walk).
+/// `struct nlmsghdr`. Shared with the interface monitor (`len`/`msg_type` drive its walk).
 #[repr(C)]
 pub(crate) struct NlMsgHdr {
     pub(crate) len: u32,
@@ -23,7 +23,7 @@ pub(crate) struct NlMsgHdr {
 const _: () = assert!(size_of::<NlMsgHdr>() == 16);
 
 /// `struct ifaddrmsg`: the body of an `RTM_*ADDR` message. A zeroed value (family
-/// `AF_UNSPEC`) is the dump request body. The address monitor reads `index` from it.
+/// `AF_UNSPEC`) is the dump request body. The interface monitor reads `index` from it.
 #[repr(C)]
 #[derive(Default)]
 pub(crate) struct IfAddrMsg {

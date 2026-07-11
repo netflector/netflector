@@ -36,7 +36,7 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::time::{Duration, Instant};
 
 use crate::capture::Capture;
-use crate::interface::{AddressMonitor, InterfaceAddresses};
+use crate::interface::{InterfaceAddresses, InterfaceMonitor};
 use crate::net::LinkType;
 use crate::net::mac::{MacAddr, MacSet};
 use crate::net::packet::Packet;
@@ -52,7 +52,7 @@ use self::interface_table::InterfaceTable;
 /// wait won't re-fire for those already-read records.
 const MAX_FRAMES_PER_EVENT: u32 = 64;
 
-/// The reactor `user_data` for the address monitor's fd. A [`CaptureKey`] packs a `u32`
+/// The reactor `user_data` for the interface monitor's fd. A [`CaptureKey`] packs a `u32`
 /// (via [`to_u64`](CaptureKey::to_u64)), so `u64::MAX` never collides with a real capture.
 const MONITOR_TAG: u64 = u64::MAX;
 
@@ -225,7 +225,7 @@ pub(crate) struct PacketDispatcher {
     route_keys: Vec<RegistrationKey>,
     /// The address-change monitor, opened best-effort in [`new`](Self::new). `None` is a
     /// degraded mode: addresses stay at their startup-resolved values.
-    monitor: Option<AddressMonitor>,
+    monitor: Option<InterfaceMonitor>,
     /// The DIAL proxy registry, shared across the SSDP advertisement/response reflectors. Empty unless a
     /// DIAL reflector is configured; the dispatcher evicts its past-grace proxies on the deadline sweep.
     dial: DialContext,
@@ -236,7 +236,7 @@ pub(crate) struct PacketDispatcher {
 }
 
 impl PacketDispatcher {
-    /// A dispatcher with no captures yet. Opens the address monitor up front, before the
+    /// A dispatcher with no captures yet. Opens the interface monitor up front, before the
     /// first [`add_capture`](Self::add_capture) resolve, so a change during startup is
     /// already queued rather than missed.
     pub(crate) fn new() -> Self {
@@ -263,14 +263,14 @@ impl PacketDispatcher {
 
     /// Open the address-change monitor. Best-effort: a failure logs and yields `None`, and the
     /// daemon then runs on its startup-resolved addresses (no live updates), never aborting.
-    fn open_monitor() -> Option<AddressMonitor> {
-        match AddressMonitor::open() {
+    fn open_monitor() -> Option<InterfaceMonitor> {
+        match InterfaceMonitor::open() {
             Ok(monitor) => {
-                log::debug!("address monitor installed");
+                log::debug!("interface monitor installed");
                 Some(monitor)
             }
             Err(e) => {
-                log::warn!("address monitor unavailable; addresses won't refresh on change: {e}");
+                log::warn!("interface monitor unavailable; addresses won't refresh on change: {e}");
                 None
             }
         }
@@ -570,7 +570,7 @@ impl PacketDispatcher {
         }
     }
 
-    /// Drain the address monitor and re-resolve each interface a notification names,
+    /// Drain the interface monitor and re-resolve each interface a notification names,
     /// coalescing duplicates so one interface re-resolves at most once per wakeup. A `0`
     /// (the overflow signal) re-resolves every interface. Best-effort: a read or resolution
     /// failure logs and is dropped, and the daemon keeps its last-known addresses.
@@ -587,7 +587,9 @@ impl PacketDispatcher {
             // The drain already consumed and collected these notifications before failing, so refresh
             // what we have rather than discard it; the socket's unread remainder stays readable and the
             // level-triggered wait re-drains it.
-            log::warn!("address monitor read failed mid-drain; refreshing what was collected: {e}");
+            log::warn!(
+                "interface monitor read failed mid-drain; refreshing what was collected: {e}"
+            );
         }
         if changed.is_empty() {
             return; // nothing collected (a spurious wakeup, or a drain error before the first read)
@@ -597,7 +599,7 @@ impl PacketDispatcher {
         let mut v4_moved: Vec<u32> = Vec::new();
         if changed.contains(&0) {
             // 0 is the overflow signal: notifications were dropped, so re-resolve every interface.
-            log::debug!("address monitor overflow; re-resolving all interfaces");
+            log::debug!("interface monitor overflow; re-resolving all interfaces");
             for (ifindex, result) in self.table.refresh_all() {
                 match result {
                     Ok(change) if change.v4 => v4_moved.push(ifindex),

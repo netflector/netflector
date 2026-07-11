@@ -1392,7 +1392,7 @@ class NativeFreeBSDBackend(NativeBackend):
     # FreeBSD's network namespace: its own stack, with interfaces, routes, PF_ROUTE events,
     # and /dev/bpf attachment all per-vnet, and the host filesystem shared via path=/. Per-jail
     # stacks keep every probe packet on the wire (nothing short-circuits over lo0), and jailing
-    # the daemon too means its address monitor hears only test-interface events -- the same
+    # the daemon too means its interface monitor hears only test-interface events -- the same
     # shape as the Linux dut namespace.
 
     def __init__(self, args: argparse.Namespace, prefix: str) -> None:
@@ -2099,7 +2099,7 @@ class AddressChangeRunner(CaseRunner):
 
     def _assert_address_changes_logged(self) -> None:
         # Full-parity log check (the Rust equivalent of the C++'s capability-down assertion):
-        # every phase removed then restored a source address, so the reflector's AddressMonitor
+        # every phase removed then restored a source address, so the reflector's InterfaceMonitor
         # must have logged both transitions -- with the monitor off it logs neither. And no
         # reflect-failure WARN may appear: a send attempted on an addressless egress would mean
         # the per-packet gate failed to catch the drop.
@@ -2112,7 +2112,7 @@ class AddressChangeRunner(CaseRunner):
                 needle = f"interface {ifname}: {verb} {family}"
                 if needle not in text:
                     raise RuntimeError(
-                        f"{self.ac.name}: reflector never logged \"{needle}\" -- the address monitor "
+                        f"{self.ac.name}: reflector never logged \"{needle}\" -- the interface monitor "
                         f"did not observe the change"
                     )
         if "cannot reflect" in text:

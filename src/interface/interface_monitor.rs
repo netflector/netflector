@@ -1,6 +1,6 @@
 //! Interface address-change monitoring: a routing socket whose readiness means some
 //! interface's addresses (or MAC) changed, so the dispatcher should re-resolve it.
-//! `NETLINK_ROUTE` on Linux, `PF_ROUTE` on the BSDs. One [`AddressMonitor`] over a
+//! `NETLINK_ROUTE` on Linux, `PF_ROUTE` on the BSDs. One [`InterfaceMonitor`] over a
 //! per-platform backend, mirroring the resolver's rtnetlink/getifaddrs split.
 //!
 //! Best-effort: only keeps already-resolved addresses fresh. A failed open (or a read error)
@@ -28,7 +28,7 @@ const MAX_CONSECUTIVE_OVERFLOWS: u32 = 16;
 
 /// A routing-socket monitor for interface address and link changes. The dispatcher watches
 /// its fd and calls [`drain`](Self::drain) on readiness.
-pub(crate) struct AddressMonitor {
+pub(crate) struct InterfaceMonitor {
     sock: OwnedFd,
     /// Reused across drains, sized once at open and never grown. Each notification is a single
     /// bounded message (not a coalesced dump), so a fixed buffer fits with headroom. No
@@ -36,7 +36,7 @@ pub(crate) struct AddressMonitor {
     buf: Box<[u8]>,
 }
 
-impl AddressMonitor {
+impl InterfaceMonitor {
     /// Open and subscribe a routing socket, non-blocking and close-on-exec.
     ///
     /// # Errors
@@ -91,12 +91,12 @@ impl AddressMonitor {
                     // re-resolve-all once per burst; the dispatcher coalesces the 0, so repeating
                     // it per ENOBUFS is redundant.
                     log::warn!(
-                        "address monitor overflowed; notifications were dropped, re-resolving every interface"
+                        "interface monitor overflowed; notifications were dropped, re-resolving every interface"
                     );
                     on_change(0);
                 } else if overflows >= MAX_CONSECUTIVE_OVERFLOWS {
                     log::warn!(
-                        "address monitor overflow did not clear after {overflows} reads; ending the drain"
+                        "interface monitor overflow did not clear after {overflows} reads; ending the drain"
                     );
                     return Ok(());
                 }
@@ -112,7 +112,7 @@ impl AddressMonitor {
                         backend::for_each_change(&self.buf[..len], &mut on_change);
                     } else {
                         log::debug!(
-                            "address monitor: dropping a notification from a non-kernel sender"
+                            "interface monitor: dropping a notification from a non-kernel sender"
                         );
                     }
                 }
@@ -130,7 +130,7 @@ mod tests {
     // degrades to no live updates, so there's nothing to drain and we skip.
     #[test]
     fn opens_and_drains_without_blocking() {
-        let mut monitor = match AddressMonitor::open() {
+        let mut monitor = match InterfaceMonitor::open() {
             Ok(monitor) => monitor,
             Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
                 eprintln!("skip: the routing socket could not be opened: {e}");
