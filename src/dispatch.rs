@@ -362,14 +362,21 @@ impl PacketDispatcher {
     }
 
     /// The DIAL proxy registry, shared by the SSDP advertisement/response reflectors so a device gets
-    /// one proxy across both paths (see [`rewrite_location`](crate::reflector::dial::rewrite_location)).
-    pub(crate) fn dial_context(&mut self) -> &mut DialContext {
-        &mut self.dial
+    /// one proxy across both paths (see [`rewrite_location`](crate::reflector::dial::rewrite_location)),
+    /// paired with the name of the interface behind `target` (the proxy's egress pin). One call
+    /// returns both because they come from disjoint fields of one `&mut self`: a caller could not
+    /// hold the borrowed name across a second `&mut` accessor.
+    pub(crate) fn dial_context(&mut self, target: CaptureKey) -> (&mut DialContext, Option<&str>) {
+        let target_iface = self
+            .table
+            .interface_of(target)
+            .and_then(|interface| self.table.interface_name(interface));
+        (&mut self.dial, target_iface)
     }
 
     /// The kernel ifindex of the interface behind `capture`, its stable identity (the address
-    /// resolver caches it at open, and the joiners bake it too). The SSDP search reflector bakes the
-    /// target's for its IPv6 link-local reserved-port binds. `None` if the key is unknown.
+    /// resolver caches it at open, and the joiners bake it too). The SSDP/WSD search reflectors read
+    /// it per session for their IPv6 link-local reserved-port binds. `None` if the key is unknown.
     pub(crate) fn capture_ifindex(&self, capture: CaptureKey) -> Option<u32> {
         self.table.ifindex_of(capture)
     }

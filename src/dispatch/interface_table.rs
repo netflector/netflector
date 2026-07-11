@@ -29,8 +29,8 @@ struct CaptureEntry {
 }
 
 /// One interface paired with its multicast joiner. Bundling them keeps the two from desyncing (one
-/// push adds both) and bakes in the relationship the joiner relies on: it carries the interface's
-/// ifindex, stable for the interface's lifetime, and a refresh re-attempts its joins.
+/// push adds both) and pins the relationship the joiner relies on: every join/rejoin passes THIS
+/// interface's ifindex, so the [`Interface`] stays the single cached copy.
 struct InterfaceEntry {
     interface: Interface,
     joiner: MulticastJoiner,
@@ -57,7 +57,7 @@ impl InterfaceTable {
     fn add_interface(&mut self, interface: Interface) -> InterfaceKey {
         let key =
             InterfaceKey(u32::try_from(self.entries.len()).expect("interface count fits a u32"));
-        let joiner = MulticastJoiner::new(interface.ifindex);
+        let joiner = MulticastJoiner::new();
         self.entries.push(InterfaceEntry { interface, joiner });
         key
     }
@@ -67,7 +67,8 @@ impl InterfaceTable {
     /// deferred to [`rejoin`](MulticastJoiner::rejoin), not an error).
     pub(super) fn join_on(&mut self, interface: InterfaceKey, group: IpAddr) -> io::Result<()> {
         // Startup-only with a freshly-minted key, so the index is always in range.
-        self.entries[interface.0 as usize].joiner.join(group)
+        let entry = &mut self.entries[interface.0 as usize];
+        entry.joiner.join(group, entry.interface.ifindex)
     }
 
     /// The key of the interface named `name`, opening and resolving it if absent, so captures on
@@ -201,7 +202,7 @@ impl InterfaceTable {
         let change = entry.interface.refresh()?;
         // Re-resolved addresses may have made a deferred join (a v4 group that had no address)
         // viable; re-attempt this interface's memberships.
-        entry.joiner.rejoin();
+        entry.joiner.rejoin(entry.interface.ifindex);
         Ok(Some(change))
     }
 
@@ -217,7 +218,7 @@ impl InterfaceTable {
             .map(|entry| (entry.interface.ifindex, entry.interface.refresh()))
             .collect();
         for entry in &mut self.entries {
-            entry.joiner.rejoin();
+            entry.joiner.rejoin(entry.interface.ifindex);
         }
         results
     }

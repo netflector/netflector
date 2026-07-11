@@ -127,8 +127,6 @@ pub(crate) struct SearchReflector {
     source: CaptureKey,
     /// The target capture: where the search is re-emitted and the replies are captured.
     target: CaptureKey,
-    /// The target interface's index, for the IPv6 link-local reserved-port bind.
-    target_ifindex: u32,
     /// The configured device allow-set, scoping the response capture as the announcement direction is.
     device_macs: Option<MacSet>,
     /// Protocol label for logs, e.g. `"SSDP"`.
@@ -151,7 +149,6 @@ impl SearchReflector {
     pub(crate) fn new(
         source: CaptureKey,
         target: CaptureKey,
-        target_ifindex: u32,
         device_macs: Option<MacSet>,
         name: &'static str,
         response_type: MessageType,
@@ -163,7 +160,6 @@ impl SearchReflector {
         Self {
             source,
             target,
-            target_ifindex,
             device_macs,
             name,
             response_type,
@@ -226,7 +222,10 @@ impl SearchReflector {
             );
             return Err(Outcome::Stalled(message_type));
         };
-        let reservation = match PortReservation::create(our_addr, self.target_ifindex) {
+        // The scope id for an IPv6 link-local bind: read per session, not cached at build, so it
+        // tracks the interface table.
+        let target_ifindex = dispatcher.capture_ifindex(self.target).unwrap_or(0);
+        let reservation = match PortReservation::create(our_addr, target_ifindex) {
             Ok(reservation) => reservation,
             Err(e) => {
                 log::warn!(
@@ -421,7 +420,6 @@ mod tests {
         SearchReflector::new(
             CaptureKey::from_u64(1),
             CaptureKey::from_u64(0),
-            0,
             None,
             "TEST",
             MessageType::SsdpResponse,
@@ -698,7 +696,6 @@ mod tests {
         let mut reflector = SearchReflector::new(
             CaptureKey::from_u64(999), // synthetic source: no reply comes back in this test
             target,
-            0,
             None,
             "TEST",
             MessageType::SsdpResponse,
