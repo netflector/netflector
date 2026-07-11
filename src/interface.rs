@@ -21,7 +21,7 @@ mod interface_monitor;
 #[cfg(target_os = "linux")]
 mod rtnetlink;
 
-pub(crate) use self::interface_monitor::InterfaceMonitor;
+pub(crate) use self::interface_monitor::{InterfaceEvent, InterfaceMonitor};
 
 /// An interface's current source addresses; any may be absent. The fields are private so a sender
 /// reaches a v6 source only through [`v6`](Self::v6), naming the destination's scope: the stored
