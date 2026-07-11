@@ -35,16 +35,17 @@ const MAX_DESC_GRACE: Duration = Duration::from_hours(2);
 pub(crate) const REWRITE_BUF_LEN: usize = crate::dispatch::SCRATCH_LEN;
 
 /// Where a minted DIAL description proxy sits across the two interfaces: it binds its source-side
-/// listeners on `source`, egress-pins device connections to `target`/`target_ifindex`, and is evicted if
+/// listeners on `source`, egress-pins device connections to `target`/`target_iface`, and is evicted if
 /// either `source_capture`'s or `target_capture`'s IPv4 address later changes. Bundling the two
 /// same-typed capture/address pairs keeps them from being transposed at the call.
 #[derive(Clone, Copy)]
-pub(crate) struct ProxyPlacement {
+pub(crate) struct ProxyPlacement<'a> {
     pub(crate) source_capture: CaptureKey,
     pub(crate) source: Ipv4Addr,
     pub(crate) target_capture: CaptureKey,
     pub(crate) target: Ipv4Addr,
-    pub(crate) target_ifindex: u32,
+    /// The target interface's name (the durable identity; `None` skips the egress pin).
+    pub(crate) target_iface: Option<&'a str>,
 }
 
 /// Rewrite a DIAL discovery message's `LOCATION` to a source-side description proxy, minting and
@@ -58,7 +59,7 @@ pub(crate) fn rewrite_location(
     ctx: &mut DialContext,
     reactor: &mut Reactor,
     payload: &[u8],
-    placement: ProxyPlacement,
+    placement: ProxyPlacement<'_>,
     out: &mut impl io::Write,
 ) -> bool {
     if !is_dial_service_message(payload) {
@@ -118,7 +119,7 @@ pub(crate) fn rewrite_location(
 fn mint_proxy(
     ctx: &mut DialContext,
     reactor: &mut Reactor,
-    placement: ProxyPlacement,
+    placement: ProxyPlacement<'_>,
     endpoint: SocketAddrV4,
     desc_grace: Instant,
 ) -> Option<SocketAddrV4> {
@@ -132,7 +133,7 @@ fn mint_proxy(
     let watches = [(desc.as_raw_fd(), 0), (rest.as_raw_fd(), 0)];
     let proxy = DialDeviceProxy::new(
         placement.target,
-        placement.target_ifindex,
+        placement.target_iface.map(str::to_owned),
         desc,
         endpoint,
         rest,
@@ -204,7 +205,7 @@ mod tests {
             source: Ipv4Addr::LOCALHOST,
             target_capture: advert_target(),
             target: Ipv4Addr::LOCALHOST,
-            target_ifindex: 0,
+            target_iface: None,
         };
         rewrite_location(ctx, reactor, payload, placement, &mut buf).then_some(buf)
     }

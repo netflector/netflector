@@ -29,11 +29,11 @@ const RECV_BUFFER_SIZE: usize = 2048;
 /// The fallback filter length: the egress-drop prologue plus the UDP classifier.
 const DROP_OUTGOING_FILTER_LEN: usize = DROP_OUTGOING_PROLOGUE.len() + ETHERNET_UDP_FILTER.len();
 
-/// A raw-capture handle on one interface.
+/// A raw-capture handle on one interface. The socket's bind is the only holder of the
+/// interface's kernel index: sends rely on it, so nothing here goes stale if the index changes.
 pub(crate) struct Capture {
     fd: OwnedFd,
     buf: Box<[u8]>,
-    send_addr: libc::sockaddr_ll,
     name: String,
 }
 
@@ -45,7 +45,6 @@ impl Capture {
     /// the filter can't be attached, or the bind fails.
     pub(crate) fn open(if_name: &str) -> io::Result<Self> {
         let ifindex = if_index(if_name)?;
-        let send_addr = link_addr(ifindex);
 
         // Protocol 0: capture nothing until the filter + loop-prevention are in place.
         // SAFETY: a `socket` call with a valid domain/type/protocol returns a fresh fd or -1.
@@ -71,7 +70,7 @@ impl Capture {
 
         // Bind with ETH_P_ALL to start capturing. The filter is already installed, so
         // there is no unfiltered-capture window.
-        bind_interface(&fd, send_addr)?;
+        bind_interface(&fd, link_addr(ifindex))?;
 
         log::debug!(
             "opened AF_PACKET capture on {if_name} (fd {}, ifindex {ifindex})",
@@ -80,7 +79,6 @@ impl Capture {
         Ok(Self {
             fd,
             buf: vec![0u8; RECV_BUFFER_SIZE].into_boxed_slice(),
-            send_addr,
             name: if_name.into(),
         })
     }
@@ -133,18 +131,16 @@ impl Capture {
     /// # Errors
     /// Returns an error if the send fails or is short.
     pub(crate) fn send(&self, frame: &[u8]) -> io::Result<()> {
-        // SOCK_RAW carries the whole L2 frame, so the kernel needs only the egress
-        // interface (the prebuilt `send_addr`); the destination MAC is in the frame.
-        // SAFETY: `frame` is a valid readable slice; `send_addr` is a fully-initialized
-        // `sockaddr_ll` of the given length.
+        // SOCK_RAW carries the whole L2 frame and the socket is bound to its interface, so a
+        // plain `send` suffices: the kernel takes the egress from the bind, and the
+        // destination MAC is in the frame.
+        // SAFETY: `frame` is a valid readable slice of `frame.len()` bytes.
         let sent = unsafe {
-            libc::sendto(
+            libc::send(
                 self.fd.as_raw_fd(),
                 frame.as_ptr().cast::<c_void>(),
                 frame.len(),
                 0,
-                (&raw const self.send_addr).cast::<libc::sockaddr>(),
-                socklen_of::<libc::sockaddr_ll>(),
             )
         };
         if sent < 0 {
@@ -191,7 +187,8 @@ fn drop_outgoing_filter() -> [BpfInsn; DROP_OUTGOING_FILTER_LEN] {
     })
 }
 
-/// A zeroed `sockaddr_ll` addressed to `ifindex` (family set, protocol left zero).
+/// A zeroed `sockaddr_ll` addressed to `ifindex` for the bind (family set, protocol left zero;
+/// [`bind_interface`] adds it).
 fn link_addr(ifindex: c_int) -> libc::sockaddr_ll {
     // SAFETY: all-zero is a valid `sockaddr_ll`: integer and byte-array fields only.
     let mut addr: libc::sockaddr_ll = unsafe { core::mem::zeroed() };

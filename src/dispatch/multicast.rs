@@ -15,56 +15,52 @@ use crate::libcex::{GroupReq, MCAST_JOIN_GROUP};
 use crate::sys::{open_socket, sockaddr_for, socklen_of};
 
 /// One capture interface's multicast memberships: one unbound `SOCK_DGRAM` fd per family, opened on
-/// that family's first join, under a fixed `ifindex`. `desired` records requested groups so they can
-/// be re-attempted when the interface re-resolves (a v4 group joined before its address existed
-/// becomes joinable then).
+/// that family's first join. The joiner holds no ifindex of its own -- the caller passes the
+/// interface's current one per call, so the table's [`Interface`](crate::interface::Interface) stays
+/// the single cached copy. `desired` records requested groups so they can be re-attempted when the
+/// interface re-resolves (a v4 group joined before its address existed becomes joinable then).
 pub(crate) struct MulticastJoiner {
-    ifindex: u32,
     v4: Option<OwnedFd>,
     v6: Option<OwnedFd>,
     desired: Vec<IpAddr>,
 }
 
 impl MulticastJoiner {
-    pub(crate) fn new(ifindex: u32) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            ifindex,
             v4: None,
             v6: None,
             desired: Vec::new(),
         }
     }
 
-    /// Join `group` on this interface and record it, so a later interface change re-attempts it.
-    /// Idempotent: the kernel keys memberships by `(group, ifindex)`.
+    /// Join `group` on the interface `ifindex` and record it, so a later interface change
+    /// re-attempts it. Idempotent: the kernel keys memberships by `(group, ifindex)`.
     ///
     /// # Errors
     /// The OS error if the socket can't open or the membership can't be added. `EADDRNOTAVAIL` (no
     /// address of that family yet) is deferrable: the group is recorded and [`rejoin`](Self::rejoin)
     /// retries it on the next address-up event.
-    pub(crate) fn join(&mut self, group: IpAddr) -> io::Result<()> {
+    pub(crate) fn join(&mut self, group: IpAddr, ifindex: u32) -> io::Result<()> {
         if !self.desired.contains(&group) {
             self.desired.push(group);
         }
-        self.apply(group)
+        self.apply(group, ifindex)
     }
 
     /// Re-attempt every recorded membership after the interface re-resolves. A group not joinable
     /// before its address existed succeeds now; an already-held one is a no-op. Best-effort: a
     /// still-unavailable family logs and waits for the next change.
-    pub(crate) fn rejoin(&mut self) {
+    pub(crate) fn rejoin(&mut self, ifindex: u32) {
         for i in 0..self.desired.len() {
             let group = self.desired[i];
-            if let Err(e) = self.apply(group) {
-                log::debug!(
-                    "re-join of {group} on ifindex {} deferred: {e}",
-                    self.ifindex
-                );
+            if let Err(e) = self.apply(group, ifindex) {
+                log::debug!("re-join of {group} on ifindex {ifindex} deferred: {e}");
             }
         }
     }
 
-    fn apply(&mut self, group: IpAddr) -> io::Result<()> {
+    fn apply(&mut self, group: IpAddr, ifindex: u32) -> io::Result<()> {
         let (slot, family, level) = match group {
             IpAddr::V4(_) => (&mut self.v4, libc::AF_INET, libc::IPPROTO_IP),
             IpAddr::V6(_) => (&mut self.v6, libc::AF_INET6, libc::IPPROTO_IPV6),
@@ -79,7 +75,7 @@ impl MulticastJoiner {
         // uninitialised, and `setsockopt` reads the whole struct (Valgrind flags them).
         // SAFETY: `group_req` is plain data; all-zero is valid.
         let mut req: GroupReq = unsafe { std::mem::zeroed() };
-        req.gr_interface = self.ifindex;
+        req.gr_interface = ifindex;
         // Interface is selected by `gr_interface`, so the group sockaddr carries no scope id.
         req.gr_group = sockaddr_for(group, 0, 0).0;
         // SAFETY: `req` is a fully-initialised `group_req` (padding zeroed), passed by address + size.
@@ -149,12 +145,13 @@ mod tests {
         // Exercises the full MCAST_JOIN_GROUP FFI against the kernel (per-OS const, group_req layout,
         // by-index selection; by-index doesn't require the interface's IFF_MULTICAST flag). QEMU
         // doesn't implement the setsockopt, so self-skip there.
-        let mut joiner = MulticastJoiner::new(loopback_ifindex());
+        let mut joiner = MulticastJoiner::new();
+        let ifindex = loopback_ifindex();
         for group in [
             IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)),
             IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb)),
         ] {
-            match joiner.join(group) {
+            match joiner.join(group, ifindex) {
                 Ok(()) => {}
                 Err(e) if join_unsupported(&e) => {
                     eprintln!(

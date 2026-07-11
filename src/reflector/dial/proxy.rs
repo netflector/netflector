@@ -62,8 +62,10 @@ pub(super) struct DialDeviceProxy {
     /// The target-interface address device connections bind, so the device sees a same-segment peer
     /// and replies via the target interface (on the BSDs the bind is the only egress steer).
     target: Ipv4Addr,
-    /// The target interface index, egress-pinning device connections to that segment.
-    target_ifindex: u32,
+    /// The target interface's name, egress-pinning device connections to that segment (`None` skips
+    /// the pin). The name, not an ifindex: `SO_BINDTODEVICE` wants it directly, and a name stays
+    /// valid across an interface recreation where a cached index would not.
+    target_iface: Option<String>,
     /// The description listener (source side); its connections proxy to `desc_endpoint`.
     desc: TcpSocket,
     /// The proxy's identity: the device's description endpoint (`device-ip:desc_port`).
@@ -79,10 +81,10 @@ pub(super) struct DialDeviceProxy {
 
 impl DialDeviceProxy {
     /// A proxy fronting `desc_endpoint` via the source-side `desc` listener (already bound by the caller).
-    /// Device connections bind the target-interface `target` and egress-pin `target_ifindex`.
+    /// Device connections bind the target-interface `target` and egress-pin `target_iface`.
     pub(super) fn new(
         target: Ipv4Addr,
-        target_ifindex: u32,
+        target_iface: Option<String>,
         desc: TcpSocket,
         desc_endpoint: SocketAddrV4,
         rest: TcpSocket,
@@ -90,7 +92,7 @@ impl DialDeviceProxy {
         Self {
             key: None,
             target,
-            target_ifindex,
+            target_iface,
             desc,
             desc_endpoint,
             rest,
@@ -159,13 +161,14 @@ impl DialDeviceProxy {
     ) {
         let key = self.own_key();
         let rest_listener = self.rest.local_addr();
-        let device = match TcpSocket::connect(device_endpoint, self.target, self.target_ifindex) {
-            Ok(device) => device,
-            Err(e) => {
-                log::warn!("dial: connect to {device_endpoint} failed: {e}");
-                return;
-            }
-        };
+        let device =
+            match TcpSocket::connect(device_endpoint, self.target, self.target_iface.as_deref()) {
+                Ok(device) => device,
+                Err(e) => {
+                    log::warn!("dial: connect to {device_endpoint} failed: {e}");
+                    return;
+                }
+            };
         let client_fd = client.as_raw_fd();
         let device_fd = device.as_raw_fd();
         // Insert first so the connection's arena key can tag both fds' `user_data`; the regs are
@@ -341,7 +344,7 @@ mod tests {
         let rest_addr = rest.local_addr();
         let mut proxy = DialDeviceProxy::new(
             Ipv4Addr::LOCALHOST,
-            0, // no egress pin on loopback
+            None, // no egress pin on loopback
             desc,
             SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 5), 8008),
             rest,
@@ -361,7 +364,7 @@ mod tests {
 
         // A client reaches the REST listener; drive accept until the loopback handshake lands.
         let _client =
-            TcpSocket::connect(rest_addr, Ipv4Addr::LOCALHOST, 0).expect("client connect");
+            TcpSocket::connect(rest_addr, Ipv4Addr::LOCALHOST, None).expect("client connect");
         for _ in 0..2000 {
             proxy.accept_rest(&mut reactor);
             if proxy.conns.iter().count() == 1 {
@@ -386,7 +389,8 @@ mod tests {
     fn accept_rest_drops_a_client_before_the_rest_endpoint_is_learned() {
         let mut reactor = Reactor::new().expect("reactor");
         let (mut proxy, rest_addr) = watched_proxy(&mut reactor); // rest_endpoint stays None
-        let client = TcpSocket::connect(rest_addr, Ipv4Addr::LOCALHOST, 0).expect("client connect");
+        let client =
+            TcpSocket::connect(rest_addr, Ipv4Addr::LOCALHOST, None).expect("client connect");
 
         // accept_rest accepts the client (draining the listener) but, with no learned endpoint, drops
         // it. The client observes EOF and no connection is recorded.

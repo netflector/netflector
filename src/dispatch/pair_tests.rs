@@ -630,9 +630,12 @@ fn pair_join_announces_membership_on_the_wire() -> io::Result<()> {
     // (and only those) through the production joiner, so its device accepts the arriving report
     // packets for the observers. Its own joins announce 224.0.0.22/ff02::16 -- never the test
     // groups -- so a test-group match below can only come from the inject side's announcements.
-    let mut receive_joiner = MulticastJoiner::new(receive_ifindex);
-    receive_joiner.join(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 22)))?;
-    receive_joiner.join(IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0x16)))?;
+    let mut receive_joiner = MulticastJoiner::new();
+    receive_joiner.join(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 22)), receive_ifindex)?;
+    receive_joiner.join(
+        IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0x16)),
+        receive_ifindex,
+    )?;
     let igmp = raw_observer(libc::AF_INET, libc::IPPROTO_IGMP)?;
     let mld = raw_observer(libc::AF_INET6, libc::IPPROTO_ICMPV6)?;
     #[cfg(target_os = "linux")]
@@ -649,9 +652,10 @@ fn pair_join_announces_membership_on_the_wire() -> io::Result<()> {
         )?;
     }
 
-    let mut joiner = MulticastJoiner::new(if_index(&pair.inject).expect("inject ifindex"));
-    joiner.join(IpAddr::V4(group_v4))?;
-    joiner.join(IpAddr::V6(group_v6))?;
+    let mut joiner = MulticastJoiner::new();
+    let inject_ifindex = if_index(&pair.inject).expect("inject ifindex");
+    joiner.join(IpAddr::V4(group_v4), inject_ifindex)?;
+    joiner.join(IpAddr::V6(group_v6), inject_ifindex)?;
 
     assert!(
         saw_membership_report(&igmp, &group_v4.octets()),
@@ -673,12 +677,13 @@ fn pair_joins_multicast_groups_idempotently() -> io::Result<()> {
     let Some(pair) = InterfacePair::create() else {
         return Ok(());
     };
-    let mut joiner = MulticastJoiner::new(if_index(&pair.inject).expect("inject ifindex"));
+    let mut joiner = MulticastJoiner::new();
+    let inject_ifindex = if_index(&pair.inject).expect("inject ifindex");
     let mdns_v4: IpAddr = "224.0.0.251".parse().expect("mDNS v4 group");
     let mdns_v6: IpAddr = "ff02::fb".parse().expect("mDNS v6 group");
-    joiner.join(mdns_v4)?;
-    joiner.join(mdns_v6)?;
-    joiner.join(mdns_v4)?;
-    joiner.join(mdns_v6)?;
+    joiner.join(mdns_v4, inject_ifindex)?;
+    joiner.join(mdns_v6, inject_ifindex)?;
+    joiner.join(mdns_v4, inject_ifindex)?;
+    joiner.join(mdns_v6, inject_ifindex)?;
     Ok(())
 }

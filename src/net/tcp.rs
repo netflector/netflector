@@ -65,19 +65,23 @@ impl TcpSocket {
         }))
     }
 
-    /// Open a connection to `dst`, egress-pinned to the target interface (`source` address + scope
-    /// `ifindex`) so the route can't leak onto the wrong segment. Non-blocking: the socket is
+    /// Open a connection to `dst`, egress-pinned to the target interface (`source` address + the
+    /// `iface` name) so the route can't leak onto the wrong segment. Non-blocking: the socket is
     /// [`is_connecting`](Self::is_connecting) until a writable edge and [`finish_connect`](Self::finish_connect).
     ///
     /// # Errors
     /// Propagates the socket / pin / `bind` / `connect` failure (other than the in-progress sentinel).
-    pub(crate) fn connect(dst: SocketAddrV4, source: Ipv4Addr, ifindex: u32) -> io::Result<Self> {
+    pub(crate) fn connect(
+        dst: SocketAddrV4,
+        source: Ipv4Addr,
+        iface: Option<&str>,
+    ) -> io::Result<Self> {
         let fd = open_socket(libc::AF_INET, libc::SOCK_STREAM)?;
         // FreeBSD has no egress-pin primitive; the source-address bind below steers egress.
         #[cfg(not(target_os = "freebsd"))]
-        pin_egress(fd.as_raw_fd(), ifindex)?;
+        pin_egress(fd.as_raw_fd(), iface)?;
         #[cfg(target_os = "freebsd")]
-        let _ = ifindex;
+        let _ = iface;
         bind_v4(fd.as_raw_fd(), source, 0)?;
         let local_addr = local_addr_v4(fd.as_raw_fd())?;
         let connecting = connect_v4(fd.as_raw_fd(), dst)?;
@@ -294,34 +298,33 @@ fn so_error(fd: RawFd) -> io::Result<c_int> {
     Ok(err)
 }
 
-/// Constrain `fd`'s egress to interface `ifindex` so a route lookup can't leak the connect onto the
-/// wrong segment; `ifindex == 0` skips the pin. Linux uses `SO_BINDTODEVICE` (needs `CAP_NET_RAW`),
-/// macOS `IP_BOUND_IF`. FreeBSD has no pin primitive, so the caller skips it and relies on the
-/// source-address bind.
+/// Constrain `fd`'s egress to the interface named `iface` so a route lookup can't leak the connect
+/// onto the wrong segment; `None` skips the pin. Linux uses `SO_BINDTODEVICE` (needs `CAP_NET_RAW`),
+/// which takes the name directly; macOS resolves the name to its current ifindex for `IP_BOUND_IF`,
+/// so the pin follows the name across an interface recreation. FreeBSD has no pin primitive, so the
+/// caller skips it and relies on the source-address bind.
 #[cfg(not(target_os = "freebsd"))]
-fn pin_egress(fd: RawFd, ifindex: u32) -> io::Result<()> {
-    if ifindex == 0 {
+fn pin_egress(fd: RawFd, iface: Option<&str>) -> io::Result<()> {
+    let Some(name) = iface else {
         return Ok(());
-    }
+    };
     #[cfg(target_os = "linux")]
     {
-        // `SO_BINDTODEVICE` takes the interface name.
-        let mut name = [0u8; libc::IF_NAMESIZE];
-        // SAFETY: `name` is a writable `IF_NAMESIZE` buffer; `if_indextoname` fills it or returns null.
-        if unsafe { libc::if_indextoname(ifindex, name.as_mut_ptr().cast::<libc::c_char>()) }
-            .is_null()
-        {
-            return Err(io::Error::last_os_error());
+        if name.len() >= libc::IF_NAMESIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "interface name too long",
+            ));
         }
-        let name_len = name.iter().position(|&b| b == 0).unwrap_or(name.len());
-        // SAFETY: `name[..name_len]` is the interface name of the passed length for `fd`.
+        // SAFETY: `name` points at `name.len()` valid bytes; the kernel NUL-terminates its copy.
         let rc = unsafe {
             libc::setsockopt(
                 fd,
                 libc::SOL_SOCKET,
                 libc::SO_BINDTODEVICE,
                 name.as_ptr().cast::<c_void>(),
-                libc::socklen_t::try_from(name_len).expect("interface name length fits socklen_t"),
+                libc::socklen_t::try_from(name.len())
+                    .expect("interface name length fits socklen_t"),
             )
         };
         if rc != 0 {
@@ -330,7 +333,13 @@ fn pin_egress(fd: RawFd, ifindex: u32) -> io::Result<()> {
     }
     #[cfg(target_os = "macos")]
     {
-        let index = c_int::try_from(ifindex).map_err(|_| io::Error::other("ifindex too large"))?;
+        let index = crate::interface::if_index(name).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("interface {name} not found"),
+            )
+        })?;
+        let index = c_int::try_from(index).map_err(|_| io::Error::other("ifindex too large"))?;
         // SAFETY: `&index` is a valid `c_int` option value for `fd`.
         let rc = unsafe {
             libc::setsockopt(
@@ -388,8 +397,8 @@ mod tests {
         let server_addr = listener.local_addr();
         assert_ne!(server_addr.port(), 0, "an ephemeral port is assigned");
 
-        let mut client =
-            TcpSocket::connect(server_addr, Ipv4Addr::LOCALHOST, 0).expect("connect to loopback");
+        let mut client = TcpSocket::connect(server_addr, Ipv4Addr::LOCALHOST, None)
+            .expect("connect to loopback");
         let server = spin(|| listener.accept()); // completes the handshake
         client.finish_connect().expect("the connect completed");
         assert!(!client.is_connecting());
@@ -410,7 +419,7 @@ mod tests {
     #[test]
     fn loopback_send_vectored_concatenates_the_slices() {
         let listener = TcpSocket::listen(Ipv4Addr::LOCALHOST).expect("listen on loopback");
-        let mut client = TcpSocket::connect(listener.local_addr(), Ipv4Addr::LOCALHOST, 0)
+        let mut client = TcpSocket::connect(listener.local_addr(), Ipv4Addr::LOCALHOST, None)
             .expect("connect to loopback");
         let server = spin(|| listener.accept());
         client.finish_connect().expect("the connect completed");
@@ -433,7 +442,7 @@ mod tests {
     fn shutdown_write_half_closes_keeping_the_read_half() {
         let listener = TcpSocket::listen(Ipv4Addr::LOCALHOST).expect("listen on loopback");
         let mut client =
-            TcpSocket::connect(listener.local_addr(), Ipv4Addr::LOCALHOST, 0).expect("connect");
+            TcpSocket::connect(listener.local_addr(), Ipv4Addr::LOCALHOST, None).expect("connect");
         let server = spin(|| listener.accept());
         client.finish_connect().expect("the connect completed");
 

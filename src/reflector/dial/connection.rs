@@ -550,7 +550,7 @@ mod tests {
         let listener =
             TcpSocket::listen(std::net::Ipv4Addr::LOCALHOST).expect("listen on loopback");
         let mut initiator =
-            TcpSocket::connect(listener.local_addr(), std::net::Ipv4Addr::LOCALHOST, 0)
+            TcpSocket::connect(listener.local_addr(), std::net::Ipv4Addr::LOCALHOST, None)
                 .expect("connect");
         let accepted = spin(|| listener.accept());
         initiator.finish_connect().expect("the connect completed");

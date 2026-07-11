@@ -86,10 +86,6 @@ pub(crate) fn build(
         reflector.target_if.as_str(),
     )?;
 
-    // The reserved-port bind for an IPv6 link-local target source needs the target's scope id; use the
-    // ifindex the capture already cached (the same value the joiners use).
-    let target_ifindex = dispatcher.capture_ifindex(target).unwrap_or(0);
-
     // Announcements are captured on target, searches on source, so join the group on both. A family with
     // no address yet is recorded and re-attempted on the next address change.
     let groups = used_groups(reflector.address_family);
@@ -129,7 +125,6 @@ pub(crate) fn build(
         Box::new(SearchReflector::new(
             source,
             target,
-            target_ifindex,
             reflector.macs.clone(),
             "WSD",
             MessageType::WsdResponse,
