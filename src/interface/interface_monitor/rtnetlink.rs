@@ -8,6 +8,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use libc::socklen_t;
 
 use super::super::rtnetlink::read_at;
+use super::InterfaceEvent;
 use crate::libcex::{IfAddrMsg, NETLINK_ROUTE, NlMsgHdr, SockAddrNl, nl_align};
 
 /// Holds one notification. Multicast delivers one message per datagram, never a coalesced
@@ -51,9 +52,10 @@ pub(super) fn open() -> io::Result<OwnedFd> {
     Ok(sock)
 }
 
-/// Walk every netlink message in one datagram; report the interface index of each
-/// `RTM_{NEW,DEL}ADDR` (from its `ifaddrmsg`) and `RTM_{NEW,DEL}LINK` (from its `ifinfomsg`).
-pub(super) fn for_each_change(buf: &[u8], on_change: &mut impl FnMut(u32)) {
+/// Walk every netlink message in one datagram; report the interface index and event kind of
+/// each `RTM_{NEW,DEL}ADDR` ([`InterfaceEvent::Address`], from its `ifaddrmsg`) and
+/// `RTM_{NEW,DEL}LINK` ([`InterfaceEvent::Link`], from its `ifinfomsg`).
+pub(super) fn for_each_change(buf: &[u8], on_change: &mut impl FnMut(InterfaceEvent)) {
     let mut offset = 0;
     while let Some(hdr) = read_at::<NlMsgHdr>(buf, offset) {
         let len = hdr.len as usize;
@@ -75,15 +77,18 @@ pub(super) fn for_each_change(buf: &[u8], on_change: &mut impl FnMut(u32)) {
         match hdr.msg_type {
             libc::RTM_NEWADDR | libc::RTM_DELADDR => {
                 if let Some(body) = read_at::<IfAddrMsg>(&buf[..end], body_at) {
-                    report(body.index, on_change);
+                    report(body.index, InterfaceEvent::Address, on_change);
                 }
             }
             libc::RTM_NEWLINK | libc::RTM_DELLINK => {
-                // `ifi_index` is i32 but always a positive kernel index.
-                if let Some(body) = read_at::<libc::ifinfomsg>(&buf[..end], body_at)
-                    && let Ok(index) = u32::try_from(body.ifi_index)
-                {
-                    report(index, on_change);
+                if let Some(body) = read_at::<libc::ifinfomsg>(&buf[..end], body_at) {
+                    // `ifi_index` is i32 but always a positive kernel index; a negative one is
+                    // as malformed as 0, so fold it in for report's drop-and-warn.
+                    report(
+                        u32::try_from(body.ifi_index).unwrap_or(0),
+                        InterfaceEvent::Link,
+                        on_change,
+                    );
                 }
             }
             _ => {}
@@ -104,14 +109,22 @@ pub(super) fn sender_ok(src: &libc::sockaddr_storage, len: socklen_t) -> bool {
     nl.pid == 0
 }
 
-/// Forward a change for `index`, unless `index` is 0. Zero names no interface (kernel
-/// indices are >= 1) and is the parent's "re-resolve everything" overflow signal, so a stray
-/// 0 must never be forwarded.
-fn report(index: u32, on_change: &mut impl FnMut(u32)) {
-    if index != 0 {
-        log::trace!("interface monitor: change for ifindex {index}");
-        on_change(index);
+/// Forward an `event(index)` change; `event` is a variant constructor
+/// ([`InterfaceEvent::Address`] or [`InterfaceEvent::Link`]). Kernel indices are >= 1, so a 0
+/// (including a folded-in negative `ifi_index`) is a malformed message: dropped with a warn
+/// rather than forwarded as nonsense.
+fn report(
+    index: u32,
+    event: fn(u32) -> InterfaceEvent,
+    on_change: &mut impl FnMut(InterfaceEvent),
+) {
+    if index == 0 {
+        log::warn!("interface monitor: dropping a change with no valid interface index");
+        return;
     }
+    let event = event(index);
+    log::trace!("interface monitor: {event:?}");
+    on_change(event);
 }
 
 #[cfg(test)]
@@ -174,8 +187,8 @@ mod tests {
         let mut buf = message(libc::RTM_NEWADDR, &ifaddrmsg(7));
         buf.extend(message(libc::RTM_DELLINK, &ifinfomsg(9)));
         let mut seen = Vec::new();
-        for_each_change(&buf, &mut |i| seen.push(i));
-        assert_eq!(seen, [7, 9]);
+        for_each_change(&buf, &mut |e| seen.push(e));
+        assert_eq!(seen, [InterfaceEvent::Address(7), InterfaceEvent::Link(9)]);
     }
 
     #[test]
@@ -183,7 +196,7 @@ mod tests {
         // NLMSG_DONE (3) and any non-addr/link type carry no interface index for us.
         let buf = message(3, &ifaddrmsg(5));
         let mut seen = Vec::new();
-        for_each_change(&buf, &mut |i| seen.push(i));
+        for_each_change(&buf, &mut |e| seen.push(e));
         assert!(seen.is_empty());
     }
 
@@ -192,7 +205,7 @@ mod tests {
         // A truncated ifaddrmsg (claimed type, body shorter than ifaddrmsg) yields nothing.
         let buf = message(libc::RTM_NEWADDR, &[0u8; 2]);
         let mut seen = Vec::new();
-        for_each_change(&buf, &mut |i| seen.push(i));
+        for_each_change(&buf, &mut |e| seen.push(e));
         assert!(seen.is_empty());
     }
 
@@ -202,7 +215,7 @@ mod tests {
         // must not be reported (which would trigger a spurious re-resolve of everything).
         let buf = message(libc::RTM_NEWADDR, &ifaddrmsg(0));
         let mut seen = Vec::new();
-        for_each_change(&buf, &mut |i| seen.push(i));
+        for_each_change(&buf, &mut |e| seen.push(e));
         assert!(seen.is_empty());
     }
 
@@ -211,7 +224,7 @@ mod tests {
         let mut buf = message(libc::RTM_NEWADDR, &ifaddrmsg(7));
         buf[0..4].copy_from_slice(&9999u32.to_ne_bytes()); // len past the datagram
         let mut seen = Vec::new();
-        for_each_change(&buf, &mut |i| seen.push(i));
+        for_each_change(&buf, &mut |e| seen.push(e));
         assert!(seen.is_empty());
     }
 
@@ -225,7 +238,7 @@ mod tests {
         buf.extend(message(libc::RTM_NEWADDR, &ifaddrmsg(9)));
         buf[second..second + 4].copy_from_slice(&u32::MAX.to_ne_bytes());
         let mut seen = Vec::new();
-        for_each_change(&buf, &mut |i| seen.push(i));
-        assert_eq!(seen, [7]);
+        for_each_change(&buf, &mut |e| seen.push(e));
+        assert_eq!(seen, [InterfaceEvent::Address(7)]);
     }
 }

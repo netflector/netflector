@@ -36,7 +36,7 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::time::{Duration, Instant};
 
 use crate::capture::Capture;
-use crate::interface::{InterfaceAddresses, InterfaceMonitor};
+use crate::interface::{InterfaceAddresses, InterfaceEvent, InterfaceMonitor};
 use crate::net::LinkType;
 use crate::net::mac::{MacAddr, MacSet};
 use crate::net::packet::Packet;
@@ -571,17 +571,21 @@ impl PacketDispatcher {
     }
 
     /// Drain the interface monitor and re-resolve each interface a notification names,
-    /// coalescing duplicates so one interface re-resolves at most once per wakeup. A `0`
-    /// (the overflow signal) re-resolves every interface. Best-effort: a read or resolution
-    /// failure logs and is dropped, and the daemon keeps its last-known addresses.
+    /// coalescing duplicates so one interface re-resolves at most once per wakeup. An
+    /// [`InterfaceEvent::Overflow`] re-resolves every interface. Best-effort: a read or
+    /// resolution failure logs and is dropped, and the daemon keeps its last-known addresses.
     fn refresh_changed_interfaces(&mut self, reactor: &mut Reactor) {
         let Some(monitor) = self.monitor.as_mut() else {
             return;
         };
         let mut changed: Vec<u32> = Vec::new();
-        if let Err(e) = monitor.drain(|ifindex| {
-            if !changed.contains(&ifindex) {
-                changed.push(ifindex);
+        let mut overflow = false;
+        if let Err(e) = monitor.drain(|event| match event {
+            InterfaceEvent::Overflow => overflow = true,
+            InterfaceEvent::Address(ifindex) | InterfaceEvent::Link(ifindex) => {
+                if !changed.contains(&ifindex) {
+                    changed.push(ifindex);
+                }
             }
         }) {
             // The drain already consumed and collected these notifications before failing, so refresh
@@ -591,14 +595,14 @@ impl PacketDispatcher {
                 "interface monitor read failed mid-drain; refreshing what was collected: {e}"
             );
         }
-        if changed.is_empty() {
+        if changed.is_empty() && !overflow {
             return; // nothing collected (a spurious wakeup, or a drain error before the first read)
         }
         // The DIAL proxies bind IPv4 only, so collect the interfaces whose v4 address actually moved. A
         // routine v6 or MAC change must not churn a proxy whose v4 (and cached LOCATION) is unchanged.
         let mut v4_moved: Vec<u32> = Vec::new();
-        if changed.contains(&0) {
-            // 0 is the overflow signal: notifications were dropped, so re-resolve every interface.
+        if overflow {
+            // Notifications were dropped, so re-resolve every interface.
             log::debug!("interface monitor overflow; re-resolving all interfaces");
             for (ifindex, result) in self.table.refresh_all() {
                 match result {

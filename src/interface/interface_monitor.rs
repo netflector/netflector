@@ -1,6 +1,6 @@
-//! Interface address-change monitoring: a routing socket whose readiness means some
-//! interface's addresses (or MAC) changed, so the dispatcher should re-resolve it.
-//! `NETLINK_ROUTE` on Linux, `PF_ROUTE` on the BSDs. One [`InterfaceMonitor`] over a
+//! Interface change monitoring: a routing socket whose readiness means some interface's
+//! addresses (or MAC) changed, or an interface itself came or went, so the dispatcher should
+//! react. `NETLINK_ROUTE` on Linux, `PF_ROUTE` on the BSDs. One [`InterfaceMonitor`] over a
 //! per-platform backend, mirroring the resolver's rtnetlink/getifaddrs split.
 //!
 //! Best-effort: only keeps already-resolved addresses fresh. A failed open (or a read error)
@@ -25,6 +25,23 @@ use self::rtnetlink as backend;
 /// flag on the next recv, so an unbroken run of them means the socket is wedged. Stop rather
 /// than spin the single-threaded loop forever; a level-triggered wait re-fires to try later.
 const MAX_CONSECUTIVE_OVERFLOWS: u32 = 16;
+
+/// What one routing-socket notification reported. The kind drives the dispatcher's trigger
+/// policy; the monitor itself attaches no meaning beyond the message-type mapping.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum InterfaceEvent {
+    /// An address-level change on the interface with this kernel index (also BSD `RTM_IFINFO`
+    /// link-state/MAC updates: a flap refreshes addresses, it doesn't signal a lifecycle change).
+    Address(u32),
+    /// A link lifecycle event on the interface with this kernel index: Linux
+    /// `RTM_{NEW,DEL}LINK` (creation, deletion, or any link change -- netlink doesn't
+    /// distinguish), FreeBSD `RTM_IFANNOUNCE` (arrival/departure). macOS has no lifecycle
+    /// message, so this variant is never constructed there.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    Link(u32),
+    /// The socket overflowed and notifications were dropped: every interface may be stale.
+    Overflow,
+}
 
 /// A routing-socket monitor for interface address and link changes. The dispatcher watches
 /// its fd and calls [`drain`](Self::drain) on readiness.
@@ -54,15 +71,15 @@ impl InterfaceMonitor {
         self.sock.as_raw_fd()
     }
 
-    /// Drain every queued notification, calling `on_change(ifindex)` per affected interface.
-    /// After an overflow it calls `on_change(0)`, meaning "re-resolve everything" (kernel
-    /// indices are >= 1, so 0 is an unambiguous signal). Reads to `EAGAIN` so a level-triggered
+    /// Drain every queued notification, calling `on_change(event)` per affected interface;
+    /// the per-interface events carry the kernel index. After an overflow it reports
+    /// [`InterfaceEvent::Overflow`] once per burst. Reads to `EAGAIN` so a level-triggered
     /// wait won't immediately re-fire.
     ///
     /// # Errors
     /// The first non-recoverable recv failure. Recoverable: `EAGAIN`/`EWOULDBLOCK` end the
-    /// drain, `ENOBUFS` reports the overflow signal and continues (bailing if it never clears).
-    pub(crate) fn drain(&mut self, mut on_change: impl FnMut(u32)) -> io::Result<()> {
+    /// drain, `ENOBUFS` reports the overflow and continues (bailing if it never clears).
+    pub(crate) fn drain(&mut self, mut on_change: impl FnMut(InterfaceEvent)) -> io::Result<()> {
         let mut overflows = 0u32;
         loop {
             // SAFETY: an all-zero sockaddr_storage is a valid, inert source-address out-param.
@@ -93,7 +110,7 @@ impl InterfaceMonitor {
                     log::warn!(
                         "interface monitor overflowed; notifications were dropped, re-resolving every interface"
                     );
-                    on_change(0);
+                    on_change(InterfaceEvent::Overflow);
                 } else if overflows >= MAX_CONSECUTIVE_OVERFLOWS {
                     log::warn!(
                         "interface monitor overflow did not clear after {overflows} reads; ending the drain"

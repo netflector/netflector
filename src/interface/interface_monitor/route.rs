@@ -9,6 +9,8 @@ use std::os::fd::{AsRawFd, OwnedFd};
 
 use libc::c_int;
 
+use super::InterfaceEvent;
+
 /// Holds one routing message: a fixed header plus a few small sockaddrs (the `RTAX_*` slots),
 /// a few hundred bytes. No rtnetlink-style attribute lists, so smaller than the `rtnetlink`
 /// backend's 8 KiB suffices.
@@ -25,6 +27,14 @@ const RECV_BUFFER: c_int = 256 * 1024;
 const INDEX_OFFSET: usize = 12;
 const _: () = assert!(std::mem::offset_of!(libc::ifa_msghdr, ifam_index) == INDEX_OFFSET);
 const _: () = assert!(std::mem::offset_of!(libc::if_msghdr, ifm_index) == INDEX_OFFSET);
+
+/// `ifan_index` (in `if_announcemsghdr`) sits earlier than the shared offset above: the announce
+/// header has no `ifam_addrs`/`ifm_data` before it. FreeBSD only; macOS has no `RTM_IFANNOUNCE`.
+#[cfg(target_os = "freebsd")]
+const ANNOUNCE_INDEX_OFFSET: usize = 4;
+#[cfg(target_os = "freebsd")]
+const _: () =
+    assert!(std::mem::offset_of!(libc::if_announcemsghdr, ifan_index) == ANNOUNCE_INDEX_OFFSET);
 
 /// Open a `PF_ROUTE` socket, non-blocking + close-on-exec.
 pub(super) fn open() -> io::Result<OwnedFd> {
@@ -63,10 +73,12 @@ pub(super) fn open() -> io::Result<OwnedFd> {
     Ok(sock)
 }
 
-/// Walk every routing message in `buf`; report the interface index of each `RTM_NEWADDR` /
-/// `RTM_DELADDR` (address change) and `RTM_IFINFO` (link/MAC change). Every routing message
-/// begins with `u16 msglen; u8 version; u8 type`.
-pub(super) fn for_each_change(buf: &[u8], on_change: &mut impl FnMut(u32)) {
+/// Walk every routing message in `buf`; report the interface index and event kind of each
+/// `RTM_NEWADDR` / `RTM_DELADDR` (address change) and `RTM_IFINFO` (link-state/MAC change --
+/// [`InterfaceEvent::Address`] too: a flap refreshes addresses, it isn't a lifecycle event),
+/// plus, on FreeBSD, `RTM_IFANNOUNCE` (interface arrival/departure, [`InterfaceEvent::Link`]).
+/// Every routing message begins with `u16 msglen; u8 version; u8 type`.
+pub(super) fn for_each_change(buf: &[u8], on_change: &mut impl FnMut(InterfaceEvent)) {
     let mut offset = 0;
     while offset + 4 <= buf.len() {
         let msglen = usize::from(u16::from_ne_bytes([buf[offset], buf[offset + 1]]));
@@ -81,18 +93,32 @@ pub(super) fn for_each_change(buf: &[u8], on_change: &mut impl FnMut(u32)) {
             );
             break;
         }
-        if matches!(
-            msg_type,
-            libc::RTM_NEWADDR | libc::RTM_DELADDR | libc::RTM_IFINFO
-        ) && msglen >= INDEX_OFFSET + 2
+        // Each subscribed type's index sits at its own fixed offset in the message header;
+        // `event` is the matching variant constructor.
+        let hit = match msg_type {
+            libc::RTM_NEWADDR | libc::RTM_DELADDR | libc::RTM_IFINFO => Some((
+                INDEX_OFFSET,
+                InterfaceEvent::Address as fn(u32) -> InterfaceEvent,
+            )),
+            #[cfg(target_os = "freebsd")]
+            libc::RTM_IFANNOUNCE => Some((
+                ANNOUNCE_INDEX_OFFSET,
+                InterfaceEvent::Link as fn(u32) -> InterfaceEvent,
+            )),
+            _ => None,
+        };
+        if let Some((index_offset, event)) = hit
+            && msglen >= index_offset + 2
         {
             let index =
-                u16::from_ne_bytes([buf[offset + INDEX_OFFSET], buf[offset + INDEX_OFFSET + 1]]);
-            // 0 names no interface (kernel indices are >= 1) and is the parent's "re-resolve
-            // everything" overflow signal, so a stray 0 must never be forwarded.
-            if index != 0 {
-                log::trace!("interface monitor: change for ifindex {index}");
-                on_change(u32::from(index));
+                u16::from_ne_bytes([buf[offset + index_offset], buf[offset + index_offset + 1]]);
+            if index == 0 {
+                // Kernel indices are >= 1, so a 0 is a malformed message; never forward it.
+                log::warn!("interface monitor: dropping a change with no valid interface index");
+            } else {
+                let event = event(u32::from(index));
+                log::trace!("interface monitor: {event:?}");
+                on_change(event);
             }
         }
         offset += msglen;
@@ -128,8 +154,26 @@ mod tests {
         let mut buf = message(libc::RTM_NEWADDR, 7, 20);
         buf.extend(message(libc::RTM_IFINFO, 9, 24));
         let mut seen = Vec::new();
-        for_each_change(&buf, &mut |i| seen.push(i));
-        assert_eq!(seen, [7, 9]);
+        for_each_change(&buf, &mut |e| seen.push(e));
+        // RTM_IFINFO is a flap/MAC change, not a lifecycle event, so both report Address.
+        assert_eq!(
+            seen,
+            [InterfaceEvent::Address(7), InterfaceEvent::Address(9)]
+        );
+    }
+
+    /// FreeBSD announces interface arrival/departure; the walk maps both to a Link event,
+    /// reading `ifan_index` at its own (earlier) offset.
+    #[cfg(target_os = "freebsd")]
+    #[test]
+    fn announce_messages_report_a_link_event() {
+        let mut m = vec![0u8; 24];
+        m[0..2].copy_from_slice(&24u16.to_ne_bytes());
+        m[3] = u8::try_from(libc::RTM_IFANNOUNCE).expect("RTM_IFANNOUNCE fits u8");
+        m[ANNOUNCE_INDEX_OFFSET..ANNOUNCE_INDEX_OFFSET + 2].copy_from_slice(&7u16.to_ne_bytes());
+        let mut seen = Vec::new();
+        for_each_change(&m, &mut |e| seen.push(e));
+        assert_eq!(seen, [InterfaceEvent::Link(7)]);
     }
 
     #[test]
@@ -137,7 +181,7 @@ mod tests {
         // RTM_ADD (a route was added) is neither an address nor a link change.
         let buf = message(libc::RTM_ADD, 5, 20);
         let mut seen = Vec::new();
-        for_each_change(&buf, &mut |i| seen.push(i));
+        for_each_change(&buf, &mut |e| seen.push(e));
         assert!(seen.is_empty());
     }
 
@@ -149,7 +193,7 @@ mod tests {
         buf[0..2].copy_from_slice(&u16::try_from(INDEX_OFFSET).unwrap().to_ne_bytes());
         buf[3] = u8::try_from(libc::RTM_NEWADDR).unwrap();
         let mut seen = Vec::new();
-        for_each_change(&buf, &mut |i| seen.push(i));
+        for_each_change(&buf, &mut |e| seen.push(e));
         assert!(seen.is_empty());
     }
 
@@ -159,7 +203,7 @@ mod tests {
         // must not be reported (which would trigger a spurious re-resolve of everything).
         let buf = message(libc::RTM_NEWADDR, 0, 20);
         let mut seen = Vec::new();
-        for_each_change(&buf, &mut |i| seen.push(i));
+        for_each_change(&buf, &mut |e| seen.push(e));
         assert!(seen.is_empty());
     }
 
@@ -168,7 +212,7 @@ mod tests {
         let mut buf = message(libc::RTM_NEWADDR, 7, 20);
         buf[0..2].copy_from_slice(&9999u16.to_ne_bytes()); // msglen past the datagram
         let mut seen = Vec::new();
-        for_each_change(&buf, &mut |i| seen.push(i));
+        for_each_change(&buf, &mut |e| seen.push(e));
         assert!(seen.is_empty());
     }
 }
