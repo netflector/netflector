@@ -11,7 +11,7 @@ use crate::interface::{AddressChange, Interface, InterfaceAddresses, if_index};
 
 use super::CaptureKey;
 use super::counters::{CaptureCounters, Outcome};
-use super::multicast::MulticastJoiner;
+use super::multicast::{MulticastJoiner, RejoinCounts};
 
 /// A `Copy` handle into the interface table's interface entries. An insert-only index like
 /// [`CaptureKey`], but a distinct newtype so the two can't be confused.
@@ -302,9 +302,10 @@ impl InterfaceTable {
     /// Captures are re-bound separately ([`rebind_capture`](Self::rebind_capture)), so the
     /// caller can log and retry them per capture. Log-free.
     ///
-    /// Returns how many group joins were deferred (see [`MulticastJoiner::rejoin`]); the
-    /// deferrals heal on the interface's next address event, but the caller should surface a
-    /// nonzero count -- after a recreation, deaf groups are a real outage.
+    /// Returns the [`RejoinCounts`] split of joined vs deferred (see
+    /// [`MulticastJoiner::rejoin`]); the deferrals heal on the interface's next address event, but
+    /// the caller should surface a nonzero deferred count -- after a recreation, deaf groups are a
+    /// real outage.
     ///
     /// # Errors
     /// Propagates a resolution syscall failure. The identity is then rolled back so the entry
@@ -312,22 +313,26 @@ impl InterfaceTable {
     /// as healthy to the scan (the captures re-bind fine) while carrying the OLD interface's
     /// addresses. The joins are replayed before the rollback either way: they need only the
     /// identity, and a transient resolver error must not leave the interface deaf.
-    pub(super) fn rebind_interface(&mut self, key: InterfaceKey, cur: u32) -> io::Result<usize> {
+    pub(super) fn rebind_interface(
+        &mut self,
+        key: InterfaceKey,
+        cur: u32,
+    ) -> io::Result<RejoinCounts> {
         // Keys come from this table's own scan, so the index is always in range.
         let entry = &mut self.entries[key.0 as usize];
         let previous = entry.interface.ifindex;
         entry.interface.ifindex = cur;
         entry.joiner.reset();
         let refreshed = entry.interface.refresh(); // logs each family's gains and losses
-        let deferred = match NonZeroU32::new(cur) {
+        let counts = match NonZeroU32::new(cur) {
             // Parked: nothing to join now; the rebuild on the interface's return replays.
-            None => 0,
+            None => RejoinCounts::default(),
             Some(ifindex) => entry.joiner.rejoin(ifindex),
         };
         if refreshed.is_err() {
             entry.interface.ifindex = previous;
         }
-        refreshed.map(|_| deferred)
+        refreshed.map(|_| counts)
     }
 
     /// The keys of the captures on `interface`, for a rebuild or eviction pass (the reverse of

@@ -15,6 +15,17 @@ use libc::c_void;
 use crate::libcex::{GroupReq, MCAST_JOIN_GROUP};
 use crate::sys::{open_socket, sockaddr_for, socklen_of};
 
+/// How a [`rejoin`](MulticastJoiner::rejoin) replay landed: `joined` groups are members after the
+/// call (freshly re-joined, or already member), `deferred` groups could not join yet and wait for
+/// the next address event. The two sum to the desired-group count. `joined` (not "rejoined": the
+/// parked-return replay is a first join) is the signal a caller uses to tell a real replay from a
+/// vacuous one over an empty desired list.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(crate) struct RejoinCounts {
+    pub(crate) joined: usize,
+    pub(crate) deferred: usize,
+}
+
 /// One capture interface's multicast memberships: one unbound `SOCK_DGRAM` fd per family, opened on
 /// that family's first join. The joiner holds no ifindex of its own -- the caller passes the
 /// interface's current one per call, so the table's [`Interface`](crate::interface::Interface) stays
@@ -69,23 +80,27 @@ impl MulticastJoiner {
         self.v6 = None;
     }
 
-    /// Re-attempt every recorded membership after the interface re-resolves, returning how many
-    /// were deferred. A group not joinable before its address existed succeeds now; an
-    /// already-held one is a no-op. Best-effort: a still-unavailable family logs at debug and
-    /// waits for the next change (routine on the address-up path; the recreation rebuild warns
-    /// on a nonzero count instead). `NonZeroU32` makes the parked case unrepresentable:
-    /// `MCAST_JOIN_GROUP` on index 0 would let the kernel pick an arbitrary interface by route
-    /// lookup and advertise our groups there, so callers skip explicitly while parked.
-    pub(crate) fn rejoin(&mut self, ifindex: NonZeroU32) -> usize {
-        let mut deferred = 0;
+    /// Re-attempt every recorded membership after the interface re-resolves, returning the
+    /// [`RejoinCounts`] split of joined vs deferred. A group not joinable before its address
+    /// existed succeeds now; an already-held one is a no-op that still counts as joined.
+    /// Best-effort: a still-unavailable family logs at debug and waits for the next change
+    /// (routine on the address-up path; the recreation rebuild warns on a nonzero deferred count
+    /// instead). `NonZeroU32` makes the parked case unrepresentable: `MCAST_JOIN_GROUP` on index 0
+    /// would let the kernel pick an arbitrary interface by route lookup and advertise our groups
+    /// there, so callers skip explicitly while parked.
+    pub(crate) fn rejoin(&mut self, ifindex: NonZeroU32) -> RejoinCounts {
+        let mut counts = RejoinCounts::default();
         for i in 0..self.desired.len() {
             let group = self.desired[i];
-            if let Err(e) = self.apply(group, ifindex) {
-                log::debug!("re-join of {group} on ifindex {ifindex} deferred: {e}");
-                deferred += 1;
+            match self.apply(group, ifindex) {
+                Ok(()) => counts.joined += 1,
+                Err(e) => {
+                    log::debug!("re-join of {group} on ifindex {ifindex} deferred: {e}");
+                    counts.deferred += 1;
+                }
             }
         }
-        deferred
+        counts
     }
 
     fn apply(&mut self, group: IpAddr, ifindex: NonZeroU32) -> io::Result<()> {
@@ -193,7 +208,12 @@ mod tests {
         joiner.reset();
         assert!(joiner.v4.is_none(), "reset drops the family sockets");
         assert_eq!(joiner.desired.len(), 1, "the desired list survives");
-        joiner.rejoin(ifindex);
+        let counts = joiner.rejoin(ifindex);
+        assert_eq!(
+            (counts.joined, counts.deferred),
+            (1, 0),
+            "rejoin replays the one recorded group, none deferred"
+        );
         assert!(
             joiner.v4.is_some(),
             "rejoin re-opens a fresh socket and re-joins"

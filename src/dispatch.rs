@@ -845,10 +845,11 @@ impl PacketDispatcher {
             match self.table.rebind_interface(stale.key, stale.cur) {
                 // Deferred joins are usually "no address yet" and heal on the interface's next
                 // address event, but after a recreation a deaf group is a real outage: warn.
-                Ok(deferred) if deferred > 0 => {
+                Ok(counts) if counts.deferred > 0 => {
                     log::warn!(
-                        "{deferred} group membership(s) on {name} not re-joined yet; retrying \
-                         on its next address event"
+                        "{} group membership(s) on {name} not re-joined yet; retrying \
+                         on its next address event",
+                        counts.deferred
                     );
                 }
                 Ok(_) => {}
