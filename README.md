@@ -321,8 +321,8 @@ interface loses its address and brought back up once both can send it again.
 
 ### Reacting to address changes
 
-The reflector watches the kernel for interface address changes (a `NETLINK_ROUTE` socket on Linux, a
-`PF_ROUTE` socket on the BSDs) and adapts at runtime, without a restart. mDNS and SSDP bring a family
+The reflector watches the kernel for interface address and lifecycle changes (a `NETLINK_ROUTE`
+socket on Linux, a `PF_ROUTE` socket on the BSDs) and adapts at runtime, without a restart. mDNS and SSDP bring a family
 up (joining its multicast group(s) and installing its capture registrations) once that family becomes
 reflectable (a source address for it is present on **both** interfaces), and tear it down when either
 interface loses the address; the family resumes automatically when the address returns. WoL keeps its
@@ -332,11 +332,16 @@ appears. Gaining a family logs at `info`; losing a *required* family logs at `er
 `info`. The monitor is best-effort: if it cannot start, the reflector logs a warning and runs without
 address refresh.
 
-It does not, however, adapt to an interface being destroyed and recreated (a fresh kernel ifindex,
-e.g. a PPPoE reconnect or a bridge/VLAN rebuild): the ifindex and capture are pinned when the interface
-is opened, so reflection on a recreated interface stays dead until you restart the daemon. The interfaces
-a reflector bridges are normally stable LAN segments, so this rarely bites, and it matches avahi, which
-likewise needs a restart when an interface disappears and returns.
+It also survives an interface being destroyed and recreated (a fresh kernel identity, e.g. a PPPoE
+reconnect or a bridge/VLAN rebuild). Lifecycle events -- backed by a periodic reconcile, so recovery
+never depends on one notification surviving -- detect that the name's kernel identity moved; the
+captures are then re-bound in place, addresses re-resolved, and multicast groups re-joined on the new
+interface, while its DIAL proxies are evicted to re-mint on the next advertisement. While the
+interface is absent its reflection parks (sends drop quietly, as on an address loss) and resumes when
+the name returns (`interface <name>: returned as ifindex B`, or `recreated (ifindex A -> B)` when the
+replacement appeared within one event batch). On macOS the route socket
+has no lifecycle messages and can drop notifications silently, so detection there may fall back to
+the periodic reconcile (up to ~30 s).
 
 ### Per-protocol behavior
 
