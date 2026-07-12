@@ -225,15 +225,28 @@ impl InterfacePair {
             // Both ends sit in one stack, so every wire-crossing v4 packet carries a local
             // source address, and Linux's fib_validate_source drops those as martians before
             // socket delivery (tcpdump still sees them below IP). accept_local admits them;
-            // the BSDs have no such gate.
-            && run(&format!(
-                "echo 1 > /proc/sys/net/ipv4/conf/{}/accept_local",
-                self.inject
-            ))
-            && run(&format!(
-                "echo 1 > /proc/sys/net/ipv4/conf/{}/accept_local",
-                self.receive
-            ))
+            // the BSDs have no such gate. It is an ORCONF sysctl (conf/all OR conf/<iface>), so
+            // a preset conf/all already covers every interface, including ones created later:
+            // skip the per-interface write then, since it needs a writable /proc/sys, which
+            // docker mounts read-only (docker_test.sh presets `all` via --sysctl instead of
+            // unmasking /proc).
+            && (Self::accept_local_preset()
+                || (run(&format!(
+                    "echo 1 > /proc/sys/net/ipv4/conf/{}/accept_local",
+                    self.inject
+                )) && run(&format!(
+                    "echo 1 > /proc/sys/net/ipv4/conf/{}/accept_local",
+                    self.receive
+                ))))
+    }
+
+    /// Whether `net.ipv4.conf.all.accept_local` is already 1. Reading /proc/sys works even where
+    /// writing it doesn't, so this lets a caller preset the ORCONF `all` knob out of band (the
+    /// docker dev container does, via `--sysctl`) and keep /proc/sys read-only.
+    #[cfg(target_os = "linux")]
+    fn accept_local_preset() -> bool {
+        std::fs::read_to_string("/proc/sys/net/ipv4/conf/all/accept_local")
+            .is_ok_and(|value| value.trim() == "1")
     }
 
     /// Destroy the pair and recreate it under the same names (deleting one veth end removes
