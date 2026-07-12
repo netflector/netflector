@@ -735,18 +735,18 @@ ROUNDTRIP_CASES = [
 
 @dataclasses.dataclass(frozen=True)
 class SearchRecreateCase:
-    # A search session cleared across an interface recreation. One searcher opens a session; the
-    # target interface is then destroyed and recreated. Its reserved port and response registration
-    # died with the interface, so the dispatcher drops every session bound to it (and logs
-    # `cleared_log`) via the on_iface_change push path; a fresh searcher then re-opens and round-trips
-    # against the recovered interface. Run both without and with a decoy that grabs the freed index:
-    # on FreeBSD (which reuses the lowest-free index) that is the difference between a same-index and a
-    # changed-index recreation -- two distinct detection paths (the attached() BIOCGDLT probe vs the
-    # index comparison), both of which must clear the session. On Linux the index always changes, so
-    # the decoy is inert there. This is the search-session path the passive mDNS and DIAL recreate
-    # cases never reach (mDNS is sessionless, the DIAL cases discover via NOTIFY). A wide MX keeps the
-    # first session alive until the recreation so there is something to clear.
+    # A search session across an interface recreation. One searcher opens a session; a reflector
+    # interface is then destroyed and recreated. The session's reserved port and response registration
+    # live on the TARGET, so recreating the target drops every session (logged, via on_iface_change) and
+    # the retransmit opens a fresh one; recreating the SOURCE leaves the session intact (the reply leg
+    # re-resolves the source at send time), so the retransmit re-reflects on the SAME reserved port. Run
+    # each interface both without and with a decoy that grabs the freed index: on FreeBSD (which reuses
+    # the lowest-free index) that is a same-index vs changed-index recreation, pinning both detection
+    # paths (the attached() BIOCGDLT probe vs the index comparison); on Linux the index always changes,
+    # so the decoy is inert there. The wide MX keeps the first session alive until the recreation. This
+    # is the search-session path the passive mDNS and DIAL recreate cases never reach.
     name: str
+    interface: str = "target"  # which reflector interface is destroyed + recreated
     family: int = 4
     group: str = SSDP_GROUP_V4
     port: int = SSDP_PORT
@@ -755,14 +755,13 @@ class SearchRecreateCase:
     config: str = "config.toml"
     timeout_seconds: float = 8.0
     decoy: bool = False  # plant a decoy on the freed index so the recreation lands on a different one
-    cleared_log: str = "cleared all sessions"
 
 
 SEARCH_RECREATE_CASES = [
-    # Same index on FreeBSD (reused), reached via the attached() probe.
-    SearchRecreateCase(name="ssdp_search_interface_recreate"),
-    # Different index everywhere, via the index comparison.
-    SearchRecreateCase(name="ssdp_search_interface_recreate_decoy", decoy=True),
+    SearchRecreateCase(name="ssdp_search_interface_recreate_source", interface="source"),
+    SearchRecreateCase(name="ssdp_search_interface_recreate_target", interface="target"),
+    SearchRecreateCase(name="ssdp_search_interface_recreate_source_decoy", interface="source", decoy=True),
+    SearchRecreateCase(name="ssdp_search_interface_recreate_target_decoy", interface="target", decoy=True),
 ]
 
 
@@ -808,13 +807,15 @@ DIAL_ADDRESS_CHANGE_CASES = [
 
 @dataclasses.dataclass(frozen=True)
 class DialRecreateCase:
-    # A full DIAL pass, then the same pass again after the reflector's target interface is
-    # destroyed and recreated, then again after the source's. The hardest DIAL recovery
-    # scenario: an address change replaces values, a recreation replaces the kernel objects
-    # underneath them -- the minted proxy's listener binds, target-address snapshot, and
-    # egress-pin all belong to the dead interface's world, so a passing re-run proves the
-    # recreation evicted the proxy and re-minted against the recreated interface.
+    # A full DIAL pass, then the same pass again after one reflector interface is destroyed and
+    # recreated. The hardest DIAL recovery scenario: a recreation replaces the kernel objects
+    # underneath the minted proxy -- its listener binds, target-address snapshot, and egress-pin all
+    # belong to the dead interface's world -- so a passing re-run proves the recreation evicted the
+    # proxy and re-minted against the recreated interface. One case per (interface, decoy): the decoy
+    # forces a changed-index recreation (vs FreeBSD's same-index reuse), pinning both detection paths.
     name: str
+    interface: str = "target"  # which reflector interface is destroyed + recreated
+    decoy: bool = False  # plant a decoy on the freed index so the recreation lands on a different one
     family: int = 4
     group: str = SSDP_GROUP_V4
     timeout_seconds: float = 8.0
@@ -824,7 +825,10 @@ class DialRecreateCase:
 
 
 DIAL_RECREATE_CASES = [
-    DialRecreateCase(name="dial_interface_recreate"),
+    DialRecreateCase(name="dial_interface_recreate_source", interface="source"),
+    DialRecreateCase(name="dial_interface_recreate_target", interface="target"),
+    DialRecreateCase(name="dial_interface_recreate_source_decoy", interface="source", decoy=True),
+    DialRecreateCase(name="dial_interface_recreate_target_decoy", interface="target", decoy=True),
 ]
 
 # Per-protocol probe parameters for the address-change phases: wol sends a magic packet (no payload
@@ -885,30 +889,21 @@ class RecreateCase:
     phases: tuple[Phase, ...]  # interface = which reflector interface is destroyed+recreated
 
 
+# One case per (interface, decoy) so a failure names the exact scenario. All probe forward
+# (source -> target): recreating the source kills the forward INGRESS (queries no longer enter),
+# the target the forward EGRESS (re-emits no longer leave), proving both halves of the capture
+# rebind. The decoy flavor forces a different-index recreation on FreeBSD, where the plain flavors
+# reuse the freed index (see Phase.decoy) -- pinning both detection paths (index comparison vs the
+# capture attachment probe).
 RECREATE_CASES = [
-    RecreateCase(
-        name="mdns_interface_recreate",
-        config="config-addrchange.toml",
-        phases=(
-            # All phases probe forward (source -> target). Unlike the address-change cases
-            # (which can only exercise the egress send-gate), recreation kills the capture
-            # itself: recreating the source kills the forward INGRESS (queries no longer
-            # enter), recreating the target kills the forward EGRESS (re-emits no longer
-            # leave). Together they prove both halves of the capture rebind. The decoy
-            # flavor forces a different-index recreation on FreeBSD, where the plain
-            # flavors reuse the freed index (see Phase.decoy).
-            Phase(label="source recreate", protocol="mdns", family=4, interface="source"),
-            Phase(label="target recreate", protocol="mdns", family=4, interface="target"),
-            Phase(
-                label="source recreate behind a decoy", protocol="mdns", family=4,
-                interface="source", decoy=True,
-            ),
-            Phase(
-                label="target recreate behind a decoy", protocol="mdns", family=4,
-                interface="target", decoy=True,
-            ),
-        ),
-    ),
+    RecreateCase(name="mdns_interface_recreate_source", config="config-addrchange.toml",
+        phases=(Phase(label="source recreate", protocol="mdns", family=4, interface="source"),)),
+    RecreateCase(name="mdns_interface_recreate_target", config="config-addrchange.toml",
+        phases=(Phase(label="target recreate", protocol="mdns", family=4, interface="target"),)),
+    RecreateCase(name="mdns_interface_recreate_source_decoy", config="config-addrchange.toml",
+        phases=(Phase(label="source recreate", protocol="mdns", family=4, interface="source", decoy=True),)),
+    RecreateCase(name="mdns_interface_recreate_target_decoy", config="config-addrchange.toml",
+        phases=(Phase(label="target recreate", protocol="mdns", family=4, interface="target", decoy=True),)),
 ]
 
 ALL_CASES: list[
@@ -2040,21 +2035,26 @@ class RoundTripRunner(CaseRunner):
 
 class SearchRecreateRunner(RoundTripRunner):
     # See SearchRecreateCase. Reuses RoundTripRunner's segment/reflector/responder setup (the shim
-    # __init__ reads only the fields both cases share), but opens a session, recreates the target, and
-    # re-searches, asserting the dispatcher dropped the orphaned session. The one-shot responder is
-    # restarted after the recreation -- on the native fabrics its wire died with the interface (docker
-    # keeps it, but the responder had already answered and exited) -- mirroring the DIAL recreate
-    # case's device restart.
+    # __init__ reads only the fields both cases share), but opens a session, recreates one interface,
+    # and re-searches. A target recreation drops the session (asserted via the cleared-sessions log); a
+    # source recreation leaves it, so the retransmit re-reflects on the same reserved port (asserted
+    # via the re-reflected log). The target retransmit expects the 200 OK (a fresh session carries the
+    # retransmit's own MAC); the source retransmit is fire-and-forget -- it reuses the surviving session
+    # whose cached searcher MAC is the baseline container's, so on docker (a separate retransmit
+    # container / MAC but a reused IP) the reply is routed to the baseline, and survival is proven by the
+    # re-reflected log, not a round trip. The responder is restarted only for the target.
 
-    def _search(self, role: str) -> None:
-        # One M-SEARCH, asserting the 200 OK proxies back.
+    def _search(self, role: str, *, no_wait: bool = False) -> None:
+        # One M-SEARCH; with no_wait, send and exit (any reply is routed elsewhere), else assert the
+        # 200 OK proxies back.
+        expectation = ["--no-wait"] if no_wait else ["--expect-payload-hex", self.rt.reply_hex]
         ifname = self.backend.helper_ifname(REFLECTOR_SOURCE_IFNAME)
         self.backend.start_probe(role, "source", ifname, [
             "search",
             "--source-port", str(SEARCHER_SOURCE_PORT), "--port", str(self.rt.port),
             "--address", self.rt.group, "--interface", ifname, "--family", str(self.rt.family),
             "--payload-hex", self.rt.probe_hex, "--timeout", str(self.rt.timeout_seconds),
-            "--expect-payload-hex", self.rt.reply_hex,
+            *expectation,
         ])
         exit_code = self.backend.wait(role)
         out, err = self.backend.logs(role)
@@ -2065,17 +2065,20 @@ class SearchRecreateRunner(RoundTripRunner):
         if exit_code != 0:
             raise RuntimeError(f"{role} failed with exit code {exit_code}")
 
-    def _recreate_target(self) -> None:
-        # With the decoy, occupy the freed index before recreating so the target returns on a different
-        # one (the changed-index path); without it, FreeBSD reuses the index (the same-index path). The
-        # dispatcher clears sessions on either, so both variants must pass.
-        ifname = REFLECTOR_IFNAMES["target"]
-        self.backend.delete_interface("target")
-        self.wait_for_log("reflector", f"interface {ifname} is gone", "target deletion")
+    def _recreate(self) -> None:
+        # With the decoy, occupy the freed index before recreating so the interface returns on a
+        # different one (the changed-index path); without it, FreeBSD reuses the index (the same-index
+        # path). Both must behave the same, so both variants run.
+        interface = self.rt.interface
+        ifname = REFLECTOR_IFNAMES[interface]
+        self.backend.delete_interface(interface)
+        self.wait_for_log("reflector", f"interface {ifname} is gone", f"{interface} deletion")
         if self.rt.decoy:
             self.backend.add_decoy_interface()
-        self.backend.recreate_interface("target")
-        self.wait_for_log("reflector", f"interface {ifname}: returned as ifindex", "target recreation")
+        self.backend.recreate_interface(interface)
+        self.wait_for_log(
+            "reflector", f"interface {ifname}: returned as ifindex", f"{interface} recreation"
+        )
         if self.rt.decoy:
             self.backend.remove_decoy_interface()
 
@@ -2084,26 +2087,34 @@ class SearchRecreateRunner(RoundTripRunner):
         self.backend.setup_segments()
         self.start_reflector()
 
-        # First search: opens a session on the target.
+        # First search: opens a session (its reservation + response registration are on the target).
         self.start_responder()
         self._search("searcher-baseline")
         print(f"{self.rt.name}: baseline round trip before the recreation", flush=True)
 
-        # Destroy + recreate the target: its reserved port and response registration die with it, so
-        # the dispatcher drops the session (asserted via cleared_log below). The wide MX keeps the
-        # session alive until the parking so there is something to clear.
-        self._recreate_target()
+        # Destroy + recreate one interface. Target: the reservation + response registration die with it,
+        # so the dispatcher drops the session; a fresh searcher re-opens and round-trips. Source: nothing
+        # session-side lives there, so the session survives and the retransmit re-reflects on the same
+        # reserved port. The wide MX keeps the first session alive across the recreation either way.
+        self._recreate()
 
-        # A fresh responder for the retransmit: the baseline's exited after its one reply, and on the
-        # native fabrics its wire died with the target regardless.
-        self.backend.remove("responder")
-        self.start_responder()
-
-        # A fresh search re-opens a session against the recovered interface and round-trips.
-        self._search("searcher-retransmit")
-        print(f"{self.rt.name}: round trip after the recreation", flush=True)
-        self.wait_for_log("reflector", self.rt.cleared_log, "session clear")
-        print(f"{self.rt.name}: sessions cleared across the recreation", flush=True)
+        if self.rt.interface == "target":
+            # A fresh responder answers the retransmit's fresh session (the baseline's exited, and on the
+            # native fabrics the target's wire died with it).
+            self.backend.remove("responder")
+            self.start_responder()
+            self._search("searcher-retransmit")
+            self.wait_for_log(
+                "reflector", "cleared all sessions after the target interface changed", "session cleared"
+            )
+            print(f"{self.rt.name}: session cleared, round trip resumed after the target recreation", flush=True)
+        else:
+            # Fire-and-forget: the retransmit reuses the surviving session (same reserved port); its
+            # reply routes to the baseline's MAC, so this container needn't receive it. The re-reflected
+            # log proves the session survived and that the source ingress rebound and re-joined its group.
+            self._search("searcher-retransmit", no_wait=True)
+            self.wait_for_log("reflector", "re-reflected SSDP search", "session reused")
+            print(f"{self.rt.name}: session survived the source recreation", flush=True)
         print(f"PASS {self.rt.name}", flush=True)
         if self.args.show_reflector_logs:
             time.sleep(0.5)
@@ -2317,17 +2328,21 @@ class DialAddressChangeRunner(DialRunner):
 
 class DialRecreateRunner(DialAddressChangeRunner):
     # See DialRecreateCase. Inherits the pass machinery; only the mutation differs: instead of
-    # replacing addresses, each phase destroys and recreates a whole reflector interface,
-    # synchronized on the daemon's own parking/recreation log lines.
+    # replacing addresses, it destroys and recreates one reflector interface (optionally behind a
+    # decoy), synchronized on the daemon's own parking/recreation log lines.
 
     def _recreate(self, interface: str) -> None:
         ifname = REFLECTOR_IFNAMES[interface]
         self.backend.delete_interface(interface)
         self.wait_for_log("reflector", f"interface {ifname} is gone", f"{interface} deletion")
+        if self.dial.decoy:
+            self.backend.add_decoy_interface()
         self.backend.recreate_interface(interface)
         self.wait_for_log(
             "reflector", f"interface {ifname}: returned as ifindex", f"{interface} recreation"
         )
+        if self.dial.decoy:
+            self.backend.remove_decoy_interface()
 
     def run(self) -> None:
         print(f"\n=== {self.dial.name} ===", flush=True)
@@ -2339,20 +2354,19 @@ class DialRecreateRunner(DialAddressChangeRunner):
 
         self._dial_pass("baseline", source_ip, device_ip)
 
-        # Target first: the baseline's proxy egress-pins its device connects to the target
-        # interface, so the recreation must evict it and the fresh pass re-mint. The device is
-        # restarted: on the native fabrics its wire died with the interface (Docker keeps its
-        # endpoint; a fresh device is harmless and keeps the flow identical across backends).
-        self._recreate("target")
-        self.backend.remove("device")
-        self.start_device()
-        device_ip = self.backend.probe_ip("device", "target")
-        self._dial_pass("after target recreation", source_ip, device_ip)
-
-        # Then the source: the proxy's listeners live on it; eviction + re-mint again.
-        self._recreate("source")
-        source_ip = self.backend.reflector_ip("source")  # re-pinned to the same address
-        self._dial_pass("after source recreation", source_ip, device_ip)
+        # Recreate one interface; the baseline's proxy -- listeners on the source, egress-pin and
+        # target-address snapshot on the target -- must be evicted and the fresh pass re-mint.
+        interface = self.dial.interface
+        self._recreate(interface)
+        if interface == "target":
+            # The device sits on the target segment: on the native fabrics its wire died with the
+            # interface (Docker keeps its endpoint; a fresh device is harmless and uniform).
+            self.backend.remove("device")
+            self.start_device()
+            device_ip = self.backend.probe_ip("device", "target")
+        else:
+            source_ip = self.backend.reflector_ip("source")  # re-pinned to the same address
+        self._dial_pass(f"after {interface} recreation", source_ip, device_ip)
 
         print(f"PASS {self.dial.name}", flush=True)
         if self.args.show_reflector_logs:
