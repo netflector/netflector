@@ -205,6 +205,19 @@ pub(crate) trait PacketHandler {
         _reactor: &mut Reactor,
     ) {
     }
+
+    /// One of `captures` was rebound to a recreated interface or had an address moved, so any state
+    /// this handler pinned to it (a reserved port, a response registration) may be stale. The search
+    /// reflectors drop their sessions on that interface; most handlers re-resolve per packet and keep
+    /// nothing, so the default is a no-op. Broadcast to every handler after the dispatcher has already
+    /// repaired the table, so `dispatcher` reads current state.
+    fn on_iface_change(
+        &mut self,
+        _captures: &[CaptureKey],
+        _dispatcher: &mut PacketDispatcher,
+        _reactor: &mut Reactor,
+    ) {
+    }
 }
 
 /// One routing registration: the ingress it applies to, its filter, and the reflector
@@ -654,22 +667,36 @@ impl PacketDispatcher {
         // The DIAL proxies bind IPv4 only, so collect the interfaces whose v4 address actually moved. A
         // routine v6 or MAC change must not churn a proxy whose v4 (and cached LOCATION) is unchanged.
         let mut v4_moved: Vec<u32> = Vec::new();
+        // Interfaces whose addresses actually moved this cycle, for the session notification below:
+        // search reflectors drop sessions whose reserved port was bound to a re-addressed interface.
+        // Only a real address delta (either family) qualifies, not a benign Link / no-op-Address event,
+        // so a healthy session survives a carrier flap or an unrelated interface's churn. (DIAL is
+        // v4-only via v4_moved; sessions can be either family. Recreations are handled by the reconcile,
+        // keyed by capture, so they need no entry here.)
+        let mut touched: Vec<u32> = Vec::new();
         if overflow {
             // Notifications were dropped, so re-resolve every interface.
             log::debug!("interface monitor overflow; re-resolving all interfaces");
             for (ifindex, result) in self.table.refresh_all() {
                 match result {
-                    Ok(change) if change.v4 => v4_moved.push(ifindex),
-                    Ok(_) => {}
+                    Ok(change) => {
+                        if change.v4 {
+                            v4_moved.push(ifindex);
+                        }
+                        if change.v4 || change.v6 {
+                            touched.push(ifindex);
+                        }
+                    }
                     Err(e) => {
                         // The overflow already means notifications were dropped, so this is the one
-                        // chance to catch a move whose event was lost, and we can't confirm the v4
-                        // survived. Treat it as moved so any DIAL proxy on it re-mints rather than
-                        // keeping listeners bound to (and advertising) a possibly-vanished address.
+                        // chance to catch a move whose event was lost, and we can't confirm the address
+                        // survived. Treat it as moved so any DIAL proxy re-mints and any session drops
+                        // rather than keeping a listener bound to a possibly-vanished address.
                         log::warn!(
                             "re-resolving ifindex {ifindex} failed: {e}; evicting its proxies"
                         );
                         v4_moved.push(ifindex);
+                        touched.push(ifindex);
                     }
                 }
             }
@@ -680,6 +707,11 @@ impl PacketDispatcher {
                         log::debug!("re-resolved interface (ifindex {ifindex}) after a change");
                         if change.v4 {
                             v4_moved.push(*ifindex);
+                        }
+                        // Only a real address delta invalidates a session's reserved reply address; a
+                        // bare Link event (carrier / MTU / flag) with no delta must not clear sessions.
+                        if change.v4 || change.v6 {
+                            touched.push(*ifindex);
                         }
                         // A lifecycle event on a watched interface, or a capture whose kernel
                         // binding died behind this (possibly reused) index: reconcile.
@@ -711,26 +743,72 @@ impl PacketDispatcher {
                             "re-resolving ifindex {ifindex} failed: {e}; evicting its proxies"
                         );
                         v4_moved.push(*ifindex);
+                        touched.push(*ifindex);
                         want_reconcile = true;
                     }
                 }
             }
         }
-        // Evict proxies whose source or target interface lost the v4 address they bound: their listeners
-        // sit on a vanished address and their cached LOCATION is stale, so they must re-mint, not be
-        // reused. Before the reconcile: v4_moved and the table's caches are still in the same
-        // identity space here; the reconcile rewrites the caches and does its own eviction.
+        // Evict proxies whose source or target interface lost the v4 address they bound, and drop
+        // search sessions whose reserved port was bound to a re-addressed interface. Both keyed by
+        // capture, materialized before the reconcile rewrites the table's caches so the ifindexes here
+        // still map to the pre-change identities. A recreation under a new index resolves to no capture
+        // here and is handled by the reconcile below.
+        let v4_captures = self.captures_for(&v4_moved);
         self.dial.evict_on_interface_change(
             reactor,
-            |cap| {
-                self.table
-                    .ifindex_of(cap)
-                    .is_some_and(|ix| v4_moved.contains(&ix))
-            },
+            &v4_captures,
             "after its interface's address changed",
         );
+        let touched_captures = self.captures_for(&touched);
+        self.notify_iface_change(&touched_captures, reactor);
         if want_reconcile {
             self.reconcile_interfaces(reactor);
+        }
+    }
+
+    /// The captures on the interfaces currently at `ifindexes`, mapping the refresh path's kernel
+    /// indexes to the stable [`CaptureKey`]s the eviction and session notification are keyed by.
+    fn captures_for(&self, ifindexes: &[u32]) -> Vec<CaptureKey> {
+        ifindexes
+            .iter()
+            .flat_map(|ifindex| self.table.captures_at_ifindex(*ifindex))
+            .collect()
+    }
+
+    /// Broadcast [`PacketHandler::on_iface_change`] to every registered handler for the interfaces
+    /// backing `captures`, taking each handler out for its call so `&mut self` is free. Off the data
+    /// path (only the interface-change / reconcile path, which allocates anyway), so it snapshots the
+    /// live keys into a fresh `Vec` rather than a reused scratch. A handler that unregisters a sibling
+    /// mid-broadcast (a search reflector dropping its sessions' response captures) is fine: the vacated
+    /// slot is skipped.
+    fn notify_iface_change(&mut self, captures: &[CaptureKey], reactor: &mut Reactor) {
+        if captures.is_empty() {
+            return;
+        }
+        let keys: Vec<RegistrationKey> = self
+            .registrations
+            .iter()
+            .map(|(key, _)| RegistrationKey(key))
+            .collect();
+        for key in keys {
+            let Some(mut handler) = self
+                .registrations
+                .get_mut(key.0)
+                .and_then(|reg| reg.handler.take())
+            else {
+                // Expected, not an error: an earlier reflector in this broadcast cleared its sessions
+                // and unregistered their response captures, which are in this snapshot, so they resolve
+                // to None here. Mirrors on_deadline's mid-sweep skip.
+                log::trace!(
+                    "iface-change broadcast: handler for {key:?} gone mid-broadcast, skipped"
+                );
+                continue;
+            };
+            handler.on_iface_change(captures, self, reactor);
+            if let Some(reg) = self.registrations.get_mut(key.0) {
+                reg.handler = Some(handler);
+            }
         }
     }
 
@@ -802,7 +880,11 @@ impl PacketDispatcher {
                 "after its interface was recreated"
             };
             self.dial
-                .evict_on_interface_change(reactor, |cap| captures.contains(&cap), reason);
+                .evict_on_interface_change(reactor, &captures, reason);
+            // Drop search sessions on the interface's captures: their reserved port and response
+            // registration belonged to the interface that was removed or recreated (even one that
+            // returned on the same index, which the reconcile reached via the attached() probe).
+            self.notify_iface_change(&captures, reactor);
             if stale.cur != 0 && !failed {
                 log::info!("interface {name}: recovery complete");
             }

@@ -144,18 +144,18 @@ impl DialContext {
         self.evict_where(reactor, "past its grace", |p| now >= p.desc_grace);
     }
 
-    /// Evict every proxy whose source or target capture is on a changed interface (`on_changed`): an
-    /// address move or recreation there stranded the proxy's listeners or its device-connect egress,
-    /// so it must re-mint against the current interface on the next advertisement rather than be
-    /// reused. `reason` names the change in the eviction log (address moved vs recreated).
+    /// Evict every proxy whose source or target capture is in `changed`: an address move or recreation
+    /// on that interface stranded the proxy's listeners or its device-connect egress, so it must
+    /// re-mint against the current interface on the next advertisement rather than be reused. `reason`
+    /// names the change in the eviction log (address moved vs recreated).
     pub(crate) fn evict_on_interface_change(
         &mut self,
         reactor: &mut Reactor,
-        on_changed: impl Fn(CaptureKey) -> bool,
+        changed: &[CaptureKey],
         reason: &str,
     ) {
         self.evict_where(reactor, reason, |p| {
-            on_changed(p.source) || on_changed(p.target)
+            changed.contains(&p.source) || changed.contains(&p.target)
         });
     }
 }

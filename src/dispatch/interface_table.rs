@@ -342,6 +342,22 @@ impl InterfaceTable {
             .collect()
     }
 
+    /// The captures on the interface currently at `ifindex`, or empty if none matches. The reverse
+    /// of [`ifindex_of`](Self::ifindex_of): the refresh path knows the changed index and needs the
+    /// stable capture keys to notify handlers, since the index itself is reusable.
+    pub(super) fn captures_at_ifindex(&self, ifindex: u32) -> Vec<CaptureKey> {
+        match self
+            .entries
+            .iter()
+            .position(|entry| entry.interface.ifindex == ifindex)
+        {
+            Some(index) => self.captures_of(InterfaceKey(
+                u32::try_from(index).expect("interface count fits a u32"),
+            )),
+            None => Vec::new(),
+        }
+    }
+
     /// Re-bind the capture behind `key` to its (recreated) interface, in place -- same fd, same
     /// slot, so every reflector-held key and the reactor's watch stay valid. `Ok(false)` means
     /// no capture sat in the slot (out of range, or taken out mid-drain) -- unreachable when

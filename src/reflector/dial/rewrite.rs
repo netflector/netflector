@@ -293,7 +293,7 @@ mod tests {
         let handler = ctx.handler_keys()[0];
 
         // A change on an unrelated interface leaves the proxy alone.
-        ctx.evict_on_interface_change(&mut reactor, |c| c == CaptureKey::from_u64(99), "test");
+        ctx.evict_on_interface_change(&mut reactor, &[CaptureKey::from_u64(99)], "test");
         assert_eq!(
             ctx.proxy_count(),
             1,
@@ -302,14 +302,14 @@ mod tests {
         assert!(reactor.is_registered(handler));
 
         // A change on its source interface evicts and unregisters it.
-        ctx.evict_on_interface_change(&mut reactor, |c| c == advert_source(), "test");
+        ctx.evict_on_interface_change(&mut reactor, &[advert_source()], "test");
         assert_eq!(ctx.proxy_count(), 0, "a source interface change evicts it");
         assert!(!reactor.is_registered(handler), "and unregisters it");
 
         // A re-mint is evicted just the same by a change on its target interface.
         rewrite_advert(&mut ctx, &mut reactor, DIAL_ADVERT).expect("re-minted");
         let handler = ctx.handler_keys()[0];
-        ctx.evict_on_interface_change(&mut reactor, |c| c == advert_target(), "test");
+        ctx.evict_on_interface_change(&mut reactor, &[advert_target()], "test");
         assert_eq!(
             ctx.proxy_count(),
             0,
@@ -328,7 +328,7 @@ mod tests {
             .unregister(ctx.handler_keys()[0])
             .expect("unregister the proxy");
         // An interface change matching no live proxy still prunes the now-stale entry.
-        ctx.evict_on_interface_change(&mut reactor, |_| false, "test");
+        ctx.evict_on_interface_change(&mut reactor, &[], "test");
         assert_eq!(ctx.proxy_count(), 0, "the already-evicted entry is pruned");
     }
 

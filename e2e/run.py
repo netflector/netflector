@@ -735,29 +735,34 @@ ROUNDTRIP_CASES = [
 
 @dataclasses.dataclass(frozen=True)
 class SearchRecreateCase:
-    # A search session surviving an interface recreation. One searcher, from a fixed source port,
-    # sends an M-SEARCH (opening a session), then -- after the target interface is destroyed and
-    # recreated on a different ifindex (a decoy grabs the freed index so even FreeBSD, which reuses
-    # the lowest free one, hands back a new index) -- retransmits from that same port while the
-    # session is still alive. The address is re-pinned unchanged, so only the index moved: this
-    # isolates the ifindex clause of the re-mint gate, which a zoneless address compare alone would
-    # miss (the motivating harm -- a reservation bound to a dead link-local zone -- is v6-only, but
-    # the fabrics cannot hold a link-local address across the MAC change a recreation brings). The
-    # gate must re-mint, and the second round trip must still return the 200 OK. This is the
-    # search-session path the passive mDNS and DIAL recreate cases never reach; logs `remint_log`.
+    # A search session cleared across an interface recreation. One searcher opens a session; the
+    # target interface is then destroyed and recreated. Its reserved port and response registration
+    # died with the interface, so the dispatcher drops every session bound to it (and logs
+    # `cleared_log`) via the on_iface_change push path; a fresh searcher then re-opens and round-trips
+    # against the recovered interface. Run both without and with a decoy that grabs the freed index:
+    # on FreeBSD (which reuses the lowest-free index) that is the difference between a same-index and a
+    # changed-index recreation -- two distinct detection paths (the attached() BIOCGDLT probe vs the
+    # index comparison), both of which must clear the session. On Linux the index always changes, so
+    # the decoy is inert there. This is the search-session path the passive mDNS and DIAL recreate
+    # cases never reach (mDNS is sessionless, the DIAL cases discover via NOTIFY). A wide MX keeps the
+    # first session alive until the recreation so there is something to clear.
     name: str
     family: int = 4
     group: str = SSDP_GROUP_V4
     port: int = SSDP_PORT
-    probe_hex: str = SSDP_MSEARCH_MX5_HEX  # wide MX window: room for the recreation between the two sends
+    probe_hex: str = SSDP_MSEARCH_MX5_HEX  # wide MX window: the first session must outlive the recreation
     reply_hex: str = SSDP_OK_HEX
     config: str = "config.toml"
     timeout_seconds: float = 8.0
-    remint_log: str = "re-minting the session"
+    decoy: bool = False  # plant a decoy on the freed index so the recreation lands on a different one
+    cleared_log: str = "cleared all sessions"
 
 
 SEARCH_RECREATE_CASES = [
+    # Same index on FreeBSD (reused), reached via the attached() probe.
     SearchRecreateCase(name="ssdp_search_interface_recreate"),
+    # Different index everywhere, via the index comparison.
+    SearchRecreateCase(name="ssdp_search_interface_recreate_decoy", decoy=True),
 ]
 
 
@@ -2035,16 +2040,14 @@ class RoundTripRunner(CaseRunner):
 
 class SearchRecreateRunner(RoundTripRunner):
     # See SearchRecreateCase. Reuses RoundTripRunner's segment/reflector/responder setup (the shim
-    # __init__ reads only the fields both cases share), but drives two searches from one source port
-    # with a target recreation between them, so the reflector must re-mint the persisted session onto
-    # the fresh interface rather than reuse a reservation bound to the dead ifindex. The one-shot
-    # responder is restarted after the recreation -- on the native fabrics its wire died with the
-    # interface (docker keeps it, but the responder had already answered and exited) -- mirroring the
-    # DIAL recreate case's device restart.
+    # __init__ reads only the fields both cases share), but opens a session, recreates the target, and
+    # re-searches, asserting the dispatcher dropped the orphaned session. The one-shot responder is
+    # restarted after the recreation -- on the native fabrics its wire died with the interface (docker
+    # keeps it, but the responder had already answered and exited) -- mirroring the DIAL recreate
+    # case's device restart.
 
     def _search(self, role: str) -> None:
-        # One M-SEARCH from the fixed source port, asserting the 200 OK proxies back. The shared port is
-        # what makes the second send a retransmit of the first's session, not a brand-new one.
+        # One M-SEARCH, asserting the 200 OK proxies back.
         ifname = self.backend.helper_ifname(REFLECTOR_SOURCE_IFNAME)
         self.backend.start_probe(role, "source", ifname, [
             "search",
@@ -2063,30 +2066,32 @@ class SearchRecreateRunner(RoundTripRunner):
             raise RuntimeError(f"{role} failed with exit code {exit_code}")
 
     def _recreate_target(self) -> None:
-        # Occupy the freed index with a decoy before recreating, so the target comes back on a
-        # different ifindex. Without it FreeBSD reuses the lowest free index, so the reply binding
-        # never moves and the session is (correctly) reused rather than re-minted -- the very thing
-        # this case asserts. Inert on Linux/docker (monotonic indexes), kept for a uniform flow.
+        # With the decoy, occupy the freed index before recreating so the target returns on a different
+        # one (the changed-index path); without it, FreeBSD reuses the index (the same-index path). The
+        # dispatcher clears sessions on either, so both variants must pass.
         ifname = REFLECTOR_IFNAMES["target"]
         self.backend.delete_interface("target")
         self.wait_for_log("reflector", f"interface {ifname} is gone", "target deletion")
-        self.backend.add_decoy_interface()
+        if self.rt.decoy:
+            self.backend.add_decoy_interface()
         self.backend.recreate_interface("target")
         self.wait_for_log("reflector", f"interface {ifname}: returned as ifindex", "target recreation")
-        self.backend.remove_decoy_interface()
+        if self.rt.decoy:
+            self.backend.remove_decoy_interface()
 
     def run(self) -> None:
         print(f"\n=== {self.rt.name} ===", flush=True)
         self.backend.setup_segments()
         self.start_reflector()
 
-        # First search: opens the session, its reservation scoped to the target's current ifindex.
+        # First search: opens a session on the target.
         self.start_responder()
         self._search("searcher-baseline")
         print(f"{self.rt.name}: baseline round trip before the recreation", flush=True)
 
-        # Destroy + recreate the target (same v4 address, fresh ifindex). The session persists -- the
-        # reconcile never touches sessions -- with a reservation now bound to the vanished zone.
+        # Destroy + recreate the target: its reserved port and response registration die with it, so
+        # the dispatcher drops the session (asserted via cleared_log below). The wide MX keeps the
+        # session alive until the parking so there is something to clear.
         self._recreate_target()
 
         # A fresh responder for the retransmit: the baseline's exited after its one reply, and on the
@@ -2094,13 +2099,11 @@ class SearchRecreateRunner(RoundTripRunner):
         self.backend.remove("responder")
         self.start_responder()
 
-        # Retransmit from the same source port while the session is still alive: the reflector must see
-        # the reply binding moved and re-mint, and the round trip must still complete against the new
-        # interface. A session that had (wrongly) been reused would keep the stale reservation.
+        # A fresh search re-opens a session against the recovered interface and round-trips.
         self._search("searcher-retransmit")
         print(f"{self.rt.name}: round trip after the recreation", flush=True)
-        self.wait_for_log("reflector", self.rt.remint_log, "session re-mint")
-        print(f"{self.rt.name}: session re-minted across the recreation", flush=True)
+        self.wait_for_log("reflector", self.rt.cleared_log, "session clear")
+        print(f"{self.rt.name}: sessions cleared across the recreation", flush=True)
         print(f"PASS {self.rt.name}", flush=True)
         if self.args.show_reflector_logs:
             time.sleep(0.5)
