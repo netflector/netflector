@@ -16,6 +16,14 @@ use crate::libcex::{IfAddrMsg, NETLINK_ROUTE, NlMsgHdr, SockAddrNl, nl_align};
 /// (stats, `IFLA_AF_SPEC`, VF info) at ~1 KB; addresses are far smaller. 8 KiB is roomy.
 pub(super) const READ_BUF: usize = 8192;
 
+/// See [`InterfaceMonitor::INDEXES_MONOTONIC`](super::InterfaceMonitor::INDEXES_MONOTONIC):
+/// Linux allocates indexes cyclically over a 31-bit space, never reusing until wrap.
+pub(super) const INDEXES_MONOTONIC: bool = true;
+
+/// See [`InterfaceMonitor::LIFECYCLE_EVENTS`](super::InterfaceMonitor::LIFECYCLE_EVENTS):
+/// `RTM_{NEW,DEL}LINK` are subscribed and forwarded.
+pub(super) const LIFECYCLE_EVENTS: bool = true;
+
 /// Subscribe v4/v6 address adds+removes and link (MAC/state) changes. A MAC change arrives
 /// as `RTM_NEWLINK`, not an address event, so `RTMGRP_LINK` is needed to catch it.
 const SUBSCRIBED_GROUPS: u32 =

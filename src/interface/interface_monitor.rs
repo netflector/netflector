@@ -54,6 +54,18 @@ pub(crate) struct InterfaceMonitor {
 }
 
 impl InterfaceMonitor {
+    /// Whether this platform allocates interface indexes monotonically (Linux: 31-bit cyclic
+    /// per netns), so a newly-created interface always carries an index above every
+    /// previously-seen one. The dispatcher gates unknown-index [`InterfaceEvent::Link`]
+    /// events on that; the BSDs reuse indexes (FreeBSD hands out the lowest free, macOS
+    /// recycles the whole ifnet), so no such gate is sound there.
+    pub(crate) const INDEXES_MONOTONIC: bool = backend::INDEXES_MONOTONIC;
+
+    /// Whether this backend delivers [`InterfaceEvent::Link`] lifecycle events at all. Where
+    /// it does not (macOS: no `RTM_IFANNOUNCE`), an unknown-index address event is the only
+    /// signal a recreated interface ever sends, and must stand in as the recreation trigger.
+    pub(crate) const LIFECYCLE_EVENTS: bool = backend::LIFECYCLE_EVENTS;
+
     /// Open and subscribe a routing socket, non-blocking and close-on-exec.
     ///
     /// # Errors

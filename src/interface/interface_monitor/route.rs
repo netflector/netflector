@@ -16,6 +16,15 @@ use super::InterfaceEvent;
 /// backend's 8 KiB suffices.
 pub(super) const READ_BUF: usize = 2048;
 
+/// See [`InterfaceMonitor::INDEXES_MONOTONIC`](super::InterfaceMonitor::INDEXES_MONOTONIC):
+/// the BSDs reuse indexes (FreeBSD hands out the lowest free one; macOS recycles the whole
+/// ifnet for stable-uniqueid drivers), so index ordering carries no creation signal.
+pub(super) const INDEXES_MONOTONIC: bool = false;
+
+/// See [`InterfaceMonitor::LIFECYCLE_EVENTS`](super::InterfaceMonitor::LIFECYCLE_EVENTS):
+/// FreeBSD announces arrival/departure via `RTM_IFANNOUNCE`; macOS has no lifecycle message.
+pub(super) const LIFECYCLE_EVENTS: bool = cfg!(target_os = "freebsd");
+
 /// Requested `SO_RCVBUF` for the route socket, whose default receive queue is only ~8 KiB. Enlarge it so
 /// a burst of routing messages is far less likely to overflow it and drop changes. Best-effort and
 /// kernel-clamped; FreeBSD's `SO_RERROR` still recovers from an overflow, and macOS (no `SO_RERROR`)
