@@ -223,6 +223,12 @@ def search(args: argparse.Namespace) -> int:
         sock.sendto(args.payload_hex, dest)
         print(f"searcher sent {len(args.payload_hex)} bytes to {args.address}:{args.port}", flush=True)
 
+        if args.no_wait:
+            # Fire-and-forget: the caller only needs the M-SEARCH sent (e.g. to trigger a reflected
+            # re-emit), not the reply -- which may be routed elsewhere (a reused session's cached MAC).
+            print("searcher: not waiting for a reply", flush=True)
+            return 0
+
         sock.settimeout(args.timeout)
         try:
             payload, peer = sock.recvfrom(4096)
@@ -669,6 +675,7 @@ def main() -> int:
     search_expectation = search_parser.add_mutually_exclusive_group(required=True)
     search_expectation.add_argument("--expect-payload-hex", type=parse_payload_hex, help="expected 200 OK payload")
     search_expectation.add_argument("--expect-none", action="store_true", help="fail if any reply is received")
+    search_expectation.add_argument("--no-wait", action="store_true", help="send the M-SEARCH and exit without awaiting a reply")
     search_parser.set_defaults(func=search)
 
     device_parser = subparsers.add_parser(
