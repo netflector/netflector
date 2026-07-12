@@ -13,7 +13,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crate::capture::Capture;
-use crate::interface::{Interface, Ipv6Scope, if_index};
+use crate::interface::{Interface, InterfaceAddresses, Ipv6Scope, if_index};
 use crate::net::packet::Packet;
 use crate::sys::socklen_of;
 #[cfg(target_os = "linux")]
@@ -23,6 +23,7 @@ use crate::{
 };
 
 use super::datagram::{build_udp, ethernet_dst};
+use super::interface_table::InterfaceTable;
 use super::multicast::MulticastJoiner;
 
 const INJECT_SRC_PORT: u16 = 40000;
@@ -145,16 +146,19 @@ impl InterfacePair {
         );
     }
 
-    /// Destroy and recreate the pair's interfaces under the same names -- fresh kernel
-    /// identities, as an operator's `PPPoE` reconnect or bridge rebuild would produce -- then
-    /// reconfigure and settle. False (with a skip note) if the platform tooling refuses.
-    fn recreate(&self) -> bool {
-        if !(self.relink() && self.configure()) {
-            eprintln!("skip pair test: could not recreate the pair");
-            return false;
-        }
+    /// Destroy and recreate the pair's interfaces under the same names -- fresh kernel identities,
+    /// as an operator's `PPPoE` reconnect or bridge rebuild would produce -- then reconfigure and
+    /// settle. Panics on failure, like [`settle`](Self::settle): the pair was created, configured,
+    /// and brought up once already, so the tooling and privileges are known good; a relink or
+    /// reconfigure that fails now is an anomaly to surface, not a precondition to skip on.
+    fn recreate(&self) {
+        assert!(
+            self.relink() && self.configure(),
+            "recreating {}/{} failed after a successful create",
+            self.inject,
+            self.receive
+        );
         self.settle();
-        true
     }
 
     /// Linux: veth names are caller-chosen, so derive them from the pid and a counter -- unique
@@ -450,14 +454,14 @@ fn capture_injected(peer: &mut Capture, dest: IpAddr) -> io::Result<Option<Captu
 /// Build a datagram with the production builder (the egress's own addresses and MAC, per-scope
 /// v6 source) and inject it through the production send path.
 fn inject(
-    iface: &Interface,
+    addrs: &InterfaceAddresses,
     injector: &Capture,
     dst: SocketAddr,
     payload: &[u8],
 ) -> io::Result<()> {
     let mut scratch = [0u8; 2048];
     let n = build_udp(
-        &iface.addrs,
+        addrs,
         injector.link_type(),
         dst,
         ethernet_dst(dst.ip()).expect("broadcast/multicast destination"),
@@ -485,7 +489,7 @@ fn pair_injected_broadcast_is_captured_on_the_peer() -> io::Result<()> {
 
     let payload = b"pair-broadcast";
     let dst = SocketAddr::from((Ipv4Addr::BROADCAST, INJECT_DST_PORT));
-    inject(&iface, &injector, dst, payload)?;
+    inject(&iface.addrs, &injector, dst, payload)?;
 
     let captured = capture_injected(&mut peer, dst.ip())?.expect("peer captured the broadcast");
     assert_eq!(captured.payload, payload);
@@ -508,9 +512,7 @@ fn pair_capture_rebinds_after_interface_recreation() -> io::Result<()> {
     let index = if_index(&pair.receive).expect("receive ifindex");
     assert!(peer.attached(index), "a fresh capture reports attached");
 
-    if !pair.recreate() {
-        return Ok(()); // recreate printed the skip note
-    }
+    pair.recreate();
     let index = if_index(&pair.receive).expect("recreated receive ifindex");
     assert!(
         !peer.attached(index),
@@ -528,9 +530,121 @@ fn pair_capture_rebinds_after_interface_recreation() -> io::Result<()> {
     let injector = Capture::open(&pair.inject)?;
     let payload = b"pair-rebind";
     let dst = SocketAddr::from((Ipv4Addr::BROADCAST, INJECT_DST_PORT));
-    inject(&iface, &injector, dst, payload)?;
+    inject(&iface.addrs, &injector, dst, payload)?;
     let captured =
         capture_injected(&mut peer, dst.ip())?.expect("the re-bound capture sees the broadcast");
+    assert_eq!(captured.payload, payload);
+    Ok(())
+}
+
+// The interface table's own recovery, end to end against a real recreation, driving BOTH ends of
+// the pair at once -- the path the periodic reconcile follows (the only detection macOS has, its
+// recreated ifnet keeping the index). Both interfaces sit in the table with a capture each, and a
+// baseline injection proves delivery works first. After the pair is destroyed and recreated under
+// its names, stale_interfaces flags BOTH entries through the captures' attached() probe -- the half
+// the unprivileged unit test leaves vacuous, and the only half that fires when the index is reused.
+// rebind_interface re-points each entry and replays its recorded joins on a fresh socket (none
+// deferred), rebind_capture re-attaches each fd in place, and a second injection -- sent on the
+// re-bound injector, observed on the re-bound receiver -- proves delivery resumed through the very
+// captures that were stranded.
+#[test]
+fn pair_interface_table_recovers_after_interface_recreation() -> io::Result<()> {
+    let Some(pair) = InterfacePair::create() else {
+        return Ok(());
+    };
+    let mut table = InterfaceTable::new();
+    let inject_key = table.find_or_add_interface(&pair.inject)?;
+    let injector = table.add_capture(Capture::open(&pair.inject)?, inject_key);
+    let receive_key = table.find_or_add_interface(&pair.receive)?;
+    let receiver = table.add_capture(Capture::open(&pair.receive)?, receive_key);
+    // Record memberships on the receive side so its rebuild has groups to replay on the fresh socket.
+    table.join_on(receive_key, IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)))?;
+    table.join_on(
+        receive_key,
+        IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb)),
+    )?;
+    assert!(
+        table.stale_interfaces().is_empty(),
+        "a freshly-built table is healthy"
+    );
+
+    // Baseline: delivery works through both captures before any recreation. The frame's source
+    // addresses come from the table's own resolved copy of the inject interface -- no second open.
+    let payload = b"pair-table-recover";
+    let dst = SocketAddr::from((Ipv4Addr::BROADCAST, INJECT_DST_PORT));
+    inject(
+        table
+            .egress_addrs(injector)
+            .expect("the inject interface's addresses"),
+        table
+            .capture(injector)
+            .expect("the injector capture is present"),
+        dst,
+        payload,
+    )?;
+    let mut receiver_cap = table
+        .take(receiver)
+        .expect("the receiver capture is present");
+    assert!(
+        capture_injected(&mut receiver_cap, dst.ip())?.is_some(),
+        "delivery works before the recreation"
+    );
+    assert!(
+        table.restore(receiver, receiver_cap),
+        "restore the receiver for the recovery"
+    );
+
+    pair.recreate();
+
+    // Both interfaces are stranded. On a reused index only the attached() probe catches it; either
+    // way both entries are flagged.
+    let stale = table.stale_interfaces();
+    assert_eq!(
+        stale.len(),
+        2,
+        "both recreated interfaces are flagged stale"
+    );
+
+    // Drive the production recovery for each: re-point + replay its joins on a fresh socket (only
+    // the receive side recorded any), then re-attach its capture fd in place.
+    for s in &stale {
+        let counts = table.rebind_interface(s.key, s.cur)?;
+        let expected_joined = if s.key == receive_key { 2 } else { 0 };
+        assert_eq!(
+            (counts.joined, counts.deferred),
+            (expected_joined, 0),
+            "the interface re-joined its recorded groups on the fresh socket, none deferred"
+        );
+        for capture in table.captures_of(s.key) {
+            assert!(
+                table.rebind_capture(capture)?,
+                "the capture re-bound in place"
+            );
+        }
+    }
+    assert!(
+        table.stale_interfaces().is_empty(),
+        "the rebuild cleared all staleness"
+    );
+
+    // Delivery resumes through the very captures that were stranded: sent on the re-bound injector
+    // (with the interface's re-resolved addresses, straight from the table), observed on the
+    // re-bound receiver.
+    inject(
+        table
+            .egress_addrs(injector)
+            .expect("the re-bound inject interface's addresses"),
+        table
+            .capture(injector)
+            .expect("the re-bound injector is present"),
+        dst,
+        payload,
+    )?;
+    let mut receiver_cap = table
+        .take(receiver)
+        .expect("the re-bound receiver is present");
+    let captured = capture_injected(&mut receiver_cap, dst.ip())?
+        .expect("delivery resumed after recovery, through both re-bound captures");
     assert_eq!(captured.payload, payload);
     Ok(())
 }
@@ -557,7 +671,7 @@ fn pair_injected_v6_multicast_reaches_a_joined_udp_socket() -> io::Result<()> {
 
     let payload = b"pair-v6-multicast";
     inject(
-        &iface,
+        &iface.addrs,
         &injector,
         SocketAddr::from((all_nodes, port)),
         payload,
@@ -584,7 +698,7 @@ fn pair_sources_v6_multicast_by_destination_scope() -> io::Result<()> {
 
     let site_group = Ipv6Addr::new(0xff05, 0, 0, 0, 0, 0, 0, 0x0c);
     inject(
-        &iface,
+        &iface.addrs,
         &injector,
         SocketAddr::from((site_group, INJECT_DST_PORT)),
         payload,
@@ -599,7 +713,7 @@ fn pair_sources_v6_multicast_by_destination_scope() -> io::Result<()> {
 
     let link_group = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0x0c);
     inject(
-        &iface,
+        &iface.addrs,
         &injector,
         SocketAddr::from((link_group, INJECT_DST_PORT)),
         payload,
