@@ -10,6 +10,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::num::NonZeroU32;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::process::Command;
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::capture::Capture;
@@ -49,6 +50,12 @@ fn run_capture(command: &str) -> Option<String> {
     let name = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     (!name.is_empty()).then_some(name)
 }
+
+/// Serializes the pair tests' interface create/destroy. They run in parallel and the feth/epair
+/// fixtures take kernel-assigned names, so one test's destroy frees a name a parallel test's
+/// create-by-name (in [`recreate`](InterfacePair::recreate)) then collides with. One creator at a
+/// time keeps the naming deterministic. Poison is ignored: a panicking test must not wedge the rest.
+static PAIR_LOCK: Mutex<()> = Mutex::new(());
 
 /// A connected virtual-interface pair for the test's lifetime. `create` returns `None` (with a
 /// skip note) without root or when the platform tooling refuses; `Drop` destroys only interfaces
@@ -96,6 +103,9 @@ impl InterfacePair {
             eprintln!("skip pair test: interface creation requires root");
             return None;
         }
+        // Held through create + settle so no parallel pair test creates an interface concurrently
+        // (see PAIR_LOCK); released when this returns, before the test body runs.
+        let _serialize = PAIR_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         let pair = Self::create_platform(NEXT_SUBNET.fetch_add(1, Ordering::Relaxed))?;
         pair.settle();
         Some(pair)
@@ -152,6 +162,9 @@ impl InterfacePair {
     /// and brought up once already, so the tooling and privileges are known good; a relink or
     /// reconfigure that fails now is an anomaly to surface, not a precondition to skip on.
     fn recreate(&self) {
+        // Serialize against every other pair test's create/recreate (see PAIR_LOCK): the destroy
+        // here frees a kernel-assigned name that a concurrent create-by-name would otherwise grab.
+        let _serialize = PAIR_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         assert!(
             self.relink() && self.configure(),
             "recreating {}/{} failed after a successful create",
