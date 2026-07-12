@@ -73,6 +73,16 @@ SSDP_MSEARCH_HEX = (
     "MX: 2\r\n"
     "ST: ssdp:all\r\n\r\n"
 ).encode().hex()
+# An M-SEARCH with the maximum MX (clamped to 5s by the reflector), so its session lives ~7s (MX + the
+# 2s reply grace). The interface-recreate round trip needs that width: it destroys and recreates the
+# target between the searcher's two sends, and the second must land while the first's session is alive.
+SSDP_MSEARCH_MX5_HEX = (
+    "M-SEARCH * HTTP/1.1\r\n"
+    "HOST: 239.255.255.250:1900\r\n"
+    'MAN: "ssdp:discover"\r\n'
+    "MX: 5\r\n"
+    "ST: ssdp:all\r\n\r\n"
+).encode().hex()
 SSDP_NOTIFY_HEX = (
     "NOTIFY * HTTP/1.1\r\n"
     "HOST: 239.255.255.250:1900\r\n"
@@ -226,6 +236,8 @@ VALGRIND_STOP_GRACE_SECONDS = 60
 REFLECTOR_SOURCE_IFNAME = "wol_src"
 REFLECTOR_TARGET_IFNAME = "wol_dst"
 RECEIVER_IFNAME = "probe0"
+REFLECTOR_IFNAMES = {"source": REFLECTOR_SOURCE_IFNAME, "target": REFLECTOR_TARGET_IFNAME}
+DECOY_IFNAME = "rfxdecoy"
 
 IPV6_ALL_NODES = "ff02::1"
 
@@ -720,6 +732,35 @@ ROUNDTRIP_CASES = [
         evict_log="evicted WSD session"),
 ]
 
+
+@dataclasses.dataclass(frozen=True)
+class SearchRecreateCase:
+    # A search session surviving an interface recreation. One searcher, from a fixed source port,
+    # sends an M-SEARCH (opening a session), then -- after the target interface is destroyed and
+    # recreated on a different ifindex (a decoy grabs the freed index so even FreeBSD, which reuses
+    # the lowest free one, hands back a new index) -- retransmits from that same port while the
+    # session is still alive. The address is re-pinned unchanged, so only the index moved: this
+    # isolates the ifindex clause of the re-mint gate, which a zoneless address compare alone would
+    # miss (the motivating harm -- a reservation bound to a dead link-local zone -- is v6-only, but
+    # the fabrics cannot hold a link-local address across the MAC change a recreation brings). The
+    # gate must re-mint, and the second round trip must still return the 200 OK. This is the
+    # search-session path the passive mDNS and DIAL recreate cases never reach; logs `remint_log`.
+    name: str
+    family: int = 4
+    group: str = SSDP_GROUP_V4
+    port: int = SSDP_PORT
+    probe_hex: str = SSDP_MSEARCH_MX5_HEX  # wide MX window: room for the recreation between the two sends
+    reply_hex: str = SSDP_OK_HEX
+    config: str = "config.toml"
+    timeout_seconds: float = 8.0
+    remint_log: str = "re-minting the session"
+
+
+SEARCH_RECREATE_CASES = [
+    SearchRecreateCase(name="ssdp_search_interface_recreate"),
+]
+
+
 @dataclasses.dataclass(frozen=True)
 class DialCase:
     name: str
@@ -759,6 +800,28 @@ DIAL_ADDRESS_CHANGE_CASES = [
     DialAddressChangeCase(name="dial_address_change"),
 ]
 
+
+@dataclasses.dataclass(frozen=True)
+class DialRecreateCase:
+    # A full DIAL pass, then the same pass again after the reflector's target interface is
+    # destroyed and recreated, then again after the source's. The hardest DIAL recovery
+    # scenario: an address change replaces values, a recreation replaces the kernel objects
+    # underneath them -- the minted proxy's listener binds, target-address snapshot, and
+    # egress-pin all belong to the dead interface's world, so a passing re-run proves the
+    # recreation evicted the proxy and re-minted against the recreated interface.
+    name: str
+    family: int = 4
+    group: str = SSDP_GROUP_V4
+    timeout_seconds: float = 8.0
+    serve_seconds: float = 120.0  # device serves across passes and the recreation waits
+    passive: bool = True
+    unreachable: bool = False
+
+
+DIAL_RECREATE_CASES = [
+    DialRecreateCase(name="dial_interface_recreate"),
+]
+
 # Per-protocol probe parameters for the address-change phases: wol sends a magic packet (no payload
 # or group); mdns sends a query to its family's group, relayed verbatim.
 PROBE_SPECS = {
@@ -781,6 +844,11 @@ class Phase:
     protocol: str  # "wol" | "mdns" -> PROBE_SPECS
     family: int  # 4 | 6
     interface: str  # "source" (wol_src) | "target" (wol_dst): which reflector interface to toggle
+    # Recreate cases only: plant a throwaway interface between the delete and the recreate. It
+    # occupies the freed slot, so FreeBSD's lowest-free index allocator is forced to hand the
+    # recreated interface a DIFFERENT index; without it the same index comes back. The two
+    # flavors pin both detection paths (index comparison vs the capture attachment probe).
+    decoy: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -805,9 +873,46 @@ ADDRESS_CHANGE_CASES = [
     ),
 ]
 
-ALL_CASES: list[TestCase | RoundTripCase | DialCase | DialAddressChangeCase | AddressChangeCase] = [
-    *TEST_CASES, *MDNS_CASES, *SSDP_CASES, *WSD_CASES, *ROUNDTRIP_CASES, *DIAL_CASES,
-    *DIAL_ADDRESS_CHANGE_CASES, *ADDRESS_CHANGE_CASES]
+@dataclasses.dataclass(frozen=True)
+class RecreateCase:
+    name: str
+    config: str  # config file (relative to e2e/), defining a dual-family reflector set
+    phases: tuple[Phase, ...]  # interface = which reflector interface is destroyed+recreated
+
+
+RECREATE_CASES = [
+    RecreateCase(
+        name="mdns_interface_recreate",
+        config="config-addrchange.toml",
+        phases=(
+            # All phases probe forward (source -> target). Unlike the address-change cases
+            # (which can only exercise the egress send-gate), recreation kills the capture
+            # itself: recreating the source kills the forward INGRESS (queries no longer
+            # enter), recreating the target kills the forward EGRESS (re-emits no longer
+            # leave). Together they prove both halves of the capture rebind. The decoy
+            # flavor forces a different-index recreation on FreeBSD, where the plain
+            # flavors reuse the freed index (see Phase.decoy).
+            Phase(label="source recreate", protocol="mdns", family=4, interface="source"),
+            Phase(label="target recreate", protocol="mdns", family=4, interface="target"),
+            Phase(
+                label="source recreate behind a decoy", protocol="mdns", family=4,
+                interface="source", decoy=True,
+            ),
+            Phase(
+                label="target recreate behind a decoy", protocol="mdns", family=4,
+                interface="target", decoy=True,
+            ),
+        ),
+    ),
+]
+
+ALL_CASES: list[
+    TestCase | RoundTripCase | SearchRecreateCase | DialCase | DialAddressChangeCase
+    | AddressChangeCase | RecreateCase | DialRecreateCase
+] = [
+    *TEST_CASES, *MDNS_CASES, *SSDP_CASES, *WSD_CASES, *ROUNDTRIP_CASES, *SEARCH_RECREATE_CASES,
+    *DIAL_CASES, *DIAL_ADDRESS_CHANGE_CASES, *ADDRESS_CHANGE_CASES, *RECREATE_CASES,
+    *DIAL_RECREATE_CASES]
 
 
 def format_command(command: list[str]) -> str:
@@ -854,6 +959,13 @@ def magic_packet_hex(mac: str) -> str:
 
 SEGMENTS = ("source", "target")
 
+# Fixed per-segment subnets: RFC 5737 test networks for v4, a ULA /64 for routable v6. The native
+# fabrics assign hosts from these directly; the docker backend hands them to `network create` as
+# user-configured subnets (required so the recreate cases can pin the same --ip/--ip6 on reconnect --
+# docker rejects a static address on an IPAM-auto subnet).
+SEGMENT_V4_SUBNET = {"source": "192.0.2", "target": "198.51.100"}
+SEGMENT_V6_PREFIX = {"source": "fd00:e2e0:1", "target": "fd00:e2e0:2"}
+
 
 class Backend:
     # The execution environment for one case: two isolated dual-stack segments, the reflector
@@ -862,6 +974,12 @@ class Backend:
     # containers; native (Linux) as netns + veth pairs and plain processes. Runners hold case
     # logic only and drive everything through this interface, so every case runs identically
     # under both backends.
+
+    # Whether the probe helpers keep working while a segment's reflector-side interface is
+    # deleted. Docker probes own separate bridge endpoints, so yes; the native fabrics realize
+    # a segment as one veth/epair pair, so deleting it takes the probe end with it and the
+    # recreate case skips its silence probe there (there is no wire left to probe on).
+    PROBES_SURVIVE_DELETE = False
 
     def __init__(self, args: argparse.Namespace, prefix: str) -> None:
         self.args = args
@@ -953,6 +1071,26 @@ class Backend:
         self.admin(f"ip route add {dest_ip}/32 dev {ifname}")
         return True
 
+    def delete_interface(self, segment: str) -> None:
+        # Destroy `segment`'s reflector-side interface outright (its far peer dies with it):
+        # the first half of an interface recreation, as a PPPoE drop or bridge teardown would
+        # produce. The reflector's capture is left bound to a dead kernel object.
+        raise NotImplementedError
+
+    def recreate_interface(self, segment: str) -> None:
+        # The second half: recreate the interface under the same name and addresses -- a fresh
+        # kernel identity the reflector must reconcile its capture onto.
+        raise NotImplementedError
+
+    def add_decoy_interface(self) -> None:
+        # Plant a throwaway interface in the reflector's network view, occupying the index a
+        # just-deleted interface freed (see Phase.decoy). Removed with
+        # [`remove_decoy_interface`]; the fabric teardown also covers it on failure.
+        raise NotImplementedError
+
+    def remove_decoy_interface(self) -> None:
+        raise NotImplementedError
+
     def reflector_ip(self, segment: str) -> str:
         raise NotImplementedError
 
@@ -964,10 +1102,14 @@ class Backend:
 
 
 class DockerBackend(Backend):
+    PROBES_SURVIVE_DELETE = True
+
     def __init__(self, args: argparse.Namespace, prefix: str) -> None:
         super().__init__(args, prefix)
         self.networks = {segment: f"{prefix}-{segment}" for segment in SEGMENTS}
         self.roles: dict[str, str] = {}  # role -> container name, in start order
+        # segment -> (v4, v6) captured at delete_interface, re-pinned at recreate_interface.
+        self._detached_addrs: dict[str, list[str]] = {}
 
     @staticmethod
     def require_available() -> None:
@@ -975,9 +1117,16 @@ class DockerBackend(Backend):
 
     def setup_segments(self) -> None:
         # Both networks are dual-stack: IPv4 cases are unaffected, and IPv6 cases need the
-        # bridges to carry IPv6 so the reflector can listen on / emit to ff02::1.
+        # bridges to carry IPv6 so the reflector can listen on / emit to ff02::1. The subnets are
+        # given explicitly (not IPAM-auto) so the recreate cases can pin the same --ip/--ip6 when
+        # they reconnect the endpoint -- docker rejects a static address on an auto-subnet network.
         for segment in SEGMENTS:
-            docker(["network", "create", "--driver", "bridge", "--ipv6", self.networks[segment]])
+            docker([
+                "network", "create", "--driver", "bridge", "--ipv6",
+                "--subnet", f"{SEGMENT_V4_SUBNET[segment]}.0/24",
+                "--subnet", f"{SEGMENT_V6_PREFIX[segment]}::/64",
+                self.networks[segment],
+            ])
 
     def cleanup(self) -> None:
         for container in reversed(self.roles.values()):
@@ -1097,6 +1246,43 @@ class DockerBackend(Backend):
             raise RuntimeError(f"no IPv4 address for {container} on {network}")
         return ip
 
+    def delete_interface(self, segment: str) -> None:
+        # Detaching the bridge endpoint destroys the veth pair, the in-container interface
+        # included. Capture the endpoint's addresses first, so the reconnect can pin them.
+        container = self.roles["reflector"]
+        network = self.networks[segment]
+        fmt = (
+            '{{(index .NetworkSettings.Networks "' + network + '").IPAddress}}'
+            '|{{(index .NetworkSettings.Networks "' + network + '").GlobalIPv6Address}}'
+        )
+        addrs = docker(["inspect", "-f", fmt, container], echo=False).stdout.strip()
+        self._detached_addrs[segment] = addrs.split("|")
+        docker(["network", "disconnect", network, container])
+
+    def recreate_interface(self, segment: str) -> None:
+        # Reconnect under the same pinned interface name and addresses: a fresh veth, a fresh
+        # kernel identity. The driver-opt on connect needs the same Docker 28.0+ as create
+        # (see start_reflector).
+        v4, v6 = self._detached_addrs.pop(segment)
+        command = [
+            "network", "connect",
+            "--driver-opt", f"com.docker.network.endpoint.ifname={REFLECTOR_IFNAMES[segment]}",
+            "--ip", v4,
+        ]
+        if v6:
+            command += ["--ip6", v6]
+        docker([*command, self.networks[segment], self.roles["reflector"]])
+
+    def add_decoy_interface(self) -> None:
+        # The privileged admin sidecar shares the reflector's network namespace, so the veth
+        # lands where the freed index lived. Linux never reuses indexes, so the decoy is inert
+        # here -- it runs anyway to keep the case uniform across backends (and exercises the
+        # reflector's unwatched-churn policy for free).
+        self.admin(f"ip link add {DECOY_IFNAME} type veth peer name {DECOY_IFNAME}p")
+
+    def remove_decoy_interface(self) -> None:
+        self.admin(f"ip link del {DECOY_IFNAME}")
+
     def reflector_ip(self, segment: str) -> str:
         return self._container_ip(self.roles["reflector"], self.networks[segment])
 
@@ -1126,12 +1312,9 @@ class DockerBackend(Backend):
                 print(inspect.stdout, end="", file=sys.stderr, flush=True)
 
 
-# Native segment addressing: the RFC 5737 test networks for v4 and a ULA /64 per segment for
-# routable v6 (Docker's --ipv6 IPAM provided that implicitly; the kernel adds fe80:: itself).
-# The reflector is always host 1 and a segment's helper host 2, replacing Docker's IPAM
-# discovery with a fixed plan.
-NATIVE_V4_SUBNET = {"source": "192.0.2", "target": "198.51.100"}
-NATIVE_V6_PREFIX = {"source": "fd00:e2e0:1", "target": "fd00:e2e0:2"}
+# Native segment addressing over SEGMENT_V4_SUBNET / SEGMENT_V6_PREFIX: the reflector is always host 1
+# and a segment's helper host 2, replacing Docker's IPAM discovery with a fixed plan (the kernel adds
+# fe80:: itself).
 NATIVE_REFLECTOR_HOST = 1
 NATIVE_HELPER_HOST = 2
 
@@ -1147,7 +1330,6 @@ class NativeBackend(Backend):
     # privileges, not the CAP_NET_RAW-only confinement of the scratch container -- a change that
     # grows a privilege requirement passes natively and only fails in the docker lane. CI runs
     # both, so the docker lane stays the privilege-contract gate.
-    REFLECTOR_IFNAMES = {"source": REFLECTOR_SOURCE_IFNAME, "target": REFLECTOR_TARGET_IFNAME}
 
     def __init__(self, args: argparse.Namespace, prefix: str) -> None:
         super().__init__(args, prefix)
@@ -1267,11 +1449,11 @@ class NativeBackend(Backend):
         return proc.returncode
 
     def reflector_ip(self, segment: str) -> str:
-        return f"{NATIVE_V4_SUBNET[segment]}.{NATIVE_REFLECTOR_HOST}"
+        return f"{SEGMENT_V4_SUBNET[segment]}.{NATIVE_REFLECTOR_HOST}"
 
     def probe_ip(self, role: str, segment: str) -> str:
         del role  # one helper per segment; the plan gives them all the same host number
-        return f"{NATIVE_V4_SUBNET[segment]}.{NATIVE_HELPER_HOST}"
+        return f"{SEGMENT_V4_SUBNET[segment]}.{NATIVE_HELPER_HOST}"
 
     def print_diagnostics(self) -> None:
         for logfile in sorted(self.logdir.iterdir()):
@@ -1290,8 +1472,9 @@ class NativeLinuxBackend(NativeBackend):
     # windows must only see the segment's traffic, unicast to the reflector must cross the wire
     # rather than short-circuit via lo, and the host's daemons (systemd-resolved speaks mDNS)
     # must not reach the test wires. Successive probe processes for a case run inside the same
-    # far namespace: the reflector caches its ifindexes at startup, so the veth ends on its side
-    # must never be recreated -- probes respawn, namespaces persist.
+    # far namespace: probes respawn, namespaces persist. The recreate cases delete and re-add
+    # whole pairs (fresh kernel identities under the same names), which the reflector survives
+    # by reconciling its captures; the probes are immune, resolving interfaces fresh at spawn.
 
     def __init__(self, args: argparse.Namespace, prefix: str) -> None:
         super().__init__(args, prefix)
@@ -1321,29 +1504,50 @@ class NativeLinuxBackend(NativeBackend):
             self._ip(["-n", ns, "link", "set", "lo", "up"])
 
         for segment in SEGMENTS:
-            dut_ifname = self.REFLECTOR_IFNAMES[segment]
-            self._ip([
-                "link", "add", dut_ifname, "netns", self.ns["dut"],
-                "type", "veth", "peer", "name", RECEIVER_IFNAME, "netns", self.ns[segment],
-            ])
-            v4, v6 = NATIVE_V4_SUBNET[segment], NATIVE_V6_PREFIX[segment]
-            dut, far = self.ns["dut"], self.ns[segment]
-            self._ip(["-n", dut, "addr", "add", f"{v4}.{NATIVE_REFLECTOR_HOST}/24", "dev", dut_ifname])
-            self._ip(["-n", dut, "addr", "add", f"{v6}::{NATIVE_REFLECTOR_HOST}/64", "dev", dut_ifname])
-            self._ip(["-n", far, "addr", "add", f"{v4}.{NATIVE_HELPER_HOST}/24", "dev", RECEIVER_IFNAME])
-            self._ip(["-n", far, "addr", "add", f"{v6}::{NATIVE_HELPER_HOST}/64", "dev", RECEIVER_IFNAME])
-            self._ip(["-n", dut, "link", "set", dut_ifname, "up"])
-            self._ip(["-n", far, "link", "set", RECEIVER_IFNAME, "up"])
-            # The probe's 255.255.255.255 sends are routed, not interface-pinned; single-homed
-            # plus this default route pins them to the segment (Docker's IPAM gateway did this).
-            self._ip(["-n", far, "route", "add", "default", "dev", RECEIVER_IFNAME])
+            self._setup_segment(segment)
 
         self._wait_carrier()
+
+    def _setup_segment(self, segment: str) -> None:
+        dut_ifname = REFLECTOR_IFNAMES[segment]
+        self._ip([
+            "link", "add", dut_ifname, "netns", self.ns["dut"],
+            "type", "veth", "peer", "name", RECEIVER_IFNAME, "netns", self.ns[segment],
+        ])
+        v4, v6 = SEGMENT_V4_SUBNET[segment], SEGMENT_V6_PREFIX[segment]
+        dut, far = self.ns["dut"], self.ns[segment]
+        self._ip(["-n", dut, "addr", "add", f"{v4}.{NATIVE_REFLECTOR_HOST}/24", "dev", dut_ifname])
+        self._ip(["-n", dut, "addr", "add", f"{v6}::{NATIVE_REFLECTOR_HOST}/64", "dev", dut_ifname])
+        self._ip(["-n", far, "addr", "add", f"{v4}.{NATIVE_HELPER_HOST}/24", "dev", RECEIVER_IFNAME])
+        self._ip(["-n", far, "addr", "add", f"{v6}::{NATIVE_HELPER_HOST}/64", "dev", RECEIVER_IFNAME])
+        self._ip(["-n", dut, "link", "set", dut_ifname, "up"])
+        self._ip(["-n", far, "link", "set", RECEIVER_IFNAME, "up"])
+        # The probe's 255.255.255.255 sends are routed, not interface-pinned; single-homed
+        # plus this default route pins them to the segment (Docker's IPAM gateway did this).
+        self._ip(["-n", far, "route", "add", "default", "dev", RECEIVER_IFNAME])
+
+    def delete_interface(self, segment: str) -> None:
+        # Deleting the dut end destroys the pair, the far probe0 included.
+        self._ip(["-n", self.ns["dut"], "link", "del", REFLECTOR_IFNAMES[segment]])
+
+    def recreate_interface(self, segment: str) -> None:
+        self._setup_segment(segment)
+        self._wait_carrier()
+
+    def add_decoy_interface(self) -> None:
+        # Inert on Linux (indexes are never reused); runs to keep the case uniform.
+        self._ip([
+            "-n", self.ns["dut"], "link", "add", DECOY_IFNAME,
+            "type", "veth", "peer", "name", f"{DECOY_IFNAME}p",
+        ])
+
+    def remove_decoy_interface(self) -> None:
+        self._ip(["-n", self.ns["dut"], "link", "del", DECOY_IFNAME])
 
     def _wait_carrier(self) -> None:
         # A veth reports operstate "up" only once BOTH ends are up; don't start the reflector
         # (or probes) on a link that hasn't settled.
-        pending = [(self.ns["dut"], ifname) for ifname in self.REFLECTOR_IFNAMES.values()]
+        pending = [(self.ns["dut"], ifname) for ifname in REFLECTOR_IFNAMES.values()]
         pending += [(self.ns[segment], RECEIVER_IFNAME) for segment in SEGMENTS]
         deadline = time.monotonic() + 5.0
         for ns, ifname in pending:
@@ -1400,6 +1604,8 @@ class NativeFreeBSDBackend(NativeBackend):
         # Jail names: play safe with the allowed character set.
         base = prefix.replace("-", "_")
         self.jails = {"dut": f"{base}_dut", "source": f"{base}_src", "target": f"{base}_dst"}
+        # The host-side end of a live decoy epair (see add_decoy_interface), for teardown.
+        self._decoy_host_end: str | None = None
 
     @staticmethod
     def require_available() -> None:
@@ -1437,32 +1643,70 @@ class NativeFreeBSDBackend(NativeBackend):
         self._make_jail(dut, *(a_end for a_end, _ in ends.values()))
         for segment in SEGMENTS:
             a_end, b_end = ends[segment]
-            dut_ifname = self.REFLECTOR_IFNAMES[segment]
             self._make_jail(self.jails[segment], b_end)
-            jexec_dut = ["jexec", dut]
-            jexec_far = ["jexec", self.jails[segment]]
-            run_command([*jexec_dut, "ifconfig", a_end, "name", dut_ifname])
-            run_command([*jexec_far, "ifconfig", b_end, "name", RECEIVER_IFNAME])
-            v4, v6 = NATIVE_V4_SUBNET[segment], NATIVE_V6_PREFIX[segment]
-            run_command([*jexec_dut, "ifconfig", dut_ifname, "inet", f"{v4}.{NATIVE_REFLECTOR_HOST}/24"])
-            run_command([*jexec_dut, "ifconfig", dut_ifname, "inet6", f"{v6}::{NATIVE_REFLECTOR_HOST}/64"])
-            run_command([*jexec_dut, "ifconfig", dut_ifname, "up"])
-            run_command([*jexec_far, "ifconfig", RECEIVER_IFNAME, "inet", f"{v4}.{NATIVE_HELPER_HOST}/24"])
-            run_command([*jexec_far, "ifconfig", RECEIVER_IFNAME, "inet6", f"{v6}::{NATIVE_HELPER_HOST}/64"])
-            run_command([*jexec_far, "ifconfig", RECEIVER_IFNAME, "up"])
-            # The probe's 255.255.255.255 sends are routed, not interface-pinned; single-homed
-            # plus this default route pins them to the segment.
-            run_command([*jexec_far, "route", "add", "default", "-interface", RECEIVER_IFNAME])
+            self._configure_segment(segment, a_end, b_end)
+
+    def _configure_segment(self, segment: str, a_end: str, b_end: str) -> None:
+        # The epair ends already sit inside the dut/far jails; rename, address, and route them.
+        dut_ifname = REFLECTOR_IFNAMES[segment]
+        jexec_dut = ["jexec", self.jails["dut"]]
+        jexec_far = ["jexec", self.jails[segment]]
+        run_command([*jexec_dut, "ifconfig", a_end, "name", dut_ifname])
+        run_command([*jexec_far, "ifconfig", b_end, "name", RECEIVER_IFNAME])
+        v4, v6 = SEGMENT_V4_SUBNET[segment], SEGMENT_V6_PREFIX[segment]
+        run_command([*jexec_dut, "ifconfig", dut_ifname, "inet", f"{v4}.{NATIVE_REFLECTOR_HOST}/24"])
+        run_command([*jexec_dut, "ifconfig", dut_ifname, "inet6", f"{v6}::{NATIVE_REFLECTOR_HOST}/64"])
+        run_command([*jexec_dut, "ifconfig", dut_ifname, "up"])
+        run_command([*jexec_far, "ifconfig", RECEIVER_IFNAME, "inet", f"{v4}.{NATIVE_HELPER_HOST}/24"])
+        run_command([*jexec_far, "ifconfig", RECEIVER_IFNAME, "inet6", f"{v6}::{NATIVE_HELPER_HOST}/64"])
+        run_command([*jexec_far, "ifconfig", RECEIVER_IFNAME, "up"])
+        # The probe's 255.255.255.255 sends are routed, not interface-pinned; single-homed
+        # plus this default route pins them to the segment.
+        run_command([*jexec_far, "route", "add", "default", "-interface", RECEIVER_IFNAME])
+
+    def delete_interface(self, segment: str) -> None:
+        # Destroying the dut end tears down the pair, the far probe0 included.
+        run_command(["jexec", self.jails["dut"], "ifconfig", REFLECTOR_IFNAMES[segment], "destroy"])
+
+    def recreate_interface(self, segment: str) -> None:
+        # A fresh epair, moved into the LIVE jails -- setup assigns interfaces at jail
+        # creation (vnet.interface=...); this is the move-into-a-running-vnet path -- then
+        # configured exactly as setup did.
+        a_end = run_command(["ifconfig", "epair", "create"]).stdout.strip()
+        if not a_end.endswith("a"):
+            raise RuntimeError(f"unexpected epair name: {a_end}")
+        b_end = f"{a_end[:-1]}b"
+        run_command(["ifconfig", a_end, "vnet", self.jails["dut"]])
+        run_command(["ifconfig", b_end, "vnet", self.jails[segment]])
+        self._configure_segment(segment, a_end, b_end)
+
+    def add_decoy_interface(self) -> None:
+        # The move into the dut vnet is what occupies the freed index there: FreeBSD's
+        # per-vnet allocator hands the mover the lowest free slot, exactly where the deleted
+        # interface sat. The b end stays on the host (destroyed with the pair later).
+        a_end = run_command(["ifconfig", "epair", "create"]).stdout.strip()
+        if not a_end.endswith("a"):
+            raise RuntimeError(f"unexpected epair name: {a_end}")
+        run_command(["ifconfig", a_end, "vnet", self.jails["dut"]])
+        run_command(["jexec", self.jails["dut"], "ifconfig", a_end, "name", DECOY_IFNAME])
+        self._decoy_host_end = f"{a_end[:-1]}b"
+
+    def remove_decoy_interface(self) -> None:
+        # Destroying the dut-side end tears down the pair, the host b end included.
+        run_command(["jexec", self.jails["dut"], "ifconfig", DECOY_IFNAME, "destroy"])
+        self._decoy_host_end = None
 
     def _teardown_fabric(self) -> None:
         # Destroy the a ends (from inside the dut jail) first: killing one end tears down the
         # whole pair, including the b end inside its probe jail -- so no jail removal can return
         # a probe0 to a stack where the other jail's probe0 already sits. The host-side destroy
         # covers a setup that failed before the interfaces moved into the dut jail.
-        for ifname in self.REFLECTOR_IFNAMES.values():
+        for ifname in REFLECTOR_IFNAMES.values():
             run_command(["jexec", self.jails["dut"], "ifconfig", ifname, "destroy"],
                         check=False, echo=False)
             run_command(["ifconfig", ifname, "destroy"], check=False, echo=False)
+        if self._decoy_host_end is not None:  # a case failed mid-decoy; free the pair
+            run_command(["ifconfig", self._decoy_host_end, "destroy"], check=False, echo=False)
         for jail in self.jails.values():
             run_command(["jail", "-r", jail], check=False, echo=False)
 
@@ -1789,8 +2033,84 @@ class RoundTripRunner(CaseRunner):
             self.print_reflector_logs()
 
 
+class SearchRecreateRunner(RoundTripRunner):
+    # See SearchRecreateCase. Reuses RoundTripRunner's segment/reflector/responder setup (the shim
+    # __init__ reads only the fields both cases share), but drives two searches from one source port
+    # with a target recreation between them, so the reflector must re-mint the persisted session onto
+    # the fresh interface rather than reuse a reservation bound to the dead ifindex. The one-shot
+    # responder is restarted after the recreation -- on the native fabrics its wire died with the
+    # interface (docker keeps it, but the responder had already answered and exited) -- mirroring the
+    # DIAL recreate case's device restart.
+
+    def _search(self, role: str) -> None:
+        # One M-SEARCH from the fixed source port, asserting the 200 OK proxies back. The shared port is
+        # what makes the second send a retransmit of the first's session, not a brand-new one.
+        ifname = self.backend.helper_ifname(REFLECTOR_SOURCE_IFNAME)
+        self.backend.start_probe(role, "source", ifname, [
+            "search",
+            "--source-port", str(SEARCHER_SOURCE_PORT), "--port", str(self.rt.port),
+            "--address", self.rt.group, "--interface", ifname, "--family", str(self.rt.family),
+            "--payload-hex", self.rt.probe_hex, "--timeout", str(self.rt.timeout_seconds),
+            "--expect-payload-hex", self.rt.reply_hex,
+        ])
+        exit_code = self.backend.wait(role)
+        out, err = self.backend.logs(role)
+        if out:
+            print(out, end="", flush=True)
+        if err:
+            print(err, end="", file=sys.stderr, flush=True)
+        if exit_code != 0:
+            raise RuntimeError(f"{role} failed with exit code {exit_code}")
+
+    def _recreate_target(self) -> None:
+        # Occupy the freed index with a decoy before recreating, so the target comes back on a
+        # different ifindex. Without it FreeBSD reuses the lowest free index, so the reply binding
+        # never moves and the session is (correctly) reused rather than re-minted -- the very thing
+        # this case asserts. Inert on Linux/docker (monotonic indexes), kept for a uniform flow.
+        ifname = REFLECTOR_IFNAMES["target"]
+        self.backend.delete_interface("target")
+        self.wait_for_log("reflector", f"interface {ifname} is gone", "target deletion")
+        self.backend.add_decoy_interface()
+        self.backend.recreate_interface("target")
+        self.wait_for_log("reflector", f"interface {ifname}: returned as ifindex", "target recreation")
+        self.backend.remove_decoy_interface()
+
+    def run(self) -> None:
+        print(f"\n=== {self.rt.name} ===", flush=True)
+        self.backend.setup_segments()
+        self.start_reflector()
+
+        # First search: opens the session, its reservation scoped to the target's current ifindex.
+        self.start_responder()
+        self._search("searcher-baseline")
+        print(f"{self.rt.name}: baseline round trip before the recreation", flush=True)
+
+        # Destroy + recreate the target (same v4 address, fresh ifindex). The session persists -- the
+        # reconcile never touches sessions -- with a reservation now bound to the vanished zone.
+        self._recreate_target()
+
+        # A fresh responder for the retransmit: the baseline's exited after its one reply, and on the
+        # native fabrics its wire died with the target regardless.
+        self.backend.remove("responder")
+        self.start_responder()
+
+        # Retransmit from the same source port while the session is still alive: the reflector must see
+        # the reply binding moved and re-mint, and the round trip must still complete against the new
+        # interface. A session that had (wrongly) been reused would keep the stale reservation.
+        self._search("searcher-retransmit")
+        print(f"{self.rt.name}: round trip after the recreation", flush=True)
+        self.wait_for_log("reflector", self.rt.remint_log, "session re-mint")
+        print(f"{self.rt.name}: session re-minted across the recreation", flush=True)
+        print(f"PASS {self.rt.name}", flush=True)
+        if self.args.show_reflector_logs:
+            time.sleep(0.5)
+            self.print_reflector_logs()
+
+
 class DialRunner(CaseRunner):
-    def __init__(self, args: argparse.Namespace, case: DialCase) -> None:
+    def __init__(
+        self, args: argparse.Namespace, case: DialCase | DialAddressChangeCase | DialRecreateCase
+    ) -> None:
         shim = TestCase(name=case.name, send_port=SSDP_PORT, receive_port=SSDP_PORT,
             expect_mac=None, timeout_seconds=case.timeout_seconds, family=case.family,
             group=case.group, direction="forward")
@@ -1992,6 +2312,51 @@ class DialAddressChangeRunner(DialRunner):
             self.print_reflector_logs()
 
 
+class DialRecreateRunner(DialAddressChangeRunner):
+    # See DialRecreateCase. Inherits the pass machinery; only the mutation differs: instead of
+    # replacing addresses, each phase destroys and recreates a whole reflector interface,
+    # synchronized on the daemon's own parking/recreation log lines.
+
+    def _recreate(self, interface: str) -> None:
+        ifname = REFLECTOR_IFNAMES[interface]
+        self.backend.delete_interface(interface)
+        self.wait_for_log("reflector", f"interface {ifname} is gone", f"{interface} deletion")
+        self.backend.recreate_interface(interface)
+        self.wait_for_log(
+            "reflector", f"interface {ifname}: returned as ifindex", f"{interface} recreation"
+        )
+
+    def run(self) -> None:
+        print(f"\n=== {self.dial.name} ===", flush=True)
+        self.backend.setup_segments()
+        self.start_reflector()
+        self.start_device()  # passive: advertises NOTIFY + serves HTTP
+        device_ip = self.backend.probe_ip("device", "target")
+        source_ip = self.backend.reflector_ip("source")
+
+        self._dial_pass("baseline", source_ip, device_ip)
+
+        # Target first: the baseline's proxy egress-pins its device connects to the target
+        # interface, so the recreation must evict it and the fresh pass re-mint. The device is
+        # restarted: on the native fabrics its wire died with the interface (Docker keeps its
+        # endpoint; a fresh device is harmless and keeps the flow identical across backends).
+        self._recreate("target")
+        self.backend.remove("device")
+        self.start_device()
+        device_ip = self.backend.probe_ip("device", "target")
+        self._dial_pass("after target recreation", source_ip, device_ip)
+
+        # Then the source: the proxy's listeners live on it; eviction + re-mint again.
+        self._recreate("source")
+        source_ip = self.backend.reflector_ip("source")  # re-pinned to the same address
+        self._dial_pass("after source recreation", source_ip, device_ip)
+
+        print(f"PASS {self.dial.name}", flush=True)
+        if self.args.show_reflector_logs:
+            time.sleep(0.5)
+            self.print_reflector_logs()
+
+
 class AddressChangeRunner(CaseRunner):
     # Proves the dynamic family bring-up/teardown end to end: with a dual-family reflector
     # running, knock out one (interface, family) source address at a time and verify -- with real
@@ -2134,14 +2499,120 @@ class AddressChangeRunner(CaseRunner):
             self.print_reflector_logs()
 
 
+class RecreateRunner(AddressChangeRunner):
+    # Proves interface hot-swap recovery end to end: destroy and recreate one reflector-side
+    # interface (same name and addresses, fresh kernel identity -- a PPPoE reconnect or bridge
+    # rebuild in miniature) and verify with real traffic that reflection through it resumes
+    # once the reconcile re-binds the capture. Inherits the probe/poll machinery; only the
+    # mutation (delete/recreate instead of address toggles), the always-forward probe
+    # direction, and the log assertion differ.
+
+    def _phase_case(self, phase: Phase, *, expect: bool, timeout: float) -> TestCase:
+        # Always probe forward, with the query payload: the recreated interface is the forward
+        # ingress (source phase) or the forward egress (target phase); the base runner's
+        # egress-derived direction flip does not apply.
+        spec = PROBE_SPECS[phase.protocol]
+        return TestCase(
+            name=self.ac.name,
+            send_port=spec["port"],
+            receive_port=spec["port"],
+            expect_mac=None,
+            timeout_seconds=timeout,
+            send_payload_hex=spec["payload"],
+            family=phase.family,
+            direction="forward",
+            group=spec["group_v6"] if phase.family == 6 else spec["group_v4"],
+            expect_payload_hex=(spec["payload"] if expect else None),
+        )
+
+    def _run_phase(self, phase: Phase) -> None:
+        desc = f"{self.ac.name} / {phase.label}"
+        print(f"--- phase: {desc} ({phase.protocol} IPv{phase.family}) ---", flush=True)
+
+        if not self._poll_reflected(phase):
+            raise RuntimeError(f"{desc}: no baseline reflection before the recreation")
+        print(f"{desc}: baseline reflected", flush=True)
+
+        self.backend.delete_interface(phase.interface)
+        if phase.decoy:
+            # Occupy the freed index before the recreation claims it (see Phase.decoy).
+            self.backend.add_decoy_interface()
+        if self.backend.PROBES_SURVIVE_DELETE:
+            if not self._poll_not_reflected(phase):
+                raise RuntimeError(
+                    f"{desc}: reflection continued after the {phase.interface} interface was "
+                    f"deleted"
+                )
+            print(f"{desc}: reflection stopped after interface deletion", flush=True)
+        else:
+            # The segment's wire died with the interface, so there is nothing to probe on;
+            # the "is gone" log assertion stands in as the observed-death proof. The pause
+            # lets the reflector see the departure and park before the name returns --
+            # otherwise it would (correctly) log only the recreation.
+            print(f"{desc}: segment wire gone; skipping the silence probe", flush=True)
+            time.sleep(2.0)
+
+        self.backend.recreate_interface(phase.interface)
+        if phase.decoy:
+            self.backend.remove_decoy_interface()
+        if not self._poll_reflected(phase):
+            raise RuntimeError(
+                f"{desc}: reflection did not resume after the {phase.interface} interface was "
+                f"recreated"
+            )
+        print(f"{desc}: reflection resumed after interface recreation", flush=True)
+
+    def _assert_recreations_logged(self) -> None:
+        # The reflector must have observed each phase as a real hot-swap, in its parts: the
+        # parking line when the interface vanished, the address losses parking implies (the
+        # egress gate closing), the recreation line when its capture re-bound, and the address
+        # gains of the re-resolve. Their absence would mean reflection "recovered" some other
+        # way than the reconcile.
+        out, err = self.backend.logs("reflector")
+        text = f"{out}\n{err}"
+        for phase in self.ac.phases:
+            ifname = REFLECTOR_IFNAMES[phase.interface]
+            needles = (
+                f"interface {ifname} is gone",
+                f"interface {ifname}: returned as ifindex",
+                f"interface {ifname}: lost IPv4",
+                f"interface {ifname}: gained IPv4",
+            )
+            for needle in needles:
+                if needle not in text:
+                    raise RuntimeError(
+                        f"{self.ac.name}: reflector never logged \"{needle}\" -- the reconcile "
+                        f"did not drive the recovery"
+                    )
+
+    def run(self) -> None:
+        print(f"\n=== {self.ac.name} ===", flush=True)
+        self.backend.setup_segments()
+        self.start_reflector()
+        for phase in self.ac.phases:
+            self._run_phase(phase)
+        self._assert_recreations_logged()
+        print(f"PASS {self.ac.name}", flush=True)
+        if self.args.show_reflector_logs:
+            time.sleep(0.5)
+            self.print_reflector_logs()
+
+
 def make_runner(args: argparse.Namespace,
-        case: TestCase | RoundTripCase | DialCase | DialAddressChangeCase | AddressChangeCase) -> CaseRunner:
+        case: TestCase | RoundTripCase | SearchRecreateCase | DialCase | DialAddressChangeCase
+        | AddressChangeCase | RecreateCase | DialRecreateCase) -> CaseRunner:
+    if isinstance(case, SearchRecreateCase):
+        return SearchRecreateRunner(args, case)
     if isinstance(case, RoundTripCase):
         return RoundTripRunner(args, case)
+    if isinstance(case, DialRecreateCase):
+        return DialRecreateRunner(args, case)
     if isinstance(case, DialAddressChangeCase):
         return DialAddressChangeRunner(args, case)
     if isinstance(case, DialCase):
         return DialRunner(args, case)
+    if isinstance(case, RecreateCase):
+        return RecreateRunner(args, case)
     if isinstance(case, AddressChangeCase):
         return AddressChangeRunner(args, case)
     return CaseRunner(args, case)
@@ -2152,7 +2623,9 @@ def build_reflector_image(image: str, target: str | None = None) -> None:
     docker(["build", *target_args, "-t", image, "."], capture=False)
 
 
-def select_cases(case_names: list[str]) -> list[TestCase | RoundTripCase | DialCase | DialAddressChangeCase | AddressChangeCase]:
+def select_cases(case_names: list[str]) -> list[
+        TestCase | RoundTripCase | SearchRecreateCase | DialCase | DialAddressChangeCase
+        | AddressChangeCase | RecreateCase | DialRecreateCase]:
     if not case_names:
         return ALL_CASES
 
