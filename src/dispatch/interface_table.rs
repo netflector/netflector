@@ -196,6 +196,13 @@ impl InterfaceTable {
         self.captures[capture.0 as usize].counters.record(outcome);
     }
 
+    /// Tally a completed recovery on a capture's row (see [`CaptureCounters::record_recovery`]).
+    /// Indexed directly, like [`record`](Self::record): the keys come from
+    /// [`captures_of`](Self::captures_of) in the reconcile, so the row always exists.
+    pub(super) fn record_recovery(&mut self, capture: CaptureKey) {
+        self.captures[capture.0 as usize].counters.record_recovery();
+    }
+
     /// Each capture's `(interface name, counter row)` for the periodic report. The table owns the
     /// capture→interface-name mapping and stays log-free (the dispatcher does the logging).
     pub(super) fn counter_rows(&self) -> impl Iterator<Item = (&str, &CaptureCounters)> {
@@ -469,6 +476,11 @@ mod tests {
             ty: MessageType,
         ) -> (u64, u64, u64, u64) {
             self.captures[capture.0 as usize].counters.typed(ty)
+        }
+
+        /// The recovery tally recorded on `capture`'s row, for the dispatcher's reconcile test.
+        pub(in crate::dispatch) fn recoveries_of(&self, capture: CaptureKey) -> u64 {
+            self.captures[capture.0 as usize].counters.recoveries()
         }
     }
 

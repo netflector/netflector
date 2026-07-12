@@ -172,12 +172,14 @@ impl TypeCounters {
     }
 }
 
-/// Every tally for one interface (capture): one [`TypeCounters`] per [`MessageType`], plus a
-/// type-less `filtered` count for junk.
+/// Every tally for one interface (capture): one [`TypeCounters`] per [`MessageType`], a type-less
+/// `filtered` count for junk, and a `recoveries` count of completed interface rebuilds (a recreated
+/// or returned interface whose captures re-bound).
 #[derive(Clone, Default)]
 pub(crate) struct CaptureCounters {
     types: [TypeCounters; MESSAGE_TYPE_COUNT],
     filtered: u64,
+    recoveries: u64,
 }
 
 impl CaptureCounters {
@@ -192,19 +194,31 @@ impl CaptureCounters {
         }
     }
 
-    /// This row's non-zero tallies as one line, e.g. `mDNS query reflected=42 skipped=10; SSDP
-    /// search reflected=5 dropped=1; filtered=2`. `None` when nothing has been counted, so an
-    /// idle interface produces no report line.
+    /// Tally one completed recovery of the interface behind this row: its kernel identity was
+    /// recreated (or it returned from absent) and its captures re-bound. A lifecycle event, not a
+    /// per-packet outcome, so it leads the report line.
+    pub(crate) fn record_recovery(&mut self) {
+        self.recoveries += 1;
+    }
+
+    /// This row's non-zero tallies as one line, e.g. `recoveries=1; mDNS query reflected=42
+    /// skipped=10; SSDP search reflected=5 dropped=1; filtered=2`. `None` when nothing has been
+    /// counted, so an idle interface produces no report line.
     fn format_nonzero(&self) -> Option<String> {
-        let mut parts: Vec<String> = MessageType::ALL
-            .iter()
-            .zip(&self.types)
-            .filter_map(|(ty, counts)| {
-                counts
-                    .format_nonzero()
-                    .map(|fields| format!("{ty} {fields}"))
-            })
-            .collect();
+        let mut parts: Vec<String> = Vec::new();
+        if self.recoveries > 0 {
+            parts.push(format!("recoveries={}", self.recoveries));
+        }
+        parts.extend(
+            MessageType::ALL
+                .iter()
+                .zip(&self.types)
+                .filter_map(|(ty, counts)| {
+                    counts
+                        .format_nonzero()
+                        .map(|fields| format!("{ty} {fields}"))
+                }),
+        );
         if self.filtered > 0 {
             parts.push(format!("filtered={}", self.filtered));
         }
@@ -236,6 +250,11 @@ mod tests {
         }
         fn filtered(&self) -> u64 {
             self.filtered
+        }
+        /// This row's recovery tally. Read from the dispatcher's reconcile test through the
+        /// interface table, hence `pub(crate)`.
+        pub(crate) fn recoveries(&self) -> u64 {
+            self.recoveries
         }
     }
 
@@ -283,6 +302,22 @@ mod tests {
         assert_eq!(c.typed(MessageType::SsdpSearch), (0, 0, 1, 1));
         assert_eq!(c.typed(MessageType::WakeOnLan), (0, 0, 0, 0));
         assert_eq!(c.filtered(), 1);
+    }
+
+    #[test]
+    fn record_recovery_counts_and_leads_the_summary() {
+        let mut c = CaptureCounters::default();
+        assert_eq!(c.recoveries(), 0);
+        c.record_recovery();
+        c.record_recovery();
+        assert_eq!(c.recoveries(), 2);
+        // A recovered but otherwise-idle interface still reports, recoveries leading.
+        assert_eq!(c.format_nonzero().as_deref(), Some("recoveries=2"));
+        c.record(Outcome::Reflected(MessageType::MdnsQuery));
+        assert_eq!(
+            c.format_nonzero().as_deref(),
+            Some("recoveries=2; mDNS query reflected=1"),
+        );
     }
 
     #[test]
