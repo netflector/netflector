@@ -396,26 +396,25 @@ impl PacketHandler for SearchReflector {
         });
     }
 
-    /// A capture this reflector uses was rebound to a recreated interface, or its address moved. Every
-    /// session's reserved port and response registration were bound to that interface's old identity,
-    /// so drop them all (their ports free with the reservations); the next search re-opens fresh
-    /// against the current one. Both captures share every session, so a change on either clears all.
+    /// The target interface was rebound (recreated) or its reply address moved, so every session's
+    /// reserved port and response registration -- both bound to the target -- are stale; drop them all
+    /// (their ports free with the reservations) and let the next search re-open fresh. A SOURCE change
+    /// is deliberately ignored: the reply leg holds only the source's `CaptureKey` (stable across a
+    /// rebind) and re-resolves the source address at send time, so a session outlives it untouched.
     fn on_iface_change(
         &mut self,
         captures: &[CaptureKey],
         dispatcher: &mut PacketDispatcher,
         _reactor: &mut Reactor,
     ) {
-        if self.sessions.is_empty()
-            || !(captures.contains(&self.source) || captures.contains(&self.target))
-        {
+        if self.sessions.is_empty() || !captures.contains(&self.target) {
             return;
         }
         for session in self.sessions.drain(..) {
             dispatcher.unregister(session.response_key);
         }
         log::debug!(
-            "{}: cleared all sessions after an interface they use changed",
+            "{}: cleared all sessions after the target interface changed",
             self.name
         );
     }
@@ -681,10 +680,11 @@ mod tests {
         );
     }
 
-    // The source capture clears sessions too: its egress leg belongs to every session, so a change
-    // on either the source or the target invalidates them.
+    // A SOURCE capture change leaves sessions intact: the reservation and response registration live
+    // on the target, and the reply leg only holds the source's (stable) CaptureKey and re-resolves the
+    // source address at send time, so a source recreation does not orphan anything.
     #[test]
-    fn on_iface_change_on_the_source_capture_clears_sessions() {
+    fn on_iface_change_leaves_sessions_on_a_source_capture_change() {
         let mut dispatcher = PacketDispatcher::new();
         let mut reactor = Reactor::new().unwrap();
         let mut reflector = test_reflector();
@@ -695,13 +695,15 @@ mod tests {
             "239.255.255.250:1900",
             Instant::now() + Duration::from_secs(5),
         );
+        assert_eq!(dispatcher.registration_count(), 1);
         let source = reflector.source;
         reflector.on_iface_change(&[source], &mut dispatcher, &mut reactor);
-        assert!(
-            reflector.sessions.is_empty(),
-            "a change on the source capture clears the session"
+        assert_eq!(
+            reflector.sessions.len(),
+            1,
+            "a source capture change leaves the session (its reply leg re-resolves)"
         );
-        assert_eq!(dispatcher.registration_count(), 0);
+        assert_eq!(dispatcher.registration_count(), 1);
     }
 
     #[test]
