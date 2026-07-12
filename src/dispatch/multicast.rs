@@ -7,6 +7,7 @@
 
 use std::io;
 use std::net::IpAddr;
+use std::num::NonZeroU32;
 use std::os::fd::{AsRawFd, OwnedFd};
 
 use libc::c_void;
@@ -34,17 +35,26 @@ impl MulticastJoiner {
         }
     }
 
+    /// Record `group` for a later [`rejoin`](Self::rejoin) without joining now: the
+    /// parked-interface path, where no live index exists to join on. Deduped, like
+    /// [`join`](Self::join)'s own recording.
+    pub(crate) fn record(&mut self, group: IpAddr) {
+        if !self.desired.contains(&group) {
+            self.desired.push(group);
+        }
+    }
+
     /// Join `group` on the interface `ifindex` and record it, so a later interface change
     /// re-attempts it. Idempotent: the kernel keys memberships by `(group, ifindex)`.
+    /// `NonZeroU32` for the same reason as [`rejoin`](Self::rejoin); a parked caller
+    /// [`record`](Self::record)s instead.
     ///
     /// # Errors
     /// The OS error if the socket can't open or the membership can't be added. `EADDRNOTAVAIL` (no
     /// address of that family yet) is deferrable: the group is recorded and [`rejoin`](Self::rejoin)
     /// retries it on the next address-up event.
-    pub(crate) fn join(&mut self, group: IpAddr, ifindex: u32) -> io::Result<()> {
-        if !self.desired.contains(&group) {
-            self.desired.push(group);
-        }
+    pub(crate) fn join(&mut self, group: IpAddr, ifindex: NonZeroU32) -> io::Result<()> {
+        self.record(group);
         self.apply(group, ifindex)
     }
 
@@ -59,19 +69,26 @@ impl MulticastJoiner {
         self.v6 = None;
     }
 
-    /// Re-attempt every recorded membership after the interface re-resolves. A group not joinable
-    /// before its address existed succeeds now; an already-held one is a no-op. Best-effort: a
-    /// still-unavailable family logs and waits for the next change.
-    pub(crate) fn rejoin(&mut self, ifindex: u32) {
+    /// Re-attempt every recorded membership after the interface re-resolves, returning how many
+    /// were deferred. A group not joinable before its address existed succeeds now; an
+    /// already-held one is a no-op. Best-effort: a still-unavailable family logs at debug and
+    /// waits for the next change (routine on the address-up path; the recreation rebuild warns
+    /// on a nonzero count instead). `NonZeroU32` makes the parked case unrepresentable:
+    /// `MCAST_JOIN_GROUP` on index 0 would let the kernel pick an arbitrary interface by route
+    /// lookup and advertise our groups there, so callers skip explicitly while parked.
+    pub(crate) fn rejoin(&mut self, ifindex: NonZeroU32) -> usize {
+        let mut deferred = 0;
         for i in 0..self.desired.len() {
             let group = self.desired[i];
             if let Err(e) = self.apply(group, ifindex) {
                 log::debug!("re-join of {group} on ifindex {ifindex} deferred: {e}");
+                deferred += 1;
             }
         }
+        deferred
     }
 
-    fn apply(&mut self, group: IpAddr, ifindex: u32) -> io::Result<()> {
+    fn apply(&mut self, group: IpAddr, ifindex: NonZeroU32) -> io::Result<()> {
         let (slot, family, level) = match group {
             IpAddr::V4(_) => (&mut self.v4, libc::AF_INET, libc::IPPROTO_IP),
             IpAddr::V6(_) => (&mut self.v6, libc::AF_INET6, libc::IPPROTO_IPV6),
@@ -86,7 +103,7 @@ impl MulticastJoiner {
         // uninitialised, and `setsockopt` reads the whole struct (Valgrind flags them).
         // SAFETY: `group_req` is plain data; all-zero is valid.
         let mut req: GroupReq = unsafe { std::mem::zeroed() };
-        req.gr_interface = ifindex;
+        req.gr_interface = ifindex.get();
         // Interface is selected by `gr_interface`, so the group sockaddr carries no scope id.
         req.gr_group = sockaddr_for(group, 0, 0).0;
         // SAFETY: `req` is a fully-initialised `group_req` (padding zeroed), passed by address + size.
@@ -133,6 +150,14 @@ mod tests {
 
     use super::*;
 
+    impl MulticastJoiner {
+        /// Whether no family socket is open (nothing joined since the last reset). Reachable
+        /// from the interface table's parked-interface tests, hence `pub(in crate::dispatch)`.
+        pub(in crate::dispatch) fn test_socketless(&self) -> bool {
+            self.v4.is_none() && self.v6.is_none()
+        }
+    }
+
     #[test]
     fn already_member_only_for_the_duplicate_join_errno() {
         let of = io::Error::from_raw_os_error;
@@ -142,13 +167,12 @@ mod tests {
         assert!(!already_member(&of(libc::EADDRNOTAVAIL))); // interface transiently down
     }
 
-    fn loopback_ifindex() -> u32 {
+    fn loopback_ifindex() -> NonZeroU32 {
         let name =
             std::ffi::CString::new(crate::interface::LOOPBACK_IFACE).expect("iface has no NUL");
         // SAFETY: `name` is a valid C string.
         let idx = unsafe { libc::if_nametoindex(name.as_ptr()) };
-        assert_ne!(idx, 0, "loopback must resolve to an index");
-        idx
+        NonZeroU32::new(idx).expect("loopback must resolve to an index")
     }
 
     // reset drops the per-family sockets while keeping the desired list, so the next rejoin
@@ -173,6 +197,22 @@ mod tests {
         assert!(
             joiner.v4.is_some(),
             "rejoin re-opens a fresh socket and re-joins"
+        );
+    }
+
+    // The parked-interface path: record keeps the group for the rebuild's replay without
+    // touching the kernel (no index exists to join on; MCAST_JOIN_GROUP on index 0 would let
+    // the kernel pick an arbitrary interface, which the NonZeroU32 signatures now forbid).
+    #[test]
+    fn record_keeps_the_group_for_the_replay_without_joining() {
+        let mut joiner = MulticastJoiner::new();
+        joiner.record(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)));
+        joiner.record(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251))); // deduped
+        assert!(joiner.v4.is_none(), "no socket opened, no join attempted");
+        assert_eq!(
+            joiner.desired.len(),
+            1,
+            "the group is recorded once for the replay"
         );
     }
 

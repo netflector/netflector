@@ -7,6 +7,7 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::num::NonZeroU32;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -731,11 +732,12 @@ fn pair_join_announces_membership_on_the_wire() -> io::Result<()> {
     // (and only those) through the production joiner, so its device accepts the arriving report
     // packets for the observers. Its own joins announce 224.0.0.22/ff02::16 -- never the test
     // groups -- so a test-group match below can only come from the inject side's announcements.
+    let receive_join_ix = NonZeroU32::new(receive_ifindex).expect("receive ifindex is nonzero");
     let mut receive_joiner = MulticastJoiner::new();
-    receive_joiner.join(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 22)), receive_ifindex)?;
+    receive_joiner.join(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 22)), receive_join_ix)?;
     receive_joiner.join(
         IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0x16)),
-        receive_ifindex,
+        receive_join_ix,
     )?;
     let igmp = raw_observer(libc::AF_INET, libc::IPPROTO_IGMP)?;
     let mld = raw_observer(libc::AF_INET6, libc::IPPROTO_ICMPV6)?;
@@ -754,7 +756,8 @@ fn pair_join_announces_membership_on_the_wire() -> io::Result<()> {
     }
 
     let mut joiner = MulticastJoiner::new();
-    let inject_ifindex = if_index(&pair.inject).expect("inject ifindex");
+    let inject_ifindex = NonZeroU32::new(if_index(&pair.inject).expect("inject ifindex"))
+        .expect("inject ifindex is nonzero");
     joiner.join(IpAddr::V4(group_v4), inject_ifindex)?;
     joiner.join(IpAddr::V6(group_v6), inject_ifindex)?;
 
@@ -779,7 +782,8 @@ fn pair_joins_multicast_groups_idempotently() -> io::Result<()> {
         return Ok(());
     };
     let mut joiner = MulticastJoiner::new();
-    let inject_ifindex = if_index(&pair.inject).expect("inject ifindex");
+    let inject_ifindex = NonZeroU32::new(if_index(&pair.inject).expect("inject ifindex"))
+        .expect("inject ifindex is nonzero");
     let mdns_v4: IpAddr = "224.0.0.251".parse().expect("mDNS v4 group");
     let mdns_v6: IpAddr = "ff02::fb".parse().expect("mDNS v6 group");
     joiner.join(mdns_v4, inject_ifindex)?;

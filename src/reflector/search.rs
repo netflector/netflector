@@ -39,6 +39,15 @@ struct Session {
     /// The multicast group searched; part of the dedup key, since its scope picks the reserved reply
     /// address — a different group is a new session, not a retransmit.
     dest: SocketAddr,
+    /// The target address the reservation was minted against. A retransmit re-checks it: if the
+    /// target's pick moved (an interface recreation or address change), the reservation is bound
+    /// to a vanished address and the session must re-mint, not be reused.
+    our_addr: IpAddr,
+    /// The target ifindex the reservation's scope was bound with. A link-local `our_addr` can
+    /// survive a recreate unchanged while its zone (this index) moves, so the retransmit re-check
+    /// compares it too -- a zoneless address match alone would reuse a reservation bound to the
+    /// dead zone.
+    our_ifindex: u32,
     expiry: Instant,
     reservation: PortReservation,
     response_key: RegistrationKey,
@@ -200,20 +209,7 @@ impl SearchReflector {
             );
             return Err(Outcome::Dropped(message_type));
         };
-        // The replies come to the address the reflected search is sourced from, at the reserved port,
-        // so this must be the same scope-matched pick `build_udp` makes for `packet.dest`, or the
-        // device replies to a source the response capture below isn't watching.
-        let our_addr = match packet.dest.ip() {
-            IpAddr::V4(_) => dispatcher
-                .egress_addrs(self.target)
-                .and_then(InterfaceAddresses::v4)
-                .map(IpAddr::V4),
-            IpAddr::V6(dst6) => dispatcher
-                .egress_addrs(self.target)
-                .and_then(|a| a.v6(Ipv6Scope::of(dst6)))
-                .map(IpAddr::V6),
-        };
-        let Some(our_addr) = our_addr else {
+        let Some(our_addr) = reply_source(dispatcher, self.target, packet.dest.ip()) else {
             log::warn!(
                 "{}: cannot reflect search from {}: target has no source address for {} yet",
                 self.name,
@@ -258,6 +254,8 @@ impl SearchReflector {
         Ok(Session {
             searcher: packet.source,
             dest: packet.dest,
+            our_addr,
+            our_ifindex: target_ifindex,
             expiry,
             reservation,
             response_key,
@@ -265,19 +263,30 @@ impl SearchReflector {
     }
 }
 
-/// The live session a search belongs to: same searcher *and* same group. The group is part of the key
-/// because its scope picks the reserved reply address, so a search to a different group is a new session,
-/// not a retransmit. A free fn over `&mut [Session]`, not a `&mut self` method: a `&mut self` return
-/// would lock all of `self`, but the caller reads other fields (`target`, `ttl`) while holding the
-/// session.
-fn session_for(
-    sessions: &mut [Session],
-    source: SocketAddr,
-    dest: SocketAddr,
-) -> Option<&mut Session> {
+/// The target-side source address replies to `dest` come back to: the same scope-matched pick
+/// `build_udp` makes for the reflected search, so the reserved port and its response capture
+/// watch the address the device actually answers.
+fn reply_source(dispatcher: &PacketDispatcher, target: CaptureKey, dest: IpAddr) -> Option<IpAddr> {
+    match dest {
+        IpAddr::V4(_) => dispatcher
+            .egress_addrs(target)
+            .and_then(InterfaceAddresses::v4)
+            .map(IpAddr::V4),
+        IpAddr::V6(dst6) => dispatcher
+            .egress_addrs(target)
+            .and_then(|a| a.v6(Ipv6Scope::of(dst6)))
+            .map(IpAddr::V6),
+    }
+}
+
+/// The index of the live session a search belongs to: same searcher *and* same group. The group is
+/// part of the key because its scope picks the reserved reply address, so a search to a different
+/// group is a new session, not a retransmit. An index, not a `&mut Session`: the caller decides
+/// between reusing the session and evicting it, and a borrow would lock `self.sessions` for both.
+fn session_for(sessions: &[Session], source: SocketAddr, dest: SocketAddr) -> Option<usize> {
     sessions
-        .iter_mut()
-        .find(|s| s.searcher == source && s.dest == dest)
+        .iter()
+        .position(|s| s.searcher == source && s.dest == dest)
 }
 
 impl PacketHandler for SearchReflector {
@@ -303,38 +312,61 @@ impl PacketHandler for SearchReflector {
         };
         let expiry = Instant::now() + (self.window)(packet.payload);
 
-        // A retransmit from a known searcher to the same group reuses its session: refresh the window and
-        // re-reflect from the same reserved port. A new searcher, or the same searcher to a different
-        // group (a different reply scope), opens a fresh session.
-        if let Some(session) = session_for(&mut self.sessions, packet.source, packet.dest) {
-            let port = session.reservation.port();
-            return match dispatcher.send_udp_group(
-                self.target,
-                packet.dest,
-                port,
-                self.ttl,
-                packet.payload,
-            ) {
-                Ok(()) => {
-                    session.expiry = expiry;
-                    log::debug!(
-                        "re-reflected {} search from {} to {} on reserved port {port}",
-                        self.name,
-                        packet.source,
-                        packet.dest
-                    );
-                    Outcome::Reflected(message_type)
-                }
-                Err(e) => {
-                    log::warn!(
-                        "{}: cannot reflect search from {} to {}: {e}",
-                        self.name,
-                        packet.source,
-                        packet.dest
-                    );
-                    Outcome::Dropped(message_type)
-                }
-            };
+        // A retransmit from a known searcher to the same group reuses its session: refresh the window
+        // and re-reflect from the same reserved port. A new searcher, or the same searcher to a
+        // different group (a different reply scope), opens a fresh session. The reuse is conditional
+        // on the session's reply binding -- the address, and the target ifindex its (link-local)
+        // zone was bound with -- still matching the target's current pick: an interface recreation
+        // or address change orphans the reservation (bound to a vanished address or zone), and an
+        // unbroken retransmit stream would otherwise keep the dead session alive forever. A
+        // transiently address-less target (`None`) keeps the session -- the same address usually
+        // returns, and the re-reflect below fails harmlessly until it does.
+        if let Some(index) = session_for(&self.sessions, packet.source, packet.dest) {
+            let current = reply_source(dispatcher, self.target, packet.dest.ip());
+            let current_ifindex = dispatcher.capture_ifindex(self.target).unwrap_or(0);
+            let moved = matches!(current, Some(addr)
+                if addr != self.sessions[index].our_addr
+                    || current_ifindex != self.sessions[index].our_ifindex);
+            if moved {
+                let session = self.sessions.swap_remove(index);
+                dispatcher.unregister(session.response_key);
+                log::debug!(
+                    "{}: re-minting the session for {} (its reply binding moved)",
+                    self.name,
+                    packet.source
+                );
+                // Fall through to open a fresh session against the current address.
+            } else {
+                let session = &mut self.sessions[index];
+                let port = session.reservation.port();
+                return match dispatcher.send_udp_group(
+                    self.target,
+                    packet.dest,
+                    port,
+                    self.ttl,
+                    packet.payload,
+                ) {
+                    Ok(()) => {
+                        session.expiry = expiry;
+                        log::debug!(
+                            "re-reflected {} search from {} to {} on reserved port {port}",
+                            self.name,
+                            packet.source,
+                            packet.dest
+                        );
+                        Outcome::Reflected(message_type)
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "{}: cannot reflect search from {} to {}: {e}",
+                            self.name,
+                            packet.source,
+                            packet.dest
+                        );
+                        Outcome::Dropped(message_type)
+                    }
+                };
+            }
         }
 
         let session = match self.make_session(packet, dispatcher, expiry, message_type) {
@@ -397,6 +429,7 @@ impl PacketHandler for SearchReflector {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
     use std::net::Ipv4Addr;
 
     use super::*;
@@ -461,6 +494,8 @@ mod tests {
         reflector.sessions.push(Session {
             searcher,
             dest,
+            our_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            our_ifindex: 0,
             expiry,
             reservation,
             response_key,
@@ -602,8 +637,136 @@ mod tests {
         let searcher: SocketAddr = "[fe80::1]:50000".parse().unwrap();
         let link_local: SocketAddr = "[ff02::c]:1900".parse().unwrap();
         let site_local: SocketAddr = "[ff05::c]:1900".parse().unwrap();
-        assert!(session_for(&mut reflector.sessions, searcher, link_local).is_some());
-        assert!(session_for(&mut reflector.sessions, searcher, site_local).is_none());
+        assert!(session_for(&reflector.sessions, searcher, link_local).is_some());
+        assert!(session_for(&reflector.sessions, searcher, site_local).is_none());
+    }
+
+    // A retransmit only reuses a session whose mint-time reply address is still the target's
+    // current pick: an interface recreation or address change orphans the reservation (bound to
+    // the vanished address), so the session is torn down and a fresh one minted. A real loopback
+    // target lets the fresh mint succeed.
+    #[test]
+    fn a_retransmit_re_mints_a_session_whose_reply_address_moved() -> io::Result<()> {
+        let Some(target_cap) = open_loopback_or_skip() else {
+            return Ok(());
+        };
+        let mut dispatcher = PacketDispatcher::new();
+        let target = dispatcher
+            .add_capture(target_cap)
+            .expect("add the loopback capture");
+        let mut reactor = Reactor::new()?;
+        let mut reflector = SearchReflector::new(
+            CaptureKey::from_u64(999), // synthetic source: no reply comes back in this test
+            target,
+            None,
+            "TEST",
+            MessageType::SsdpResponse,
+            TEST_TTL,
+            always_reflect,
+            fixed_window,
+            Box::new(|| Box::new(NoRewrite) as Box<dyn ReplyRewrite>),
+        );
+        push_session(
+            &mut reflector,
+            &mut dispatcher,
+            "10.0.0.7:50000",
+            "239.255.255.250:1900",
+            Instant::now() + Duration::from_secs(5),
+        );
+        // The session was minted against an address the target no longer holds.
+        reflector.sessions[0].our_addr = IpAddr::V4(Ipv4Addr::new(10, 9, 9, 9));
+        assert_eq!(dispatcher.registration_count(), 1);
+
+        let packet = Packet {
+            source: "10.0.0.7:50000".parse().unwrap(),
+            dest: "239.255.255.250:1900".parse().unwrap(),
+            ttl: TEST_TTL,
+            dst_mac: None,
+            src_mac: Some(MacAddr::from([0x02, 0, 0, 0, 0, 1])),
+            payload: b"a search",
+        };
+        reflector.on_packet(&packet, &mut dispatcher, &mut reactor);
+
+        assert_eq!(
+            reflector.sessions.len(),
+            1,
+            "one fresh session replaces the orphaned one"
+        );
+        assert_eq!(
+            reflector.sessions[0].our_addr,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            "the fresh session is minted against the target's current address"
+        );
+        assert_eq!(
+            dispatcher.registration_count(),
+            1,
+            "the orphaned response capture was unregistered, the fresh one registered"
+        );
+        Ok(())
+    }
+
+    // A retransmit also re-mints when the target's reply address is unchanged but its ifindex
+    // moved: a recreate can keep a link-local address while its zone (the ifindex the reservation
+    // was bound with) changes, orphaning the reservation. Exercised with a stale ifindex on a
+    // loopback target whose address still matches the current pick, so only the zone clause fires.
+    #[test]
+    fn a_retransmit_re_mints_a_session_whose_target_ifindex_moved() -> io::Result<()> {
+        let Some(target_cap) = open_loopback_or_skip() else {
+            return Ok(());
+        };
+        let mut dispatcher = PacketDispatcher::new();
+        let target = dispatcher
+            .add_capture(target_cap)
+            .expect("add the loopback capture");
+        let mut reactor = Reactor::new()?;
+        let mut reflector = SearchReflector::new(
+            CaptureKey::from_u64(999), // synthetic source: no reply comes back in this test
+            target,
+            None,
+            "TEST",
+            MessageType::SsdpResponse,
+            TEST_TTL,
+            always_reflect,
+            fixed_window,
+            Box::new(|| Box::new(NoRewrite) as Box<dyn ReplyRewrite>),
+        );
+        push_session(
+            &mut reflector,
+            &mut dispatcher,
+            "10.0.0.7:50000",
+            "239.255.255.250:1900",
+            Instant::now() + Duration::from_secs(5),
+        );
+        // Address still matches the target's current pick, but the reservation was bound under a
+        // since-vanished ifindex, so the zone clause of the re-mint gate must fire.
+        reflector.sessions[0].our_ifindex = 9999;
+        assert_eq!(dispatcher.registration_count(), 1);
+
+        let packet = Packet {
+            source: "10.0.0.7:50000".parse().unwrap(),
+            dest: "239.255.255.250:1900".parse().unwrap(),
+            ttl: TEST_TTL,
+            dst_mac: None,
+            src_mac: Some(MacAddr::from([0x02, 0, 0, 0, 0, 1])),
+            payload: b"a search",
+        };
+        reflector.on_packet(&packet, &mut dispatcher, &mut reactor);
+
+        assert_eq!(
+            reflector.sessions.len(),
+            1,
+            "one fresh session replaces the stale-zone one"
+        );
+        assert_ne!(
+            reflector.sessions[0].our_ifindex, 9999,
+            "the fresh session is minted against the target's current ifindex"
+        );
+        assert_eq!(
+            dispatcher.registration_count(),
+            1,
+            "the orphaned response capture was unregistered, the fresh one registered"
+        );
+        Ok(())
     }
 
     #[test]

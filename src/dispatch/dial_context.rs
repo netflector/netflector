@@ -145,14 +145,16 @@ impl DialContext {
     }
 
     /// Evict every proxy whose source or target capture is on a changed interface (`on_changed`): an
-    /// address move there stranded the proxy's listeners or its device-connect egress, so it must re-mint
-    /// against the current addresses on the next advertisement rather than be reused.
+    /// address move or recreation there stranded the proxy's listeners or its device-connect egress,
+    /// so it must re-mint against the current interface on the next advertisement rather than be
+    /// reused. `reason` names the change in the eviction log (address moved vs recreated).
     pub(crate) fn evict_on_interface_change(
         &mut self,
         reactor: &mut Reactor,
         on_changed: impl Fn(CaptureKey) -> bool,
+        reason: &str,
     ) {
-        self.evict_where(reactor, "after its interface's address changed", |p| {
+        self.evict_where(reactor, reason, |p| {
             on_changed(p.source) || on_changed(p.target)
         });
     }
