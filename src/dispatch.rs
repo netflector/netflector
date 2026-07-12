@@ -887,6 +887,9 @@ impl PacketDispatcher {
             // returned on the same index, which the reconcile reached via the attached() probe).
             self.notify_iface_change(&captures, reactor);
             if stale.cur != 0 && !failed {
+                for capture in &captures {
+                    self.table.record_recovery(*capture);
+                }
                 log::info!("interface {name}: recovery complete");
             }
             pending |= failed;
@@ -1059,6 +1062,29 @@ mod tests {
         assert!(
             dispatcher.next_reconcile > Instant::now() + RECONCILE_RETRY,
             "recovery re-arms the slow tick"
+        );
+        Ok(())
+    }
+
+    // A completed recovery bumps the recoveries tally on each of the interface's capture rows.
+    // Unprivileged: the moved identity is faked through the test seam and the capture row is a
+    // capture-less test entry (rebind_capture reports it missing, which does not fail the recovery).
+    #[test]
+    fn reconcile_counts_a_recovery_on_the_interface_captures() -> io::Result<()> {
+        let mut reactor = Reactor::new()?;
+        let mut dispatcher = PacketDispatcher::new();
+        let key = dispatcher.table.find_or_add_interface(LOOPBACK_IFACE)?;
+        let capture = dispatcher.table.add_test_capture(); // links the first interface
+        assert_eq!(dispatcher.table.recoveries_of(capture), 0);
+        let real = crate::interface::if_index(LOOPBACK_IFACE).expect("loopback has an ifindex");
+        dispatcher.table.set_test_ifindex(key, real + 1000); // as a recreation would move it
+
+        dispatcher.reconcile_interfaces(&mut reactor);
+
+        assert_eq!(
+            dispatcher.table.recoveries_of(capture),
+            1,
+            "the completed recovery is counted on the interface's capture row"
         );
         Ok(())
     }
