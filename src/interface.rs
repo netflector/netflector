@@ -127,14 +127,14 @@ impl Ipv6Scope {
     }
 }
 
-/// One configured interface: its name (kept for re-resolution), kernel ifindex (the address
-/// monitor's lookup key), and current source addresses. Built by [`open`](Self::open); the
-/// monitor later refreshes `addrs` in place.
+/// One configured interface: its name (the durable identity, kept for re-resolution), kernel
+/// ifindex (the interface monitor's lookup key), and current source addresses. Built by
+/// [`open`](Self::open); the monitor later refreshes `addrs` in place.
 ///
-/// The `ifindex` is cached at open, not re-derived: if the OS destroys and recreates the interface
-/// (a fresh kernel ifindex, e.g. a `PPPoE` reconnect or a bridge/VLAN rebuild), the monitor no longer
-/// matches its notifications and the capture stays bound to the dead index, so reflection on it is
-/// dead until a restart.
+/// The `ifindex` is a cache of what the name resolves to -- the process's only persistent copy
+/// of an interface index. If the OS destroys and recreates the interface (a fresh kernel
+/// identity, e.g. a `PPPoE` reconnect or a bridge/VLAN rebuild), the dispatcher's reconcile
+/// re-points it (0 while the name resolves to nothing) and re-binds the captures.
 pub(crate) struct Interface {
     pub(crate) name: String,
     pub(crate) ifindex: u32,

@@ -58,7 +58,9 @@ impl InterfaceMonitor {
     /// per netns), so a newly-created interface always carries an index above every
     /// previously-seen one. The dispatcher gates unknown-index [`InterfaceEvent::Link`]
     /// events on that; the BSDs reuse indexes (FreeBSD hands out the lowest free, macOS
-    /// recycles the whole ifnet), so no such gate is sound there.
+    /// recycles the whole ifnet), so no such gate is sound there. Two Linux corners slip the
+    /// gate -- a device moved between netns keeps its (possibly low) index when free, and the
+    /// 31-bit wrap -- both backstopped by the reconcile tick.
     pub(crate) const INDEXES_MONOTONIC: bool = backend::INDEXES_MONOTONIC;
 
     /// Whether this backend delivers [`InterfaceEvent::Link`] lifecycle events at all. Where

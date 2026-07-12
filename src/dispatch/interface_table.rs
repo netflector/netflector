@@ -3,6 +3,7 @@
 
 use std::io;
 use std::net::IpAddr;
+use std::num::NonZeroU32;
 use std::os::fd::{AsRawFd, RawFd};
 
 use crate::capture::Capture;
@@ -79,7 +80,14 @@ impl InterfaceTable {
     pub(super) fn join_on(&mut self, interface: InterfaceKey, group: IpAddr) -> io::Result<()> {
         // Startup-only with a freshly-minted key, so the index is always in range.
         let entry = &mut self.entries[interface.0 as usize];
-        entry.joiner.join(group, entry.interface.ifindex)
+        if let Some(ifindex) = NonZeroU32::new(entry.interface.ifindex) {
+            entry.joiner.join(group, ifindex)
+        } else {
+            // Unreachable at startup (the capture opened, so the interface exists), but the
+            // defensively right behavior: record for the rebuild's replay, never join index 0.
+            entry.joiner.record(group);
+            Ok(())
+        }
     }
 
     /// The key of the interface named `name`, opening and resolving it if absent, so captures on
@@ -126,7 +134,8 @@ impl InterfaceTable {
             .map(|entry| &entry.interface.addrs)
     }
 
-    /// The kernel ifindex of the interface `capture` runs on. Its stable identity, cached at open.
+    /// The kernel ifindex of the interface `capture` runs on: cached at open, re-pointed by the
+    /// reconcile on recreation (0 while parked absent).
     pub(super) fn ifindex_of(&self, capture: CaptureKey) -> Option<u32> {
         self.interface_index(self.interface_of(capture)?)
     }
@@ -216,8 +225,11 @@ impl InterfaceTable {
         };
         let change = entry.interface.refresh()?;
         // Re-resolved addresses may have made a deferred join (a v4 group that had no address)
-        // viable; re-attempt this interface's memberships.
-        entry.joiner.rejoin(entry.interface.ifindex);
+        // viable; re-attempt this interface's memberships. Always present here: the entry was
+        // found by matching a real notification's index.
+        if let Some(ifindex) = NonZeroU32::new(entry.interface.ifindex) {
+            entry.joiner.rejoin(ifindex);
+        }
         Ok(Some(change))
     }
 
@@ -290,19 +302,32 @@ impl InterfaceTable {
     /// Captures are re-bound separately ([`rebind_capture`](Self::rebind_capture)), so the
     /// caller can log and retry them per capture. Log-free.
     ///
+    /// Returns how many group joins were deferred (see [`MulticastJoiner::rejoin`]); the
+    /// deferrals heal on the interface's next address event, but the caller should surface a
+    /// nonzero count -- after a recreation, deaf groups are a real outage.
+    ///
     /// # Errors
-    /// Propagates a resolution syscall failure; the identity and joiner state are already
-    /// updated, and the probe re-flags the entry if captures never re-bind.
-    pub(super) fn rebind_interface(&mut self, key: InterfaceKey, cur: u32) -> io::Result<()> {
+    /// Propagates a resolution syscall failure. The identity is then rolled back so the entry
+    /// stays visibly stale and the retry re-runs the whole rebuild -- committed, it would read
+    /// as healthy to the scan (the captures re-bind fine) while carrying the OLD interface's
+    /// addresses. The joins are replayed before the rollback either way: they need only the
+    /// identity, and a transient resolver error must not leave the interface deaf.
+    pub(super) fn rebind_interface(&mut self, key: InterfaceKey, cur: u32) -> io::Result<usize> {
         // Keys come from this table's own scan, so the index is always in range.
         let entry = &mut self.entries[key.0 as usize];
+        let previous = entry.interface.ifindex;
         entry.interface.ifindex = cur;
         entry.joiner.reset();
-        entry.interface.refresh()?; // logs each family's gains and losses
-        if cur != 0 {
-            entry.joiner.rejoin(cur);
+        let refreshed = entry.interface.refresh(); // logs each family's gains and losses
+        let deferred = match NonZeroU32::new(cur) {
+            // Parked: nothing to join now; the rebuild on the interface's return replays.
+            None => 0,
+            Some(ifindex) => entry.joiner.rejoin(ifindex),
+        };
+        if refreshed.is_err() {
+            entry.interface.ifindex = previous;
         }
-        Ok(())
+        refreshed.map(|_| deferred)
     }
 
     /// The keys of the captures on `interface`, for a rebuild or eviction pass (the reverse of
@@ -350,7 +375,11 @@ impl InterfaceTable {
             .map(|entry| (entry.interface.ifindex, entry.interface.refresh()))
             .collect();
         for entry in &mut self.entries {
-            entry.joiner.rejoin(entry.interface.ifindex);
+            // A parked interface (index 0) has nothing to re-join; the rebuild on its return
+            // replays the recorded groups.
+            if let Some(ifindex) = NonZeroU32::new(entry.interface.ifindex) {
+                entry.joiner.rejoin(ifindex);
+            }
         }
         results
     }
@@ -530,6 +559,30 @@ mod tests {
         assert!(
             table.stale_interfaces().is_empty(),
             "a parked entry matches its (absent) identity"
+        );
+        Ok(())
+    }
+
+    // The overflow response must not touch a parked interface's joiner: a rejoin there would
+    // have targeted index 0, which the kernel resolves to an arbitrary interface. Socket-less
+    // after the park, the joiner must stay socket-less through refresh_all.
+    #[test]
+    fn refresh_all_does_not_rejoin_a_parked_interface() -> io::Result<()> {
+        let mut table = InterfaceTable::new();
+        let key = table.find_or_add_interface(LOOPBACK_IFACE)?;
+        if let Err(e) = table.join_on(key, IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251))) {
+            if join_unsupported(&e) {
+                eprintln!("skip refresh_all_does_not_rejoin: joins unsupported here ({e})");
+                return Ok(());
+            }
+            return Err(e);
+        }
+        table.entries[key.0 as usize].interface.name = "reflector-gone0".into();
+        table.rebind_interface(key, 0)?; // park: joiner reset, no rejoin
+        table.refresh_all();
+        assert!(
+            table.entries[key.0 as usize].joiner.test_socketless(),
+            "a parked interface's joiner stays socket-less through the overflow refresh"
         );
         Ok(())
     }

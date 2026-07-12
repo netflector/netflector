@@ -398,9 +398,10 @@ impl PacketDispatcher {
         (&mut self.dial, target_iface)
     }
 
-    /// The kernel ifindex of the interface behind `capture`, its stable identity (the address
-    /// resolver caches it at open, and the joiners bake it too). The SSDP/WSD search reflectors read
-    /// it per session for their IPv6 link-local reserved-port binds. `None` if the key is unknown.
+    /// The kernel ifindex of the interface behind `capture`: the table's cached identity,
+    /// re-pointed by the reconcile when the interface is recreated (0 while it is parked
+    /// absent). The SSDP/WSD search reflectors read it per session for their IPv6 link-local
+    /// reserved-port binds. `None` if the key is unknown.
     pub(crate) fn capture_ifindex(&self, capture: CaptureKey) -> Option<u32> {
         self.table.ifindex_of(capture)
     }
@@ -503,14 +504,17 @@ impl PacketDispatcher {
                 Ok(Some(frame)) => frame,
                 Ok(None) => break,
                 Err(e) => {
-                    log::error!("fd {fd}: capture read failed, abandoning batch: {e}");
                     // A dead capture's read error (Linux parks ENETDOWN on the unregistered
-                    // packet socket; a detached BPF descriptor reads ENXIO): pull the
-                    // reconcile forward -- it must not run from here, mid-drain, with this
-                    // capture taken out of its slot. Other read errors are left to the tick;
+                    // packet socket; a detached BPF descriptor reads ENXIO) is the expected
+                    // first sign of an interface destruction: pull the reconcile forward --
+                    // it must not run from here, mid-drain, with this capture taken out of
+                    // its slot. Other read errors are real failures and are left to the tick;
                     // they say nothing about the interface.
                     if matches!(e.raw_os_error(), Some(libc::ENETDOWN | libc::ENXIO)) {
+                        log::info!("fd {fd}: capture lost its interface ({e}); reconciling");
                         self.next_reconcile = Instant::now();
+                    } else {
+                        log::error!("fd {fd}: capture read failed, abandoning batch: {e}");
                     }
                     break;
                 }
@@ -702,10 +706,12 @@ impl PacketDispatcher {
                         // Same conservative stance as the overflow branch: a failed re-resolve can't
                         // confirm the bound v4 survived (a notification arrived, so something changed),
                         // so evict any proxy on it rather than risk a stale, silently-dead listener.
+                        // Reconcile, since it can't confirm the interface survived either.
                         log::warn!(
                             "re-resolving ifindex {ifindex} failed: {e}; evicting its proxies"
                         );
                         v4_moved.push(*ifindex);
+                        want_reconcile = true;
                     }
                 }
             }
@@ -714,11 +720,15 @@ impl PacketDispatcher {
         // sit on a vanished address and their cached LOCATION is stale, so they must re-mint, not be
         // reused. Before the reconcile: v4_moved and the table's caches are still in the same
         // identity space here; the reconcile rewrites the caches and does its own eviction.
-        self.dial.evict_on_interface_change(reactor, |cap| {
-            self.table
-                .ifindex_of(cap)
-                .is_some_and(|ix| v4_moved.contains(&ix))
-        });
+        self.dial.evict_on_interface_change(
+            reactor,
+            |cap| {
+                self.table
+                    .ifindex_of(cap)
+                    .is_some_and(|ix| v4_moved.contains(&ix))
+            },
+            "after its interface's address changed",
+        );
         if want_reconcile {
             self.reconcile_interfaces(reactor);
         }
@@ -740,21 +750,34 @@ impl PacketDispatcher {
                 .expect("stale keys come from this table's own scan")
                 .to_owned();
             let captures = self.table.captures_of(stale.key);
-            if stale.cur == 0 {
-                log::info!(
-                    "interface {name} is gone (was ifindex {}); parking until it returns",
-                    stale.cached
-                );
-            } else {
-                log::info!(
-                    "interface {name}: recreated (ifindex {} -> {}); re-binding",
-                    stale.cached,
-                    stale.cur
-                );
+            let mut failed = false;
+            match (stale.cached, stale.cur) {
+                (was, 0) => {
+                    log::info!(
+                        "interface {name} is gone (was ifindex {was}); parking until it returns"
+                    );
+                }
+                (0, now) => {
+                    log::info!("interface {name}: returned as ifindex {now}; re-binding");
+                }
+                (was, now) => {
+                    log::info!("interface {name}: recreated (ifindex {was} -> {now}); re-binding");
+                }
             }
-            if let Err(e) = self.table.rebind_interface(stale.key, stale.cur) {
-                log::warn!("re-resolving {name} failed: {e}; will retry");
-                pending = true;
+            match self.table.rebind_interface(stale.key, stale.cur) {
+                // Deferred joins are usually "no address yet" and heal on the interface's next
+                // address event, but after a recreation a deaf group is a real outage: warn.
+                Ok(deferred) if deferred > 0 => {
+                    log::warn!(
+                        "{deferred} group membership(s) on {name} not re-joined yet; retrying \
+                         on its next address event"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    log::warn!("re-resolving {name} failed: {e}; will retry");
+                    failed = true;
+                }
             }
             if stale.cur != 0 {
                 for capture in &captures {
@@ -765,7 +788,7 @@ impl PacketDispatcher {
                         }
                         Err(e) => {
                             log::warn!("re-binding a capture on {name} failed: {e}; will retry");
-                            pending = true;
+                            failed = true;
                         }
                     }
                 }
@@ -773,8 +796,17 @@ impl PacketDispatcher {
             // The proxies' snapshots reference the dead interface regardless of what the
             // replacement resolves to, so the eviction is keyed by capture, not by address
             // deltas (and not through v4_moved, whose indexes predate the rebuild).
+            let reason = if stale.cur == 0 {
+                "after its interface was removed"
+            } else {
+                "after its interface was recreated"
+            };
             self.dial
-                .evict_on_interface_change(reactor, |cap| captures.contains(&cap));
+                .evict_on_interface_change(reactor, |cap| captures.contains(&cap), reason);
+            if stale.cur != 0 && !failed {
+                log::info!("interface {name}: recovery complete");
+            }
+            pending |= failed;
         }
         // The fast cadence also covers parked interfaces (quiescent, so not in the stale list):
         // their return must be picked up promptly even if every event for it is lost.
