@@ -56,6 +56,15 @@ const MAX_FRAMES_PER_EVENT: u32 = 64;
 /// (via [`to_u64`](CaptureKey::to_u64)), so `u64::MAX` never collides with a real capture.
 const MONITOR_TAG: u64 = u64::MAX;
 
+/// The reconcile's periodic floor: the guarantee that an interface recreation whose every
+/// event was lost (macOS's silent route-socket overflow) is still detected. Cheap while
+/// healthy -- one name lookup per watched interface plus one kernel probe per capture.
+const RECONCILE_TICK: Duration = Duration::from_secs(30);
+
+/// The reconcile cadence while an interface is parked absent or a rebuild step failed: the
+/// retry driver that picks up the interface's return and re-attempts failed re-binds.
+const RECONCILE_RETRY: Duration = Duration::from_secs(1);
+
 /// The dispatcher's reused send-buffer size. A standard-MTU datagram fits. One buffer serves
 /// every reflector: the single-threaded loop runs one [`send_udp_group`](PacketDispatcher::send_udp_group)
 /// at a time. An oversized payload is a `BufferTooSmall` error, not a truncation. It also caps a
@@ -233,6 +242,15 @@ pub(crate) struct PacketDispatcher {
     scratch: Box<[u8]>,
     /// The periodic counter-summary schedule, or `None` when the summary is disabled.
     report: Option<CounterReport>,
+    /// The largest kernel ifindex seen: the watched interfaces' own, raised by every drained
+    /// notification. On monotonic platforms ([`InterfaceMonitor::INDEXES_MONOTONIC`]) an
+    /// unknown-index Link event at or below this ceiling is churn on an existing unwatched
+    /// interface, not a creation, so it doesn't trigger the reconcile.
+    max_seen_ifindex: u32,
+    /// When the next reconcile pass is due: the [`RECONCILE_TICK`] floor when healthy,
+    /// [`RECONCILE_RETRY`] while an interface is parked absent or a rebuild step failed, `now`
+    /// when a capture read error pulls it forward.
+    next_reconcile: Instant,
 }
 
 impl PacketDispatcher {
@@ -248,6 +266,8 @@ impl PacketDispatcher {
             dial: DialContext::new(),
             scratch: vec![0u8; SCRATCH_LEN].into_boxed_slice(),
             report: None,
+            max_seen_ifindex: 0,
+            next_reconcile: Instant::now() + RECONCILE_TICK,
         }
     }
 
@@ -285,6 +305,10 @@ impl PacketDispatcher {
     pub(crate) fn add_capture(&mut self, capture: Capture) -> io::Result<CaptureKey> {
         let interface = self.table.find_or_add_interface(capture.if_name())?;
         let key = self.table.add_capture(capture, interface);
+        // Seed the seen-index ceiling with the watched interfaces' own identities.
+        self.max_seen_ifindex = self
+            .max_seen_ifindex
+            .max(self.table.interface_index(interface).unwrap_or(0));
         if let Some(name) = self.table.interface_name(interface) {
             log::debug!("watching {name} as capture {key:?}");
         }
@@ -480,6 +504,14 @@ impl PacketDispatcher {
                 Ok(None) => break,
                 Err(e) => {
                     log::error!("fd {fd}: capture read failed, abandoning batch: {e}");
+                    // A dead capture's read error (Linux parks ENETDOWN on the unregistered
+                    // packet socket; a detached BPF descriptor reads ENXIO): pull the
+                    // reconcile forward -- it must not run from here, mid-drain, with this
+                    // capture taken out of its slot. Other read errors are left to the tick;
+                    // they say nothing about the interface.
+                    if matches!(e.raw_os_error(), Some(libc::ENETDOWN | libc::ENXIO)) {
+                        self.next_reconcile = Instant::now();
+                    }
                     break;
                 }
             };
@@ -574,17 +606,27 @@ impl PacketDispatcher {
     /// coalescing duplicates so one interface re-resolves at most once per wakeup. An
     /// [`InterfaceEvent::Overflow`] re-resolves every interface. Best-effort: a read or
     /// resolution failure logs and is dropped, and the daemon keeps its last-known addresses.
+    ///
+    /// Doubles as the recreation detector: events that can announce a destroyed or recreated
+    /// interface run the reconcile afterwards. A `Link` event on a watched interface, or one
+    /// carrying an index above everything seen (a creation, on platforms whose indexes are
+    /// monotonic), or any unknown-index event where no lifecycle messages exist (macOS), or an
+    /// overflow (the announcement may be among the drops) -- and, for a recreation that reused
+    /// the watched index, a per-capture kernel probe on every matched refresh.
     fn refresh_changed_interfaces(&mut self, reactor: &mut Reactor) {
         let Some(monitor) = self.monitor.as_mut() else {
             return;
         };
-        let mut changed: Vec<u32> = Vec::new();
+        // Coalesce to one (ifindex, saw-a-Link-event) row per interface.
+        let mut changed: Vec<(u32, bool)> = Vec::new();
         let mut overflow = false;
         if let Err(e) = monitor.drain(|event| match event {
             InterfaceEvent::Overflow => overflow = true,
             InterfaceEvent::Address(ifindex) | InterfaceEvent::Link(ifindex) => {
-                if !changed.contains(&ifindex) {
-                    changed.push(ifindex);
+                let is_link = matches!(event, InterfaceEvent::Link(_));
+                match changed.iter_mut().find(|(seen, _)| *seen == ifindex) {
+                    Some((_, link)) => *link |= is_link,
+                    None => changed.push((ifindex, is_link)),
                 }
             }
         }) {
@@ -598,6 +640,13 @@ impl PacketDispatcher {
         if changed.is_empty() && !overflow {
             return; // nothing collected (a spurious wakeup, or a drain error before the first read)
         }
+        // The creation gate compares against the ceiling from BEFORE this batch: the creation's
+        // own Link event would otherwise raise the ceiling past itself and slip through.
+        let prior_ceiling = self.max_seen_ifindex;
+        for (ifindex, _) in &changed {
+            self.max_seen_ifindex = self.max_seen_ifindex.max(*ifindex);
+        }
+        let mut want_reconcile = overflow;
         // The DIAL proxies bind IPv4 only, so collect the interfaces whose v4 address actually moved. A
         // routine v6 or MAC change must not churn a proxy whose v4 (and cached LOCATION) is unchanged.
         let mut v4_moved: Vec<u32> = Vec::new();
@@ -621,15 +670,34 @@ impl PacketDispatcher {
                 }
             }
         } else {
-            for ifindex in &changed {
+            for (ifindex, is_link) in &changed {
                 match self.table.refresh_by_ifindex(*ifindex) {
                     Ok(Some(change)) => {
                         log::debug!("re-resolved interface (ifindex {ifindex}) after a change");
                         if change.v4 {
                             v4_moved.push(*ifindex);
                         }
+                        // A lifecycle event on a watched interface, or a capture whose kernel
+                        // binding died behind this (possibly reused) index: reconcile.
+                        if *is_link || !self.table.probe_by_ifindex(*ifindex) {
+                            want_reconcile = true;
+                        }
                     }
-                    Ok(None) => {} // a change on an interface we don't watch
+                    Ok(None) => {
+                        // An interface we don't watch -- unless it is one of ours, recreated
+                        // under a new index. A Link event above every index seen so far is a
+                        // creation where indexes are monotonic; where they aren't (FreeBSD),
+                        // any Link announcement reconciles; where lifecycle events don't
+                        // exist at all (macOS), any unknown-index event has to.
+                        let creation = if InterfaceMonitor::INDEXES_MONOTONIC {
+                            *is_link && *ifindex > prior_ceiling
+                        } else {
+                            *is_link
+                        };
+                        if creation || !InterfaceMonitor::LIFECYCLE_EVENTS {
+                            want_reconcile = true;
+                        }
+                    }
                     Err(e) => {
                         // Same conservative stance as the overflow branch: a failed re-resolve can't
                         // confirm the bound v4 survived (a notification arrived, so something changed),
@@ -643,12 +711,80 @@ impl PacketDispatcher {
             }
         }
         // Evict proxies whose source or target interface lost the v4 address they bound: their listeners
-        // sit on a vanished address and their cached LOCATION is stale, so they must re-mint, not be reused.
+        // sit on a vanished address and their cached LOCATION is stale, so they must re-mint, not be
+        // reused. Before the reconcile: v4_moved and the table's caches are still in the same
+        // identity space here; the reconcile rewrites the caches and does its own eviction.
         self.dial.evict_on_interface_change(reactor, |cap| {
             self.table
                 .ifindex_of(cap)
                 .is_some_and(|ix| v4_moved.contains(&ix))
         });
+        if want_reconcile {
+            self.reconcile_interfaces(reactor);
+        }
+    }
+
+    /// Detect and repair interfaces whose kernel identity moved out from under the table: the
+    /// recreation recovery. Each stale entry is re-pointed at its name's current interface (or
+    /// parked absent), its captures re-bound in place behind their stable keys, and its DIAL
+    /// proxies evicted -- their mint-time snapshots (listener binds, target address, egress
+    /// pin) died with the old interface, whatever the new one's values. Re-arms the next pass:
+    /// the [`RECONCILE_TICK`] floor when healthy, [`RECONCILE_RETRY`] while an interface is
+    /// absent or a rebuild step failed (the probe keeps re-flagging a half-rebuilt entry).
+    fn reconcile_interfaces(&mut self, reactor: &mut Reactor) {
+        let mut pending = false;
+        for stale in self.table.stale_interfaces() {
+            let name = self
+                .table
+                .interface_name(stale.key)
+                .expect("stale keys come from this table's own scan")
+                .to_owned();
+            let captures = self.table.captures_of(stale.key);
+            if stale.cur == 0 {
+                log::info!(
+                    "interface {name} is gone (was ifindex {}); parking until it returns",
+                    stale.cached
+                );
+            } else {
+                log::info!(
+                    "interface {name}: recreated (ifindex {} -> {}); re-binding",
+                    stale.cached,
+                    stale.cur
+                );
+            }
+            if let Err(e) = self.table.rebind_interface(stale.key, stale.cur) {
+                log::warn!("re-resolving {name} failed: {e}; will retry");
+                pending = true;
+            }
+            if stale.cur != 0 {
+                for capture in &captures {
+                    match self.table.rebind_capture(*capture) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            log::warn!("capture {capture:?} missing during {name}'s rebuild");
+                        }
+                        Err(e) => {
+                            log::warn!("re-binding a capture on {name} failed: {e}; will retry");
+                            pending = true;
+                        }
+                    }
+                }
+            }
+            // The proxies' snapshots reference the dead interface regardless of what the
+            // replacement resolves to, so the eviction is keyed by capture, not by address
+            // deltas (and not through v4_moved, whose indexes predate the rebuild).
+            self.dial
+                .evict_on_interface_change(reactor, |cap| captures.contains(&cap));
+        }
+        // The fast cadence also covers parked interfaces (quiescent, so not in the stale list):
+        // their return must be picked up promptly even if every event for it is lost.
+        let retry = pending || self.table.any_absent();
+        self.next_reconcile = Instant::now()
+            + if retry {
+                RECONCILE_RETRY
+            } else {
+                RECONCILE_TICK
+            };
     }
 }
 
@@ -675,6 +811,7 @@ impl Handler for PacketDispatcher {
             .filter_map(|(_, reg)| reg.handler.as_ref().and_then(|h| h.next_deadline()))
             .chain(self.dial.next_grace()) // and the soonest DIAL proxy grace, for its eviction sweep
             .chain(self.report.as_ref().map(|r| r.next)) // and the next counter summary, if enabled
+            .chain(Some(self.next_reconcile)) // and the interface reconcile tick
             .min()
     }
 
@@ -718,6 +855,12 @@ impl Handler for PacketDispatcher {
             log_counters(self.table.counter_rows());
             report.next = now + report.interval;
         }
+
+        // The interface reconcile tick (it re-arms itself): the detection floor for
+        // recreations whose events were lost, and the retry driver while one is mid-recovery.
+        if now >= self.next_reconcile {
+            self.reconcile_interfaces(reactor);
+        }
     }
 
     /// A SIGUSR1 diagnostics dump: log the per-interface counter summary on demand. Independent of the
@@ -744,6 +887,65 @@ mod tests {
         pub(crate) fn registration_count(&self) -> usize {
             self.registrations.iter().count()
         }
+    }
+
+    // The reconcile detects a cached identity that moved (corrupted here through the test
+    // seam, as a recreation would move it) and repairs it in place, then re-arms the slow
+    // tick. Unprivileged: resolution only, no captures.
+    #[test]
+    fn reconcile_repairs_a_moved_identity_and_arms_the_slow_tick() -> io::Result<()> {
+        let mut reactor = Reactor::new()?;
+        let mut dispatcher = PacketDispatcher::new();
+        let key = dispatcher.table.find_or_add_interface(LOOPBACK_IFACE)?;
+        let real = crate::interface::if_index(LOOPBACK_IFACE).expect("loopback has an ifindex");
+        dispatcher.table.set_test_ifindex(key, real + 1000);
+        assert!(!dispatcher.table.stale_interfaces().is_empty());
+
+        dispatcher.reconcile_interfaces(&mut reactor);
+
+        assert!(
+            dispatcher.table.stale_interfaces().is_empty(),
+            "the moved identity is repaired"
+        );
+        assert!(
+            dispatcher.next_reconcile > Instant::now() + RECONCILE_RETRY,
+            "a healthy table re-arms the slow tick, not the retry"
+        );
+        Ok(())
+    }
+
+    // A vanished interface parks (identity 0, quiescent thereafter) and keeps the fast retry
+    // cadence armed, so its return is picked up promptly even with every event lost.
+    #[test]
+    fn reconcile_parks_a_vanished_interface_and_keeps_the_fast_retry() -> io::Result<()> {
+        let mut reactor = Reactor::new()?;
+        let mut dispatcher = PacketDispatcher::new();
+        let key = dispatcher.table.find_or_add_interface(LOOPBACK_IFACE)?;
+        dispatcher.table.set_test_name(key, "reflector-gone0");
+
+        dispatcher.reconcile_interfaces(&mut reactor);
+
+        assert!(
+            dispatcher.table.stale_interfaces().is_empty(),
+            "a parked entry is quiescent, not perpetually stale"
+        );
+        assert!(dispatcher.table.any_absent());
+        assert!(
+            dispatcher.next_reconcile <= Instant::now() + RECONCILE_RETRY,
+            "an absent interface keeps the fast retry cadence"
+        );
+        // The interface "returns" (the name resolves again): the next pass rebuilds it.
+        dispatcher.table.set_test_name(key, LOOPBACK_IFACE);
+        dispatcher.reconcile_interfaces(&mut reactor);
+        assert!(
+            !dispatcher.table.any_absent(),
+            "the returned interface is re-pointed"
+        );
+        assert!(
+            dispatcher.next_reconcile > Instant::now() + RECONCILE_RETRY,
+            "recovery re-arms the slow tick"
+        );
+        Ok(())
     }
 
     fn packet(
@@ -1161,11 +1363,12 @@ mod tests {
         let now = Instant::now();
         assert_eq!(
             dispatcher.next_deadline(),
-            None,
-            "no deadline until enabled"
+            Some(dispatcher.next_reconcile),
+            "until enabled, the only standing deadline is the reconcile tick"
         );
 
-        let interval = Duration::from_secs(30);
+        // Shorter than RECONCILE_TICK, so the report deadline is the min() at each assert.
+        let interval = Duration::from_secs(5);
         dispatcher.enable_counter_report(interval, now);
         assert_eq!(dispatcher.next_deadline(), Some(now + interval));
 
