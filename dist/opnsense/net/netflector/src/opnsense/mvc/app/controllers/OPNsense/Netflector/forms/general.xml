@@ -1,0 +1,23 @@
+<form>
+    <!-- No <type>header</type> field: base_form renders one as a collapsible section (the thead gets a
+         click handler and the tbody the "collapsible" class), and there is no flag to turn that off. The
+         page titles the section with an h2 instead, so it matches the Reflectors grid below it. -->
+    <field>
+        <id>netflector.general.enabled</id>
+        <label>Enable</label>
+        <type>checkbox</type>
+        <help><![CDATA[Run netflector. The daemon needs at least one enabled reflector below, so the service stays stopped until you add one.]]></help>
+    </field>
+    <field>
+        <id>netflector.general.log_level</id>
+        <label>Log level</label>
+        <type>dropdown</type>
+        <help><![CDATA[Verbosity of the daemon's log. "Debug" and "Trace" are noisy and are meant for diagnosing a problem, not for running.]]></help>
+    </field>
+    <field>
+        <id>netflector.general.counters_interval_secs</id>
+        <label>Counter interval</label>
+        <type>text</type>
+        <help><![CDATA[Seconds between per-interface packet-counter summaries in the log. 0 disables them.]]></help>
+    </field>
+</form>
