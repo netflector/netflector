@@ -1,0 +1,5 @@
+<menu>
+    <Services>
+        <Netflector VisibleName="Netflector" cssClass="fa fa-exchange fa-fw" url="/ui/netflector"/>
+    </Services>
+</menu>
