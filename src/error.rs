@@ -26,9 +26,9 @@ pub struct Error(ErrorKind);
 /// The private cause behind an [`struct@Error`]: one variant per subsystem.
 #[derive(Debug, Error)]
 enum ErrorKind {
-    /// The command line was misused (see [`TooManyArgs`]).
+    /// The command line was misused (see [`UsageError`]).
     #[error(transparent)]
-    Usage(#[from] TooManyArgs),
+    Usage(#[from] UsageError),
     /// Configuration could not be loaded or failed validation.
     #[error("config: {0}")]
     Config(#[from] ConfigError),
@@ -88,14 +88,19 @@ impl From<io::Error> for Error {
     }
 }
 
-impl From<TooManyArgs> for Error {
-    fn from(source: TooManyArgs) -> Self {
+impl From<UsageError> for Error {
+    fn from(source: UsageError) -> Self {
         Self(ErrorKind::Usage(source))
     }
 }
 
-/// More than the single optional config-path argument was passed on the command line; the payload is the
-/// first unexpected argument. The CLI's own matchable error, lifted into [`struct@Error`] by `?`.
+/// The command line was misused. The CLI's own matchable error, lifted into [`struct@Error`] by `?`.
 #[derive(Debug, Error)]
-#[error("unexpected extra argument \"{0}\"; usage: reflector [CONFIG_PATH]")]
-pub(crate) struct TooManyArgs(pub(crate) String);
+pub(crate) enum UsageError {
+    /// More than the single optional config path was given; the payload is the first extra argument.
+    #[error("unexpected extra argument \"{0}\"; try `reflector --help`")]
+    TooManyArgs(String),
+    /// An option the CLI does not know; the payload is the option as written.
+    #[error("unknown option \"{0}\"; try `reflector --help`")]
+    UnknownOption(String),
+}
