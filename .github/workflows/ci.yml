@@ -497,6 +497,103 @@ jobs:
           triple='${{ matrix.target.triple }}'
           sudo python3 e2e/run.py --backend native --binary "target/${triple:+$triple/}release/reflector"
 
+  # The unit suite under Miri, for every shipped target. Valgrind (below) watches the machine: it catches
+  # an access that is actually invalid, but it is blind to UB that performs no invalid access at all -- an
+  # unaligned read the hardware tolerates, or a raw pointer used after a &mut reborrow invalidated its
+  # provenance. Both are UB the optimizer is entitled to act on, and both live in our unsafe: read_unaligned
+  # casts into netlink/BPF byte buffers, StreamBuffer's MaybeUninit tail. Miri interprets the abstract
+  # machine and checks the alignment/aliasing/provenance rules instead, so it covers exactly the class
+  # memcheck cannot. The two lanes are complements, not duplicates.
+  #
+  # Miri cannot call foreign functions, so a test needing a real socket, capture device, poll backend,
+  # interface or signal handler is gated with cfg_attr(miri, ignore = "what it needs"). Everything else
+  # runs UNFILTERED, deliberately: a new test is covered by Miri by default, and one that reaches the
+  # kernel fails loudly until it is gated. A name-filtered allowlist would instead go quietly stale.
+  #
+  # Miri interprets rather than executes, so --target needs no toolchain, emulator or VM for that OS: this
+  # one ubuntu runner covers the BSD-only cfg code and the 32-bit ARM layouts (where an alignment bug in
+  # the parsers would actually surface) as well as its own. It needs no privileges either -- Miri's geteuid
+  # is a constant, so the root-gated tests always take their skip branch.
+  #
+  # Toolchain: the latest nightly that actually ships Miri, resolved per run rather than pinned. Floating is
+  # deliberate -- new Miri releases tighten the checks (Tree Borrows) and add shims, and a pin would freeze
+  # us at whatever the lane was born with. Not every nightly ships the component though (it is gated on
+  # Miri's own tests passing), so plain `nightly` hard-fails on a day Miri did not build, which would red
+  # every PR for a reason that has nothing to do with this repo. rust-lang's components-history serves the
+  # most recent date that DID ship it, so float on that.
+  #
+  # The cost of floating, stated plainly: a Miri or rustc regression can red this lane on an unrelated PR.
+  # That is the accepted trade for picking up new checks the day they land. When Miri gains a shim for
+  # something we gate on (kqueue, say), the gate does NOT lift itself -- the cfg_attr has to be deleted by
+  # hand; the lane just makes that possible.
+  miri:
+    name: Miri (${{ matrix.target }})
+    needs: gate
+    if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - armv7-unknown-linux-musleabihf
+          - armv5te-unknown-linux-musleabi
+          - x86_64-unknown-freebsd
+          - aarch64-unknown-freebsd
+          - aarch64-apple-darwin
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - name: Resolve the newest nightly that ships Miri
+        run: |
+          date=$(curl -fsSL https://rust-lang.github.io/rustup-components-history/x86_64-unknown-linux-gnu/miri)
+          # The endpoint serves a bare date. Anything else (an error page, an outage) must fail here
+          # rather than turn into a confusing rustup error two steps later.
+          case "$date" in
+            20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
+            *) echo "::error::expected a nightly date, got: $date"; exit 1 ;;
+          esac
+          echo "MIRI_TOOLCHAIN=nightly-$date" >> "$GITHUB_ENV"
+      - name: Cache cargo build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          # ~/.cache/miri holds the per-target sysroot Miri builds from rust-src; without it every run
+          # recompiles std for the target. The toolchain is in the key because a new nightly needs a new
+          # sysroot; the second restore-key still reuses the previous day's registry and target dir.
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ~/.cache/miri
+            target
+          key: cargo-miri-${{ matrix.target }}-${{ env.MIRI_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-miri-${{ matrix.target }}-${{ env.MIRI_TOOLCHAIN }}-
+            cargo-miri-${{ matrix.target }}-
+      - name: Install the Miri toolchain
+        run: rustup toolchain install "$MIRI_TOOLCHAIN" --profile minimal --component miri,rust-src
+      - name: Show toolchain
+        run: rustc "+$MIRI_TOOLCHAIN" -V && cargo "+$MIRI_TOOLCHAIN" miri -V
+      # Both aliasing models. They are different rulesets, not a strictness ordering: Stacked Borrows is
+      # today's default, Tree Borrows is the successor, and each accepts things the other rejects. Code
+      # sound under both stays sound whichever one rustc settles on -- worth having for unsafe that holds
+      # raw pointers into buffers it also hands out as &mut (StreamBuffer's tail, the parsers).
+      # -Zmiri-strict-provenance rejects int-to-pointer casts that launder provenance away, which is a real
+      # hazard in FFI glue: it is what keeps kqueue's udata round-trip on ptr::without_provenance_mut.
+      # The two runs share the sysroot, so the second only re-interprets the suite.
+      - name: cargo miri test (stacked borrows)
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance
+        run: cargo "+$MIRI_TOOLCHAIN" miri test --locked --target ${{ matrix.target }} --lib
+      - name: cargo miri test (tree borrows)
+        env:
+          MIRIFLAGS: -Zmiri-tree-borrows -Zmiri-strict-provenance
+        run: cargo "+$MIRI_TOOLCHAIN" miri test --locked --target ${{ matrix.target }} --lib
+
   # The unit suite under Valgrind memcheck. The valgrind-e2e job below only ever sees the daemon's
   # datapath; the unit suite is where the unsafe surface actually executes -- the netlink walk
   # arithmetic, sockaddr conversions, StreamBuffer's unsafe commit, MaybeUninit buffers, the
@@ -578,7 +675,7 @@ jobs:
   success:
     name: Success
     if: ${{ !cancelled() }}
-    needs: [gate, fmt, lint, test, freebsd, docker-e2e, native-e2e, freebsd-native-e2e, valgrind-test, valgrind-e2e]
+    needs: [gate, fmt, lint, test, freebsd, docker-e2e, native-e2e, freebsd-native-e2e, miri, valgrind-test, valgrind-e2e]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
