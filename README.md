@@ -86,14 +86,17 @@ build produces a single-arch image for the host:
 docker build -t reflector .
 ```
 
-The Dockerfile's builder runs on the build host and cross-compiles with LLVM's `lld` (no QEMU), so a
-multi-arch image builds on one machine:
+The Dockerfile's builder runs on the build host (no QEMU) and links the cross layers with LLVM's
+`lld`, so a multi-arch image builds on one machine:
 
 ```sh
 docker buildx build --platform linux/amd64,linux/arm64,linux/arm/v7,linux/arm/v5 -t reflector .
 ```
 
-Releases publish that multi-arch manifest to GHCR automatically (see [Release](#release)).
+Releases take a different path (see [Release](#release)): each arch builds on its own runner and the
+digests are stitched into one manifest. amd64 and arm64 have native runners, so those layers link
+with rustc's default linker rather than cross-linking with `lld`; only armv7 and armv5, which have no
+native runner, cross-compile.
 
 ## Run
 
