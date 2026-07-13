@@ -193,6 +193,7 @@ mod tests {
     // reset drops the per-family sockets while keeping the desired list, so the next rejoin
     // replays every group on fresh fds (no zombie memberships from a destroyed interface).
     #[test]
+    #[cfg_attr(miri, ignore = "resolves a real interface")]
     fn reset_keeps_desired_and_rejoin_replays_on_fresh_sockets() {
         let mut joiner = MulticastJoiner::new();
         let ifindex = loopback_ifindex();
@@ -237,6 +238,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "resolves a real interface")]
     fn kernel_accepts_a_join_on_loopback() {
         // Exercises the full MCAST_JOIN_GROUP FFI against the kernel (per-OS const, group_req layout,
         // by-index selection; by-index doesn't require the interface's IFF_MULTICAST flag). QEMU

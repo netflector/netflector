@@ -619,6 +619,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real socket")]
     fn forward_dir_frames_a_request_and_rewrites_host() {
         let (peer_in, from) = connected_pair(); // peer_in -> from (the client side)
         let (to, peer_out) = connected_pair(); // to -> peer_out (the device side)
@@ -649,6 +650,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real socket")]
     fn forward_dir_rewrites_application_url_to_the_rest_listener_and_learns_it() {
         let (peer_in, from) = connected_pair();
         let (to, peer_out) = connected_pair();
@@ -687,6 +689,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real socket")]
     fn forward_dir_rewrites_a_location_redirect_to_the_desc_listener() {
         let (peer_in, from) = connected_pair();
         let (to, peer_out) = connected_pair();
@@ -717,6 +720,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real socket")]
     fn forward_reports_source_eof_when_the_peer_closes_its_write() {
         let (peer_in, from) = connected_pair();
         let (to, _peer_out) = connected_pair();
@@ -812,6 +816,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real poll backend")]
     fn close_if_complete_closes_only_when_both_flows_are_done() {
         let (_reactor, mut conn, _client_peer, _device_peer) = watched_connection();
         // Both Open: keep.
@@ -829,6 +834,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real poll backend")]
     fn forward_eof_finishes_the_flow_and_fins_the_destination() {
         let (mut reactor, mut conn, client_peer, device_peer) = watched_connection();
         // The client sends a full request, then closes its write half (a FIN after the bytes).
@@ -853,6 +859,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real poll backend")]
     fn half_close_holds_in_source_closed_until_the_backlog_drains() {
         let (mut reactor, mut conn, _client_peer, device_peer) = watched_connection();
         // A backlog still owed to the device at the moment the client half-closes.
@@ -885,6 +892,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real poll backend")]
     fn source_hangup_with_no_backlog_tears_down() {
         let (mut reactor, mut conn, _client_peer, _device_peer) = watched_connection();
         // A readable edge once the flow is past Open is a hangup on the disarmed source. With nothing
@@ -904,6 +912,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real poll backend")]
     fn source_hangup_still_drains_the_forward_backlog() {
         let (mut reactor, mut conn, _client_peer, device_peer) = watched_connection();
         // The client half-closed with a request still buffered toward the (live) device...
@@ -945,6 +954,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real poll backend")]
     fn both_peers_hangup_closes_without_panic() {
         let (mut reactor, mut conn, _client_peer, _device_peer) = watched_connection();
         // Both directions still owe a backlog to their (about-to-vanish) peers.

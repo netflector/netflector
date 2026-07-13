@@ -670,6 +670,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(all(miri, not(target_os = "linux")), ignore = "needs a real kqueue")]
     fn dispatch_calls_on_readable() {
         let mut reactor = Reactor::new().unwrap();
         let (a, _peer) = pair();
@@ -685,6 +686,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(all(miri, not(target_os = "linux")), ignore = "needs a real kqueue")]
     fn handler_can_unregister_itself() {
         let mut reactor = Reactor::new().unwrap();
         let (a, _peer) = pair();
@@ -714,6 +716,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(all(miri, not(target_os = "linux")), ignore = "needs a real kqueue")]
     fn handler_can_register_during_dispatch() {
         // The classic mid-dispatch hazard: registering a new handler while dispatching.
         // Nothing borrows the arenas during the call, so it is simply allowed.
@@ -743,6 +746,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(all(miri, not(target_os = "linux")), ignore = "needs a real kqueue")]
     fn handler_can_unregister_another() {
         let mut reactor = Reactor::new().unwrap();
         let (victim_fd, _pv) = pair();
@@ -777,6 +781,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(all(miri, not(target_os = "linux")), ignore = "needs a real kqueue")]
     fn write_interest_gates_on_writable() {
         let mut reactor = Reactor::new().unwrap();
         let (a, _peer) = pair();
@@ -798,6 +803,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(all(miri, not(target_os = "linux")), ignore = "needs a real kqueue")]
     fn read_handler_disarming_write_skips_the_write_phase() {
         let mut reactor = Reactor::new().unwrap();
         let (a, _peer) = pair();
@@ -830,6 +836,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(all(miri, not(target_os = "linux")), ignore = "needs a real kqueue")]
     fn read_handler_unregistering_itself_skips_the_write_phase() {
         let mut reactor = Reactor::new().unwrap();
         let (a, _peer) = pair();
@@ -861,6 +868,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(all(miri, not(target_os = "linux")), ignore = "needs a real kqueue")]
     fn dispatching_a_stale_reg_is_a_noop() {
         let mut reactor = Reactor::new().unwrap();
         let (a, _peer) = pair();
@@ -872,6 +880,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real poll backend")]
     fn poll_once_dispatches_a_ready_fd() {
         let mut reactor = Reactor::new().unwrap();
         let (a, peer) = pair();
@@ -894,6 +903,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real poll backend")]
     fn run_loop_stops_when_a_handler_requests_shutdown() {
         let mut reactor = Reactor::new().unwrap();
         let (a, peer) = pair();
@@ -917,6 +927,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(all(miri, not(target_os = "linux")), ignore = "needs a real kqueue")]
     fn dispatch_control_reaches_every_handler() {
         let mut reactor = Reactor::new().unwrap();
         let count = Rc::new(Cell::new(0u32));
@@ -931,6 +942,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real poll backend")]
     fn run_loop_broadcasts_a_pending_dump() {
         let mut reactor = Reactor::new().unwrap();
         let (a, peer) = pair();
@@ -953,6 +965,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(all(miri, not(target_os = "linux")), ignore = "needs a real kqueue")]
     fn unwatch_removes_one_fd_and_leaves_the_handler() {
         let mut reactor = Reactor::new().unwrap();
         let (a, _pa) = pair();
@@ -985,6 +998,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(all(miri, not(target_os = "linux")), ignore = "needs a real kqueue")]
     fn watch_hands_back_the_ready_event() {
         let mut reactor = Reactor::new().unwrap();
         let (a, _peer) = pair();
@@ -1004,6 +1018,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(all(miri, not(target_os = "linux")), ignore = "needs a real kqueue")]
     fn register_hands_the_handler_its_own_key() {
         // A handler that records the key it is adopted with, so we can check it matches `register`'s.
         struct KeyRecorder(Rc<Cell<Option<HandlerKey>>>);
@@ -1024,6 +1039,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(all(miri, not(target_os = "linux")), ignore = "needs a real kqueue")]
     fn watch_on_a_stale_handler_errors() {
         let mut reactor = Reactor::new().unwrap();
         let (a, _pa) = pair();
@@ -1035,6 +1051,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(all(miri, not(target_os = "linux")), ignore = "needs a real kqueue")]
     fn watch_rejects_a_duplicate_fd() {
         let mut reactor = Reactor::new().unwrap();
         let (a, _pa) = pair();
@@ -1047,6 +1064,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(all(miri, not(target_os = "linux")), ignore = "needs a real kqueue")]
     fn watch_failure_errors_and_leaves_the_handler_usable() {
         let mut reactor = Reactor::new().unwrap();
         let (a, _pa) = pair();
@@ -1065,6 +1083,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(all(miri, not(target_os = "linux")), ignore = "needs a real kqueue")]
     fn setting_interest_on_a_stale_reg_is_a_benign_false() {
         let mut reactor = Reactor::new().unwrap();
         let (a, _peer) = pair();
@@ -1104,6 +1123,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(all(miri, not(target_os = "linux")), ignore = "needs a real kqueue")]
     fn next_deadline_reports_the_soonest_across_handlers() {
         let mut reactor = Reactor::new().unwrap();
         let base = Instant::now();
@@ -1114,6 +1134,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(all(miri, not(target_os = "linux")), ignore = "needs a real kqueue")]
     fn dispatch_deadlines_fires_only_the_handlers_that_are_due() {
         let mut reactor = Reactor::new().unwrap();
         let base = Instant::now();
@@ -1133,6 +1154,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(all(miri, not(target_os = "linux")), ignore = "needs a real kqueue")]
     fn run_loop_wakes_at_a_deadline_and_runs_the_timer() {
         let mut reactor = Reactor::new().unwrap();
         let fired = Rc::new(Cell::new(false));

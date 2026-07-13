@@ -316,6 +316,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "resolves a real interface")]
     fn resolves_loopback_v4() {
         // Every host's loopback has 127.0.0.1; resolution needs no privileges, so this
         // exercises the full backend (the v4 path, and on Linux the rtnetlink round-trip).
@@ -324,6 +325,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "resolves a real interface")]
     fn refresh_reports_which_source_fields_changed() {
         let mut iface = Interface::open(LOOPBACK_IFACE).unwrap();
         // Re-resolving an interface whose addresses are already current reports nothing moved.
@@ -347,6 +349,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "resolves a real interface")]
     fn unknown_interface_has_no_addresses() {
         let addrs = Interface::open("nonexistent-xyz-999").unwrap().addrs;
         assert_eq!(addrs, InterfaceAddresses::default());

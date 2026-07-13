@@ -43,6 +43,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real poll backend")]
     fn reports_readable_with_the_registered_key() {
         let (a, b) = UnixStream::pair().unwrap();
         let mut poller = Poller::new(CAPACITY).unwrap();
@@ -61,6 +62,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(all(miri, not(target_os = "linux")), ignore = "needs a real kqueue")]
     fn write_interest_toggles() {
         let (a, _b) = UnixStream::pair().unwrap();
         let mut poller = Poller::new(CAPACITY).unwrap();
@@ -85,6 +87,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real poll backend")]
     fn read_interest_toggles() {
         let (a, b) = UnixStream::pair().unwrap();
         let mut poller = Poller::new(CAPACITY).unwrap();
@@ -109,6 +112,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(all(miri, not(target_os = "linux")), ignore = "needs a real kqueue")]
     fn disarming_unarmed_write_is_ok() {
         let (a, _b) = UnixStream::pair().unwrap();
         let poller = Poller::new(CAPACITY).unwrap();
@@ -121,6 +125,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real poll backend")]
     fn remove_clears_interest() {
         let (a, b) = UnixStream::pair().unwrap();
         let mut poller = Poller::new(CAPACITY).unwrap();
@@ -131,6 +136,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(all(miri, not(target_os = "linux")), ignore = "needs a real kqueue")]
     fn remove_unregistered_is_benign() {
         let (a, _b) = UnixStream::pair().unwrap();
         let poller = Poller::new(CAPACITY).unwrap();
@@ -139,6 +145,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real poll backend")]
     fn reports_each_ready_fd() {
         let (a1, b1) = UnixStream::pair().unwrap();
         let (a2, b2) = UnixStream::pair().unwrap();
@@ -159,6 +166,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real poll backend")]
     fn level_triggered_refires_until_drained() {
         // Level-triggered (no edge/one-shot mode): a readable fd re-fires every wait until drained, so a
         // handler may read once and trust the next wait for the rest.

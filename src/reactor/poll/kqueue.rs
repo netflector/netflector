@@ -206,6 +206,7 @@ mod tests {
     // The shared `Poller` contract tests live in the parent `poll` module; only the
     // kqueue-specific re-add behavior is tested here.
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real poll backend")]
     fn re_add_is_idempotent() {
         let (a, _b) = UnixStream::pair().unwrap();
         let poller = Poller::new(CAPACITY).unwrap();

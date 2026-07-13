@@ -98,6 +98,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(miri, ignore = "reads the process resource usage from the kernel")]
     fn peak_rss_is_nonzero_for_the_running_process() {
         // A live process has a non-zero high-water RSS; this also exercises the getrusage path.
         assert!(peak_rss_kib() > 0);
@@ -105,11 +106,13 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[cfg_attr(miri, ignore = "reads /proc/self/status")]
     fn current_rss_reads_proc_self_status() {
         assert!(current_rss_kib().is_some_and(|rss| rss > 0));
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real poll backend")]
     fn reporter_schedules_the_next_report_an_interval_out() {
         let interval = Duration::from_secs(30);
         let now = Instant::now();
@@ -121,6 +124,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real poll backend")]
     fn dump_only_reporter_keeps_no_deadline() {
         let mut reporter = MemoryReporter::new(None, Instant::now());
         assert_eq!(reporter.next_deadline(), None);

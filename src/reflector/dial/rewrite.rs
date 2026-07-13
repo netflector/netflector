@@ -211,6 +211,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real poll backend")]
     fn rewrite_location_mints_a_proxy_and_rewrites_to_its_desc_listener() {
         let mut reactor = Reactor::new().expect("reactor");
         let mut ctx = DialContext::new();
@@ -233,6 +234,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real poll backend")]
     fn rewrite_location_reuses_a_live_proxy_for_the_same_device() {
         let mut reactor = Reactor::new().expect("reactor");
         let mut ctx = DialContext::new();
@@ -243,6 +245,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real poll backend")]
     fn rewrite_location_refreshes_the_grace_on_every_advertisement() {
         let mut reactor = Reactor::new().expect("reactor");
         let mut ctx = DialContext::new();
@@ -265,6 +268,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real poll backend")]
     fn rewrite_location_remints_after_the_proxy_is_evicted() {
         let mut reactor = Reactor::new().expect("reactor");
         let mut ctx = DialContext::new();
@@ -286,6 +290,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real poll backend")]
     fn an_interface_change_evicts_a_proxy_by_source_or_target() {
         let mut reactor = Reactor::new().expect("reactor");
         let mut ctx = DialContext::new();
@@ -319,6 +324,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real poll backend")]
     fn evict_on_interface_change_prunes_an_already_evicted_entry() {
         let mut reactor = Reactor::new().expect("reactor");
         let mut ctx = DialContext::new();
@@ -333,6 +339,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(all(miri, not(target_os = "linux")), ignore = "needs a real kqueue")]
     fn rewrite_location_forwards_non_dial_and_unrewritable_messages_unchanged() {
         let mut reactor = Reactor::new().expect("reactor");
         let mut ctx = DialContext::new();
@@ -348,6 +355,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real poll backend")]
     fn dial_context_sweep_evicts_a_proxy_past_its_grace() {
         let mut reactor = Reactor::new().expect("reactor");
         let mut ctx = DialContext::new();
@@ -367,6 +375,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real poll backend")]
     fn rewrite_location_clamps_an_oversized_max_age() {
         let mut reactor = Reactor::new().expect("reactor");
         let mut ctx = DialContext::new();

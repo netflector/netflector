@@ -1011,6 +1011,7 @@ mod tests {
     // seam, as a recreation would move it) and repairs it in place, then re-arms the slow
     // tick. Unprivileged: resolution only, no captures.
     #[test]
+    #[cfg_attr(miri, ignore = "resolves a real interface")]
     fn reconcile_repairs_a_moved_identity_and_arms_the_slow_tick() -> io::Result<()> {
         let mut reactor = Reactor::new()?;
         let mut dispatcher = PacketDispatcher::new();
@@ -1035,6 +1036,7 @@ mod tests {
     // A vanished interface parks (identity 0, quiescent thereafter) and keeps the fast retry
     // cadence armed, so its return is picked up promptly even with every event lost.
     #[test]
+    #[cfg_attr(miri, ignore = "resolves a real interface")]
     fn reconcile_parks_a_vanished_interface_and_keeps_the_fast_retry() -> io::Result<()> {
         let mut reactor = Reactor::new()?;
         let mut dispatcher = PacketDispatcher::new();
@@ -1070,6 +1072,7 @@ mod tests {
     // Unprivileged: the moved identity is faked through the test seam and the capture row is a
     // capture-less test entry (rebind_capture reports it missing, which does not fail the recovery).
     #[test]
+    #[cfg_attr(miri, ignore = "resolves a real interface")]
     fn reconcile_counts_a_recovery_on_the_interface_captures() -> io::Result<()> {
         let mut reactor = Reactor::new()?;
         let mut dispatcher = PacketDispatcher::new();
@@ -1296,6 +1299,7 @@ mod tests {
     // UDP probe off the ingress key, routes it through the matching Echo reflector,
     // which re-emits on the *egress* key. Skips without capture access (no CAP_NET_RAW).
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real capture device")]
     fn routes_a_captured_packet_to_a_matching_reflector() -> io::Result<()> {
         let Some(ingress_cap) = open_or_skip(LOOPBACK_IFACE, "dispatch_ingress")? else {
             return Ok(());
@@ -1375,6 +1379,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real socket")]
     fn unregister_stops_routing_to_a_handler() -> io::Result<()> {
         let mut dispatcher = PacketDispatcher::new();
         let mut reactor = Reactor::new()?;
@@ -1427,6 +1432,7 @@ mod tests {
     // a reflect and its mirror skip (both matching) tally a single reflect, and a handler whose filter
     // misses doesn't contribute at all.
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real socket")]
     fn route_folds_matched_outcomes_and_records_once() -> io::Result<()> {
         let mut dispatcher = PacketDispatcher::new();
         let mut reactor = Reactor::new()?;
@@ -1469,6 +1475,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real socket")]
     fn route_folds_fan_out_reflects_and_records_once() -> io::Result<()> {
         let mut dispatcher = PacketDispatcher::new();
         let mut reactor = Reactor::new()?;
@@ -1498,6 +1505,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real socket")]
     fn counter_report_fires_on_its_interval() -> io::Result<()> {
         let mut dispatcher = PacketDispatcher::new();
         let mut reactor = Reactor::new()?;
@@ -1539,6 +1547,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real socket")]
     fn reports_the_soonest_deadline_and_sweeps_only_the_due_one() -> io::Result<()> {
         let mut dispatcher = PacketDispatcher::new();
         let mut reactor = Reactor::new()?;
@@ -1604,6 +1613,7 @@ mod tests {
     // call isn't in the snapshot and doesn't receive the in-flight frame. True whether it appends
     // or reuses a freed slot (a key snapshot, unlike the old length bound, doesn't depend on index).
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real socket")]
     fn a_mid_route_registration_is_not_fed_the_in_flight_frame() -> io::Result<()> {
         let mut dispatcher = PacketDispatcher::new();
         let mut reactor = Reactor::new()?;
@@ -1659,6 +1669,7 @@ mod tests {
     // second and panics `route`'s `expect`; with it, the outer loop handles both
     // (calls == 2). Skips without capture access (no CAP_NET_RAW).
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real capture device")]
     fn reentrant_drain_on_the_same_ingress_hits_the_guard() -> io::Result<()> {
         let Some(ingress_cap) = open_or_skip(LOOPBACK_IFACE, "dispatch_reentrant")? else {
             return Ok(());
@@ -1708,6 +1719,7 @@ mod tests {
     // capture, drains it, and routes to the Echo, which re-emits on the egress key.
     // Exercises the per-fd `on_readable`. Skips without capture access (no CAP_NET_RAW).
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real capture device")]
     fn reactor_drives_the_dispatcher_to_route_a_packet() -> io::Result<()> {
         let Some(ingress_cap) = open_or_skip(LOOPBACK_IFACE, "dispatch_reactor_in")? else {
             return Ok(());
@@ -1759,6 +1771,7 @@ mod tests {
     // and `send_udp_group` must each be a safe no-op (log-drop / `None` / `Ok`), never a panic:
     // the new behavior the capture-gated e2e tests above skip without `CAP_NET_RAW`.
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real socket")]
     fn unknown_capture_key_is_a_safe_no_op() -> io::Result<()> {
         let mut dispatcher = PacketDispatcher::new();
         let mut reactor = Reactor::new()?;
@@ -1807,6 +1820,7 @@ mod tests {
     // are checked from inside the reflector's call, when the ingress entry's capture is
     // `None`. Skips without capture access (no CAP_NET_RAW).
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real capture device")]
     fn ingress_resolves_and_drops_while_taken_out() -> io::Result<()> {
         let Some(ingress_cap) = open_or_skip(LOOPBACK_IFACE, "dispatch_mid_drain")? else {
             return Ok(());
@@ -1855,6 +1869,7 @@ mod tests {
     // distinct from any capture key. Best-effort: the watch appears only if the socket opened
     // (some sandboxes deny it), so an empty watch list means skip.
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real socket")]
     fn monitor_fd_is_watched_under_the_sentinel_tag() {
         let dispatcher = PacketDispatcher::new();
         let watches = dispatcher.capture_watches();
@@ -1872,6 +1887,7 @@ mod tests {
 
     // A join_group on an unknown capture is logged and skipped, not an error or a panic.
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real socket")]
     fn join_group_ignores_an_unknown_capture() {
         let mut dispatcher = PacketDispatcher::new();
         let group = IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251));

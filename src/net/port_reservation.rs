@@ -118,6 +118,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real socket")]
     fn reserves_a_nonzero_port_on_loopback() {
         let r = PortReservation::create(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
             .expect("bind an ephemeral port on loopback");
@@ -128,6 +129,7 @@ mod tests {
     // rejects the pairing (Linux never reads it, macOS zeroes it), so this has teeth on the
     // FreeBSD lane and pins the contract elsewhere.
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real socket")]
     fn routable_v6_reservation_ignores_the_ifindex() {
         let r = PortReservation::create(IpAddr::V6(Ipv6Addr::LOCALHOST), u32::MAX)
             .expect("bind an ephemeral port on v6 loopback without a zone id");
@@ -135,6 +137,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real socket")]
     fn two_reservations_get_distinct_ports() {
         let a = PortReservation::create(IpAddr::V4(Ipv4Addr::LOCALHOST), 0).unwrap();
         let b = PortReservation::create(IpAddr::V4(Ipv4Addr::LOCALHOST), 0).unwrap();

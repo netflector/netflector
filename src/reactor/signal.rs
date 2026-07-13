@@ -219,6 +219,7 @@ mod tests {
     static SIGNAL_STATE: Mutex<()> = Mutex::new(());
 
     #[test]
+    #[cfg_attr(all(miri, target_os = "macos"), ignore = "reads real fd flags")]
     fn self_pipe_is_cloexec_and_nonblocking() {
         let (read, write) = self_pipe().unwrap();
 
@@ -243,6 +244,7 @@ mod tests {
     // Installs process-global signal handlers, so it is serialized with the other install test via
     // `SIGNAL_STATE`.
     #[test]
+    #[cfg_attr(miri, ignore = "installs a real signal handler")]
     fn installed_handler_flags_shutdown_and_dump() {
         let _serialized = SIGNAL_STATE
             .lock()
@@ -277,6 +279,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "installs a real signal handler")]
     fn install_clears_a_stale_signal_flag() {
         let _serialized = SIGNAL_STATE
             .lock()
