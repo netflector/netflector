@@ -101,7 +101,7 @@ native runner, cross-compile.
 ## Run
 
 ```sh
-./target/release/reflector [config.toml]
+./target/release/reflector [--check-config] [--] [config.toml]
 ```
 
 Configuration comes from a TOML file, from environment variables, or from both. With a path argument
@@ -110,6 +110,22 @@ configuration comes entirely from the environment (see [Environment variables](#
 The process logs to stderr with UTC timestamps, shuts down cleanly on `SIGINT` / `SIGTERM`, and on
 `SIGUSR1` dumps the per-interface [packet counters](#configuration) to the log on demand (regardless of
 `counters_interval_secs`).
+
+| Option | |
+| --- | --- |
+| `--check-config` | Load and validate the configuration, print a summary, exit. |
+| `-V`, `--version` | Print the version and exit. |
+| `-h`, `--help` | Print the usage and exit. |
+| `--` | End of options. Needed only for a config file whose name begins with a dash. |
+
+`--check-config` parses and validates only. It opens no interface, so it needs no privileges and runs
+on a machine where the configured interfaces do not exist (useful for validating a generated config on
+a build host), but for the same reason it cannot tell you that an interface is missing:
+
+```sh
+$ reflector --check-config /usr/local/etc/reflector.toml
+config ok: 1 reflector
+```
 
 ### Runtime privileges
 
