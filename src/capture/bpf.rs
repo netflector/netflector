@@ -468,6 +468,7 @@ mod tests {
     // Traffic to 127.0.0.1 / ::1 is deterministic, no env var needed. Dynamically
     // skips when BPF (or IPv6 loopback) is unavailable; fails on real errors.
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real capture device")]
     fn loopback_capture_decodes_known_frames() -> io::Result<()> {
         let Some(mut capture) = open_or_skip("lo0", "loopback_capture")? else {
             return Ok(());
@@ -506,6 +507,7 @@ mod tests {
     // means FreeBSD behaves like macOS: loopback send isn't observable this way.
     #[cfg(target_os = "freebsd")]
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real capture device")]
     fn loopback_send_reaches_a_local_socket() -> io::Result<()> {
         use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6, UdpSocket};
 

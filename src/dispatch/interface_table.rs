@@ -488,6 +488,7 @@ mod tests {
     // the changed fields (`None` for an unwatched index). Resolution is unprivileged (no capture
     // needed), so this exercises the monitor's refresh path without CAP_NET_RAW.
     #[test]
+    #[cfg_attr(miri, ignore = "resolves a real interface")]
     fn refresh_by_ifindex_targets_the_matching_interface() -> io::Result<()> {
         let mut table = InterfaceTable::new();
         table.find_or_add_interface(LOOPBACK_IFACE)?;
@@ -510,6 +511,7 @@ mod tests {
     // the recorded memberships idempotently. Unprivileged: loopback accepts the join and resolving
     // the interface needs no CAP_NET_RAW.
     #[test]
+    #[cfg_attr(miri, ignore = "resolves a real interface")]
     fn join_on_records_a_membership_and_refresh_re_attempts_it() -> io::Result<()> {
         let mut table = InterfaceTable::new();
         let iface = table.find_or_add_interface(LOOPBACK_IFACE)?;
@@ -540,6 +542,7 @@ mod tests {
     // rebind_interface repairs it. Unprivileged: pure resolution, no captures, so the probe
     // half of the predicate stays vacuous here (pair tests cover it against real interfaces).
     #[test]
+    #[cfg_attr(miri, ignore = "resolves a real interface")]
     fn stale_interfaces_flags_and_rebind_repairs_a_moved_index() -> io::Result<()> {
         let mut table = InterfaceTable::new();
         let key = table.find_or_add_interface(LOOPBACK_IFACE)?;
@@ -571,6 +574,7 @@ mod tests {
     // identity 0, addresses cleared (the egress gate closes), no join attempted (a join on
     // index 0 would let the kernel pick an arbitrary interface).
     #[test]
+    #[cfg_attr(miri, ignore = "resolves a real interface")]
     fn rebind_to_absent_parks_the_entry() -> io::Result<()> {
         let mut table = InterfaceTable::new();
         let key = table.find_or_add_interface(LOOPBACK_IFACE)?;
@@ -600,6 +604,7 @@ mod tests {
     // have targeted index 0, which the kernel resolves to an arbitrary interface. Socket-less
     // after the park, the joiner must stay socket-less through refresh_all.
     #[test]
+    #[cfg_attr(miri, ignore = "resolves a real interface")]
     fn refresh_all_does_not_rejoin_a_parked_interface() -> io::Result<()> {
         let mut table = InterfaceTable::new();
         let key = table.find_or_add_interface(LOOPBACK_IFACE)?;
@@ -634,6 +639,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "resolves a real interface")]
     fn find_or_add_interface_dedups_by_name() -> io::Result<()> {
         let mut table = InterfaceTable::new();
         let first = table.find_or_add_interface(LOOPBACK_IFACE)?;

@@ -160,6 +160,7 @@ mod tests {
     // or erroring. Best-effort: some sandboxes deny the routing socket, where the monitor
     // degrades to no live updates, so there's nothing to drain and we skip.
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real routing socket")]
     fn opens_and_drains_without_blocking() {
         let mut monitor = match InterfaceMonitor::open() {
             Ok(monitor) => monitor,

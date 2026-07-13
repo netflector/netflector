@@ -372,6 +372,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real socket")]
     fn loopback_listen_connect_accept_stream() {
         let listener = TcpSocket::listen(Ipv4Addr::LOCALHOST).expect("listen on loopback");
         let server_addr = listener.local_addr();
@@ -397,6 +398,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real socket")]
     fn loopback_send_vectored_concatenates_the_slices() {
         let listener = TcpSocket::listen(Ipv4Addr::LOCALHOST).expect("listen on loopback");
         let mut client = TcpSocket::connect(listener.local_addr(), Ipv4Addr::LOCALHOST, None)
@@ -419,6 +421,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real socket")]
     fn shutdown_write_half_closes_keeping_the_read_half() {
         let listener = TcpSocket::listen(Ipv4Addr::LOCALHOST).expect("listen on loopback");
         let mut client =

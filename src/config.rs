@@ -590,6 +590,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "opens a real file")]
     fn read_config_file_tolerates_a_non_utf8_path() {
         use std::os::unix::ffi::OsStrExt;
         // An invalid-UTF-8 path byte must not panic; a missing file yields ReadFile (rendered lossily).

@@ -202,6 +202,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(all(miri, not(target_os = "linux")), ignore = "needs a real kqueue")]
     fn next_grace_reports_the_soonest_or_none_when_empty() {
         let mut reactor = Reactor::new().unwrap();
         let mut ctx = DialContext::new();
@@ -230,6 +231,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(all(miri, not(target_os = "linux")), ignore = "needs a real kqueue")]
     fn lookup_finds_a_live_proxy_and_prunes_an_evicted_one() {
         let mut reactor = Reactor::new().unwrap();
         let mut ctx = DialContext::new();

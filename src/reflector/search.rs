@@ -493,6 +493,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real socket")]
     fn next_deadline_is_the_soonest_session_expiry() {
         let mut dispatcher = PacketDispatcher::new();
         let mut reflector = test_reflector();
@@ -523,6 +524,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real socket")]
     fn on_deadline_evicts_expired_sessions_and_unregisters_their_captures() {
         let mut dispatcher = PacketDispatcher::new();
         let mut reactor = Reactor::new().unwrap();
@@ -567,6 +569,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real socket")]
     fn a_retransmit_reuses_its_session_and_refreshes_the_window() {
         let mut dispatcher = PacketDispatcher::new();
         let mut reactor = Reactor::new().unwrap();
@@ -610,6 +613,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real socket")]
     fn a_session_is_keyed_by_searcher_and_group() {
         // The dedup key is (searcher, group). One live session for a searcher's link-local search: a
         // retransmit (same searcher, same group) finds it, but the same searcher's site-local search does
@@ -636,6 +640,7 @@ mod tests {
     // ports free with the reservations) and the next search re-opens fresh. A change on a capture the
     // reflector does not use leaves them.
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real socket")]
     fn on_iface_change_clears_sessions_on_a_used_capture() {
         let mut dispatcher = PacketDispatcher::new();
         let mut reactor = Reactor::new().unwrap();
@@ -684,6 +689,7 @@ mod tests {
     // on the target, and the reply leg only holds the source's (stable) CaptureKey and re-resolves the
     // source address at send time, so a source recreation does not orphan anything.
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real socket")]
     fn on_iface_change_leaves_sessions_on_a_source_capture_change() {
         let mut dispatcher = PacketDispatcher::new();
         let mut reactor = Reactor::new().unwrap();
@@ -707,6 +713,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real socket")]
     fn make_session_drops_a_search_with_no_source_mac() {
         // No source MAC means no L2 address to reply to, so make_session drops the search rather than
         // open a session it could never answer.
@@ -733,6 +740,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real socket")]
     fn make_session_drops_at_the_session_cap() {
         // At MAX_SESSIONS in flight a new searcher is dropped; no live session is evicted early.
         let mut dispatcher = PacketDispatcher::new();
@@ -781,6 +789,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real capture device")]
     fn a_failed_reflect_rolls_back_the_session_registration() {
         // make_session registers the response capture before reflecting; if the reflect then fails, that
         // registration must be rolled back, not leaked. A real loopback target lets make_session succeed;

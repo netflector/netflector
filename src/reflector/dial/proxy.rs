@@ -354,6 +354,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real poll backend")]
     fn accept_rest_proxies_to_the_learned_rest_endpoint() {
         let mut reactor = Reactor::new().expect("reactor");
         let (mut proxy, rest_addr) = watched_proxy(&mut reactor);
@@ -386,6 +387,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real poll backend")]
     fn accept_rest_drops_a_client_before_the_rest_endpoint_is_learned() {
         let mut reactor = Reactor::new().expect("reactor");
         let (mut proxy, rest_addr) = watched_proxy(&mut reactor); // rest_endpoint stays None

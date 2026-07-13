@@ -351,6 +351,7 @@ mod tests {
     // looped frame off `lo`. Validates the open/filter/bind/recv path and that lo
     // is Ethernet-framed. PACKET_IGNORE_OUTGOING drops the TX copy; we see the RX one.
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real capture device")]
     fn captures_a_known_frame_on_lo() -> io::Result<()> {
         const PROBE: &[u8] = b"reflector-afpacket-capture-probe";
         let Some(mut capture) = open_or_skip("lo", "afpacket_capture")? else {
@@ -393,6 +394,7 @@ mod tests {
     // delivers a raw-injected loopback frame to a socket is kernel-specific, and not
     // what send() is for: on a real interface it reaches other hosts, not us.)
     #[test]
+    #[cfg_attr(miri, ignore = "needs a real capture device")]
     fn send_loops_back_on_lo() -> io::Result<()> {
         const PROBE: &[u8] = b"reflector-afpacket-send-probe";
         let Some(mut capture) = open_or_skip("lo", "afpacket_send")? else {
