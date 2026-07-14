@@ -1,4 +1,4 @@
-//! Observability counters: what the reflector did with each packet, tallied per message type and
+//! Observability counters: what netflector did with each packet, tallied per message type and
 //! interface.
 //!
 //! A single packet can match several handlers: mirrored `a→b`/`b→a` reflectors put one reflecting and

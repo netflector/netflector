@@ -62,7 +62,7 @@ SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
 # rc.conf.local write is never re-read; the per-service /etc/rc.conf.d/<name>
 # file is the one rc knob each script sources fresh.
 seed_iso() {
-    printf 'instance-id: reflector-ci\nlocal-hostname: reflector-freebsd\n' \
+    printf 'instance-id: netflector-ci\nlocal-hostname: netflector-freebsd\n' \
         > "$VM_DIR/meta-data"
     cat > "$VM_DIR/user-data" <<EOF
 #cloud-config

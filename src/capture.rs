@@ -43,13 +43,13 @@ mod tests {
     use super::open_or_skip;
     use crate::net::LinkType;
 
-    // Live capture against a real interface (`REFLECTOR_TEST_IFACE`). Backend-neutral
+    // Live capture against a real interface (`NETFLECTOR_TEST_IFACE`). Backend-neutral
     // because a real interface is Ethernet-framed on both backends: BPF reports
     // DLT_EN10MB, AF_PACKET delivers the Ethernet header.
     #[test]
     fn live_capture_decodes_real_frames() -> std::io::Result<()> {
-        let Some(iface) = std::env::var_os("REFLECTOR_TEST_IFACE") else {
-            eprintln!("skip live_capture: set REFLECTOR_TEST_IFACE to an Ethernet interface");
+        let Some(iface) = std::env::var_os("NETFLECTOR_TEST_IFACE") else {
+            eprintln!("skip live_capture: set NETFLECTOR_TEST_IFACE to an Ethernet interface");
             return Ok(());
         };
         let iface = iface.to_string_lossy();

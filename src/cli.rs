@@ -11,7 +11,7 @@ use crate::error::UsageError;
 /// What the command line asked for.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Invocation<'a> {
-    /// Run the reflector, configured from the given file (if any) plus `REFLECTOR_*`.
+    /// Run netflector, configured from the given file (if any) plus `NETFLECTOR_*`.
     Run(Option<&'a Path>),
     /// Load and validate that same configuration, then exit.
     CheckConfig(Option<&'a Path>),
@@ -22,11 +22,11 @@ pub(crate) enum Invocation<'a> {
 /// Parse `args` (with `argv[0]` already stripped).
 ///
 /// `--help` and `--version` win over everything else, so they answer even when the rest of the
-/// line is nonsense. Otherwise the reflector takes at most one positional; extras are rejected
+/// line is nonsense. Otherwise netflector takes at most one positional; extras are rejected
 /// rather than ignored, since a second path is far more likely a typo than an intent.
 ///
 /// `--` ends option parsing, so a config file whose name begins with a dash is still reachable
-/// (`reflector -- --check-config` reads a file called `--check-config`). Without it such a path
+/// (`netflector -- --check-config` reads a file called `--check-config`). Without it such a path
 /// would be unreachable, since every leading-dash argument is otherwise read as an option.
 ///
 /// # Errors
@@ -74,16 +74,16 @@ pub(crate) fn parse(args: &[OsString]) -> Result<Invocation<'_>, UsageError> {
 
 /// `--help` text. Ends with a newline; print it with `print!`.
 pub(crate) const HELP: &str = concat!(
-    "reflector ",
+    "netflector ",
     env!("CARGO_PKG_VERSION"),
     "
 
 Reflects link-local service traffic (Wake-on-LAN, mDNS, SSDP, WS-Discovery, DIAL) between
 two network interfaces.
 
-usage: reflector [--check-config] [--] [CONFIG]
+usage: netflector [--check-config] [--] [CONFIG]
 
-  CONFIG           TOML config file. REFLECTOR_* environment variables are merged on top of
+  CONFIG           TOML config file. NETFLECTOR_* environment variables are merged on top of
                    it. Omit it to configure from the environment alone. Put `--` first if the
                    file name begins with a dash.
 
@@ -110,10 +110,10 @@ mod tests {
 
     #[test]
     fn a_lone_positional_is_the_config_path() {
-        let a = args(&["reflector.toml"]);
+        let a = args(&["netflector.toml"]);
         assert_eq!(
             parse(&a).unwrap(),
-            Invocation::Run(Some(Path::new("reflector.toml")))
+            Invocation::Run(Some(Path::new("netflector.toml")))
         );
     }
 
@@ -121,23 +121,23 @@ mod tests {
     fn check_config_takes_the_same_optional_path() {
         let a = args(&["--check-config"]);
         assert_eq!(parse(&a).unwrap(), Invocation::CheckConfig(None));
-        let b = args(&["--check-config", "reflector.toml"]);
+        let b = args(&["--check-config", "netflector.toml"]);
         assert_eq!(
             parse(&b).unwrap(),
-            Invocation::CheckConfig(Some(Path::new("reflector.toml")))
+            Invocation::CheckConfig(Some(Path::new("netflector.toml")))
         );
         // The flag may follow the path as readily as precede it.
-        let c = args(&["reflector.toml", "--check-config"]);
+        let c = args(&["netflector.toml", "--check-config"]);
         assert_eq!(
             parse(&c).unwrap(),
-            Invocation::CheckConfig(Some(Path::new("reflector.toml")))
+            Invocation::CheckConfig(Some(Path::new("netflector.toml")))
         );
     }
 
     #[test]
     fn help_and_version_win_over_the_rest_of_the_line() {
         for flag in ["-h", "--help"] {
-            let a = args(&[flag, "reflector.toml", "--nonsense"]);
+            let a = args(&[flag, "netflector.toml", "--nonsense"]);
             assert_eq!(parse(&a).unwrap(), Invocation::Help);
         }
         for flag in ["-V", "--version"] {
@@ -148,7 +148,7 @@ mod tests {
 
     #[test]
     fn a_second_positional_is_rejected_not_ignored() {
-        let a = args(&["reflector.toml", "extra"]);
+        let a = args(&["netflector.toml", "extra"]);
         assert!(matches!(parse(&a), Err(UsageError::TooManyArgs(arg)) if arg == "extra"));
     }
 

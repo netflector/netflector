@@ -358,11 +358,11 @@ mod tests {
     fn process_env_sees_a_set_variable() {
         // SAFETY: nothing else in the test binary reads or writes the process
         // environment concurrently (config tests take env as a parameter).
-        unsafe { std::env::set_var("REFLECTOR_SYS_ENV_PROBE", "probe-value") };
+        unsafe { std::env::set_var("NETFLECTOR_SYS_ENV_PROBE", "probe-value") };
         let env = process_env();
         assert!(
             env.iter()
-                .any(|(k, v)| k == "REFLECTOR_SYS_ENV_PROBE" && v == "probe-value")
+                .any(|(k, v)| k == "NETFLECTOR_SYS_ENV_PROBE" && v == "probe-value")
         );
     }
 }

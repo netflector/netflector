@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 #
-# End-to-end tests for the (Rust) reflector, runnable on two backends.
+# End-to-end tests for netflector, runnable on two backends.
 #
-# Each case stands up two isolated dual-stack segments (a source and a target), runs the reflector
+# Each case stands up two isolated dual-stack segments (a source and a target), runs netflector
 # straddling both with its interface names pinned to wol_src / wol_dst, then runs a sender prober on
 # one segment and a receiver prober on the other and asserts the traffic is (or is not) reflected
 # across. The default docker backend realizes segments as bridge networks and participants as
-# containers (reflector image built from ./Dockerfile, CAP_NET_RAW on that container only; probers
+# containers (netflector image built from ./Dockerfile, CAP_NET_RAW on that container only; probers
 # run unprivileged). The native backend (root; Linux or FreeBSD) uses plain processes over netns +
 # veth pairs (Linux) or vnet jails + epairs (FreeBSD) instead -- same cases, no Docker:
 #
 #   python3 e2e/run.py
 #   python3 e2e/run.py --case reflects_matching_magic_packet
-#   python3 e2e/run.py --skip-build --image reflector:e2e
-#   sudo python3 e2e/run.py --backend native --binary target/release/reflector
+#   python3 e2e/run.py --skip-build --image netflector:e2e
+#   sudo python3 e2e/run.py --backend native --binary target/release/netflector
 
 from __future__ import annotations
 
@@ -34,8 +34,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 E2E_DIR = Path(__file__).resolve().parent
 
-DEFAULT_REFLECTOR_IMAGE = "reflector:e2e"
-VALGRIND_REFLECTOR_IMAGE = "reflector:e2e-valgrind"
+DEFAULT_NETFLECTOR_IMAGE = "netflector:e2e"
+VALGRIND_NETFLECTOR_IMAGE = "netflector:e2e-valgrind"
 DEFAULT_HELPER_IMAGE = "python:3.13-alpine"
 CONFIGURED_MAC = "02:42:ac:11:00:09"
 # A second address in wol-mac's `macs` allow-set, to prove the list admits every member, not just the first.
@@ -51,7 +51,7 @@ MDNS_GROUP_V6 = "ff02::fb"
 MDNS_PORT = 5353
 MDNS_WRONG_PORT = 5354
 # A 12-byte DNS header + "test". The query has QR=0 (flags 0x0000); the response sets QR+AA
-# (flags 0x8400). The reflector classifies on the QR bit alone.
+# (flags 0x8400). netflector classifies on the QR bit alone.
 MDNS_QUERY_HEX = "00000000000100000000000074657374"
 MDNS_RESPONSE_HEX = "00008400000100010000000074657374"
 # 8 bytes: below the 12-byte DNS-header minimum, so classify() returns None and drops it.
@@ -64,7 +64,7 @@ SSDP_PORT = 1900
 # A non-SSDP UDP port: the dispatcher filter pins dst_port=1900, so a datagram to the group on this
 # port is captured but never dispatched to the reflector.
 SSDP_WRONG_PORT = 1901
-# SSDP discovery messages (HTTPU). The reflector classifies on the leading method token only and relays
+# SSDP discovery messages (HTTPU). netflector classifies on the leading method token only and relays
 # the bytes verbatim, so the receiver expects exactly what was sent; the HOST line is immaterial here.
 SSDP_MSEARCH_HEX = (
     "M-SEARCH * HTTP/1.1\r\n"
@@ -73,7 +73,7 @@ SSDP_MSEARCH_HEX = (
     "MX: 2\r\n"
     "ST: ssdp:all\r\n\r\n"
 ).encode().hex()
-# An M-SEARCH with the maximum MX (clamped to 5s by the reflector), so its session lives ~7s (MX + the
+# An M-SEARCH with the maximum MX (clamped to 5s by netflector), so its session lives ~7s (MX + the
 # 2s reply grace). The interface-recreate round trip needs that width: it destroys and recreates the
 # target between the searcher's two sends, and the second must land while the first's session is alive.
 SSDP_MSEARCH_MX5_HEX = (
@@ -89,14 +89,14 @@ SSDP_NOTIFY_HEX = (
     "NT: upnp:rootdevice\r\n"
     "NTS: ssdp:alive\r\n\r\n"
 ).encode().hex()
-# A search response that strayed onto the group: neither M-SEARCH nor NOTIFY, so the reflector
+# A search response that strayed onto the group: neither M-SEARCH nor NOTIFY, so netflector
 # classifies it as non-SSDP and drops it.
 SSDP_HTTP_RESPONSE_HEX = (
     "HTTP/1.1 200 OK\r\n"
     "ST: ssdp:all\r\n\r\n"
 ).encode().hex()
 # The unicast 200 OK a device sends back to an M-SEARCH; the round-trip responder replies with this and
-# the searcher asserts it arrives verbatim after the reflector proxies it across segments.
+# the searcher asserts it arrives verbatim after netflector proxies it across segments.
 SSDP_OK_HEX = (
     "HTTP/1.1 200 OK\r\n"
     "CACHE-CONTROL: max-age=1800\r\n"
@@ -118,7 +118,7 @@ SSDP_DIAL_MSEARCH_HEX = (
 ).encode().hex()
 DIAL_CLIENT_SOURCE_PORT = 49153
 # --- WSD (WS-Discovery): SOAP-over-UDP. Groups 239.255.255.250 / ff02::c (shared with SSDP) on UDP
-# 3702 -- the port distinguishes it from SSDP. The reflector classifies on the <Action> URI segment and
+# 3702 -- the port distinguishes it from SSDP. netflector classifies on the <Action> URI segment and
 # relays the bytes verbatim, so the receiver expects exactly what was sent. Real ONVIF-style envelopes
 # (2005/04 namespace). ---
 WSD_GROUP_V4 = SSDP_GROUP_V4
@@ -181,7 +181,7 @@ WSD_RESOLVE_HEX = (
     "</d:Resolve></s:Body></s:Envelope>"
 ).encode().hex()
 # The unicast ProbeMatches a device answers a Probe with; the round-trip responder replies with this and
-# the searcher asserts it arrives verbatim after the reflector proxies it back across segments.
+# the searcher asserts it arrives verbatim after netflector proxies it back across segments.
 WSD_PROBEMATCHES_HEX = (
     '<?xml version="1.0" encoding="utf-8"?>'
     '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"'
@@ -219,24 +219,24 @@ WSD_RESOLVEMATCHES_HEX = (
     "<d:MetadataVersion>1</d:MetadataVersion>"
     "</d:ResolveMatch></d:ResolveMatches></s:Body></s:Envelope>"
 ).encode().hex()
-# --- Address-change cases: knock out one (interface, family) source on the reflector, prove
-# reflection of that family stops, then restore it and prove it resumes. The reflector reacts on
+# --- Address-change cases: knock out one (interface, family) source on netflector, prove
+# reflection of that family stops, then restore it and prove it resumes. netflector reacts on
 # its own event loop after the netlink notification, so each check polls across that async window.
 ADDR_CHANGE_REFLECTED_WINDOW = 4.0
 ADDR_CHANGE_SILENCE_WINDOW = 2.5
 ADDR_CHANGE_SILENCE_CONSECUTIVE = 2
 ADDR_CHANGE_POLL_DEADLINE = 60.0
 # A substring of the line the daemon logs immediately before entering its event loop.
-REFLECTOR_READY_LOG = "running; press Ctrl-C or send SIGTERM to stop"
+NETFLECTOR_READY_LOG = "running; press Ctrl-C or send SIGTERM to stop"
 RECEIVER_READY_LOG = "receiver ready: UDP socket bound"
 CONTAINER_READY_TIMEOUT_SECONDS = 15.0
 # A clean SIGTERM exit triggers valgrind's leak analysis; give `docker stop` this much grace before it
 # SIGKILLs, so the analysis (which can take tens of seconds) finishes and its exit code is read.
 VALGRIND_STOP_GRACE_SECONDS = 60
-REFLECTOR_SOURCE_IFNAME = "wol_src"
-REFLECTOR_TARGET_IFNAME = "wol_dst"
+NETFLECTOR_SOURCE_IFNAME = "wol_src"
+NETFLECTOR_TARGET_IFNAME = "wol_dst"
 RECEIVER_IFNAME = "probe0"
-REFLECTOR_IFNAMES = {"source": REFLECTOR_SOURCE_IFNAME, "target": REFLECTOR_TARGET_IFNAME}
+NETFLECTOR_IFNAMES = {"source": NETFLECTOR_SOURCE_IFNAME, "target": NETFLECTOR_TARGET_IFNAME}
 DECOY_IFNAME = "rfxdecoy"
 
 IPV6_ALL_NODES = "ff02::1"
@@ -258,7 +258,7 @@ class TestCase:
     timeout_seconds: float
     send_mac: str | None = None
     send_payload_hex: str | None = None
-    # IP version exercised end to end. The reflector runs both pipelines from one config; each case
+    # IP version exercised end to end. netflector runs both pipelines from one config; each case
     # drives just one of them.
     family: int = 4
     # Reflection direction. "forward" sends from the source network and receives on the target (WoL);
@@ -272,7 +272,7 @@ class TestCase:
     # Also require the reflected packet's source to be routable (non-link-local) — the per-scope v6
     # source selection: a site-local group (ff05::c) must not be sourced from a link-local address.
     expect_routable_source: bool = False
-    # Reflector config file (relative to e2e/) mounted into the reflector container. Most cases share
+    # netflector config file (relative to e2e/) mounted into the netflector container. Most cases share
     # config.toml; a case needing a distinct reflector set (e.g. single-family) names its own.
     config: str = "config.toml"
 
@@ -567,7 +567,7 @@ SSDP_CASES = [
         group=SSDP_GROUP_V4,
         direction="forward",
     ),
-    # The dispatcher filter pins dst_port=1900. Listen on the SEND port, not 1900: the reflector
+    # The dispatcher filter pins dst_port=1900. Listen on the SEND port, not 1900: netflector
     # re-emits to the captured dest port verbatim, so a regression that dispatched this 1901 datagram
     # would re-emit it to the group on 1901 -- invisible to a 1900-bound receiver. Binding the send
     # port keeps the "not reflected" assertion able to observe a misforward.
@@ -700,7 +700,7 @@ class RoundTripCase:
     family: int  # 4 or 6
     group: str
     timeout_seconds: float = 8.0
-    # When False, no responder is started and the searcher must receive nothing -- the reflector must
+    # When False, no responder is started and the searcher must receive nothing -- netflector must
     # not fabricate or loop back a reply to a search no device answered.
     expect_reply: bool = True
     # Protocol parameters, defaulting to SSDP's M-SEARCH round trip; WSD overrides them (its Probe ->
@@ -735,7 +735,7 @@ ROUNDTRIP_CASES = [
 
 @dataclasses.dataclass(frozen=True)
 class SearchRecreateCase:
-    # A search session across an interface recreation. One searcher opens a session; a reflector
+    # A search session across an interface recreation. One searcher opens a session; a netflector
     # interface is then destroyed and recreated. The session's reserved port and response registration
     # live on the TARGET, so recreating the target drops every session (logged, via on_iface_change) and
     # the retransmit opens a fresh one; recreating the SOURCE leaves the session intact (the reply leg
@@ -746,7 +746,7 @@ class SearchRecreateCase:
     # so the decoy is inert there. The wide MX keeps the first session alive until the recreation. This
     # is the search-session path the passive mDNS and DIAL recreate cases never reach.
     name: str
-    interface: str = "target"  # which reflector interface is destroyed + recreated
+    interface: str = "target"  # which netflector interface is destroyed + recreated
     family: int = 4
     group: str = SSDP_GROUP_V4
     port: int = SSDP_PORT
@@ -785,12 +785,12 @@ DIAL_CASES = [
 
 @dataclasses.dataclass(frozen=True)
 class DialAddressChangeCase:
-    # A full DIAL pass, then the same pass again after the reflector's source IPv4 changes, then again
+    # A full DIAL pass, then the same pass again after netflector's source IPv4 changes, then again
     # after its target IPv4 changes -- to a *different* address each time. A passing re-run is the 7d
     # proof: a proxy not evicted on the change would re-advertise a LOCATION on the vanished source
     # address (the fetch can't reach it) or bind the vanished target on its upstream connect. The device
-    # advertises NOTIFY throughout (passive discovery), so each phase's fresh client rediscovers and the
-    # reflector re-mints against the current addresses.
+    # advertises NOTIFY throughout (passive discovery), so each phase's fresh client rediscovers and
+    # netflector re-mints against the current addresses.
     name: str
     family: int = 4
     group: str = SSDP_GROUP_V4
@@ -807,14 +807,14 @@ DIAL_ADDRESS_CHANGE_CASES = [
 
 @dataclasses.dataclass(frozen=True)
 class DialRecreateCase:
-    # A full DIAL pass, then the same pass again after one reflector interface is destroyed and
+    # A full DIAL pass, then the same pass again after one netflector interface is destroyed and
     # recreated. The hardest DIAL recovery scenario: a recreation replaces the kernel objects
     # underneath the minted proxy -- its listener binds, target-address snapshot, and egress-pin all
     # belong to the dead interface's world -- so a passing re-run proves the recreation evicted the
     # proxy and re-minted against the recreated interface. One case per (interface, decoy): the decoy
     # forces a changed-index recreation (vs FreeBSD's same-index reuse), pinning both detection paths.
     name: str
-    interface: str = "target"  # which reflector interface is destroyed + recreated
+    interface: str = "target"  # which netflector interface is destroyed + recreated
     decoy: bool = False  # plant a decoy on the freed index so the recreation lands on a different one
     family: int = 4
     group: str = SSDP_GROUP_V4
@@ -847,12 +847,12 @@ PROBE_SPECS = {
 @dataclasses.dataclass(frozen=True)
 class Phase:
     # One knock-out within an address-change case: take down a single (interface, family) source
-    # address on the reflector, prove reflection of `protocol`/`family` stops, then restore it and
+    # address on netflector, prove reflection of `protocol`/`family` stops, then restore it and
     # prove reflection resumes -- all via real traffic.
     label: str
     protocol: str  # "wol" | "mdns" -> PROBE_SPECS
     family: int  # 4 | 6
-    interface: str  # "source" (wol_src) | "target" (wol_dst): which reflector interface to toggle
+    interface: str  # "source" (wol_src) | "target" (wol_dst): which netflector interface to toggle
     # Recreate cases only: plant a throwaway interface between the delete and the recreate. It
     # occupies the freed slot, so FreeBSD's lowest-free index allocator is forced to hand the
     # recreated interface a DIFFERENT index; without it the same index comes back. The two
@@ -886,7 +886,7 @@ ADDRESS_CHANGE_CASES = [
 class RecreateCase:
     name: str
     config: str  # config file (relative to e2e/), defining a dual-family reflector set
-    phases: tuple[Phase, ...]  # interface = which reflector interface is destroyed+recreated
+    phases: tuple[Phase, ...]  # interface = which netflector interface is destroyed+recreated
 
 
 # One case per (interface, decoy) so a failure names the exact scenario. All probe forward
@@ -968,14 +968,14 @@ SEGMENT_V6_PREFIX = {"source": "fd00:e2e0:1", "target": "fd00:e2e0:2"}
 
 
 class Backend:
-    # The execution environment for one case: two isolated dual-stack segments, the reflector
+    # The execution environment for one case: two isolated dual-stack segments, netflector
     # straddling both, and single-homed probe helpers referenced by role name ("receiver",
     # "sender", "device", ...). Docker realizes segments as bridge networks and participants as
     # containers; native (Linux) as netns + veth pairs and plain processes. Runners hold case
     # logic only and drive everything through this interface, so every case runs identically
     # under both backends.
 
-    # Whether the probe helpers keep working while a segment's reflector-side interface is
+    # Whether the probe helpers keep working while a segment's netflector-side interface is
     # deleted. Docker probes own separate bridge endpoints, so yes; the native fabrics realize
     # a segment as one veth/epair pair, so deleting it takes the probe end with it and the
     # recreate case skips its silence probe there (there is no wire left to probe on).
@@ -1002,7 +1002,7 @@ class Backend:
         # debuggable state.
         pass
 
-    def start_reflector(self, config_path: Path) -> None:
+    def start_netflector(self, config_path: Path) -> None:
         raise NotImplementedError
 
     def start_probe(
@@ -1030,17 +1030,17 @@ class Backend:
     def remove(self, role: str) -> None:
         raise NotImplementedError
 
-    def stop_reflector(self, grace_seconds: int) -> int:
-        # SIGTERM the reflector, allow `grace_seconds` for a clean exit (valgrind's leak
+    def stop_netflector(self, grace_seconds: int) -> int:
+        # SIGTERM netflector, allow `grace_seconds` for a clean exit (valgrind's leak
         # analysis needs it), then kill; returns the exit code.
         raise NotImplementedError
 
     def admin(self, script: str, *, capture: bool = False) -> str:
-        # Run a shell script inside the reflector's network view (addr/route/sysctl mutation).
+        # Run a shell script inside netflector's network view (addr/route/sysctl mutation).
         raise NotImplementedError
 
     def set_address(self, ifname: str, family: int, *, up: bool, cidr: str | None = None) -> str | None:
-        # Bring one (interface, family) source address down or back up in the reflector's
+        # Bring one (interface, family) source address down or back up in netflector's
         # network view. IPv6 drops every v6 address and, on re-enable, has the kernel regenerate
         # a usable link-local; v4 deletes and later re-adds the exact CIDR (returned on removal
         # so the caller can restore it). This base implementation speaks Linux (ip + /proc
@@ -1063,7 +1063,7 @@ class Backend:
         return captured
 
     def add_decoy_route(self, dest_ip: str, ifname: str) -> bool:
-        # Plant a host route to `dest_ip` via the (wrong) `ifname` in the reflector's network
+        # Plant a host route to `dest_ip` via the (wrong) `ifname` in netflector's network
         # view; returns whether it was armed. Linux-shaped: the DIAL egress pin there is
         # SO_BINDTODEVICE, which constrains the route lookup and so defeats the decoy. FreeBSD
         # has no pin primitive (net/tcp.rs relies on the source-address bind alone), so an armed
@@ -1072,18 +1072,18 @@ class Backend:
         return True
 
     def delete_interface(self, segment: str) -> None:
-        # Destroy `segment`'s reflector-side interface outright (its far peer dies with it):
+        # Destroy `segment`'s netflector-side interface outright (its far peer dies with it):
         # the first half of an interface recreation, as a PPPoE drop or bridge teardown would
-        # produce. The reflector's capture is left bound to a dead kernel object.
+        # produce. netflector's capture is left bound to a dead kernel object.
         raise NotImplementedError
 
     def recreate_interface(self, segment: str) -> None:
         # The second half: recreate the interface under the same name and addresses -- a fresh
-        # kernel identity the reflector must reconcile its capture onto.
+        # kernel identity netflector must reconcile its capture onto.
         raise NotImplementedError
 
     def add_decoy_interface(self) -> None:
-        # Plant a throwaway interface in the reflector's network view, occupying the index a
+        # Plant a throwaway interface in netflector's network view, occupying the index a
         # just-deleted interface freed (see Phase.decoy). Removed with
         # [`remove_decoy_interface`]; the fabric teardown also covers it on failure.
         raise NotImplementedError
@@ -1091,7 +1091,7 @@ class Backend:
     def remove_decoy_interface(self) -> None:
         raise NotImplementedError
 
-    def reflector_ip(self, segment: str) -> str:
+    def netflector_ip(self, segment: str) -> str:
         raise NotImplementedError
 
     def probe_ip(self, role: str, segment: str) -> str:
@@ -1117,7 +1117,7 @@ class DockerBackend(Backend):
 
     def setup_segments(self) -> None:
         # Both networks are dual-stack: IPv4 cases are unaffected, and IPv6 cases need the
-        # bridges to carry IPv6 so the reflector can listen on / emit to ff02::1. The subnets are
+        # bridges to carry IPv6 so netflector can listen on / emit to ff02::1. The subnets are
         # given explicitly (not IPAM-auto) so the recreate cases can pin the same --ip/--ip6 when
         # they reconnect the endpoint -- docker rejects a static address on an auto-subnet network.
         for segment in SEGMENTS:
@@ -1138,12 +1138,12 @@ class DockerBackend(Backend):
     def keep_artifacts(self) -> str:
         return f"Docker resources {self.prefix}"
 
-    def start_reflector(self, config_path: Path) -> None:
-        container = f"{self.prefix}-reflector"
-        self.roles["reflector"] = container
+    def start_netflector(self, config_path: Path) -> None:
+        container = f"{self.prefix}-netflector"
+        self.roles["netflector"] = container
         # Pin in-container interface names per network. Without this, Docker's interface naming
-        # at start time is non-deterministic when multiple endpoints are attached, which made the
-        # reflector's SO_BINDTODEVICE land on the wrong bridge ~16% of runs. Using a non-"eth"
+        # at start time is non-deterministic when multiple endpoints are attached, which made
+        # netflector's SO_BINDTODEVICE land on the wrong bridge ~16% of runs. Using a non-"eth"
         # prefix avoids the prefix-collision caveat in moby/moby#49155. Requires Docker 28.0+
         # (the com.docker.network.endpoint.ifname driver-opt).
         docker(
@@ -1152,11 +1152,11 @@ class DockerBackend(Backend):
                 "--name",
                 container,
                 "--network",
-                f"name={self.networks['source']},driver-opt=com.docker.network.endpoint.ifname={REFLECTOR_SOURCE_IFNAME}",
+                f"name={self.networks['source']},driver-opt=com.docker.network.endpoint.ifname={NETFLECTOR_SOURCE_IFNAME}",
                 "--network",
-                f"name={self.networks['target']},driver-opt=com.docker.network.endpoint.ifname={REFLECTOR_TARGET_IFNAME}",
+                f"name={self.networks['target']},driver-opt=com.docker.network.endpoint.ifname={NETFLECTOR_TARGET_IFNAME}",
                 # Skip Duplicate Address Detection on the link-local addresses. Without this the
-                # kernel's autogenerated fe80:: is tentative (unusable) when the reflector resolves
+                # kernel's autogenerated fe80:: is tentative (unusable) when netflector resolves
                 # at startup, so it falls back to the Docker-assigned ULA as its sole v6 source and
                 # never distinguishes link-local from routable -- masking the per-scope source
                 # selection. With DAD off the fe80:: is usable immediately, so v6 (link-local) and
@@ -1166,9 +1166,9 @@ class DockerBackend(Backend):
                 "--cap-add",
                 "NET_RAW",
                 "--mount",
-                f"type=bind,source={config_path},target=/etc/reflector/config.toml,readonly",
+                f"type=bind,source={config_path},target=/etc/netflector/config.toml,readonly",
                 self.args.image,
-                "/etc/reflector/config.toml",
+                "/etc/netflector/config.toml",
             ]
         )
         docker(["start", container])
@@ -1185,7 +1185,7 @@ class DockerBackend(Backend):
             "--name",
             container,
             # Pin the helper's interface name so the probe can scope multicast egress / group
-            # joins to it deterministically (see start_reflector for the rationale).
+            # joins to it deterministically (see start_netflector for the rationale).
             "--network",
             f"name={self.networks[segment]},driver-opt=com.docker.network.endpoint.ifname={ifname}",
             "--mount",
@@ -1223,18 +1223,18 @@ class DockerBackend(Backend):
         if container is not None:
             docker(["rm", "-f", container], check=False, echo=False)
 
-    def stop_reflector(self, grace_seconds: int) -> int:
-        docker(["stop", "-t", str(grace_seconds), self.roles["reflector"]])
-        return self.wait("reflector")
+    def stop_netflector(self, grace_seconds: int) -> int:
+        docker(["stop", "-t", str(grace_seconds), self.roles["netflector"]])
+        return self.wait("netflector")
 
     def admin(self, script: str, *, capture: bool = False) -> str:
-        # Address/route changes need CAP_NET_ADMIN and a writable /proc/sys, which the reflector
+        # Address/route changes need CAP_NET_ADMIN and a writable /proc/sys, which the netflector
         # container (scratch image, NET_RAW only) has by neither. Run a throwaway privileged
-        # container in the reflector's network namespace, so `ip addr` / the disable_ipv6 sysctl
-        # act on the very interfaces the reflector watches -- without widening the reflector's
+        # container in netflector's network namespace, so `ip addr` / the disable_ipv6 sysctl
+        # act on the very interfaces netflector watches -- without widening netflector's
         # own privileges.
         result = docker([
-            "run", "--rm", "--privileged", "--network", f"container:{self.roles['reflector']}",
+            "run", "--rm", "--privileged", "--network", f"container:{self.roles['netflector']}",
             self.args.helper_image, "sh", "-ec", script,
         ])
         return result.stdout.strip() if capture else ""
@@ -1249,7 +1249,7 @@ class DockerBackend(Backend):
     def delete_interface(self, segment: str) -> None:
         # Detaching the bridge endpoint destroys the veth pair, the in-container interface
         # included. Capture the endpoint's addresses first, so the reconnect can pin them.
-        container = self.roles["reflector"]
+        container = self.roles["netflector"]
         network = self.networks[segment]
         fmt = (
             '{{(index .NetworkSettings.Networks "' + network + '").IPAddress}}'
@@ -1262,29 +1262,29 @@ class DockerBackend(Backend):
     def recreate_interface(self, segment: str) -> None:
         # Reconnect under the same pinned interface name and addresses: a fresh veth, a fresh
         # kernel identity. The driver-opt on connect needs the same Docker 28.0+ as create
-        # (see start_reflector).
+        # (see start_netflector).
         v4, v6 = self._detached_addrs.pop(segment)
         command = [
             "network", "connect",
-            "--driver-opt", f"com.docker.network.endpoint.ifname={REFLECTOR_IFNAMES[segment]}",
+            "--driver-opt", f"com.docker.network.endpoint.ifname={NETFLECTOR_IFNAMES[segment]}",
             "--ip", v4,
         ]
         if v6:
             command += ["--ip6", v6]
-        docker([*command, self.networks[segment], self.roles["reflector"]])
+        docker([*command, self.networks[segment], self.roles["netflector"]])
 
     def add_decoy_interface(self) -> None:
-        # The privileged admin sidecar shares the reflector's network namespace, so the veth
+        # The privileged admin sidecar shares netflector's network namespace, so the veth
         # lands where the freed index lived. Linux never reuses indexes, so the decoy is inert
-        # here -- it runs anyway to keep the case uniform across backends (and exercises the
-        # reflector's unwatched-churn policy for free).
+        # here -- it runs anyway to keep the case uniform across backends (and exercises
+        # netflector's unwatched-churn policy for free).
         self.admin(f"ip link add {DECOY_IFNAME} type veth peer name {DECOY_IFNAME}p")
 
     def remove_decoy_interface(self) -> None:
         self.admin(f"ip link del {DECOY_IFNAME}")
 
-    def reflector_ip(self, segment: str) -> str:
-        return self._container_ip(self.roles["reflector"], self.networks[segment])
+    def netflector_ip(self, segment: str) -> str:
+        return self._container_ip(self.roles["netflector"], self.networks[segment])
 
     def probe_ip(self, role: str, segment: str) -> str:
         return self._container_ip(self.roles[role], self.networks[segment])
@@ -1312,10 +1312,10 @@ class DockerBackend(Backend):
                 print(inspect.stdout, end="", file=sys.stderr, flush=True)
 
 
-# Native segment addressing over SEGMENT_V4_SUBNET / SEGMENT_V6_PREFIX: the reflector is always host 1
+# Native segment addressing over SEGMENT_V4_SUBNET / SEGMENT_V6_PREFIX: netflector is always host 1
 # and a segment's helper host 2, replacing Docker's IPAM discovery with a fixed plan (the kernel adds
 # fe80:: itself).
-NATIVE_REFLECTOR_HOST = 1
+NATIVE_NETFLECTOR_HOST = 1
 NATIVE_HELPER_HOST = 2
 
 
@@ -1324,9 +1324,9 @@ class NativeBackend(Backend):
     # are plain processes with stdout/stderr teed to per-role files in a case tmpdir (the
     # docker-logs replacement), and addressing follows the fixed plan above instead of IPAM
     # discovery. Subclasses provide the fabric: segment construction/teardown, the exec prefix
-    # that places a probe in a segment's stack, and the reflector's launch.
+    # that places a probe in a segment's stack, and netflector's launch.
     #
-    # Fidelity gap vs the docker backend: the reflector runs here with the harness's full root
+    # Fidelity gap vs the docker backend: netflector runs here with the harness's full root
     # privileges, not the CAP_NET_RAW-only confinement of the scratch container -- a change that
     # grows a privilege requirement passes natively and only fails in the docker lane. CI runs
     # both, so the docker lane stays the privilege-contract gate.
@@ -1354,7 +1354,7 @@ class NativeBackend(Backend):
         # The command prefix that places a probe process in `segment`'s network stack.
         raise NotImplementedError
 
-    def _reflector_command(self, config_path: Path) -> list[str]:
+    def _netflector_command(self, config_path: Path) -> list[str]:
         raise NotImplementedError
 
     def _teardown_fabric(self) -> None:
@@ -1382,10 +1382,10 @@ class NativeBackend(Backend):
     def _spawn(self, role: str, command: list[str]) -> None:
         self.remove(role)
         print(f"+ {format_command(command)}", flush=True)
-        # Scrub REFLECTOR_* so the daemon sees only its config file, as it would in the docker
-        # backend's clean container env -- a stray host REFLECTOR_LOG_LEVEL (or worse, an env
+        # Scrub NETFLECTOR_* so the daemon sees only its config file, as it would in the docker
+        # backend's clean container env -- a stray host NETFLECTOR_LOG_LEVEL (or worse, an env
         # reflector entry) must not alter the system under test.
-        env = {key: value for key, value in os.environ.items() if not key.startswith("REFLECTOR_")}
+        env = {key: value for key, value in os.environ.items() if not key.startswith("NETFLECTOR_")}
         out = open(self.logdir / f"{role}.out", "wb")
         err = open(self.logdir / f"{role}.err", "wb")
         try:
@@ -1394,8 +1394,8 @@ class NativeBackend(Backend):
             out.close()
             err.close()
 
-    def start_reflector(self, config_path: Path) -> None:
-        self._spawn("reflector", self._reflector_command(config_path))
+    def start_netflector(self, config_path: Path) -> None:
+        self._spawn("netflector", self._netflector_command(config_path))
 
     def start_probe(
         self, role: str, segment: str, ifname: str, probe_args: list[str], *, detach: bool = True
@@ -1437,8 +1437,8 @@ class NativeBackend(Backend):
             proc.kill()
             proc.wait()
 
-    def stop_reflector(self, grace_seconds: int) -> int:
-        proc = self.procs["reflector"]
+    def stop_netflector(self, grace_seconds: int) -> int:
+        proc = self.procs["netflector"]
         if proc.poll() is None:
             proc.send_signal(signal.SIGTERM)
             try:
@@ -1448,8 +1448,8 @@ class NativeBackend(Backend):
                 proc.wait()
         return proc.returncode
 
-    def reflector_ip(self, segment: str) -> str:
-        return f"{SEGMENT_V4_SUBNET[segment]}.{NATIVE_REFLECTOR_HOST}"
+    def netflector_ip(self, segment: str) -> str:
+        return f"{SEGMENT_V4_SUBNET[segment]}.{NATIVE_NETFLECTOR_HOST}"
 
     def probe_ip(self, role: str, segment: str) -> str:
         del role  # one helper per segment; the plan gives them all the same host number
@@ -1469,11 +1469,11 @@ class NativeLinuxBackend(NativeBackend):
     # wol_src + wol_dst (so the checked-in configs work unchanged), and one persistent far
     # namespace per segment holds the peer end, always named probe0. Every participant gets its
     # own namespace for the same reasons Docker gave them one: wildcard binds and --expect-none
-    # windows must only see the segment's traffic, unicast to the reflector must cross the wire
+    # windows must only see the segment's traffic, unicast to netflector must cross the wire
     # rather than short-circuit via lo, and the host's daemons (systemd-resolved speaks mDNS)
     # must not reach the test wires. Successive probe processes for a case run inside the same
     # far namespace: probes respawn, namespaces persist. The recreate cases delete and re-add
-    # whole pairs (fresh kernel identities under the same names), which the reflector survives
+    # whole pairs (fresh kernel identities under the same names), which netflector survives
     # by reconciling its captures; the probes are immune, resolving interfaces fresh at spawn.
 
     def __init__(self, args: argparse.Namespace, prefix: str) -> None:
@@ -1509,15 +1509,15 @@ class NativeLinuxBackend(NativeBackend):
         self._wait_carrier()
 
     def _setup_segment(self, segment: str) -> None:
-        dut_ifname = REFLECTOR_IFNAMES[segment]
+        dut_ifname = NETFLECTOR_IFNAMES[segment]
         self._ip([
             "link", "add", dut_ifname, "netns", self.ns["dut"],
             "type", "veth", "peer", "name", RECEIVER_IFNAME, "netns", self.ns[segment],
         ])
         v4, v6 = SEGMENT_V4_SUBNET[segment], SEGMENT_V6_PREFIX[segment]
         dut, far = self.ns["dut"], self.ns[segment]
-        self._ip(["-n", dut, "addr", "add", f"{v4}.{NATIVE_REFLECTOR_HOST}/24", "dev", dut_ifname])
-        self._ip(["-n", dut, "addr", "add", f"{v6}::{NATIVE_REFLECTOR_HOST}/64", "dev", dut_ifname])
+        self._ip(["-n", dut, "addr", "add", f"{v4}.{NATIVE_NETFLECTOR_HOST}/24", "dev", dut_ifname])
+        self._ip(["-n", dut, "addr", "add", f"{v6}::{NATIVE_NETFLECTOR_HOST}/64", "dev", dut_ifname])
         self._ip(["-n", far, "addr", "add", f"{v4}.{NATIVE_HELPER_HOST}/24", "dev", RECEIVER_IFNAME])
         self._ip(["-n", far, "addr", "add", f"{v6}::{NATIVE_HELPER_HOST}/64", "dev", RECEIVER_IFNAME])
         self._ip(["-n", dut, "link", "set", dut_ifname, "up"])
@@ -1528,7 +1528,7 @@ class NativeLinuxBackend(NativeBackend):
 
     def delete_interface(self, segment: str) -> None:
         # Deleting the dut end destroys the pair, the far probe0 included.
-        self._ip(["-n", self.ns["dut"], "link", "del", REFLECTOR_IFNAMES[segment]])
+        self._ip(["-n", self.ns["dut"], "link", "del", NETFLECTOR_IFNAMES[segment]])
 
     def recreate_interface(self, segment: str) -> None:
         self._setup_segment(segment)
@@ -1545,9 +1545,9 @@ class NativeLinuxBackend(NativeBackend):
         self._ip(["-n", self.ns["dut"], "link", "del", DECOY_IFNAME])
 
     def _wait_carrier(self) -> None:
-        # A veth reports operstate "up" only once BOTH ends are up; don't start the reflector
+        # A veth reports operstate "up" only once BOTH ends are up; don't start netflector
         # (or probes) on a link that hasn't settled.
-        pending = [(self.ns["dut"], ifname) for ifname in REFLECTOR_IFNAMES.values()]
+        pending = [(self.ns["dut"], ifname) for ifname in NETFLECTOR_IFNAMES.values()]
         pending += [(self.ns[segment], RECEIVER_IFNAME) for segment in SEGMENTS]
         deadline = time.monotonic() + 5.0
         for ns, ifname in pending:
@@ -1572,11 +1572,11 @@ class NativeLinuxBackend(NativeBackend):
     def _probe_exec(self, segment: str) -> list[str]:
         return ["ip", "netns", "exec", self.ns[segment]]
 
-    def _reflector_command(self, config_path: Path) -> list[str]:
+    def _netflector_command(self, config_path: Path) -> list[str]:
         return ["ip", "netns", "exec", self.ns["dut"], str(self.args.binary), str(config_path)]
 
     def admin(self, script: str, *, capture: bool = False) -> str:
-        # The harness already runs as root, so the reflector's network view is one netns exec
+        # The harness already runs as root, so netflector's network view is one netns exec
         # away -- no privileged sidecar needed.
         result = run_command(["ip", "netns", "exec", self.ns["dut"], "sh", "-ec", script])
         return result.stdout.strip() if capture else ""
@@ -1648,14 +1648,14 @@ class NativeFreeBSDBackend(NativeBackend):
 
     def _configure_segment(self, segment: str, a_end: str, b_end: str) -> None:
         # The epair ends already sit inside the dut/far jails; rename, address, and route them.
-        dut_ifname = REFLECTOR_IFNAMES[segment]
+        dut_ifname = NETFLECTOR_IFNAMES[segment]
         jexec_dut = ["jexec", self.jails["dut"]]
         jexec_far = ["jexec", self.jails[segment]]
         run_command([*jexec_dut, "ifconfig", a_end, "name", dut_ifname])
         run_command([*jexec_far, "ifconfig", b_end, "name", RECEIVER_IFNAME])
         v4, v6 = SEGMENT_V4_SUBNET[segment], SEGMENT_V6_PREFIX[segment]
-        run_command([*jexec_dut, "ifconfig", dut_ifname, "inet", f"{v4}.{NATIVE_REFLECTOR_HOST}/24"])
-        run_command([*jexec_dut, "ifconfig", dut_ifname, "inet6", f"{v6}::{NATIVE_REFLECTOR_HOST}/64"])
+        run_command([*jexec_dut, "ifconfig", dut_ifname, "inet", f"{v4}.{NATIVE_NETFLECTOR_HOST}/24"])
+        run_command([*jexec_dut, "ifconfig", dut_ifname, "inet6", f"{v6}::{NATIVE_NETFLECTOR_HOST}/64"])
         run_command([*jexec_dut, "ifconfig", dut_ifname, "up"])
         run_command([*jexec_far, "ifconfig", RECEIVER_IFNAME, "inet", f"{v4}.{NATIVE_HELPER_HOST}/24"])
         run_command([*jexec_far, "ifconfig", RECEIVER_IFNAME, "inet6", f"{v6}::{NATIVE_HELPER_HOST}/64"])
@@ -1666,7 +1666,7 @@ class NativeFreeBSDBackend(NativeBackend):
 
     def delete_interface(self, segment: str) -> None:
         # Destroying the dut end tears down the pair, the far probe0 included.
-        run_command(["jexec", self.jails["dut"], "ifconfig", REFLECTOR_IFNAMES[segment], "destroy"])
+        run_command(["jexec", self.jails["dut"], "ifconfig", NETFLECTOR_IFNAMES[segment], "destroy"])
 
     def recreate_interface(self, segment: str) -> None:
         # A fresh epair, moved into the LIVE jails -- setup assigns interfaces at jail
@@ -1701,7 +1701,7 @@ class NativeFreeBSDBackend(NativeBackend):
         # whole pair, including the b end inside its probe jail -- so no jail removal can return
         # a probe0 to a stack where the other jail's probe0 already sits. The host-side destroy
         # covers a setup that failed before the interfaces moved into the dut jail.
-        for ifname in REFLECTOR_IFNAMES.values():
+        for ifname in NETFLECTOR_IFNAMES.values():
             run_command(["jexec", self.jails["dut"], "ifconfig", ifname, "destroy"],
                         check=False, echo=False)
             run_command(["ifconfig", ifname, "destroy"], check=False, echo=False)
@@ -1716,7 +1716,7 @@ class NativeFreeBSDBackend(NativeBackend):
     def _probe_exec(self, segment: str) -> list[str]:
         return ["jexec", self.jails[segment]]
 
-    def _reflector_command(self, config_path: Path) -> list[str]:
+    def _netflector_command(self, config_path: Path) -> list[str]:
         return ["jexec", self.jails["dut"], str(self.args.binary), str(config_path)]
 
     def admin(self, script: str, *, capture: bool = False) -> str:
@@ -1787,7 +1787,7 @@ class CaseRunner:
     def __init__(self, args: argparse.Namespace, case: TestCase) -> None:
         self.args = args
         self.case = case
-        self.prefix = f"reflector-e2e-{case.name.replace('_', '-')}-{uuid.uuid4().hex[:8]}"
+        self.prefix = f"netflector-e2e-{case.name.replace('_', '-')}-{uuid.uuid4().hex[:8]}"
         self.backend = make_backend(args, self.prefix)
         self.config_path = E2E_DIR / case.config
 
@@ -1799,10 +1799,10 @@ class CaseRunner:
         # can join the multicast group on it. The address-change runner re-selects per phase (its
         # phases differ in direction), so this stays a method rather than inline __init__ code.
         if direction == "reverse":
-            self.sender_segment, self.sender_ifname = "target", REFLECTOR_TARGET_IFNAME
+            self.sender_segment, self.sender_ifname = "target", NETFLECTOR_TARGET_IFNAME
             self.receiver_segment = "source"
         else:
-            self.sender_segment, self.sender_ifname = "source", REFLECTOR_SOURCE_IFNAME
+            self.sender_segment, self.sender_ifname = "source", NETFLECTOR_SOURCE_IFNAME
             self.receiver_segment = "target"
         self.receiver_ifname = RECEIVER_IFNAME
 
@@ -1824,23 +1824,23 @@ class CaseRunner:
         self.backend.cleanup()
         return False
 
-    def check_reflector_valgrind(self) -> None:
-        # SIGTERM the reflector so it shuts down cleanly and valgrind runs its leak analysis, then
+    def check_netflector_valgrind(self) -> None:
+        # SIGTERM netflector so it shuts down cleanly and valgrind runs its leak analysis, then
         # read its exit code: the image's --error-exitcode=1 fires on any leak, leaked fd, or
         # memcheck error.
-        exit_code = self.backend.stop_reflector(VALGRIND_STOP_GRACE_SECONDS)
+        exit_code = self.backend.stop_netflector(VALGRIND_STOP_GRACE_SECONDS)
         if exit_code != 0:
             print(f"\n--- valgrind report: {self.case.name} ---", file=sys.stderr, flush=True)
-            _, err = self.backend.logs("reflector")
+            _, err = self.backend.logs("netflector")
             if err:
                 print(err, end="", file=sys.stderr, flush=True)
             raise RuntimeError(
-                f"valgrind reported errors in case {self.case.name} (reflector exited {exit_code})"
+                f"valgrind reported errors in case {self.case.name} (netflector exited {exit_code})"
             )
 
-    def start_reflector(self) -> None:
-        self.backend.start_reflector(self.config_path)
-        self.wait_for_reflector()
+    def start_netflector(self) -> None:
+        self.backend.start_netflector(self.config_path)
+        self.wait_for_netflector()
 
     def wait_for_log(self, role: str, marker: str, description: str) -> None:
         deadline = time.monotonic() + CONTAINER_READY_TIMEOUT_SECONDS
@@ -1862,8 +1862,8 @@ class CaseRunner:
             f"timed out waiting for {description} readiness marker ({marker}); last state: {last_state}"
         )
 
-    def wait_for_reflector(self) -> None:
-        self.wait_for_log("reflector", REFLECTOR_READY_LOG, "reflector")
+    def wait_for_netflector(self) -> None:
+        self.wait_for_log("netflector", NETFLECTOR_READY_LOG, "netflector")
 
     def start_receiver(self, case: TestCase | None = None) -> None:
         case = case or self.case
@@ -1932,9 +1932,9 @@ class CaseRunner:
         if exit_code != 0:
             raise RuntimeError(f"receiver failed with exit code {exit_code}")
 
-    def print_reflector_logs(self) -> None:
-        out, err = self.backend.logs("reflector")
-        print(f"--- reflector logs: {self.case.name} ---", flush=True)
+    def print_netflector_logs(self) -> None:
+        out, err = self.backend.logs("netflector")
+        print(f"--- netflector logs: {self.case.name} ---", flush=True)
         if out:
             print(out, end="", flush=True)
         if err:
@@ -1947,7 +1947,7 @@ class CaseRunner:
     ) -> str | None:
         # Bring one (interface, family) source address down or back up; the verbs live in the
         # backend (Linux vs FreeBSD). Returns the removed v4 CIDR so the caller can restore it.
-        ifname = REFLECTOR_SOURCE_IFNAME if interface == "source" else REFLECTOR_TARGET_IFNAME
+        ifname = NETFLECTOR_SOURCE_IFNAME if interface == "source" else NETFLECTOR_TARGET_IFNAME
         return self.backend.set_address(ifname, family, up=up, cidr=cidr)
 
     def print_diagnostics(self) -> None:
@@ -1957,25 +1957,25 @@ class CaseRunner:
     def run(self) -> None:
         print(f"\n=== {self.case.name} ===", flush=True)
         self.backend.setup_segments()
-        self.start_reflector()
+        self.start_netflector()
         self.start_receiver()
         self.run_sender()
         self.wait_for_result()
         print(f"PASS {self.case.name}", flush=True)
-        if self.args.show_reflector_logs:
+        if self.args.show_netflector_logs:
             time.sleep(0.5)
-            self.print_reflector_logs()
+            self.print_netflector_logs()
 
 
 class RoundTripRunner(CaseRunner):
-    # The SSDP M-SEARCH round trip: a searcher on the source segment sends an M-SEARCH; the
-    # reflector relays it to the group on the target from a reserved port; a responder (device)
-    # on the target unicasts a 200 OK back to that reserved port; the reflector proxies the reply
+    # The SSDP M-SEARCH round trip: a searcher on the source segment sends an M-SEARCH;
+    # netflector relays it to the group on the target from a reserved port; a responder (device)
+    # on the target unicasts a 200 OK back to that reserved port; netflector proxies the reply
     # to the searcher. The negative case (expect_reply=False) starts no responder and asserts the
-    # searcher hears nothing -- the reflector must not fabricate a reply.
+    # searcher hears nothing -- netflector must not fabricate a reply.
     def __init__(self, args: argparse.Namespace, case: RoundTripCase) -> None:
         # The base __init__ only reads case.name and case.direction; a TestCase shim reuses all
-        # its segment/reflector setup + cleanup with no duplication.
+        # its segment/netflector setup + cleanup with no duplication.
         shim = TestCase(name=case.name, send_port=case.port, receive_port=case.port,
             expect_mac=None, timeout_seconds=case.timeout_seconds, family=case.family,
             group=case.group, direction="forward", config=case.config)
@@ -1994,7 +1994,7 @@ class RoundTripRunner(CaseRunner):
 
     def run_searcher(self) -> None:
         expectation = ["--expect-payload-hex", self.rt.reply_hex] if self.rt.expect_reply else ["--expect-none"]
-        ifname = self.backend.helper_ifname(REFLECTOR_SOURCE_IFNAME)
+        ifname = self.backend.helper_ifname(NETFLECTOR_SOURCE_IFNAME)
         self.backend.start_probe("searcher", "source", ifname, [
             "search",
             "--source-port", str(SEARCHER_SOURCE_PORT), "--port", str(self.rt.port),
@@ -2016,25 +2016,25 @@ class RoundTripRunner(CaseRunner):
     def run(self) -> None:
         print(f"\n=== {self.rt.name} ===", flush=True)
         self.backend.setup_segments()
-        self.start_reflector()
+        self.start_netflector()
         if self.rt.expect_reply:
             self.start_responder()  # must be listening before the search goes out
         self.run_searcher()
         self.wait_for_searcher()
         # The per-searcher session must be torn down once it expires (SSDP: MX 2 + 2s grace ~= 4s;
         # WSD: a fixed 5s window): the deadline timer sweeps it, drops its port reservation, and
-        # unregisters its response capture -- logged by the reflector. wait_for_log raises if it
+        # unregisters its response capture -- logged by netflector. wait_for_log raises if it
         # never fires.
-        self.wait_for_log("reflector", self.rt.evict_log, "session eviction")
+        self.wait_for_log("netflector", self.rt.evict_log, "session eviction")
         print(f"{self.rt.name}: session evicted after expiry", flush=True)
         print(f"PASS {self.rt.name}", flush=True)
-        if self.args.show_reflector_logs:
+        if self.args.show_netflector_logs:
             time.sleep(0.5)
-            self.print_reflector_logs()
+            self.print_netflector_logs()
 
 
 class SearchRecreateRunner(RoundTripRunner):
-    # See SearchRecreateCase. Reuses RoundTripRunner's segment/reflector/responder setup (the shim
+    # See SearchRecreateCase. Reuses RoundTripRunner's segment/netflector/responder setup (the shim
     # __init__ reads only the fields both cases share), but opens a session, recreates one interface,
     # and re-searches. A target recreation drops the session (asserted via the cleared-sessions log); a
     # source recreation leaves it, so the retransmit re-reflects on the same reserved port (asserted
@@ -2048,7 +2048,7 @@ class SearchRecreateRunner(RoundTripRunner):
         # One M-SEARCH; with no_wait, send and exit (any reply is routed elsewhere), else assert the
         # 200 OK proxies back.
         expectation = ["--no-wait"] if no_wait else ["--expect-payload-hex", self.rt.reply_hex]
-        ifname = self.backend.helper_ifname(REFLECTOR_SOURCE_IFNAME)
+        ifname = self.backend.helper_ifname(NETFLECTOR_SOURCE_IFNAME)
         self.backend.start_probe(role, "source", ifname, [
             "search",
             "--source-port", str(SEARCHER_SOURCE_PORT), "--port", str(self.rt.port),
@@ -2070,14 +2070,14 @@ class SearchRecreateRunner(RoundTripRunner):
         # different one (the changed-index path); without it, FreeBSD reuses the index (the same-index
         # path). Both must behave the same, so both variants run.
         interface = self.rt.interface
-        ifname = REFLECTOR_IFNAMES[interface]
+        ifname = NETFLECTOR_IFNAMES[interface]
         self.backend.delete_interface(interface)
-        self.wait_for_log("reflector", f"interface {ifname} is gone", f"{interface} deletion")
+        self.wait_for_log("netflector", f"interface {ifname} is gone", f"{interface} deletion")
         if self.rt.decoy:
             self.backend.add_decoy_interface()
         self.backend.recreate_interface(interface)
         self.wait_for_log(
-            "reflector", f"interface {ifname}: returned as ifindex", f"{interface} recreation"
+            "netflector", f"interface {ifname}: returned as ifindex", f"{interface} recreation"
         )
         if self.rt.decoy:
             self.backend.remove_decoy_interface()
@@ -2085,7 +2085,7 @@ class SearchRecreateRunner(RoundTripRunner):
     def run(self) -> None:
         print(f"\n=== {self.rt.name} ===", flush=True)
         self.backend.setup_segments()
-        self.start_reflector()
+        self.start_netflector()
 
         # First search: opens a session (its reservation + response registration are on the target).
         self.start_responder()
@@ -2105,7 +2105,7 @@ class SearchRecreateRunner(RoundTripRunner):
             self.start_responder()
             self._search("searcher-retransmit")
             self.wait_for_log(
-                "reflector", "cleared all sessions after the target interface changed", "session cleared"
+                "netflector", "cleared all sessions after the target interface changed", "session cleared"
             )
             print(f"{self.rt.name}: session cleared, round trip resumed after the target recreation", flush=True)
         else:
@@ -2113,12 +2113,12 @@ class SearchRecreateRunner(RoundTripRunner):
             # reply routes to the baseline's MAC, so this container needn't receive it. The re-reflected
             # log proves the session survived and that the source ingress rebound and re-joined its group.
             self._search("searcher-retransmit", no_wait=True)
-            self.wait_for_log("reflector", "re-reflected SSDP search", "session reused")
+            self.wait_for_log("netflector", "re-reflected SSDP search", "session reused")
             print(f"{self.rt.name}: session survived the source recreation", flush=True)
         print(f"PASS {self.rt.name}", flush=True)
-        if self.args.show_reflector_logs:
+        if self.args.show_netflector_logs:
             time.sleep(0.5)
-            self.print_reflector_logs()
+            self.print_netflector_logs()
 
 
 class DialRunner(CaseRunner):
@@ -2130,7 +2130,7 @@ class DialRunner(CaseRunner):
             group=case.group, direction="forward")
         super().__init__(args, shim)
         self.dial = case
-        # The DIAL reflector loads a config with a single DIAL entry. The shared config's any-MAC
+        # The DIAL case's netflector loads a config with a single DIAL entry. The shared config's any-MAC
         # [reflectors.discovery] entry also reflects SSDP, which would double-reflect the device's
         # 200 OK (only one copy rewritten) -- so the DIAL case gets its own config to keep the
         # relayed reply unambiguous.
@@ -2138,8 +2138,8 @@ class DialRunner(CaseRunner):
 
     def start_device(self) -> None:
         # Single-homed on the target segment: the device's HTTP endpoints are reachable only via
-        # the reflector's egress-pinned upstream connect, so the peer it records is the
-        # reflector's target_if address -- never the source-side client (which cannot route to the
+        # netflector's egress-pinned upstream connect, so the peer it records is
+        # netflector's target_if address -- never the source-side client (which cannot route to the
         # target subnet directly).
         ifname = self.backend.helper_ifname(RECEIVER_IFNAME)
         probe_args = [
@@ -2155,16 +2155,16 @@ class DialRunner(CaseRunner):
         self.backend.start_probe("device", "target", ifname, probe_args)
         self.wait_for_log("device", "dial-device ready", "dial-device")
 
-    def _client_args(self, reflector_authority: str, device_authority: str) -> list[str]:
-        # The client is single-homed on the source segment. It is told the reflector's source_if
+    def _client_args(self, netflector_authority: str, device_authority: str) -> list[str]:
+        # The client is single-homed on the source segment. It is told netflector's source_if
         # address (what the rewritten authorities must point at) and the device's true target_if
         # address (which must never leak through a rewrite).
-        ifname = self.backend.helper_ifname(REFLECTOR_SOURCE_IFNAME)
+        ifname = self.backend.helper_ifname(NETFLECTOR_SOURCE_IFNAME)
         probe_args = [
             "dial-client",
             "--port", str(SSDP_PORT), "--address", self.dial.group, "--interface", ifname,
             "--family", str(self.dial.family), "--timeout", str(self.dial.timeout_seconds),
-            "--reflector-authority", reflector_authority, "--device-authority", device_authority,
+            "--netflector-authority", netflector_authority, "--device-authority", device_authority,
         ]
         if self.dial.passive:
             probe_args.append("--passive")  # listen for the relayed NOTIFY instead of sending an M-SEARCH
@@ -2176,8 +2176,8 @@ class DialRunner(CaseRunner):
 
     def run_client(self) -> None:
         device_target_ip = self.backend.probe_ip("device", "target")
-        refl_source_ip = self.backend.reflector_ip("source")
-        ifname = self.backend.helper_ifname(REFLECTOR_SOURCE_IFNAME)
+        refl_source_ip = self.backend.netflector_ip("source")
+        ifname = self.backend.helper_ifname(NETFLECTOR_SOURCE_IFNAME)
         self.backend.start_probe(
             "client", "source", ifname, self._client_args(refl_source_ip, device_target_ip)
         )
@@ -2194,10 +2194,10 @@ class DialRunner(CaseRunner):
 
     def assert_device_verdicts(self) -> None:
         # Two device-side checks: (1) the device exits non-zero if any request reached it with a
-        # Host that was not rewritten to its own authority (the reflector must rewrite Host
-        # source->device); (2) the reflector's upstream connect is egress-pinned to target_if, so
-        # the only peer the device recorded must be exactly the reflector's target_if address.
-        refl_target_ip = self.backend.reflector_ip("target")
+        # Host that was not rewritten to its own authority (netflector must rewrite Host
+        # source->device); (2) netflector's upstream connect is egress-pinned to target_if, so
+        # the only peer the device recorded must be exactly netflector's target_if address.
+        refl_target_ip = self.backend.netflector_ip("target")
         exit_code = self.backend.wait("device")
         out, err = self.backend.logs("device")
         if out:
@@ -2213,30 +2213,30 @@ class DialRunner(CaseRunner):
             raise RuntimeError("dial-device did not report the upstream peers it saw")
         seen = ast.literal_eval(line.split(marker, 1)[1].strip())
         if seen != [refl_target_ip]:
-            raise RuntimeError(f"device saw upstream peers {seen}, expected only the reflector's target_if "
+            raise RuntimeError(f"device saw upstream peers {seen}, expected only netflector's target_if "
                                f"address [{refl_target_ip!r}] (egress not pinned to target_if)")
         print(f"dial: every request's Host was rewritten to the device, and every upstream connection came "
-              f"from the reflector's target_if address {refl_target_ip}", flush=True)
+              f"from netflector's target_if address {refl_target_ip}", flush=True)
 
     def _force_upstream_egress_ambiguity(self) -> None:
         # Make the upstream egress pin load-bearing. The device is single-homed on the target
-        # segment, so the reflector's connect reaches it via target_if by routing alone, and
+        # segment, so netflector's connect reaches it via target_if by routing alone, and
         # SO_BINDTODEVICE (TcpSocket PinEgress) would be untestable -- assert_device_verdicts'
-        # "peer == reflector target_if address" passes even if the pin were dropped. Plant a
+        # "peer == netflector target_if address" passes even if the pin were dropped. Plant a
         # more-specific host route to the device via the WRONG interface (source_if): an unpinned
         # connect now follows it, ARPs the device on the source segment (where it does not live)
         # and fails, so the whole DIAL flow breaks. Only the egress pin -- which constrains the
         # route lookup to target_if -- still reaches the device, so PASS now requires it.
         # (FreeBSD declines: no pin primitive there, see Backend.add_decoy_route.)
         device_ip = self.backend.probe_ip("device", "target")
-        if not self.backend.add_decoy_route(device_ip, REFLECTOR_SOURCE_IFNAME):
+        if not self.backend.add_decoy_route(device_ip, NETFLECTOR_SOURCE_IFNAME):
             print(f"{self.dial.name}: no egress-pin primitive on this backend; decoy route skipped",
                   flush=True)
 
     def run(self) -> None:
         print(f"\n=== {self.dial.name} ===", flush=True)
         self.backend.setup_segments()
-        self.start_reflector()
+        self.start_netflector()
         self.start_device()      # must be serving before the client searches
         if not self.dial.unreachable:
             # The unreachable case asserts a PROMPT connect failure; a decoy route would change
@@ -2253,16 +2253,16 @@ class DialRunner(CaseRunner):
         else:
             self.assert_device_verdicts()  # device-side verdict: Host rewrite + egress-pinned upstream
         print(f"PASS {self.dial.name}", flush=True)
-        if self.args.show_reflector_logs:
+        if self.args.show_netflector_logs:
             time.sleep(0.5)
-            self.print_reflector_logs()
+            self.print_netflector_logs()
 
 
 class DialAddressChangeRunner(DialRunner):
-    # A DIAL pass, then the same pass after the reflector's source IPv4 changes, then after its
+    # A DIAL pass, then the same pass after netflector's source IPv4 changes, then after its
     # target IPv4 changes -- each to a different same-subnet address. The device stays up (passive
     # NOTIFY + HTTP) across all three; a fresh client runs each pass. _set_address (base) does the
-    # change in the reflector's network view; the reflector reacts on its own event loop, so each
+    # change in netflector's network view; netflector reacts on its own event loop, so each
     # change waits for the "gained IPv4 <new>" log before the next pass.
     def _different_cidr(self, cidr: str) -> str:
         # A different host on the same subnet: both backends hand out low addresses (Docker IPAM
@@ -2274,25 +2274,25 @@ class DialAddressChangeRunner(DialRunner):
         return f"{'.'.join(octets)}/{prefix}"
 
     def _change_v4(self, interface: str) -> str:
-        # Replace the reflector's IPv4 on `interface` with a different same-subnet address, then
-        # wait for the reflector to observe it -- which is when 7d evicts the now-stale proxy.
+        # Replace netflector's IPv4 on `interface` with a different same-subnet address, then
+        # wait for netflector to observe it -- which is when 7d evicts the now-stale proxy.
         # Returns the new host.
         old_cidr = self._set_address(interface, 4, up=False)        # del old, capture its CIDR
         new_cidr = self._different_cidr(old_cidr)
         self._set_address(interface, 4, up=True, cidr=new_cidr)     # add the different one
         new_host = new_cidr.split("/")[0]
         print(f"{self.dial.name}: {interface} IPv4 {old_cidr} -> {new_cidr}", flush=True)
-        self.wait_for_log("reflector", f"gained IPv4 {new_host}", f"{interface} IPv4 change")
+        self.wait_for_log("netflector", f"gained IPv4 {new_host}", f"{interface} IPv4 change")
         return new_host
 
-    def _dial_pass(self, label: str, reflector_authority: str, device_authority: str) -> None:
-        # One full DIAL flow through the reflector from a fresh client, asserting every rewrite
-        # points at `reflector_authority` (the reflector's CURRENT source IPv4) and never leaks
+    def _dial_pass(self, label: str, netflector_authority: str, device_authority: str) -> None:
+        # One full DIAL flow through netflector from a fresh client, asserting every rewrite
+        # points at `netflector_authority` (netflector's CURRENT source IPv4) and never leaks
         # `device_authority`.
         role = f"client-{label.replace(' ', '-')}"
-        ifname = self.backend.helper_ifname(REFLECTOR_SOURCE_IFNAME)
+        ifname = self.backend.helper_ifname(NETFLECTOR_SOURCE_IFNAME)
         self.backend.start_probe(
-            role, "source", ifname, self._client_args(reflector_authority, device_authority)
+            role, "source", ifname, self._client_args(netflector_authority, device_authority)
         )
         exit_code = self.backend.wait(role)
         out, err = self.backend.logs(role)
@@ -2302,15 +2302,15 @@ class DialAddressChangeRunner(DialRunner):
             print(err, end="", file=sys.stderr, flush=True)
         if exit_code != 0:
             raise RuntimeError(f"{self.dial.name}: DIAL pass '{label}' failed with exit code {exit_code}")
-        print(f"{self.dial.name}: DIAL pass '{label}' succeeded (rewrites -> {reflector_authority})", flush=True)
+        print(f"{self.dial.name}: DIAL pass '{label}' succeeded (rewrites -> {netflector_authority})", flush=True)
 
     def run(self) -> None:
         print(f"\n=== {self.dial.name} ===", flush=True)
         self.backend.setup_segments()
-        self.start_reflector()
+        self.start_netflector()
         self.start_device()  # passive: advertises NOTIFY + serves HTTP for serve_seconds
         device_ip = self.backend.probe_ip("device", "target")
-        source_ip = self.backend.reflector_ip("source")
+        source_ip = self.backend.netflector_ip("source")
 
         # Baseline, then re-run after each interface's IPv4 moves to a different address. A
         # passing re-run requires 7d to have evicted the proxy bound to the vanished address.
@@ -2321,25 +2321,25 @@ class DialAddressChangeRunner(DialRunner):
         self._dial_pass("after target IPv4 change", source_ip, device_ip)
 
         print(f"PASS {self.dial.name}", flush=True)
-        if self.args.show_reflector_logs:
+        if self.args.show_netflector_logs:
             time.sleep(0.5)
-            self.print_reflector_logs()
+            self.print_netflector_logs()
 
 
 class DialRecreateRunner(DialAddressChangeRunner):
     # See DialRecreateCase. Inherits the pass machinery; only the mutation differs: instead of
-    # replacing addresses, it destroys and recreates one reflector interface (optionally behind a
+    # replacing addresses, it destroys and recreates one netflector interface (optionally behind a
     # decoy), synchronized on the daemon's own parking/recreation log lines.
 
     def _recreate(self, interface: str) -> None:
-        ifname = REFLECTOR_IFNAMES[interface]
+        ifname = NETFLECTOR_IFNAMES[interface]
         self.backend.delete_interface(interface)
-        self.wait_for_log("reflector", f"interface {ifname} is gone", f"{interface} deletion")
+        self.wait_for_log("netflector", f"interface {ifname} is gone", f"{interface} deletion")
         if self.dial.decoy:
             self.backend.add_decoy_interface()
         self.backend.recreate_interface(interface)
         self.wait_for_log(
-            "reflector", f"interface {ifname}: returned as ifindex", f"{interface} recreation"
+            "netflector", f"interface {ifname}: returned as ifindex", f"{interface} recreation"
         )
         if self.dial.decoy:
             self.backend.remove_decoy_interface()
@@ -2347,10 +2347,10 @@ class DialRecreateRunner(DialAddressChangeRunner):
     def run(self) -> None:
         print(f"\n=== {self.dial.name} ===", flush=True)
         self.backend.setup_segments()
-        self.start_reflector()
+        self.start_netflector()
         self.start_device()  # passive: advertises NOTIFY + serves HTTP
         device_ip = self.backend.probe_ip("device", "target")
-        source_ip = self.backend.reflector_ip("source")
+        source_ip = self.backend.netflector_ip("source")
 
         self._dial_pass("baseline", source_ip, device_ip)
 
@@ -2365,20 +2365,20 @@ class DialRecreateRunner(DialAddressChangeRunner):
             self.start_device()
             device_ip = self.backend.probe_ip("device", "target")
         else:
-            source_ip = self.backend.reflector_ip("source")  # re-pinned to the same address
+            source_ip = self.backend.netflector_ip("source")  # re-pinned to the same address
         self._dial_pass(f"after {interface} recreation", source_ip, device_ip)
 
         print(f"PASS {self.dial.name}", flush=True)
-        if self.args.show_reflector_logs:
+        if self.args.show_netflector_logs:
             time.sleep(0.5)
-            self.print_reflector_logs()
+            self.print_netflector_logs()
 
 
 class AddressChangeRunner(CaseRunner):
     # Proves the dynamic family bring-up/teardown end to end: with a dual-family reflector
     # running, knock out one (interface, family) source address at a time and verify -- with real
     # traffic, not logs -- that reflection of exactly that family stops, then resumes once the
-    # address returns. The reflector reacts on its own event loop after the netlink notification,
+    # address returns. netflector reacts on its own event loop after the netlink notification,
     # so every check polls across that async window. All phases probe forward (source -> target).
     def __init__(self, args: argparse.Namespace, case: AddressChangeCase) -> None:
         shim = TestCase(
@@ -2481,43 +2481,43 @@ class AddressChangeRunner(CaseRunner):
 
     def _assert_address_changes_logged(self) -> None:
         # Full-parity log check (the Rust equivalent of the C++'s capability-down assertion):
-        # every phase removed then restored a source address, so the reflector's InterfaceMonitor
+        # every phase removed then restored a source address, so netflector's InterfaceMonitor
         # must have logged both transitions -- with the monitor off it logs neither. And no
         # reflect-failure WARN may appear: a send attempted on an addressless egress would mean
         # the per-packet gate failed to catch the drop.
-        out, err = self.backend.logs("reflector")
+        out, err = self.backend.logs("netflector")
         text = f"{out}\n{err}"
         for phase in self.ac.phases:
-            ifname = REFLECTOR_SOURCE_IFNAME if phase.interface == "source" else REFLECTOR_TARGET_IFNAME
+            ifname = NETFLECTOR_SOURCE_IFNAME if phase.interface == "source" else NETFLECTOR_TARGET_IFNAME
             family = f"IPv{phase.family}"
             for verb in ("lost", "gained"):
                 needle = f"interface {ifname}: {verb} {family}"
                 if needle not in text:
                     raise RuntimeError(
-                        f"{self.ac.name}: reflector never logged \"{needle}\" -- the interface monitor "
+                        f"{self.ac.name}: netflector never logged \"{needle}\" -- the interface monitor "
                         f"did not observe the change"
                     )
         if "cannot reflect" in text:
             raise RuntimeError(
-                f"{self.ac.name}: reflector logged a reflect failure -- a send was attempted on an "
+                f"{self.ac.name}: netflector logged a reflect failure -- a send was attempted on an "
                 f"addressless egress (the gate did not catch the drop)"
             )
 
     def run(self) -> None:
         print(f"\n=== {self.ac.name} ===", flush=True)
         self.backend.setup_segments()
-        self.start_reflector()
+        self.start_netflector()
         for phase in self.ac.phases:
             self._run_phase(phase)
         self._assert_address_changes_logged()
         print(f"PASS {self.ac.name}", flush=True)
-        if self.args.show_reflector_logs:
+        if self.args.show_netflector_logs:
             time.sleep(0.5)
-            self.print_reflector_logs()
+            self.print_netflector_logs()
 
 
 class RecreateRunner(AddressChangeRunner):
-    # Proves interface hot-swap recovery end to end: destroy and recreate one reflector-side
+    # Proves interface hot-swap recovery end to end: destroy and recreate one netflector-side
     # interface (same name and addresses, fresh kernel identity -- a PPPoE reconnect or bridge
     # rebuild in miniature) and verify with real traffic that reflection through it resumes
     # once the reconcile re-binds the capture. Inherits the probe/poll machinery; only the
@@ -2564,7 +2564,7 @@ class RecreateRunner(AddressChangeRunner):
         else:
             # The segment's wire died with the interface, so there is nothing to probe on;
             # the "is gone" log assertion stands in as the observed-death proof. The pause
-            # lets the reflector see the departure and park before the name returns --
+            # lets netflector see the departure and park before the name returns --
             # otherwise it would (correctly) log only the recreation.
             print(f"{desc}: segment wire gone; skipping the silence probe", flush=True)
             time.sleep(2.0)
@@ -2580,15 +2580,15 @@ class RecreateRunner(AddressChangeRunner):
         print(f"{desc}: reflection resumed after interface recreation", flush=True)
 
     def _assert_recreations_logged(self) -> None:
-        # The reflector must have observed each phase as a real hot-swap, in its parts: the
+        # netflector must have observed each phase as a real hot-swap, in its parts: the
         # parking line when the interface vanished, the address losses parking implies (the
         # egress gate closing), the recreation line when its capture re-bound, and the address
         # gains of the re-resolve. Their absence would mean reflection "recovered" some other
         # way than the reconcile.
-        out, err = self.backend.logs("reflector")
+        out, err = self.backend.logs("netflector")
         text = f"{out}\n{err}"
         for phase in self.ac.phases:
-            ifname = REFLECTOR_IFNAMES[phase.interface]
+            ifname = NETFLECTOR_IFNAMES[phase.interface]
             needles = (
                 f"interface {ifname} is gone",
                 f"interface {ifname}: returned as ifindex",
@@ -2598,21 +2598,21 @@ class RecreateRunner(AddressChangeRunner):
             for needle in needles:
                 if needle not in text:
                     raise RuntimeError(
-                        f"{self.ac.name}: reflector never logged \"{needle}\" -- the reconcile "
+                        f"{self.ac.name}: netflector never logged \"{needle}\" -- the reconcile "
                         f"did not drive the recovery"
                     )
 
     def run(self) -> None:
         print(f"\n=== {self.ac.name} ===", flush=True)
         self.backend.setup_segments()
-        self.start_reflector()
+        self.start_netflector()
         for phase in self.ac.phases:
             self._run_phase(phase)
         self._assert_recreations_logged()
         print(f"PASS {self.ac.name}", flush=True)
-        if self.args.show_reflector_logs:
+        if self.args.show_netflector_logs:
             time.sleep(0.5)
-            self.print_reflector_logs()
+            self.print_netflector_logs()
 
 
 def make_runner(args: argparse.Namespace,
@@ -2635,7 +2635,7 @@ def make_runner(args: argparse.Namespace,
     return CaseRunner(args, case)
 
 
-def build_reflector_image(image: str, target: str | None = None) -> None:
+def build_netflector_image(image: str, target: str | None = None) -> None:
     target_args = ["--target", target] if target is not None else []
     docker(["build", *target_args, "-t", image, "."], capture=False)
 
@@ -2656,23 +2656,23 @@ def select_cases(case_names: list[str]) -> list[
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run reflector e2e tests (Docker or native backend)")
+    parser = argparse.ArgumentParser(description="Run netflector e2e tests (Docker or native backend)")
     parser.add_argument("--backend", choices=["docker", "native"], default="docker",
         help="execution environment: Docker bridge networks + containers, or (Linux, root) "
              "netns + veth pairs + plain processes (default: docker)")
-    parser.add_argument("--image", default=DEFAULT_REFLECTOR_IMAGE,
-        help="reflector image tag to run (default: reflector:e2e; docker backend only)")
+    parser.add_argument("--image", default=DEFAULT_NETFLECTOR_IMAGE,
+        help="netflector image tag to run (default: netflector:e2e; docker backend only)")
     parser.add_argument("--skip-build", action="store_true",
         help="use --image without building it first (docker backend only)")
     parser.add_argument("--valgrind", action="store_true",
-        help="run the reflector under Valgrind memcheck (the runtime-valgrind image; fails on any leak, fd leak, or memcheck error)")
+        help="run netflector under Valgrind memcheck (the runtime-valgrind image; fails on any leak, fd leak, or memcheck error)")
     parser.add_argument("--helper-image", default=DEFAULT_HELPER_IMAGE,
         help="Python image used for UDP probes (docker backend only)")
     parser.add_argument("--binary", type=Path, default=None,
-        help="reflector binary to run (native backend, required); build it unprivileged first, "
+        help="netflector binary to run (native backend, required); build it unprivileged first, "
              "e.g. cargo build --release --locked")
     parser.add_argument("--keep-on-failure", action="store_true", help="leave resources behind after a failure")
-    parser.add_argument("--show-reflector-logs", action="store_true", help="print reflector logs after each passing case")
+    parser.add_argument("--show-netflector-logs", action="store_true", help="print netflector logs after each passing case")
     parser.add_argument(
         "--case",
         action="append",
@@ -2701,8 +2701,8 @@ def main() -> int:
     else:
         DockerBackend.require_available()
         # --valgrind selects the valgrind image unless one was passed explicitly.
-        if args.valgrind and args.image == DEFAULT_REFLECTOR_IMAGE:
-            args.image = VALGRIND_REFLECTOR_IMAGE
+        if args.valgrind and args.image == DEFAULT_NETFLECTOR_IMAGE:
+            args.image = VALGRIND_NETFLECTOR_IMAGE
 
     cases = select_cases(args.case)
     print(f"expected magic payload: {magic_packet_hex(CONFIGURED_MAC)}", flush=True)
@@ -2712,15 +2712,15 @@ def main() -> int:
         # path that validated here would otherwise point somewhere else at exec time.
         args.binary = args.binary.resolve()
         if not args.binary.is_file():
-            raise RuntimeError(f"reflector binary not found: {args.binary}")
+            raise RuntimeError(f"netflector binary not found: {args.binary}")
     elif not args.skip_build:
-        build_reflector_image(args.image, "runtime-valgrind" if args.valgrind else None)
+        build_netflector_image(args.image, "runtime-valgrind" if args.valgrind else None)
 
     for case in cases:
         with make_runner(args, case) as runner:
             runner.run()
             if args.valgrind:
-                runner.check_reflector_valgrind()
+                runner.check_netflector_valgrind()
 
     suffix = " under valgrind" if args.valgrind else ""
     print(f"\nPASS {len(cases)} e2e case(s){suffix}", flush=True)

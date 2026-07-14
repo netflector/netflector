@@ -353,7 +353,7 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "needs a real capture device")]
     fn captures_a_known_frame_on_lo() -> io::Result<()> {
-        const PROBE: &[u8] = b"reflector-afpacket-capture-probe";
+        const PROBE: &[u8] = b"netflector-afpacket-capture-probe";
         let Some(mut capture) = open_or_skip("lo", "afpacket_capture")? else {
             return Ok(());
         };
@@ -396,7 +396,7 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "needs a real capture device")]
     fn send_loops_back_on_lo() -> io::Result<()> {
-        const PROBE: &[u8] = b"reflector-afpacket-send-probe";
+        const PROBE: &[u8] = b"netflector-afpacket-send-probe";
         let Some(mut capture) = open_or_skip("lo", "afpacket_send")? else {
             return Ok(());
         };

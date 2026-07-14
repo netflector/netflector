@@ -51,7 +51,7 @@ pub(crate) struct Ssdp {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Reflector {
     /// Display name for logs, from the `[reflectors.<name>]` key or
-    /// `REFLECTOR_<tag>_NAME`.
+    /// `NETFLECTOR_<tag>_NAME`.
     pub(crate) name: ReflectorName,
     /// Interface to listen on.
     pub(crate) source_if: InterfaceName,
@@ -275,13 +275,13 @@ pub(crate) fn read_config_file(path: &Path) -> Result<String, ConfigError> {
 /// so the rest of loading is logged at that level. Environment overrides the file,
 /// which overrides the default.
 ///
-/// Deliberately lightweight: it reads only `REFLECTOR_LOG_LEVEL` and the file's
+/// Deliberately lightweight: it reads only `NETFLECTOR_LOG_LEVEL` and the file's
 /// top-level `log_level`, never touching the reflector tables, so it can't fail
 /// on a reflector error that should instead surface (logged) from the full parse.
 ///
 /// # Errors
 /// Returns [`ConfigError::Parse`] for malformed TOML, or [`ConfigError::EnvBadValue`]
-/// if `REFLECTOR_LOG_LEVEL` is not a valid level.
+/// if `NETFLECTOR_LOG_LEVEL` is not a valid level.
 pub(crate) fn resolve_log_level(
     toml_text: Option<&str>,
     env: &[(String, String)],

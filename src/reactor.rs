@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use self::poll::Poller;
 
-/// How many ready fds one [`wait`](poll::Poller::wait) reports. The reflector watches
+/// How many ready fds one [`wait`](poll::Poller::wait) reports. netflector watches
 /// only a handful of fds; level-triggering re-reports any overflow on the next wait,
 /// so a small buffer never loses events.
 const EVENT_CAPACITY: NonZeroUsize = NonZeroUsize::new(64).unwrap();

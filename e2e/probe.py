@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 #
-# In-container UDP prober for the reflector Wake-on-LAN e2e tests. run.py drives two of these in
+# In-container UDP prober for the netflector Wake-on-LAN e2e tests. run.py drives two of these in
 # separate helper containers: a `receive` prober binds the receive port (and, for IPv6, joins the
 # all-nodes group on its pinned interface) and asserts what it sees, while a `send` prober emits the
-# magic packet (broadcast for IPv4, all-nodes multicast for IPv6) toward the reflector. The receiver's
+# magic packet (broadcast for IPv4, all-nodes multicast for IPv6) toward netflector. The receiver's
 # process exit code is the verdict run.py waits on: 0 = expectation held, non-zero = failed.
 #
 # The send/receive verbs cover WoL and the verbatim-relay protocols (mDNS, one-way SSDP). The
 # respond/search verbs drive the SSDP M-SEARCH round trip: a `respond` device unicasts a 200 OK back to
-# whoever searched, and a `search` searcher awaits that reply proxied across segments by the reflector.
+# whoever searched, and a `search` searcher awaits that reply proxied across segments by netflector.
 # The DIAL probe verbs (dial-device/dial-client) from the C++ harness are absent because the DIAL cases
 # (see DIAL_CASES in run.py) drive a dedicated HTTP emulator rather than this prober.
 
@@ -166,7 +166,7 @@ def receive(args: argparse.Namespace) -> int:
 
 def respond(args: argparse.Namespace) -> int:
     # The SSDP round-trip "device": wait for one (relayed) M-SEARCH on the group, then unicast a 200 OK
-    # straight back to its sender. The sender is the reflector's reserved port on the target segment,
+    # straight back to its sender. The sender is netflector's reserved port on the target segment,
     # which proxies the reply back to the searcher on the source segment.
     family = socket.AF_INET6 if args.family == 6 else socket.AF_INET
     bind_address = "::" if family == socket.AF_INET6 else "0.0.0.0"
@@ -187,7 +187,7 @@ def respond(args: argparse.Namespace) -> int:
             return 1
 
         print(f"responder received {len(payload)} bytes from {peer[0]}:{peer[1]}", flush=True)
-        # Reply straight back to the sender (the reflector's target_if:P); it proxies to the searcher.
+        # Reply straight back to the sender (netflector's target_if:P); it proxies to the searcher.
         # peer is the full tuple recvfrom returned (4-tuple for IPv6), preserving the link-local scope.
         sock.sendto(args.reply_hex, peer)
         print(f"responder replied {len(args.reply_hex)} bytes to {peer[0]}:{peer[1]}", flush=True)
@@ -196,7 +196,7 @@ def respond(args: argparse.Namespace) -> int:
 
 def search(args: argparse.Namespace) -> int:
     # The SSDP round-trip "searcher": send an M-SEARCH to the group from a known source port, then await
-    # the proxied unicast 200 OK the reflector relays back from the device on the target segment.
+    # the proxied unicast 200 OK netflector relays back from the device on the target segment.
     family = socket.AF_INET6 if args.family == 6 else socket.AF_INET
     bind_address = "::" if family == socket.AF_INET6 else "0.0.0.0"
 
@@ -253,7 +253,7 @@ DIAL_SERVICE_TYPE = "urn:dial-multiscreen-org:service:dial:1"
 
 
 def _own_address(interface: str, family: int) -> str:
-    # This container's address on the interface facing the reflector -- the address the reflector's
+    # This container's address on the interface facing netflector -- the address netflector's
     # egress-pinned upstream connect() lands on, and the host we advertise in LOCATION / Application-URL.
     # A dummy connect + getsockname resolves it without parsing `ip addr`. The DIAL device is single-homed
     # (target network only), so the route -- and hence the source address -- is unambiguous.
@@ -271,16 +271,16 @@ def dial_device(args: argparse.Namespace) -> int:
     # Emulate a DIAL device: answer the proxied M-SEARCH with a 200 OK whose LOCATION points at our own
     # (target-side) HTTP description endpoint, and serve the description + REST endpoints over TCP. We
     # record the peer address of every accepted HTTP connection: with the device single-homed on the
-    # target network, the only client that can reach these endpoints is the reflector's upstream connect,
-    # so the recorded peer must be the reflector's target_if address (run.py asserts this).
+    # target network, the only client that can reach these endpoints is netflector's upstream connect,
+    # so the recorded peer must be netflector's target_if address (run.py asserts this).
     own = _own_address(args.interface, args.family)
     peers: set[str] = set()
     host_errors: list[str] = []
     state_lock = threading.Lock()
 
     def note(peer_ip: str, host, expected: str) -> None:
-        # Record the upstream peer (must be the reflector's target_if address) and verify the request's Host
-        # was rewritten to this device's own authority -- the device must never see the reflector's authority.
+        # Record the upstream peer (must be netflector's target_if address) and verify the request's Host
+        # was rewritten to this device's own authority -- the device must never see netflector's authority.
         with state_lock:
             peers.add(peer_ip)
             if host != expected:
@@ -350,8 +350,8 @@ def dial_device(args: argparse.Namespace) -> int:
             self._chunked(200, b"")
 
     # Bind the HTTP servers on ephemeral ports (the description port is "dynamic" by design). In
-    # --unreachable mode no server is started: the advertised port is one we bind-then-close, so the
-    # reflector's upstream connect is refused -- exercising the connect-failure path.
+    # --unreachable mode no server is started: the advertised port is one we bind-then-close, so
+    # netflector's upstream connect is refused -- exercising the connect-failure path.
     bind_host = "::" if args.family == 6 else "0.0.0.0"
     if args.unreachable:
         with socket.socket(socket.AF_INET6 if args.family == 6 else socket.AF_INET, socket.SOCK_STREAM) as dead:
@@ -380,7 +380,7 @@ def dial_device(args: argparse.Namespace) -> int:
 
         if args.notify:
             # Passive discovery: advertise an unsolicited NOTIFY ssdp:alive periodically (as real devices
-            # do), so the later-listening client catches one; the reflector relays each and rewrites LOCATION.
+            # do), so the later-listening client catches one; netflector relays each and rewrites LOCATION.
             notify = (
                 "NOTIFY * HTTP/1.1\r\n"
                 f"HOST: {args.join_group}:{args.port}\r\n"
@@ -458,7 +458,7 @@ def _http_request(host, port, method, path, family, body=b""):
         for line in lines[1:]:
             key, _, value = line.partition(":")
             headers[key.strip().lower()] = value.strip()
-        # Read the body per its framing rather than waiting for the connection close: the reflector
+        # Read the body per its framing rather than waiting for the connection close: netflector
         # defers the client-side close to its eviction timer, so an EOF-driven read would block on that.
         if headers.get("transfer-encoding", "").lower() == "chunked":
             while not rest.endswith(b"0\r\n\r\n"):
@@ -482,7 +482,7 @@ def _authority(url: str) -> str:
 
 
 def _dial_discover(args):
-    # Return the (reflector-rewritten) SSDP response carrying the device LOCATION, or None on timeout. Active
+    # Return the (netflector-rewritten) SSDP response carrying the device LOCATION, or None on timeout. Active
     # discovery sends an M-SEARCH and reads the unicast 200 OK; passive discovery joins the group and waits
     # for the relayed NOTIFY ssdp:alive.
     family = socket.AF_INET6 if args.family == 6 else socket.AF_INET
@@ -534,11 +534,11 @@ def _dial_discover(args):
 
 
 def dial_client(args: argparse.Namespace) -> int:
-    # Run the full DIAL flow through the reflector and assert each rewritable authority was rewritten to
-    # the reflector's source-side address (and never leaks the device's true target-side address). The
-    # device is unreachable from this (source) network except via the reflector, so a missing rewrite
+    # Run the full DIAL flow through netflector and assert each rewritable authority was rewritten to
+    # netflector's source-side address (and never leaks the device's true target-side address). The
+    # device is unreachable from this (source) network except via netflector, so a missing rewrite
     # makes the HTTP step connect to an unroutable address and fail.
-    refl = args.reflector_authority   # the reflector's source_if address (host only; LOCATION ports are dynamic)
+    refl = args.netflector_authority  # netflector's source_if address (host only; LOCATION ports are dynamic)
     device = args.device_authority    # the device's TRUE target-side host, asserted absent from rewrites
 
     text = _dial_discover(args)
@@ -551,7 +551,7 @@ def dial_client(args: argparse.Namespace) -> int:
         return 1
     loc_host = _authority(location).rsplit(":", 1)[0]
     if loc_host != refl:
-        print(f"dial-client: LOCATION host {loc_host!r} is not the reflector authority {refl!r} "
+        print(f"dial-client: LOCATION host {loc_host!r} is not the netflector authority {refl!r} "
               f"(rewrite missing); full LOCATION {location!r}", file=sys.stderr, flush=True)
         return 1
     if device in _authority(location):
@@ -560,11 +560,11 @@ def dial_client(args: argparse.Namespace) -> int:
     desc_host, _, desc_port_s = _authority(location).rpartition(":")
     desc_port = int(desc_port_s)
     desc_path = "/" + location.split("://", 1)[1].split("/", 1)[1]
-    print(f"dial-client: LOCATION rewritten to reflector authority {desc_host}:{desc_port}", flush=True)
+    print(f"dial-client: LOCATION rewritten to netflector authority {desc_host}:{desc_port}", flush=True)
 
     if args.expect_fetch_failure:
         # The LOCATION was rewritten (the listener was minted), but the device's upstream is dead, so the
-        # proxied fetch must fail -- and fail PROMPTLY. The reflector must FIN the client when the upstream
+        # proxied fetch must fail -- and fail PROMPTLY. netflector must FIN the client when the upstream
         # connect is refused, not leave it hanging until the eviction timer (~5s). A 2s budget cleanly
         # separates the prompt close from that stall.
         start = time.monotonic()
@@ -573,7 +573,7 @@ def dial_client(args: argparse.Namespace) -> int:
         except Exception as exc:  # noqa: BLE001 - any failure (refused / reset / EOF / timeout) is the point
             elapsed = time.monotonic() - start
             if elapsed > 2.0:
-                print(f"dial-client: fetch failed but only after {elapsed:.1f}s (> 2s) -- the reflector did "
+                print(f"dial-client: fetch failed but only after {elapsed:.1f}s (> 2s) -- netflector did "
                       f"not close the client promptly on upstream failure", file=sys.stderr, flush=True)
                 return 1
             print(f"dial-client: description fetch failed promptly after {elapsed:.1f}s "
@@ -593,7 +593,7 @@ def dial_client(args: argparse.Namespace) -> int:
         return 1
     app_host = _authority(app_url).rsplit(":", 1)[0]
     if app_host != refl or device in _authority(app_url):
-        print(f"dial-client: Application-URL {app_url!r} not rewritten to reflector authority {refl!r}",
+        print(f"dial-client: Application-URL {app_url!r} not rewritten to netflector authority {refl!r}",
               file=sys.stderr, flush=True)
         return 1
     rest_host, _, rest_port_s = _authority(app_url).rpartition(":")
@@ -612,7 +612,7 @@ def dial_client(args: argparse.Namespace) -> int:
         return 1
     run_host = _authority(run_loc).rsplit(":", 1)[0]
     if run_host != refl or device in _authority(run_loc):
-        print(f"dial-client: 201 LOCATION {run_loc!r} not rewritten to reflector authority {refl!r}",
+        print(f"dial-client: 201 LOCATION {run_loc!r} not rewritten to netflector authority {refl!r}",
               file=sys.stderr, flush=True)
         return 1
     print(f"dial-client: 201 LOCATION rewritten to {_authority(run_loc)}", flush=True)
@@ -628,7 +628,7 @@ def dial_client(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="UDP probe used by reflector Docker e2e tests")
+    parser = argparse.ArgumentParser(description="UDP probe used by netflector Docker e2e tests")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     send_parser = subparsers.add_parser("send", help="send a Wake-on-LAN magic packet")
@@ -682,7 +682,7 @@ def main() -> int:
         "dial-device", help="emulate a DIAL device: SSDP 200 OK + description + REST HTTP endpoints")
     device_parser.add_argument("--port", required=True, type=int, help="SSDP UDP port to bind (1900)")
     device_parser.add_argument("--join-group", required=True, help="SSDP multicast group to join")
-    device_parser.add_argument("--interface", required=True, help="interface facing the reflector")
+    device_parser.add_argument("--interface", required=True, help="interface facing netflector")
     device_parser.add_argument("--family", default=4, type=int, choices=(4, 6), help="IP version")
     device_parser.add_argument("--timeout", required=True, type=float, help="seconds to await the M-SEARCH")
     device_parser.add_argument("--serve-seconds", required=True, type=float,
@@ -690,11 +690,11 @@ def main() -> int:
     device_parser.add_argument("--notify", action="store_true",
                                help="passive discovery: advertise periodic NOTIFY instead of awaiting an M-SEARCH")
     device_parser.add_argument("--unreachable", action="store_true",
-                               help="advertise a dead HTTP port (no server) so the reflector's upstream is refused")
+                               help="advertise a dead HTTP port (no server) so netflector's upstream is refused")
     device_parser.set_defaults(func=dial_device)
 
     client_parser = subparsers.add_parser(
-        "dial-client", help="run the DIAL flow through the reflector and assert the rewrites")
+        "dial-client", help="run the DIAL flow through netflector and assert the rewrites")
     client_parser.add_argument("--source-port", type=int, help="M-SEARCH source port (active discovery only)")
     client_parser.add_argument("--port", required=True, type=int, help="SSDP destination/group port (1900)")
     client_parser.add_argument("--address", required=True, help="SSDP multicast group")
@@ -706,8 +706,8 @@ def main() -> int:
                                help="passive discovery: listen for a NOTIFY instead of sending an M-SEARCH")
     client_parser.add_argument("--expect-fetch-failure", action="store_true",
                                help="expect the proxied description fetch to fail (upstream unreachable)")
-    client_parser.add_argument("--reflector-authority", required=True,
-                               help="reflector source_if address (host only; LOCATION ports are dynamic)")
+    client_parser.add_argument("--netflector-authority", required=True,
+                               help="netflector source_if address (host only; LOCATION ports are dynamic)")
     client_parser.add_argument("--device-authority", required=True,
                                help="device's true target-side host, asserted absent from the rewrites")
     client_parser.set_defaults(func=dial_client)

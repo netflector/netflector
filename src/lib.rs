@@ -1,4 +1,4 @@
-//! reflector: reflects link-local service traffic (Wake-on-LAN, mDNS, SSDP, WS-Discovery,
+//! netflector: reflects link-local service traffic (Wake-on-LAN, mDNS, SSDP, WS-Discovery,
 //! and an optional DIAL proxy) between two network interfaces.
 //!
 //! The behavior lives in this library crate so it stays testable in-process;
@@ -34,7 +34,7 @@ use self::reflector::InterfaceMap;
 /// Run whatever the command line asked for.
 ///
 /// `args` is the process argument list with `argv[0]` already stripped: an optional TOML config path,
-/// which `REFLECTOR_*` environment variables are merged on top of, plus `--check-config`, `--version`
+/// which `NETFLECTOR_*` environment variables are merged on top of, plus `--check-config`, `--version`
 /// and `--help`. Run the binary with `--help` for the full text.
 ///
 /// # Errors
@@ -47,7 +47,7 @@ pub fn run(args: &[OsString]) -> Result<()> {
             Ok(())
         }
         Invocation::Version => {
-            println!("reflector {}", env!("CARGO_PKG_VERSION"));
+            println!("netflector {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         Invocation::CheckConfig(path) => check_config(path),
@@ -73,7 +73,7 @@ fn check_config(path: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-/// Run the reflector to completion.
+/// Run netflector to completion.
 ///
 /// # Errors
 /// Returns [`Error`] if configuration loading or validation fails, or if the
@@ -87,14 +87,14 @@ fn reflect(path: Option<&Path>) -> Result<()> {
     // Resolve the log level first from a minimal read of env + file, so the full parse below
     // logs at the configured verbosity (see resolve_log_level).
     logging::set_level(config::resolve_log_level(toml_text.as_deref(), &env)?);
-    log::info!("reflector {} starting", env!("CARGO_PKG_VERSION"));
+    log::info!("netflector {} starting", env!("CARGO_PKG_VERSION"));
     if let Some(path) = path {
         log::debug!(
-            "loading configuration from {} with REFLECTOR_* overrides",
+            "loading configuration from {} with NETFLECTOR_* overrides",
             path.display()
         );
     } else {
-        log::debug!("loading configuration from REFLECTOR_* environment only");
+        log::debug!("loading configuration from NETFLECTOR_* environment only");
     }
 
     let config = Config::from_sources(toml_text.as_deref(), env)?;

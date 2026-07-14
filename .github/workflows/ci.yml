@@ -383,9 +383,9 @@ jobs:
         run: ci/freebsd-vm.sh run 'pkg install -y python3 && python3 --version'
       - name: Run the e2e suite in the VM
         run: |
-          ci/freebsd-vm.sh run 'mkdir -p /root/reflector'
-          ci/freebsd-vm.sh push e2e target/${{ matrix.arch.triple }}/release/reflector /root/reflector/
-          ci/freebsd-vm.sh run 'cd /root/reflector && python3 e2e/run.py --backend native --binary ./reflector'
+          ci/freebsd-vm.sh run 'mkdir -p /root/netflector'
+          ci/freebsd-vm.sh push e2e target/${{ matrix.arch.triple }}/release/netflector /root/netflector/
+          ci/freebsd-vm.sh run 'cd /root/netflector && python3 e2e/run.py --backend native --binary ./netflector'
       - name: VM console log
         if: failure()
         run: ci/freebsd-vm.sh console
@@ -412,16 +412,16 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
-      - name: Build reflector image
+      - name: Build netflector image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
-          tags: reflector:e2e
+          tags: netflector:e2e
           load: true
           cache-from: type=gha,scope=${{ matrix.arch.name }}
           cache-to: type=gha,mode=max,scope=${{ matrix.arch.name }}
       - name: Run e2e
-        run: python3 e2e/run.py --skip-build --image reflector:e2e
+        run: python3 e2e/run.py --skip-build --image netflector:e2e
 
   # The same e2e suite without Docker: netns + veth segments and plain processes. The glibc lanes
   # run a release binary built directly on the runner -- the from-source configuration. The 64-bit
@@ -429,7 +429,7 @@ jobs:
   # toolchain, built and run natively. The 32-bit ARM lanes run that shipped configuration too,
   # lld-cross-linked like the Dockerfile's cross layers, with the daemon executing under qemu-user
   # via binfmt_misc: the harness, probes, and every kernel primitive (netns, veth, AF_PACKET,
-  # netlink) are native; only the reflector is emulated. That puts real 32-bit pointer-width
+  # netlink) are native; only netflector is emulated. That puts real 32-bit pointer-width
   # traffic through the whole capture -> classify -> re-emit path, which the QEMU unit-test lanes
   # can't (unit-only) and the docker-e2e lanes can't (64-bit images).
   native-e2e:
@@ -495,7 +495,7 @@ jobs:
       - name: Run e2e natively
         run: |
           triple='${{ matrix.target.triple }}'
-          sudo python3 e2e/run.py --backend native --binary "target/${triple:+$triple/}release/reflector"
+          sudo python3 e2e/run.py --backend native --binary "target/${triple:+$triple/}release/netflector"
 
   # The FreeBSD port pins every byte it builds from: the release tarball and all 20 crates, each with a
   # SHA256 in distinfo. If Cargo.lock moves and those are not regenerated, the port either fails to build
@@ -738,7 +738,7 @@ jobs:
           export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-fds=yes --num-callers=30 --error-exitcode=1'
           sudo -E "$(command -v cargo)" test --locked
 
-  # The e2e suite with the reflector under Valgrind memcheck (the runtime-valgrind image: a glibc release
+  # The e2e suite with netflector under Valgrind memcheck (the runtime-valgrind image: a glibc release
   # binary with debug symbols). run.py --valgrind SIGTERMs the daemon per case so Valgrind runs its leak
   # analysis at a clean exit; --error-exitcode=1 fails on any leak, leaked fd, or memcheck error.
   # --skip-build reuses the image built here.
@@ -758,7 +758,7 @@ jobs:
         with:
           context: .
           target: runtime-valgrind
-          tags: reflector:e2e-valgrind
+          tags: netflector:e2e-valgrind
           load: true
           cache-from: type=gha,scope=valgrind
           cache-to: type=gha,mode=max,scope=valgrind

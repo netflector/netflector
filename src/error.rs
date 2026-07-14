@@ -15,7 +15,7 @@ use crate::reflector::BuildError;
 /// Crate-wide result alias, so signatures read `Result<T>`.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Anything that can go wrong while configuring or running the reflector.
+/// Anything that can go wrong while configuring or running netflector.
 ///
 /// Opaque on purpose: callers only print it (`Display`). The structured cause
 /// stays crate-internal. Each subsystem keeps its own matchable error type; `?`
@@ -98,9 +98,9 @@ impl From<UsageError> for Error {
 #[derive(Debug, Error)]
 pub(crate) enum UsageError {
     /// More than the single optional config path was given; the payload is the first extra argument.
-    #[error("unexpected extra argument \"{0}\"; try `reflector --help`")]
+    #[error("unexpected extra argument \"{0}\"; try `netflector --help`")]
     TooManyArgs(String),
     /// An option the CLI does not know; the payload is the option as written.
-    #[error("unknown option \"{0}\"; try `reflector --help`")]
+    #[error("unknown option \"{0}\"; try `netflector --help`")]
     UnknownOption(String),
 }
