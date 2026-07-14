@@ -1,0 +1,56 @@
+#!/bin/sh
+#
+# PROVIDE: netflector
+# REQUIRE: LOGIN
+# KEYWORD: shutdown
+#
+# Add the following to /etc/rc.conf to enable netflector:
+#
+#   netflector_enable="YES"
+#
+# Optional:
+#
+#   netflector_config="/path/to/netflector.toml"   # default %%PREFIX%%/etc/netflector.toml
+#   netflector_flags=""                            # extra arguments
+
+. /etc/rc.subr
+
+name="netflector"
+rcvar="netflector_enable"
+desc="Reflect link-local service discovery between interfaces"
+
+load_rc_config $name
+
+: ${netflector_enable:="NO"}
+: ${netflector_config:="%%PREFIX%%/etc/netflector.toml"}
+
+pidfile="/var/run/${name}.pid"
+# v0.12.1 predates the project rename and ships its binary as "reflector"; this moves to
+# bin/netflector at the 0.13.0 bump.
+procname="%%PREFIX%%/bin/reflector"
+
+# The daemon runs in the foreground and logs to stderr, so daemon(8) backgrounds it and -S routes that
+# stderr into syslog under our own tag rather than /dev/null.
+command="/usr/sbin/daemon"
+command_args="-S -T ${name} -p ${pidfile} ${procname} ${netflector_config}"
+
+start_precmd="${name}_precmd"
+
+netflector_precmd()
+{
+    if [ ! -f "${netflector_config}" ]; then
+        err 1 "${netflector_config} does not exist"
+    fi
+
+    # Refuse to start on a configuration the daemon would reject, so the failure is one clear message
+    # here rather than a service that appears to start and is gone a moment later. --check-config parses
+    # and validates only: it opens no interface and needs no privileges.
+    if ! ${procname} --check-config "${netflector_config}" > /dev/null 2>&1; then
+        ${procname} --check-config "${netflector_config}" 2>&1 | while read -r line; do
+            warn "${line}"
+        done
+        err 1 "refusing to start: ${netflector_config} is not valid"
+    fi
+}
+
+run_rc_command "$1"
