@@ -53,6 +53,10 @@ fn action_segment(payload: &[u8]) -> Option<&[u8]> {
         if matches!(tag.first().copied(), Some(b'/' | b'?' | b'!')) {
             continue;
         }
+        // A self-closed element (`<a:Action/>`) has no text content, so there is no URI to read.
+        if tag.last() == Some(&b'/') {
+            continue;
+        }
         // The element name runs up to the first whitespace or self-close '/'; drop any `prefix:`.
         let name = tag
             .split(|&b| b.is_ascii_whitespace() || b == b'/')
@@ -126,6 +130,17 @@ mod tests {
             classify(&envelope(&format!("{NS_2009}/ResolveMatches"))),
             None
         );
+    }
+
+    #[test]
+    fn a_self_closed_action_yields_none() {
+        // A self-closed `<a:Action/>` carries no URI. The text after it is the trap: it must not
+        // be read as the element's content (a following tag already yielded an empty, filtered
+        // segment, so only trailing text distinguishes the broken scan from the correct one).
+        let msg = format!(
+            "<s:Envelope><s:Header><a:Action/>{NS_2005}/Hello</s:Header><s:Body/></s:Envelope>"
+        );
+        assert_eq!(classify(msg.as_bytes()), None);
     }
 
     #[test]
