@@ -499,4 +499,4 @@ CLI (`gh`, authenticated) for its CI check; nothing else runs locally.
 
 Copyright 2026 Sergii Bogomolov.
 
-Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).
+Licensed under the BSD 2-Clause License. See [LICENSE](LICENSE).
