@@ -4,6 +4,6 @@ AirPlay), SSDP (UPnP), WS-Discovery (ONVIF cameras, Windows printers), and an
 optional DIAL proxy for casting.
 
 The traffic discovery depends on is link-local by design and does not cross a
-router, which is why a phone on the LAN cannot see a TV on the IoT VLAN. The
-reflector re-emits it on the other interface with the addressing rewritten, so
+router, which is why a phone on the LAN cannot see a TV on the IoT VLAN.
+netflector re-emits it on the other interface with the addressing rewritten, so
 both sides discover each other without being bridged.

@@ -23,12 +23,12 @@ import time
 import urllib.request
 from pathlib import Path
 
-PORT = Path(__file__).resolve().parent.parent / 'dist' / 'freebsd' / 'net' / 'reflector'
+PORT = Path(__file__).resolve().parent.parent / 'dist' / 'freebsd' / 'net' / 'netflector'
 MAKEFILE = PORT / 'Makefile'
 DISTINFO = PORT / 'distinfo'
 
-GH_ACCOUNT = 'sbogomolov'
-GH_PROJECT = 'reflector'
+GH_ACCOUNT = 'netflector'
+GH_PROJECT = 'netflector'
 CRATE_URL = 'https://crates.io/api/v1/crates/{name}/{version}/download'
 TARBALL_URL = 'https://codeload.github.com/{acct}/{proj}/tar.gz/v{version}'
 

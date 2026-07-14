@@ -1,11 +1,11 @@
-PORTNAME=	reflector
+PORTNAME=	netflector
 DISTVERSIONPREFIX=	v
 DISTVERSION=	0.12.1
 CATEGORIES=	net
 
 MAINTAINER=	sergii@bogomolov.io
 COMMENT=	Reflect link-local service discovery between interfaces
-WWW=		https://github.com/sbogomolov/reflector
+WWW=		https://github.com/netflector/netflector
 
 LICENSE=	APACHE20
 LICENSE_FILE=	${WRKSRC}/LICENSE
@@ -15,9 +15,11 @@ ONLY_FOR_ARCHS_REASON=	upstream builds and tests FreeBSD on aarch64 and amd64 on
 
 USES=		cargo
 USE_GITHUB=	yes
-GH_ACCOUNT=	sbogomolov
+GH_ACCOUNT=	netflector
+GH_PROJECT=	netflector
+GH_TAGNAME=	${DISTVERSIONPREFIX}${DISTVERSION}
 
-USE_RC_SUBR=	reflector
+USE_RC_SUBR=	netflector
 CARGO_CRATES=	equivalent-1.0.2 \
 		hashbrown-0.17.1 \
 		indexmap-2.14.0 \
