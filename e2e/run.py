@@ -1214,6 +1214,10 @@ class DockerBackend(Backend):
             echo=False,
         )
         if result.returncode != 0:
+            # A vanished container must fail the wait immediately, not spin out the ready
+            # timeout; any other inspect failure (a daemon hiccup) is worth retrying.
+            if "no such object" in result.stderr.lower():
+                return False, "container no longer exists"
             return True, "unknown"
         state = result.stdout.strip()
         return not state.startswith("false "), state
