@@ -1041,7 +1041,7 @@ mod tests {
         let mut reactor = Reactor::new()?;
         let mut dispatcher = PacketDispatcher::new();
         let key = dispatcher.table.find_or_add_interface(LOOPBACK_IFACE)?;
-        dispatcher.table.set_test_name(key, "reflector-gone0");
+        dispatcher.table.set_test_name(key, "netflector-gone0");
 
         dispatcher.reconcile_interfaces(&mut reactor);
 
@@ -1251,7 +1251,7 @@ mod tests {
         assert!(!v6.matches(&packet("10.0.0.1:5353", "224.0.0.251:5353", None, None)));
     }
 
-    const PROBE: &[u8] = b"reflector-dispatch-probe";
+    const PROBE: &[u8] = b"netflector-dispatch-probe";
     /// The echo re-emits to this port, distinct from the filter's, so the looped-back
     /// echo can't re-match and amplify.
     const ECHO_DST_PORT: u16 = 1;

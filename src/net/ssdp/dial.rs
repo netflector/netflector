@@ -13,7 +13,7 @@ pub(crate) fn is_dial_service_message(payload: &[u8]) -> bool {
 }
 
 /// Parse the device authority from a DIAL discovery message's `LOCATION:` header, the byte span
-/// mapped into the whole `payload` so the SSDP path splices a reflector authority over it. The
+/// mapped into the whole `payload` so the SSDP path splices a netflector authority over it. The
 /// `LOCATION` must be a rewritable `http://ipv4[:port]` URL; `None` otherwise (forward unchanged).
 pub(crate) fn parse_dial_location_authority(payload: &[u8]) -> Option<Authority> {
     for line in payload.split(|&b| b == b'\n') {

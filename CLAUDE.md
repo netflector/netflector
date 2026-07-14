@@ -1,4 +1,4 @@
-# reflector
+# netflector
 
 ## Hard invariants
 
@@ -8,7 +8,7 @@
 - Must cross-compile to linux/arm/v7, linux/arm/v5, and static FreeBSD (amd64/arm64).
 - Error `Display` text is user-facing (printed to stderr) — keep it clear. Test
   structured error variants (`matches!`), not Display substrings.
-- lib/bin split: logic in the `reflector` library (`src/lib.rs`); thin binary (`src/main.rs`).
+- lib/bin split: logic in the `netflector` library (`src/lib.rs`); thin binary (`src/main.rs`).
 
 ## Build / test
 
@@ -26,7 +26,7 @@
   cargo, e.g. `./docker_test.sh clippy --all-targets -- -D warnings`). Check both
   host and Linux when touching `cfg(target_os)` code.
 - `cargo run` — no path arg: config from env only; with a path arg: TOML merged
-  with `REFLECTOR_*` env.
+  with `NETFLECTOR_*` env.
 - Test-only seams (`cfg(test)` accessor methods, consts) go in an `impl` block
   inside `mod tests`, never as `#[cfg(test)]` members of a production `impl`.
 

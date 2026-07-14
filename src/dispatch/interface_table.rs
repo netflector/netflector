@@ -578,7 +578,7 @@ mod tests {
     fn rebind_to_absent_parks_the_entry() -> io::Result<()> {
         let mut table = InterfaceTable::new();
         let key = table.find_or_add_interface(LOOPBACK_IFACE)?;
-        table.entries[key.0 as usize].interface.name = "reflector-gone0".into();
+        table.entries[key.0 as usize].interface.name = "netflector-gone0".into();
         let real = if_index(LOOPBACK_IFACE).expect("loopback has an ifindex");
         assert_eq!(
             table.stale_interfaces(),
@@ -615,7 +615,7 @@ mod tests {
             }
             return Err(e);
         }
-        table.entries[key.0 as usize].interface.name = "reflector-gone0".into();
+        table.entries[key.0 as usize].interface.name = "netflector-gone0".into();
         table.rebind_interface(key, 0)?; // park: joiner reset, no rejoin
         table.refresh_all();
         assert!(

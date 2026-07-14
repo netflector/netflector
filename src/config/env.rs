@@ -1,4 +1,4 @@
-//! Environment-variable configuration (`REFLECTOR_*`).
+//! Environment-variable configuration (`NETFLECTOR_*`).
 //!
 //! [`parse_env`] produces the same [`RawConfig`] as the TOML path, so downstream
 //! validation is shared. Values parse through their [`FromStr`] type, with failures
@@ -12,7 +12,7 @@ use super::raw::{RawConfig, RawReflector};
 use super::value::{AddressFamily, InterfaceName, LogLevel, ReflectorName, WolPorts};
 use crate::net::mac::MacSet;
 
-/// Accumulates a reflector's fields across its `REFLECTOR_<tag>_<param>` variables,
+/// Accumulates a reflector's fields across its `NETFLECTOR_<tag>_<param>` variables,
 /// then converts to a [`RawReflector`] once all are seen.
 #[derive(Debug, Default)]
 struct PartialReflector {
@@ -78,10 +78,10 @@ impl PartialReflector {
     }
 }
 
-/// Parse `REFLECTOR_*` variables into the raw configuration they describe.
+/// Parse `NETFLECTOR_*` variables into the raw configuration they describe.
 ///
-/// `REFLECTOR_LOG_LEVEL`, `REFLECTOR_DEBUG_MEMORY_INTERVAL_SECS`, and
-/// `REFLECTOR_COUNTERS_INTERVAL_SECS` set the globals; every other `REFLECTOR_<tag>_<param>`
+/// `NETFLECTOR_LOG_LEVEL`, `NETFLECTOR_DEBUG_MEMORY_INTERVAL_SECS`, and
+/// `NETFLECTOR_COUNTERS_INTERVAL_SECS` set the globals; every other `NETFLECTOR_<tag>_<param>`
 /// contributes to the reflector keyed by the lowercased `tag`. Unprefixed variables are ignored.
 pub(super) fn parse_env(
     vars: impl IntoIterator<Item = (String, String)>,
@@ -92,7 +92,7 @@ pub(super) fn parse_env(
     let mut partials: BTreeMap<String, PartialReflector> = BTreeMap::new();
 
     for (key, value) in vars {
-        let Some(rest) = key.strip_prefix("REFLECTOR_") else {
+        let Some(rest) = key.strip_prefix("NETFLECTOR_") else {
             continue;
         };
         match rest {
@@ -145,7 +145,7 @@ pub(super) fn parse_env(
     })
 }
 
-/// Resolve `REFLECTOR_LOG_LEVEL` alone, ignoring the rest of the environment.
+/// Resolve `NETFLECTOR_LOG_LEVEL` alone, ignoring the rest of the environment.
 ///
 /// Raises the logger to the configured verbosity *before* the full parse runs, so
 /// the parse itself (env merge, reflector build) logs at that level.
@@ -153,7 +153,7 @@ pub(super) fn log_level_from_env(
     vars: &[(String, String)],
 ) -> Result<Option<LogLevel>, ConfigError> {
     vars.iter()
-        .find(|(key, _)| key == "REFLECTOR_LOG_LEVEL")
+        .find(|(key, _)| key == "NETFLECTOR_LOG_LEVEL")
         .map(|(key, value)| env_value::<LogLevel>(value, key))
         .transpose()
 }
@@ -206,10 +206,10 @@ mod tests {
     #[test]
     fn env_only_minimal_reflector() {
         let cfg = from_env(&[
-            ("REFLECTOR_TV_SOURCE_IF", "lan"),
-            ("REFLECTOR_TV_TARGET_IF", "iot"),
-            ("REFLECTOR_TV_MDNS", "true"),
-            ("PATH", "/usr/bin"), // non-REFLECTOR vars are ignored
+            ("NETFLECTOR_TV_SOURCE_IF", "lan"),
+            ("NETFLECTOR_TV_TARGET_IF", "iot"),
+            ("NETFLECTOR_TV_MDNS", "true"),
+            ("PATH", "/usr/bin"), // non-NETFLECTOR vars are ignored
         ])
         .unwrap();
         assert_eq!(cfg.reflectors.len(), 1);
@@ -223,13 +223,13 @@ mod tests {
     #[test]
     fn env_globals_and_bool_forms() {
         let cfg = from_env(&[
-            ("REFLECTOR_LOG_LEVEL", "debug"),
-            ("REFLECTOR_DEBUG_MEMORY_INTERVAL_SECS", "30"),
-            ("REFLECTOR_COUNTERS_INTERVAL_SECS", "45"),
-            ("REFLECTOR_TV_SOURCE_IF", "a"),
-            ("REFLECTOR_TV_TARGET_IF", "b"),
-            ("REFLECTOR_TV_WOL", "1"),
-            ("REFLECTOR_TV_MDNS", "false"),
+            ("NETFLECTOR_LOG_LEVEL", "debug"),
+            ("NETFLECTOR_DEBUG_MEMORY_INTERVAL_SECS", "30"),
+            ("NETFLECTOR_COUNTERS_INTERVAL_SECS", "45"),
+            ("NETFLECTOR_TV_SOURCE_IF", "a"),
+            ("NETFLECTOR_TV_TARGET_IF", "b"),
+            ("NETFLECTOR_TV_WOL", "1"),
+            ("NETFLECTOR_TV_MDNS", "false"),
         ])
         .unwrap();
         assert_eq!(cfg.log_level, LogLevel::Debug);
@@ -249,9 +249,9 @@ mod tests {
     #[test]
     fn env_wsd_flag() {
         let cfg = from_env(&[
-            ("REFLECTOR_CAMS_SOURCE_IF", "lan"),
-            ("REFLECTOR_CAMS_TARGET_IF", "cams"),
-            ("REFLECTOR_CAMS_WSD", "true"),
+            ("NETFLECTOR_CAMS_SOURCE_IF", "lan"),
+            ("NETFLECTOR_CAMS_TARGET_IF", "cams"),
+            ("NETFLECTOR_CAMS_WSD", "true"),
         ])
         .unwrap();
         assert!(cfg.reflectors[0].wsd);
@@ -260,10 +260,10 @@ mod tests {
     #[test]
     fn env_name_overrides_label_not_key() {
         let cfg = from_env(&[
-            ("REFLECTOR_TV_SOURCE_IF", "a"),
-            ("REFLECTOR_TV_TARGET_IF", "b"),
-            ("REFLECTOR_TV_MDNS", "true"),
-            ("REFLECTOR_TV_NAME", "Living Room"),
+            ("NETFLECTOR_TV_SOURCE_IF", "a"),
+            ("NETFLECTOR_TV_TARGET_IF", "b"),
+            ("NETFLECTOR_TV_MDNS", "true"),
+            ("NETFLECTOR_TV_NAME", "Living Room"),
         ])
         .unwrap();
         // NAME sets the display name (canonicalized lowercase), overriding the `TV` tag.
@@ -273,10 +273,10 @@ mod tests {
     #[test]
     fn env_wol_ports_csv() {
         let cfg = from_env(&[
-            ("REFLECTOR_TV_SOURCE_IF", "a"),
-            ("REFLECTOR_TV_TARGET_IF", "b"),
-            ("REFLECTOR_TV_WOL", "true"),
-            ("REFLECTOR_TV_WOL_PORTS", "7, 9, 4000"),
+            ("NETFLECTOR_TV_SOURCE_IF", "a"),
+            ("NETFLECTOR_TV_TARGET_IF", "b"),
+            ("NETFLECTOR_TV_WOL", "true"),
+            ("NETFLECTOR_TV_WOL_PORTS", "7, 9, 4000"),
         ])
         .unwrap();
         let ports: Vec<u16> = cfg.reflectors[0]
@@ -293,10 +293,10 @@ mod tests {
     #[test]
     fn env_macs_csv() {
         let cfg = from_env(&[
-            ("REFLECTOR_TV_SOURCE_IF", "a"),
-            ("REFLECTOR_TV_TARGET_IF", "b"),
-            ("REFLECTOR_TV_MDNS", "true"),
-            ("REFLECTOR_TV_MACS", "00:00:00:00:00:01, 00:00:00:00:00:02"),
+            ("NETFLECTOR_TV_SOURCE_IF", "a"),
+            ("NETFLECTOR_TV_TARGET_IF", "b"),
+            ("NETFLECTOR_TV_MDNS", "true"),
+            ("NETFLECTOR_TV_MACS", "00:00:00:00:00:01, 00:00:00:00:00:02"),
         ])
         .unwrap();
         let macs = cfg.reflectors[0].macs.as_ref().unwrap();
@@ -310,10 +310,10 @@ mod tests {
         // `mac` was replaced by `macs` in 0.9.0.
         assert!(matches!(
             from_env(&[
-                ("REFLECTOR_TV_SOURCE_IF", "a"),
-                ("REFLECTOR_TV_TARGET_IF", "b"),
-                ("REFLECTOR_TV_MDNS", "true"),
-                ("REFLECTOR_TV_MAC", "02:42:ac:11:00:09"),
+                ("NETFLECTOR_TV_SOURCE_IF", "a"),
+                ("NETFLECTOR_TV_TARGET_IF", "b"),
+                ("NETFLECTOR_TV_MDNS", "true"),
+                ("NETFLECTOR_TV_MAC", "02:42:ac:11:00:09"),
             ])
             .unwrap_err(),
             ConfigError::EnvUnknownParam { param, .. } if param == "mac"
@@ -323,9 +323,9 @@ mod tests {
     #[test]
     fn env_reuses_cross_field_validation() {
         let e = from_env(&[
-            ("REFLECTOR_TV_SOURCE_IF", "a"),
-            ("REFLECTOR_TV_TARGET_IF", "a"),
-            ("REFLECTOR_TV_MDNS", "true"),
+            ("NETFLECTOR_TV_SOURCE_IF", "a"),
+            ("NETFLECTOR_TV_TARGET_IF", "a"),
+            ("NETFLECTOR_TV_MDNS", "true"),
         ])
         .unwrap_err();
         assert!(matches!(e, ConfigError::SameInterface { value, .. } if value.as_str() == "a"));
@@ -341,7 +341,7 @@ mod tests {
             mdns = true
         "#;
         let cfg =
-            Config::from_sources(Some(toml), env(&[("REFLECTOR_LOG_LEVEL", "error")])).unwrap();
+            Config::from_sources(Some(toml), env(&[("NETFLECTOR_LOG_LEVEL", "error")])).unwrap();
         assert_eq!(cfg.log_level, LogLevel::Error);
     }
 
@@ -356,9 +356,9 @@ mod tests {
         let cfg = Config::from_sources(
             Some(toml),
             env(&[
-                ("REFLECTOR_RADIO_SOURCE_IF", "c"),
-                ("REFLECTOR_RADIO_TARGET_IF", "d"),
-                ("REFLECTOR_RADIO_MDNS", "true"),
+                ("NETFLECTOR_RADIO_SOURCE_IF", "c"),
+                ("NETFLECTOR_RADIO_TARGET_IF", "d"),
+                ("NETFLECTOR_RADIO_MDNS", "true"),
             ]),
         )
         .unwrap();
@@ -379,9 +379,9 @@ mod tests {
         let e = Config::from_sources(
             Some(toml),
             env(&[
-                ("REFLECTOR_TV_SOURCE_IF", "c"),
-                ("REFLECTOR_TV_TARGET_IF", "d"),
-                ("REFLECTOR_TV_MDNS", "true"),
+                ("NETFLECTOR_TV_SOURCE_IF", "c"),
+                ("NETFLECTOR_TV_TARGET_IF", "d"),
+                ("NETFLECTOR_TV_MDNS", "true"),
             ]),
         )
         .unwrap_err();
@@ -401,9 +401,9 @@ mod tests {
         let e = Config::from_sources(
             Some(toml),
             env(&[
-                ("REFLECTOR_TV_SOURCE_IF", "c"),
-                ("REFLECTOR_TV_TARGET_IF", "d"),
-                ("REFLECTOR_TV_MDNS", "true"),
+                ("NETFLECTOR_TV_SOURCE_IF", "c"),
+                ("NETFLECTOR_TV_TARGET_IF", "d"),
+                ("NETFLECTOR_TV_MDNS", "true"),
             ]),
         )
         .unwrap_err();
@@ -414,7 +414,7 @@ mod tests {
     fn env_malformed_var_rejected() {
         // No underscore to split into <tag>_<param>.
         assert!(matches!(
-            from_env(&[("REFLECTOR_TV", "x")]).unwrap_err(),
+            from_env(&[("NETFLECTOR_TV", "x")]).unwrap_err(),
             ConfigError::EnvMalformedVar { .. }
         ));
     }
@@ -423,12 +423,12 @@ mod tests {
     fn env_invalid_tag_rejected() {
         // Empty tag.
         assert!(matches!(
-            from_env(&[("REFLECTOR__SOURCE_IF", "x")]).unwrap_err(),
+            from_env(&[("NETFLECTOR__SOURCE_IF", "x")]).unwrap_err(),
             ConfigError::EnvInvalidTag { .. }
         ));
         // Non-alphanumeric tag.
         assert!(matches!(
-            from_env(&[("REFLECTOR_T-V_SOURCE_IF", "x")]).unwrap_err(),
+            from_env(&[("NETFLECTOR_T-V_SOURCE_IF", "x")]).unwrap_err(),
             ConfigError::EnvInvalidTag { tag, .. } if tag == "T-V"
         ));
     }
@@ -436,9 +436,9 @@ mod tests {
     #[test]
     fn env_reserved_tag_rejected() {
         for var in [
-            "REFLECTOR_LOG_SOMETHING",
-            "REFLECTOR_DEBUG_SOMETHING",
-            "REFLECTOR_COUNTERS_SOURCE_IF",
+            "NETFLECTOR_LOG_SOMETHING",
+            "NETFLECTOR_DEBUG_SOMETHING",
+            "NETFLECTOR_COUNTERS_SOURCE_IF",
         ] {
             assert!(matches!(
                 from_env(&[(var, "x")]).unwrap_err(),
@@ -451,8 +451,8 @@ mod tests {
     fn env_unknown_param_rejected() {
         assert!(matches!(
             from_env(&[
-                ("REFLECTOR_TV_SOURCE_IF", "a"),
-                ("REFLECTOR_TV_BOGUS", "1"),
+                ("NETFLECTOR_TV_SOURCE_IF", "a"),
+                ("NETFLECTOR_TV_BOGUS", "1"),
             ])
             .unwrap_err(),
             ConfigError::EnvUnknownParam { param, .. } if param == "bogus"
@@ -463,9 +463,9 @@ mod tests {
     fn env_bad_value_is_structured() {
         assert!(matches!(
             from_env(&[
-                ("REFLECTOR_TV_SOURCE_IF", ""),
-                ("REFLECTOR_TV_TARGET_IF", "b"),
-                ("REFLECTOR_TV_MDNS", "true"),
+                ("NETFLECTOR_TV_SOURCE_IF", ""),
+                ("NETFLECTOR_TV_TARGET_IF", "b"),
+                ("NETFLECTOR_TV_MDNS", "true"),
             ])
             .unwrap_err(),
             ConfigError::EnvBadValue {
@@ -474,14 +474,14 @@ mod tests {
             }
         ));
         assert!(matches!(
-            from_env(&[("REFLECTOR_TV_MACS", "zz")]).unwrap_err(),
+            from_env(&[("NETFLECTOR_TV_MACS", "zz")]).unwrap_err(),
             ConfigError::EnvBadValue {
                 source: ParseValueError::Macs(_),
                 ..
             }
         ));
         assert!(matches!(
-            from_env(&[("REFLECTOR_TV_WOL", "maybe")]).unwrap_err(),
+            from_env(&[("NETFLECTOR_TV_WOL", "maybe")]).unwrap_err(),
             ConfigError::EnvBadValue {
                 value,
                 source: ParseValueError::Bool(_),
@@ -489,7 +489,7 @@ mod tests {
             } if value == "maybe"
         ));
         assert!(matches!(
-            from_env(&[("REFLECTOR_COUNTERS_INTERVAL_SECS", "soon")]).unwrap_err(),
+            from_env(&[("NETFLECTOR_COUNTERS_INTERVAL_SECS", "soon")]).unwrap_err(),
             ConfigError::EnvBadValue {
                 source: ParseValueError::Integer(_),
                 ..
@@ -501,8 +501,8 @@ mod tests {
     fn env_reflector_missing_required_field() {
         assert!(matches!(
             from_env(&[
-                ("REFLECTOR_TV_TARGET_IF", "b"),
-                ("REFLECTOR_TV_MDNS", "true"),
+                ("NETFLECTOR_TV_TARGET_IF", "b"),
+                ("NETFLECTOR_TV_MDNS", "true"),
             ])
             .unwrap_err(),
             ConfigError::EnvMissingField {
@@ -515,7 +515,7 @@ mod tests {
     #[test]
     fn env_only_no_reflectors_rejected() {
         assert!(matches!(
-            Config::from_sources(None, env(&[("REFLECTOR_LOG_LEVEL", "info")])).unwrap_err(),
+            Config::from_sources(None, env(&[("NETFLECTOR_LOG_LEVEL", "info")])).unwrap_err(),
             ConfigError::NoReflectors
         ));
     }
@@ -523,10 +523,10 @@ mod tests {
     #[test]
     fn env_name_is_trimmed_and_lowercased() {
         let cfg = from_env(&[
-            ("REFLECTOR_TV_SOURCE_IF", "a"),
-            ("REFLECTOR_TV_TARGET_IF", "b"),
-            ("REFLECTOR_TV_MDNS", "true"),
-            ("REFLECTOR_TV_NAME", "  Living Room  "),
+            ("NETFLECTOR_TV_SOURCE_IF", "a"),
+            ("NETFLECTOR_TV_TARGET_IF", "b"),
+            ("NETFLECTOR_TV_MDNS", "true"),
+            ("NETFLECTOR_TV_NAME", "  Living Room  "),
         ])
         .unwrap();
         assert_eq!(cfg.reflectors[0].name.as_str(), "living room");
@@ -544,9 +544,9 @@ mod tests {
         let e = Config::from_sources(
             Some(toml),
             env(&[
-                ("REFLECTOR_RADIO_SOURCE_IF", "lan"),
-                ("REFLECTOR_RADIO_TARGET_IF", "iot"),
-                ("REFLECTOR_RADIO_MDNS", "true"),
+                ("NETFLECTOR_RADIO_SOURCE_IF", "lan"),
+                ("NETFLECTOR_RADIO_TARGET_IF", "iot"),
+                ("NETFLECTOR_RADIO_MDNS", "true"),
             ]),
         )
         .unwrap_err();
@@ -563,10 +563,10 @@ mod tests {
     fn env_whitespace_name_rejected() {
         assert!(matches!(
             from_env(&[
-                ("REFLECTOR_TV_SOURCE_IF", "a"),
-                ("REFLECTOR_TV_TARGET_IF", "b"),
-                ("REFLECTOR_TV_MDNS", "true"),
-                ("REFLECTOR_TV_NAME", "   "),
+                ("NETFLECTOR_TV_SOURCE_IF", "a"),
+                ("NETFLECTOR_TV_TARGET_IF", "b"),
+                ("NETFLECTOR_TV_MDNS", "true"),
+                ("NETFLECTOR_TV_NAME", "   "),
             ])
             .unwrap_err(),
             ConfigError::EnvBadValue {

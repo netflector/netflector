@@ -1,4 +1,4 @@
-# reflector
+# netflector
 
 Reflects link-local service traffic between two network interfaces. Useful when devices that need to
 talk to each other sit on different L2 segments that don't forward each other's broadcasts or
@@ -34,9 +34,9 @@ these. The same shape serves one or a few specific devices (`macs`) or a whole n
 
 ## Platform support
 
-reflector runs on **Linux, macOS, and FreeBSD**.
+netflector runs on **Linux, macOS, and FreeBSD**.
 
-**Docker**: a multi-arch image is published to `ghcr.io/sbogomolov/reflector` for `linux/amd64`,
+**Docker**: a multi-arch image is published to `ghcr.io/netflector/netflector` for `linux/amd64`,
 `linux/arm64`, `linux/arm/v7`, and `linux/arm/v5`; Docker pulls the variant matching the host. The
 32-bit ARM variants reach low-end embedded routers and SBCs, down to soft-float ARMv5, handy for the
 router that bridges the two segments.
@@ -59,8 +59,8 @@ components, so with [`rustup`](https://rustup.rs) the right toolchain (and any m
 installed on the first `cargo` invocation. The crate is edition 2024 (Rust ≥ 1.85), with a 1.93 MSRV.
 
 ```sh
-cargo build            # debug binary at target/debug/reflector
-cargo build --release  # optimized binary at target/release/reflector
+cargo build            # debug binary at target/debug/netflector
+cargo build --release  # optimized binary at target/release/netflector
 ```
 
 The release profile enables LTO, a single codegen unit, and symbol stripping for a small footprint
@@ -83,14 +83,14 @@ The runtime image is a single static musl binary on `scratch`: no shell, no pack
 build produces a single-arch image for the host:
 
 ```sh
-docker build -t reflector .
+docker build -t netflector .
 ```
 
 The Dockerfile's builder runs on the build host (no QEMU) and links the cross layers with LLVM's
 `lld`, so a multi-arch image builds on one machine:
 
 ```sh
-docker buildx build --platform linux/amd64,linux/arm64,linux/arm/v7,linux/arm/v5 -t reflector .
+docker buildx build --platform linux/amd64,linux/arm64,linux/arm/v7,linux/arm/v5 -t netflector .
 ```
 
 Releases take a different path (see [Release](#release)): each arch builds on its own runner and the
@@ -101,11 +101,11 @@ native runner, cross-compile.
 ## Run
 
 ```sh
-./target/release/reflector [--check-config] [--] [config.toml]
+./target/release/netflector [--check-config] [--] [config.toml]
 ```
 
 Configuration comes from a TOML file, from environment variables, or from both. With a path argument
-the file is read and merged with any `REFLECTOR_*` environment variables; with **no argument** the
+the file is read and merged with any `NETFLECTOR_*` environment variables; with **no argument** the
 configuration comes entirely from the environment (see [Environment variables](#environment-variables)).
 The process logs to stderr with UTC timestamps, shuts down cleanly on `SIGINT` / `SIGTERM`, and on
 `SIGUSR1` dumps the per-interface [packet counters](#configuration) to the log on demand (regardless of
@@ -123,13 +123,13 @@ on a machine where the configured interfaces do not exist (useful for validating
 a build host), but for the same reason it cannot tell you that an interface is missing:
 
 ```sh
-$ reflector --check-config /usr/local/etc/reflector.toml
+$ netflector --check-config /usr/local/etc/netflector.toml
 config ok: 1 reflector
 ```
 
 ### Runtime privileges
 
-The reflector opens one L2 packet-capture socket per interface: it both observes incoming packets and
+netflector opens one L2 packet-capture socket per interface: it both observes incoming packets and
 re-injects reflected ones through that same socket (the sender doesn't bind a port, so no port
 privileges are involved). mDNS and SSDP additionally join their multicast group(s) on it, which needs
 no privilege beyond opening the socket. That capture socket drives the requirements below.
@@ -140,14 +140,14 @@ Capture and injection use `AF_PACKET`; the DIAL proxy's TCP connect pins its int
 `SO_BINDTODEVICE`. Both require `CAP_NET_RAW`. Either run as root or grant the capability once:
 
 ```sh
-sudo setcap cap_net_raw=eip ./target/release/reflector
+sudo setcap cap_net_raw=eip ./target/release/netflector
 ```
 
 #### macOS
 
 Capture and injection use BPF (`/dev/bpf*`); the DIAL proxy's connect uses `IP_BOUND_IF`, which needs
 no extra privilege. BPF devices are owned by `root:wheel` with mode `0600` on a default install, so out
-of the box the reflector must run as root. To run unprivileged, install Wireshark's `ChmodBPF` helper.
+of the box netflector must run as root. To run unprivileged, install Wireshark's `ChmodBPF` helper.
 It creates an `access_bpf` group, adds the current user to it, and re-applies the right permissions to
 `/dev/bpf*` on every boot:
 
@@ -161,30 +161,30 @@ Log out and back in after installing for the group membership to take effect.
 
 Capture and injection use BPF (`/dev/bpf*`), like macOS. FreeBSD has no `IP_BOUND_IF`, so the DIAL
 proxy's connect pins its interface by binding the source address; no port privileges are needed. BPF
-devices are root-only by default, so out of the box the reflector must run as root. To run
+devices are root-only by default, so out of the box netflector must run as root. To run
 unprivileged, grant a group read/write on `/dev/bpf*` with a devfs ruleset (`/etc/devfs.rules` +
 `devfs_system_ruleset` in `/etc/rc.conf`) and add the user to that group.
 
 ### Run in Docker
 
-Prebuilt multi-arch images are published to `ghcr.io/sbogomolov/reflector`, tagged `latest` and per
+Prebuilt multi-arch images are published to `ghcr.io/netflector/netflector`, tagged `latest` and per
 release version, for `linux/amd64`, `linux/arm64`, `linux/arm/v7`, and `linux/arm/v5`; Docker pulls the
 variant matching the host. The image is a single static binary on `scratch`: no shell, no package
-manager. Its entrypoint is the reflector with no default argument, so it configures itself from
-`REFLECTOR_*` [environment variables](#environment-variables); pass a config file path to use a file
+manager. Its entrypoint is netflector with no default argument, so it configures itself from
+`NETFLECTOR_*` [environment variables](#environment-variables); pass a config file path to use a file
 instead.
 
-Because the reflector captures at L2 on each interface, the container must be **on the real segments it
+Because netflector captures at L2 on each interface, the container must be **on the real segments it
 bridges**, not on a default NAT bridge network (which would hide that traffic from it). On a Linux host,
 `--network host` is the simplest way. Configure it with `-e` variables:
 
 ```sh
 docker run --rm \
     --network host \
-    -e REFLECTOR_TV_SOURCE_IF=eth0 \
-    -e REFLECTOR_TV_TARGET_IF=eth1 \
-    -e REFLECTOR_TV_MDNS=true \
-    ghcr.io/sbogomolov/reflector:latest
+    -e NETFLECTOR_TV_SOURCE_IF=eth0 \
+    -e NETFLECTOR_TV_TARGET_IF=eth1 \
+    -e NETFLECTOR_TV_MDNS=true \
+    ghcr.io/netflector/netflector:latest
 ```
 
 `CAP_NET_RAW` is required (see [Runtime privileges](#runtime-privileges)) and is in Docker's default
@@ -195,26 +195,26 @@ just that one:
 docker run --rm \
     --network host \
     --cap-drop ALL --cap-add NET_RAW \
-    -e REFLECTOR_TV_SOURCE_IF=eth0 \
-    -e REFLECTOR_TV_TARGET_IF=eth1 \
-    -e REFLECTOR_TV_MDNS=true \
-    ghcr.io/sbogomolov/reflector:latest
+    -e NETFLECTOR_TV_SOURCE_IF=eth0 \
+    -e NETFLECTOR_TV_TARGET_IF=eth1 \
+    -e NETFLECTOR_TV_MDNS=true \
+    ghcr.io/netflector/netflector:latest
 ```
 
 To use a config file instead of (or alongside) the environment, mount it and pass its path as the
 argument. This form also shows running it as a service, `-d` with a restart policy:
 
 ```sh
-docker run -d --name reflector --restart unless-stopped \
+docker run -d --name netflector --restart unless-stopped \
     --network host \
     --cap-drop ALL --cap-add NET_RAW \
-    -v /path/to/config.toml:/etc/reflector/config.toml:ro \
-    ghcr.io/sbogomolov/reflector:latest /etc/reflector/config.toml
+    -v /path/to/config.toml:/etc/netflector/config.toml:ro \
+    ghcr.io/netflector/netflector:latest /etc/netflector/config.toml
 ```
 
 #### On MikroTik RouterOS
 
-The `arm64`, `arm/v7`, and `arm/v5` variants let the reflector run on the router itself through the
+The `arm64`, `arm/v7`, and `arm/v5` variants let netflector run on the router itself through the
 RouterOS *Container* feature, bridging two of the router's VLANs without a separate host. Since it has
 to see both segments, give the container **two `veth` interfaces, one bridged into each VLAN**, and name
 them as the entry's `source_if` / `target_if`:
@@ -232,10 +232,10 @@ wsd       = true         # enable WS-Discovery, disabled by default
 ```
 
 On RouterOS, setting the container's environment variables is usually easier than mounting a file: the
-entry above becomes `REFLECTOR_TV_SOURCE_IF=veth-lan`, `REFLECTOR_TV_TARGET_IF=veth-iot`,
-`REFLECTOR_TV_MACS=B0:37:95:C5:60:BE`, `REFLECTOR_TV_WOL=true`, and so on (see
+entry above becomes `NETFLECTOR_TV_SOURCE_IF=veth-lan`, `NETFLECTOR_TV_TARGET_IF=veth-iot`,
+`NETFLECTOR_TV_MACS=B0:37:95:C5:60:BE`, `NETFLECTOR_TV_WOL=true`, and so on (see
 [Environment variables](#environment-variables)). To use the file instead, mount it to
-`/etc/reflector/config.toml` and set that path as the container's command argument. For the RouterOS
+`/etc/netflector/config.toml` and set that path as the container's command argument. For the RouterOS
 side (enabling container mode, creating the `veth`s, and attaching each to its VLAN), see MikroTik's
 [Container documentation](https://help.mikrotik.com/docs/spaces/ROS/pages/84901929/Container).
 
@@ -274,34 +274,34 @@ proxy (so it requires `ssdp`; see [DIAL](#dial)).
 
 Every setting can also come from the environment, which is convenient for containers. A file argument is
 then optional; with none, the environment is the whole configuration. Variables are named
-`REFLECTOR_<TAG>_<PARAM>`:
+`NETFLECTOR_<TAG>_<PARAM>`:
 
 - `<TAG>` ties one entry's parameters together: any alphanumeric string (`1`, `2`, `TV`, …). It also
   becomes the entry's name (and thus its log label) unless a `NAME` parameter overrides it.
 - `<PARAM>` is `NAME` or any field from the entry table above (`SOURCE_IF`, `TARGET_IF`, `MACS`,
   `WOL`, `MDNS`, `SSDP`, `WSD`, `DIAL`, `WOL_PORTS`, `ADDRESS_FAMILY`), case-insensitive.
 
-The globals are `REFLECTOR_LOG_LEVEL`, `REFLECTOR_DEBUG_MEMORY_INTERVAL_SECS`, and
-`REFLECTOR_COUNTERS_INTERVAL_SECS`, so `LOG`, `DEBUG`, and `COUNTERS` are reserved tags. Booleans are
+The globals are `NETFLECTOR_LOG_LEVEL`, `NETFLECTOR_DEBUG_MEMORY_INTERVAL_SECS`, and
+`NETFLECTOR_COUNTERS_INTERVAL_SECS`, so `LOG`, `DEBUG`, and `COUNTERS` are reserved tags. Booleans are
 `true`/`false` or `1`/`0`; `WOL_PORTS`
 and `MACS` are comma-separated (`7,9` / `B0:...,C4:...`). The `[reflectors.tv]` entry above looks like
 this in the environment:
 
 ```sh
-REFLECTOR_LOG_LEVEL=info
-REFLECTOR_TV_SOURCE_IF=en0
-REFLECTOR_TV_TARGET_IF=lo0
-REFLECTOR_TV_MACS=B0:37:95:C5:60:BE
-REFLECTOR_TV_WOL=true
-REFLECTOR_TV_MDNS=true
-REFLECTOR_TV_SSDP=true
-REFLECTOR_TV_DIAL=true
-REFLECTOR_TV_WSD=true
+NETFLECTOR_LOG_LEVEL=info
+NETFLECTOR_TV_SOURCE_IF=en0
+NETFLECTOR_TV_TARGET_IF=lo0
+NETFLECTOR_TV_MACS=B0:37:95:C5:60:BE
+NETFLECTOR_TV_WOL=true
+NETFLECTOR_TV_MDNS=true
+NETFLECTOR_TV_SSDP=true
+NETFLECTOR_TV_DIAL=true
+NETFLECTOR_TV_WSD=true
 ```
 
 When a file and environment variables are both given they are merged: each contributes entries to one
-combined configuration, and each global variable (`REFLECTOR_LOG_LEVEL`,
-`REFLECTOR_DEBUG_MEMORY_INTERVAL_SECS`, `REFLECTOR_COUNTERS_INTERVAL_SECS`) overrides its file
+combined configuration, and each global variable (`NETFLECTOR_LOG_LEVEL`,
+`NETFLECTOR_DEBUG_MEMORY_INTERVAL_SECS`, `NETFLECTOR_COUNTERS_INTERVAL_SECS`) overrides its file
 counterpart. The
 [duplicate detection](#duplicate-detection) below applies across both
 sources. An unknown `<PARAM>`, a non-alphanumeric or reserved tag, and a tag with no parameter are all
@@ -340,7 +340,7 @@ interface loses its address and brought back up once both can send it again.
 
 ### Reacting to address changes
 
-The reflector watches the kernel for interface address and lifecycle changes (a `NETLINK_ROUTE`
+netflector watches the kernel for interface address and lifecycle changes (a `NETLINK_ROUTE`
 socket on Linux, a `PF_ROUTE` socket on the BSDs) and adapts at runtime, without a restart. mDNS and SSDP bring a family
 up (joining its multicast group(s) and installing its capture registrations) once that family becomes
 reflectable (a source address for it is present on **both** interfaces), and tear it down when either
@@ -348,7 +348,7 @@ interface loses the address; the family resumes automatically when the address r
 captures installed and instead checks reachability per packet, so it has nothing to join or leave.
 Either way, a best-effort IPv6 family that had no address at startup begins reflecting as soon as one
 appears. Gaining a family logs at `info`; losing a *required* family logs at `error`, an optional one at
-`info`. The monitor is best-effort: if it cannot start, the reflector logs a warning and runs without
+`info`. The monitor is best-effort: if it cannot start, netflector logs a warning and runs without
 address refresh.
 
 It also survives an interface being destroyed and recreated (a fresh kernel identity, e.g. a PPPoE
@@ -399,21 +399,21 @@ device/printer discovery across segments.
 DIAL (DIscovery And Launch, the protocol behind "cast to TV" for YouTube, Netflix, etc.) lets a phone
 or laptop find a smart TV and launch an app on it. The catch: a DIAL device restricts its description
 and REST endpoints to its **own subnet**, so a client on a different segment discovers the device but
-cannot drive it. Setting `dial = true` on an SSDP entry makes the reflector bridge that gap.
+cannot drive it. Setting `dial = true` on an SSDP entry makes netflector bridge that gap.
 
 It is a **terminating HTTP reverse proxy**. When a DIAL `LOCATION` (in a relayed `NOTIFY` or `M-SEARCH`
-`200 OK`) crosses target→source, the reflector mints a per-device ephemeral TCP listener on
+`200 OK`) crosses target→source, netflector mints a per-device ephemeral TCP listener on
 `source_if`'s address and rewrites the `LOCATION` authority to point at that listener. A source-side
-client then connects to the reflector, which opens an upstream connection to the device **bound to
+client then connects to netflector, which opens an upstream connection to the device **bound to
 `target_if`'s address**, so the device sees an on-subnet client and serves it. Along the way it
 rewrites the four authority-bearing headers (`LOCATION`, the description's `Application-URL`, request
-`Host`, and response `Location`) from the device's authority to a reflector authority and back; HTTP
+`Host`, and response `Location`) from the device's authority to a netflector authority and back; HTTP
 bodies stream through untouched. App launch (`POST`) and stop (`DELETE`) work end to end.
 
 `dial = true` requires `ssdp` and is **IPv4-only** (the DIAL spec ties the device authority to an IPv4
 address); an `ipv6`-only entry with `dial = true` is rejected at startup. It is the only DIAL knob;
 every cap and timeout is a fixed constant. The proxy degrades benignly: a `LOCATION`/`Application-URL`
-the reflector can't rewrite (an `https` URL, a hostname instead of an IPv4 literal, a listener cap/bind
+netflector can't rewrite (an `https` URL, a hostname instead of an IPv4 literal, a listener cap/bind
 failure) is forwarded unchanged and logged, leaving on-subnet discovery unaffected.
 
 ### Duplicate detection
@@ -438,7 +438,7 @@ cargo doc --no-deps --document-private-items   # the rustdoc intra-doc link gate
 ```
 
 A subset of tests does privileged work (real packet capture, or binding a socket to an interface) and
-needs the same privileges the reflector itself does (see [Runtime privileges](#runtime-privileges)).
+needs the same privileges netflector itself does (see [Runtime privileges](#runtime-privileges)).
 Each probes for the privilege and self-skips cleanly when it's missing, so a default `cargo test` run is
 green on an under-privileged box.
 
@@ -448,7 +448,7 @@ a macOS/FreeBSD dev box (e.g. `./docker_test.sh test`).
 
 ### End-to-end tests
 
-The end-to-end suite drives the real data path: the reflector straddles two isolated network segments
+The end-to-end suite drives the real data path: netflector straddles two isolated network segments
 and the suite verifies traffic is reflected, multi-protocol. It runs on two backends. The default
 `docker` backend uses bridge networks and containers; it's opt-in (it builds/runs containers and
 creates temporary Docker networks):
@@ -459,10 +459,10 @@ python3 e2e/run.py --valgrind     # run the daemon under Valgrind memcheck
 python3 e2e/run.py --case reflects_matching_magic_packet   # one case
 ```
 
-`--valgrind` runs the reflector under memcheck (the `runtime-valgrind` image: a glibc release binary
+`--valgrind` runs netflector under memcheck (the `runtime-valgrind` image: a glibc release binary
 with debug symbols) and fails the run on any leak, leaked fd, or memcheck error. The runner builds
-`reflector:e2e` by default, uses `python:3.13-alpine` for UDP-probe containers, can print reflector logs
-with `--show-reflector-logs`, and leaves resources behind on failure with `--keep-on-failure`.
+`netflector:e2e` by default, uses `python:3.13-alpine` for UDP-probe containers, can print netflector logs
+with `--show-netflector-logs`, and leaves resources behind on failure with `--keep-on-failure`.
 
 The `native` backend runs the same cases without Docker, as root: network namespaces + veth pairs on
 Linux, vnet jails + epair(4) on FreeBSD -- one namespace/jail per participant either way. Build the
@@ -470,7 +470,7 @@ binary first; the harness never runs cargo as root:
 
 ```sh
 cargo build --release --locked
-sudo python3 e2e/run.py --backend native --binary target/release/reflector
+sudo python3 e2e/run.py --backend native --binary target/release/netflector
 ```
 
 CI runs the native suite on linux amd64/arm64 (glibc and the shipped static musl), on armv7/armv5
@@ -482,7 +482,7 @@ The `[package]` version in `Cargo.toml` is the single source of truth: `version.
 `release.sh` (the git tag), the published image tag, and the GitHub release name all derive from it. To
 cut a release:
 
-- Bump the version in `Cargo.toml`, refresh `Cargo.lock` (`cargo build` updates its `reflector`
+- Bump the version in `Cargo.toml`, refresh `Cargo.lock` (`cargo build` updates its `netflector`
   entry; CI builds `--locked`, so a stale lockfile fails the release), and merge it to `origin/main`.
 - From a clean `main` in sync with `origin/main`, run `./release.sh`.
 

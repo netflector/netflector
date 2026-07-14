@@ -164,12 +164,12 @@ jobs:
       - name: Stage binary
         run: |
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/reflector" "dist/reflector-${{ github.ref_name }}-${{ matrix.variant }}"
+          cp "target/${{ matrix.target }}/release/netflector" "dist/netflector-${{ github.ref_name }}-${{ matrix.variant }}"
 
       - name: Verify static linking (Linux)
         if: runner.os == 'Linux'
         run: |
-          bin="dist/reflector-${{ github.ref_name }}-${{ matrix.variant }}"
+          bin="dist/netflector-${{ github.ref_name }}-${{ matrix.variant }}"
           file "$bin"
           # The static binary has no shared-library deps (the invariant that matters), but PIE-ness
           # varies -- musl x86_64 is static-pie, the ARM targets and FreeBSD are plain static -- so
@@ -180,15 +180,14 @@ jobs:
       - name: Upload binary artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: reflector-${{ matrix.variant }}
-          path: dist/reflector-${{ github.ref_name }}-${{ matrix.variant }}
+          name: netflector-${{ matrix.variant }}
+          path: dist/netflector-${{ github.ref_name }}-${{ matrix.variant }}
           if-no-files-found: error
 
   # Each image arch builds on its own runner and pushes by digest; the manifest job stitches the
-  # digests into one multi-arch tag (the same shape the C++ reflector releases with). Native
-  # runners for amd64/arm64 mean those layers link with rustc's default toolchain -- the
-  # Dockerfile writes its lld config only for cross builds, i.e. the arm32 pair, which have no
-  # native runner and cross-compile on the amd64 host (no QEMU).
+  # digests into one multi-arch tag. Native runners for amd64/arm64 mean those layers link with
+  # rustc's default toolchain -- the Dockerfile writes its lld config only for cross builds, i.e.
+  # the arm32 pair, which have no native runner and cross-compile on the amd64 host (no QEMU).
   image:
     name: Image (${{ matrix.arch }})
     needs: verify-ci
@@ -235,7 +234,7 @@ jobs:
         with:
           context: .
           platforms: ${{ matrix.platform }}
-          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/reflector,push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
 
@@ -284,7 +283,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
-          images: ghcr.io/${{ github.repository_owner }}/reflector
+          images: ghcr.io/${{ github.repository }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -293,7 +292,7 @@ jobs:
       - name: Create and push the manifest list
         working-directory: /tmp/digests
         env:
-          IMAGE: ghcr.io/${{ github.repository_owner }}/reflector
+          IMAGE: ghcr.io/${{ github.repository }}
           METADATA: ${{ steps.meta.outputs.json }}
         run: |
           mapfile -t tags < <(jq -r '.tags[]' <<< "$METADATA")
@@ -304,7 +303,7 @@ jobs:
 
       - name: Inspect
         env:
-          IMAGE: ghcr.io/${{ github.repository_owner }}/reflector
+          IMAGE: ghcr.io/${{ github.repository }}
           VERSION: ${{ steps.meta.outputs.version }}
         run: docker buildx imagetools inspect "${IMAGE}:${VERSION}"
 
@@ -320,19 +319,19 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: dist
-          pattern: reflector-*
+          pattern: netflector-*
           merge-multiple: true
 
       - name: Checksums
         run: |
           cd dist
-          sha256sum reflector-* | tee SHA256SUMS
+          sha256sum netflector-* | tee SHA256SUMS
 
       - name: Create release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
           files: |
-            dist/reflector-*
+            dist/netflector-*
             dist/SHA256SUMS
           generate_release_notes: true
           fail_on_unmatched_files: true

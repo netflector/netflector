@@ -78,7 +78,7 @@ pub(crate) enum ConfigError {
         target_if: InterfaceName,
     },
 
-    #[error("environment variable \"{var}\" is malformed (expected REFLECTOR_<tag>_<param>)")]
+    #[error("environment variable \"{var}\" is malformed (expected NETFLECTOR_<tag>_<param>)")]
     EnvMalformedVar { var: String },
 
     #[error(

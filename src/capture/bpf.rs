@@ -438,7 +438,7 @@ mod tests {
         family: u32,
         version: u8,
     ) -> bool {
-        const PROBE: &[u8] = b"reflector-loopback-probe";
+        const PROBE: &[u8] = b"netflector-loopback-probe";
         let receiver = std::net::UdpSocket::bind(bind).unwrap();
         let target = receiver.local_addr().unwrap();
         let sender = std::net::UdpSocket::bind(bind).unwrap();
@@ -511,7 +511,7 @@ mod tests {
     fn loopback_send_reaches_a_local_socket() -> io::Result<()> {
         use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6, UdpSocket};
 
-        const PROBE: &[u8] = b"reflector-loopback-send-probe";
+        const PROBE: &[u8] = b"netflector-loopback-send-probe";
 
         let Some(cap) = open_or_skip("lo0", "loopback_send")? else {
             return Ok(());

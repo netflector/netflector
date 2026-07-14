@@ -222,7 +222,7 @@ fn log_field_change<A: PartialEq + fmt::Display>(
 }
 
 /// An IPv6 source candidate's rank, ordered worst-to-best so a higher variant outranks a lower one
-/// (the derived `Ord` follows declaration order). The reflector reflects link-local service traffic, so
+/// (the derived `Ord` follows declaration order). netflector reflects link-local service traffic, so
 /// a link-local source is preferred, then ULA, then global; a multicast / `::` / `::1` address is never
 /// a source.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Debug)]
@@ -433,11 +433,11 @@ mod tests {
 
     // Opt-in diagnostic: trace-log every address (and each v6's flag status) the resolver
     // finds on a real interface. Run with, e.g.:
-    //   REFLECTOR_TEST_IFACE=en0 cargo test -- --nocapture resolve_traces_test_interface
+    //   NETFLECTOR_TEST_IFACE=en0 cargo test -- --nocapture resolve_traces_test_interface
     #[test]
     fn resolve_traces_test_interface() {
-        let Some(iface) = std::env::var_os("REFLECTOR_TEST_IFACE") else {
-            eprintln!("skip: set REFLECTOR_TEST_IFACE to inspect an interface");
+        let Some(iface) = std::env::var_os("NETFLECTOR_TEST_IFACE") else {
+            eprintln!("skip: set NETFLECTOR_TEST_IFACE to inspect an interface");
             return;
         };
         let iface = iface.to_string_lossy();

@@ -31,7 +31,7 @@ pub(super) struct RawConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RawReflector {
-    /// Display name; set only by the environment layer (`REFLECTOR_<tag>_NAME`).
+    /// Display name; set only by the environment layer (`NETFLECTOR_<tag>_NAME`).
     /// File reflectors take their name from the `[reflectors.<name>]` table key.
     #[serde(skip)]
     pub(super) name: Option<ReflectorName>,
@@ -64,7 +64,7 @@ impl RawConfig {
         self.counters_interval_secs = env.counters_interval_secs.or(self.counters_interval_secs);
         for (name, reflector) in env.reflectors {
             // Compare folded: an env tag is already lowercase and unpadded, but a TOML table key is
-            // stored verbatim, so `[reflectors.TV]` (or `"  tv  "`) and env `REFLECTOR_TV_*` name the
+            // stored verbatim, so `[reflectors.TV]` (or `"  tv  "`) and env `NETFLECTOR_TV_*` name the
             // same reflector and must collide rather than silently produce two.
             if self
                 .reflectors

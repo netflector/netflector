@@ -1,18 +1,18 @@
 //! Thin binary entry point.
 //!
-//! All logic lives in the `reflector` library so it can be tested without
+//! All logic lives in the `netflector` library so it can be tested without
 //! spawning a process. `main` installs the logger, collects the environment,
-//! and turns a [`reflector::Result`] into an exit code: on failure it logs the
+//! and turns a [`netflector::Result`] into an exit code: on failure it logs the
 //! error and exits non-zero.
 
 use std::ffi::OsString;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    reflector::init_logging();
+    netflector::init_logging();
     // args_os, not args: a non-UTF-8 argument (a path can be non-UTF-8 on Unix) makes args() panic.
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
-    match reflector::run(&args) {
+    match netflector::run(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             // Log facade, not eprintln, so a fatal error reads like every other line

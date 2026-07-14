@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# Build the reflector as a fully static musl binary and ship it on scratch — nothing else to carry
+# Build netflector as a fully static musl binary and ship it on scratch — nothing else to carry
 # or to grow CVEs. Architecture-agnostic: buildx's TARGETARCH/TARGETVARIANT select the musl target,
 # and the builder runs on the native build host (BUILDPLATFORM) and cross-compiles, so the arm
 # images don't crawl under QEMU. Cross layers link with LLVM's lld (any arch, no per-arch gcc);
@@ -59,9 +59,9 @@ COPY src/ ./src/
 RUN --mount=type=cache,id=cargo-registry-${TARGETARCH}${TARGETVARIANT},target=/usr/local/cargo/registry \
     triple="$(cat /triple)"; \
     cargo build --release --locked --target "${triple}"; \
-    install -D "target/${triple}/release/reflector" /out/reflector
+    install -D "target/${triple}/release/netflector" /out/netflector
 
-# The reflector under Valgrind memcheck, for `e2e/run.py --valgrind`. A glibc release binary with debug
+# netflector under Valgrind memcheck, for `e2e/run.py --valgrind`. A glibc release binary with debug
 # symbols (unstripped): the same -O3/LTO codegen the scratch image ships, just with -g for readable traces
 # and dynamic glibc -- Valgrind supports that well, unlike the static musl target. amd64-only (the Valgrind
 # e2e job is); built and run on the one rust:slim base so the glibc versions match. run.py SIGTERMs the
@@ -79,7 +79,7 @@ COPY src/ ./src/
 RUN --mount=type=cache,id=cargo-registry-valgrind,target=/usr/local/cargo/registry \
     CARGO_PROFILE_RELEASE_DEBUG=true CARGO_PROFILE_RELEASE_STRIP=false \
     cargo build --release --locked \
-    && install -D target/release/reflector /usr/local/bin/reflector
+    && install -D target/release/netflector /usr/local/bin/netflector
 ENTRYPOINT ["valgrind", \
     "--leak-check=full", \
     "--show-leak-kinds=all", \
@@ -87,11 +87,11 @@ ENTRYPOINT ["valgrind", \
     "--track-fds=yes", \
     "--num-callers=30", \
     "--error-exitcode=1", \
-    "/usr/local/bin/reflector"]
-CMD ["/etc/reflector/config.toml"]
+    "/usr/local/bin/netflector"]
+CMD ["/etc/netflector/config.toml"]
 
 # Production image: one fully static binary on scratch -- nothing else to ship or grow CVEs. Keep this LAST
 # so a bare `docker build .` (no --target, as releases and the non-valgrind e2e use) defaults to it.
 FROM scratch AS runtime
-COPY --from=builder /out/reflector /usr/local/bin/reflector
-ENTRYPOINT ["/usr/local/bin/reflector"]
+COPY --from=builder /out/netflector /usr/local/bin/netflector
+ENTRYPOINT ["/usr/local/bin/netflector"]

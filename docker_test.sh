@@ -27,7 +27,7 @@ cd "$(dirname "$0")"
 
 [ "$#" -eq 0 ] && set -- test
 
-IMAGE=reflector-devtest
+IMAGE=netflector-devtest
 docker build -q -t "$IMAGE" - >/dev/null <<'DOCKERFILE'
 FROM rust:slim
 RUN apt-get update \
@@ -39,11 +39,11 @@ exec docker run --rm \
     --cap-add=NET_ADMIN \
     --cap-add=NET_RAW \
     --sysctl net.ipv4.conf.all.accept_local=1 \
-    -v "$PWD":/reflector \
-    -v reflector-linux-target:/linux-target \
-    -v reflector-cargo-registry:/usr/local/cargo/registry \
-    -v reflector-rustup:/usr/local/rustup \
+    -v "$PWD":/netflector \
+    -v netflector-linux-target:/linux-target \
+    -v netflector-cargo-registry:/usr/local/cargo/registry \
+    -v netflector-rustup:/usr/local/rustup \
     -e CARGO_TARGET_DIR=/linux-target \
-    -w /reflector \
+    -w /netflector \
     "$IMAGE" \
     cargo "$@"
