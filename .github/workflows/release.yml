@@ -177,6 +177,17 @@ jobs:
           file "$bin" | grep -qE 'statically linked|static-pie linked' \
             || { echo "::error::binary is not statically/static-pie linked"; exit 1; }
 
+      - name: Verify system-only linking (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          bin="dist/netflector-${{ github.ref_name }}-${{ matrix.variant }}"
+          otool -L "$bin"
+          # macOS has no static linking; the invariant that matters is the same one the Linux
+          # check enforces: no dependencies beyond the OS (nothing from Homebrew or the
+          # toolchain). A stock build wants libSystem and libiconv, both under /usr/lib.
+          bad=$(otool -L "$bin" | tail -n +2 | awk '{print $1}' | grep -vE '^(/usr/lib/|/System/)' || true)
+          [ -z "$bad" ] || { echo "::error::binary links non-system libraries: $bad"; exit 1; }
+
       - name: Upload binary artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
