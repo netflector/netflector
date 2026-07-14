@@ -1,6 +1,6 @@
 PORTNAME=	netflector
 DISTVERSIONPREFIX=	v
-DISTVERSION=	0.12.1
+DISTVERSION=	0.13.0
 CATEGORIES=	net
 
 MAINTAINER=	sergii@bogomolov.io
@@ -34,13 +34,13 @@ CARGO_CRATES=	equivalent-1.0.2 \
 		syn-2.0.118 \
 		thiserror-2.0.18 \
 		thiserror-impl-2.0.18 \
-		toml-1.1.2+spec-1.1.0 \
+		toml-1.1.3+spec-1.1.0 \
 		toml_datetime-1.1.1+spec-1.1.0 \
 		toml_parser-1.1.2+spec-1.1.0 \
-		toml_writer-1.1.1+spec-1.1.0 \
+		toml_writer-1.1.2+spec-1.1.0 \
 		unicode-ident-1.0.24 \
 		winnow-1.0.3
 
-PLIST_FILES=	bin/reflector
+PLIST_FILES=	bin/netflector
 
 .include <bsd.port.mk>
