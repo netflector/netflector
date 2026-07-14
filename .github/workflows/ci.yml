@@ -497,6 +497,105 @@ jobs:
           triple='${{ matrix.target.triple }}'
           sudo python3 e2e/run.py --backend native --binary "target/${triple:+$triple/}release/reflector"
 
+  # The FreeBSD port pins every byte it builds from: the release tarball and all 20 crates, each with a
+  # SHA256 in distinfo. If Cargo.lock moves and those are not regenerated, the port either fails to build
+  # (a crate it has never heard of) or builds something other than what we released. Cargo.lock already
+  # carries the SHA256 of every .crate file, so this needs no network and no FreeBSD: it is seconds.
+  #
+  # It compares against the lockfile AT THE TAG the port declares, not the working tree: main's version is
+  # bumped to the next patch the moment a release is cut, so comparing against main would fail forever
+  # after. That is also why this needs the tags (fetch-depth 0).
+  port-check:
+    name: Port in sync with Cargo.lock
+    needs: gate
+    if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 0
+      - name: Port matches the lockfile of the release it builds
+        run: ci/port-sync.py --check
+
+  # Build the port the way FreeBSD would, so a broken port is caught here and not by a reviewer (or by
+  # the package cluster, months later). The QA targets are the ones a ports committer runs: portlint,
+  # stage-qa (shebangs, stripping, dependencies) and check-plist (installed-but-unlisted files).
+  #
+  # The ports tree is checked out at the exact commit the installed packages were built from, which every
+  # package records in ports_top_git_hash. Chasing a branch instead means the tree's lang/rust can be
+  # newer than the rust package, the dependency looks unsatisfied, and the build quietly starts compiling
+  # the Rust compiler from source for hours.
+  port-build:
+    name: Port builds on FreeBSD
+    needs: gate
+    if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      FREEBSD_VM_ARCH: amd64
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - name: Install QEMU
+        run: |
+          sudo apt-get update || true
+          sudo apt-get install -y --no-install-recommends qemu-utils qemu-system-x86 genisoimage
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Launch the FreeBSD VM
+        run: ci/freebsd-vm.sh launch
+      - name: Wait for the VM
+        run: ci/freebsd-vm.sh wait
+      - name: Ports tree, pinned to the commit our packages were built from
+        # shellcheck disable=SC2016  # the single quotes are the point: $hash expands in the guest
+        run: |
+          ci/freebsd-vm.sh run 'pkg install -y git rust ports-mgmt/portlint'
+          ci/freebsd-vm.sh run '
+            set -e
+            hash=$(pkg info -A rust | sed -n "s/.*ports_top_git_hash:[[:space:]]*//p")
+            [ -n "$hash" ] || { echo "rust package records no ports_top_git_hash"; exit 1; }
+            echo "ports tree at $hash (the commit our rust package was built from)"
+            mkdir -p /usr/ports && cd /usr/ports
+            git init -q .
+            git remote add origin https://git.FreeBSD.org/ports.git
+            git fetch -q --depth 1 origin "$hash"
+            git checkout -q FETCH_HEAD
+            [ "$(git rev-parse HEAD)" = "$hash" ] || { echo "tree is not at the pinned commit"; exit 1; }
+          '
+      - name: Install the port into the tree
+        run: |
+          ci/freebsd-vm.sh push dist/freebsd/net/reflector /usr/ports/net/reflector
+          # net/Makefile's SUBDIR list is a deliverable of the submission, and portlint checks it.
+          ci/freebsd-vm.sh run 'cd /usr/ports/net && awk "/SUBDIR \+= redir\$/ { print; print \"    SUBDIR += reflector\"; next } 1" Makefile > Makefile.new && mv Makefile.new Makefile && grep -n "SUBDIR += reflector" Makefile'
+      - name: portlint
+        run: |
+          ci/freebsd-vm.sh run 'cd /usr/ports && git add -f net/reflector net/Makefile'
+          ci/freebsd-vm.sh run 'cd /usr/ports/net/reflector && portlint -AC'
+      - name: Build, and run the QA a ports committer runs
+        run: |
+          ci/freebsd-vm.sh run 'cd /usr/ports/net/reflector && make stage'
+          ci/freebsd-vm.sh run 'cd /usr/ports/net/reflector && make stage-qa'
+          ci/freebsd-vm.sh run 'cd /usr/ports/net/reflector && make check-plist'
+          ci/freebsd-vm.sh run 'cd /usr/ports/net/reflector && make package'
+      - name: Install, run, deinstall
+        run: |
+          ci/freebsd-vm.sh run 'cd /usr/ports/net/reflector && make install'
+          ci/freebsd-vm.sh run '/usr/local/bin/reflector --version'
+          # The rc script must refuse a configuration the daemon would reject, rather than launching a
+          # service that dies a second later.
+          ci/freebsd-vm.sh run 'sysrc reflector_enable=YES'
+          ci/freebsd-vm.sh run 'printf "[reflectors.bad]\nsource_if = \"em0\"\ntarget_if = \"em0\"\nmdns = true\n" > /usr/local/etc/reflector.toml'
+          ci/freebsd-vm.sh run 'service reflector start 2>&1 | grep -q "refusing to start" && echo "rc refused an invalid configuration"'
+          ci/freebsd-vm.sh run 'cd /usr/ports/net/reflector && make deinstall'
+      - name: Console on failure
+        if: failure()
+        run: ci/freebsd-vm.sh console
+
   # The unit suite under Miri, for every shipped target. Valgrind (below) watches the machine: it catches
   # an access that is actually invalid, but it is blind to UB that performs no invalid access at all -- an
   # unaligned read the hardware tolerates, or a raw pointer used after a &mut reborrow invalidated its
@@ -675,7 +774,7 @@ jobs:
   success:
     name: Success
     if: ${{ !cancelled() }}
-    needs: [gate, fmt, lint, test, freebsd, docker-e2e, native-e2e, freebsd-native-e2e, miri, valgrind-test, valgrind-e2e]
+    needs: [gate, fmt, lint, test, freebsd, docker-e2e, native-e2e, freebsd-native-e2e, miri, port-check, port-build, valgrind-test, valgrind-e2e]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
