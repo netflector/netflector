@@ -25,9 +25,7 @@ load_rc_config $name
 : ${netflector_config:="%%PREFIX%%/etc/netflector.toml"}
 
 pidfile="/var/run/${name}.pid"
-# v0.12.1 predates the project rename and ships its binary as "reflector"; this moves to
-# bin/netflector at the 0.13.0 bump.
-procname="%%PREFIX%%/bin/reflector"
+procname="%%PREFIX%%/bin/${name}"
 
 # The daemon runs in the foreground and logs to stderr, so daemon(8) backgrounds it and -S routes that
 # stderr into syslog under our own tag rather than /dev/null.

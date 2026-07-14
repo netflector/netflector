@@ -585,7 +585,7 @@ jobs:
       - name: Install, run, deinstall
         run: |
           ci/freebsd-vm.sh run 'cd /usr/ports/net/netflector && make install'
-          ci/freebsd-vm.sh run '/usr/local/bin/reflector --version'
+          ci/freebsd-vm.sh run '/usr/local/bin/netflector --version'
           # The rc script must refuse a configuration the daemon would reject, rather than launching a
           # service that dies a second later.
           ci/freebsd-vm.sh run 'sysrc netflector_enable=YES'
