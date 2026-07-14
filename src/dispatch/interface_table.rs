@@ -439,9 +439,6 @@ mod tests {
     use crate::interface::{LOOPBACK_IFACE, if_index};
 
     impl InterfaceTable {
-        /// Push a capture-less entry (no fd) so a routing test can mint a valid [`CaptureKey`] and
-        /// exercise the record path without opening a capture; the dangling [`InterfaceKey`] is
-        /// never resolved. Reachable from the dispatcher's own tests, hence `pub(in crate::dispatch)`.
         /// Overwrite an entry's cached identity, standing in for the kernel recreating the
         /// interface out from under the table. For the dispatcher's reconcile tests.
         pub(in crate::dispatch) fn set_test_ifindex(
@@ -458,6 +455,9 @@ mod tests {
             self.entries[interface.0 as usize].interface.name = name.to_owned();
         }
 
+        /// Push a capture-less entry (no fd) so a routing test can mint a valid [`CaptureKey`] and
+        /// exercise the record path without opening a capture; the dangling [`InterfaceKey`] is
+        /// never resolved. Reachable from the dispatcher's own tests, hence `pub(in crate::dispatch)`.
         pub(in crate::dispatch) fn add_test_capture(&mut self) -> CaptureKey {
             let key =
                 CaptureKey(u32::try_from(self.captures.len()).expect("capture count fits a u32"));

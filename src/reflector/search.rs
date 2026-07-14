@@ -123,7 +123,7 @@ impl PacketHandler for ResponseReflector {
 /// search to handle, [`Verdict::Skip`] = the other direction, [`Verdict::Junk`] = log and drop);
 /// `window` is the per-search session lifetime; `make_reply` mints the per-session reply transform.
 pub(crate) struct SearchReflector {
-    /// The source capture: this reflector's ingress, and the egress its responses leave reply on.
+    /// The source capture: this reflector's ingress, and the egress its responses leave on.
     source: CaptureKey,
     /// The target capture: where the search is re-emitted and the replies are captured.
     target: CaptureKey,

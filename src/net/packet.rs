@@ -216,7 +216,7 @@ fn ipv6_addr(bytes: &[u8]) -> Result<Ipv6Addr, ParseError> {
         .map_err(|_| ParseError::Truncated)
 }
 
-/// Read a 6-byte MAC field, the [`ipv4_addr`] counterpart.
+/// Read a 6-byte MAC field.
 fn read_mac(bytes: &[u8]) -> Result<MacAddr, ParseError> {
     <[u8; 6]>::try_from(bytes)
         .map(MacAddr::from)
@@ -303,6 +303,7 @@ mod tests {
 
         let packet = Packet::parse(LinkType::DltNull, &buf[..n]).unwrap();
         assert_eq!(packet.source, SocketAddr::V6(src));
+        assert_eq!(packet.dest, SocketAddr::V6(dst));
         assert_eq!(packet.ttl, 255);
         assert_eq!(packet.payload, &payload);
     }
