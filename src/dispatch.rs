@@ -558,6 +558,16 @@ impl PacketDispatcher {
 
     /// Offer `packet` (captured on `ingress`) to every matching registration, in order.
     fn route(&mut self, ingress: CaptureKey, packet: &Packet, reactor: &mut Reactor) {
+        // A handler is `None` only while it is out for a call, so one missing here proves a
+        // handler re-entered routing (it would clear the shared `route_keys` scratch out from
+        // under the outer loop). The same-ingress case bounces off the capture take-out guard;
+        // this catches the cross-ingress case the guard cannot see.
+        debug_assert!(
+            self.registrations
+                .iter()
+                .all(|(_, reg)| reg.handler.is_some()),
+            "route re-entered from inside a handler call"
+        );
         // Snapshot the live registration keys into the reused buffer. Taking them once means a
         // reflector registering mid-route isn't fed the in-flight frame (its key isn't in the
         // snapshot whether it appended or reused a freed slot), and a generational key keeps the
@@ -1709,6 +1719,80 @@ mod tests {
             *calls.borrow(),
             2,
             "both probes should route via the outer drain; the re-entrant call must no-op"
+        );
+        Ok(())
+    }
+
+    /// A reflector that re-enters the drain on a *different* ingress: the case the same-ingress
+    /// take-out guard cannot see.
+    struct CrossDrainer {
+        other: CaptureKey,
+    }
+
+    impl PacketHandler for CrossDrainer {
+        fn on_packet(
+            &mut self,
+            _packet: &Packet,
+            dispatcher: &mut PacketDispatcher,
+            reactor: &mut Reactor,
+        ) -> Outcome {
+            dispatcher.drain_and_route(self.other, reactor);
+            Outcome::Filtered
+        }
+    }
+
+    // The cross-ingress re-drain slips past the take-out guard (the other capture is present, so
+    // its drain proceeds into `route`, which would rebuild the shared `route_keys` scratch under
+    // the outer loop); the entry assert must catch it. Both loopback captures see the one probe.
+    // `should_panic` can't express the no-privilege skip, so the panic is caught by hand. Skips
+    // without capture access.
+    #[test]
+    #[cfg_attr(
+        not(debug_assertions),
+        ignore = "route's re-entry guard is a debug_assert!, compiled out in release"
+    )]
+    #[cfg_attr(miri, ignore = "needs a real capture device")]
+    fn reentrant_drain_on_another_ingress_trips_the_assert() -> io::Result<()> {
+        let Some(cap_a) = open_or_skip(LOOPBACK_IFACE, "dispatch_cross_a")? else {
+            return Ok(());
+        };
+        let Some(cap_b) = open_or_skip(LOOPBACK_IFACE, "dispatch_cross_b")? else {
+            return Ok(());
+        };
+
+        let (_receiver, target, sender) = probe_rig()?;
+
+        let mut dispatcher = PacketDispatcher::new();
+        let a = dispatcher.add_capture(cap_a)?;
+        let b = dispatcher.add_capture(cap_b)?;
+        dispatcher.register(
+            a,
+            Filter {
+                dst_port: Some(target.port().into()),
+                ..Filter::default()
+            },
+            Box::new(CrossDrainer { other: b }),
+        );
+
+        let mut reactor = Reactor::new()?;
+        sender.send_to(PROBE, target)?;
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pump_until(
+                1,
+                || false, // no success condition: the only exit is the assert firing
+                || dispatcher.drain_and_route(a, &mut reactor),
+            );
+        }))
+        .expect_err("a cross-ingress re-drain must trip route's re-entry assert");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(
+            message.contains("route re-entered"),
+            "unexpected panic message: {message}"
         );
         Ok(())
     }
