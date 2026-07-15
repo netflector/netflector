@@ -262,8 +262,15 @@ def _own_address(interface: str, family: int) -> str:
         if family == 6:
             probe.connect(("ff02::1", 9, 0, socket.if_nametoindex(interface)))
         else:
-            probe.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            probe.connect(("255.255.255.255", 9))
+            # FreeBSD 15 refuses a broadcast connect (ENETUNREACH, SO_BROADCAST or not), so pin the
+            # interface like the v6 branch and connect to the multicast group instead; that needs no
+            # route at all (the vnet-jail case) and works the same on Linux.
+            mreqn = struct.pack(
+                "@4s4si", socket.inet_aton("0.0.0.0"), b"\x00\x00\x00\x00",
+                socket.if_nametoindex(interface),
+            )
+            probe.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, mreqn)
+            probe.connect(("239.255.255.250", 9))
         return probe.getsockname()[0]
 
 
