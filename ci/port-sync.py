@@ -160,7 +160,7 @@ def check():
             problems.append(f'distinfo has no SIZE for {name}')
 
     # The tarball's hash cannot be checked here: it is not in Cargo.lock, and GitHub generates that
-    # archive server-side. The port-build job verifies it (and every SIZE) by fetching for real.
+    # archive server-side. The freebsd-port-build job verifies it (and every SIZE) by fetching for real.
     for name, ver, sha in crates:
         crate = f'rust/crates/{name}-{ver}.crate'
         if crate in hashes and hashes[crate] != sha:

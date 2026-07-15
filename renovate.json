@@ -6,7 +6,7 @@
   "customManagers": [
     {
       "customType": "regex",
-      "managerFilePatterns": ["ci/freebsd.env"],
+      "managerFilePatterns": ["ci/freebsd14.env", "ci/freebsd15.env"],
       "matchStrings": [
         "# renovate: datasource=(?<datasource>[a-z-]+) depName=(?<depName>\\S+)\\nRELEASE=(?<currentValue>\\S+)"
       ]
@@ -15,7 +15,13 @@
   "packageRules": [
     {
       "matchDepNames": ["freebsd"],
+      "matchFileNames": ["ci/freebsd14.env"],
       "allowedVersions": "/^14\\./"
+    },
+    {
+      "matchDepNames": ["freebsd"],
+      "matchFileNames": ["ci/freebsd15.env"],
+      "allowedVersions": "/^15\\./"
     }
   ]
 }

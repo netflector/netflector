@@ -18,11 +18,13 @@
 # arch is a silently wrong VM) picks the guest: amd64 (KVM) or arm64 (TCG --
 # no GitHub runner has arm64 KVM, so the guest is emulated and gets a far
 # larger ssh-wait budget). The release + image hash pins live in
-# ci/freebsd.env (Renovate bumps the release, ci/freebsd-pin.sh refreshes
+# ci/freebsd<major>.env (Renovate bumps the release, ci/freebsd-pin.sh refreshes
 # the hashes).
 set -euo pipefail
 
-. "$(dirname "$0")/freebsd.env"
+# FREEBSD_VM_VERSION picks the pinned release (major): each has a freebsd<major>.env.
+VERSION=${FREEBSD_VM_VERSION:?set FREEBSD_VM_VERSION to a pinned major, e.g. 14 or 15}
+. "$(dirname "$0")/freebsd${VERSION}.env"
 ARCH=${FREEBSD_VM_ARCH:?set FREEBSD_VM_ARCH to amd64 or arm64}
 case "$ARCH" in
 amd64)
@@ -55,7 +57,8 @@ SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
 # existing root user; the sshd_config append permits key-only root login
 # before sshd first starts (FreeBSD's sshd defaults root login off, and sshd
 # takes the first uncommented value -- the stock file has none). The rc.conf.d
-# drop-in disables the image's first-boot freebsd-update, an unpinned fetch
+# drop-ins disable the image's first-boot updaters (freebsd-update on 14,
+# pkgbase's firstboot_pkg_upgrade on 15), an unpinned fetch
 # plus reboot that cost 4 minutes per lane. It must be rc.conf.d, NOT
 # rc.conf.local: /etc/rc loads the rc.conf files once at boot start and every
 # rc.d script inherits that snapshot (rc.subr _rc_conf_loaded), so a same-boot
@@ -78,6 +81,9 @@ write_files:
   - path: /etc/rc.conf.d/firstboot_freebsd_update
     content: |
       firstboot_freebsd_update_enable="NO"
+  - path: /etc/rc.conf.d/firstboot_pkg_upgrade
+    content: |
+      firstboot_pkg_upgrade_enable="NO"
 EOF
     genisoimage -quiet -output "$VM_DIR/seed.iso" -volid cidata -joliet -rock \
         "$VM_DIR/user-data" "$VM_DIR/meta-data"

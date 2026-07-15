@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Set up cross-linking to <arch>-unknown-freebsd on a Linux runner (arch =
-# $1, required: amd64 or arm64). rustup provides the target's std, so the
+# Set up cross-linking to <arch>-unknown-freebsd on a Linux runner (arch from
+# FREEBSD_SYSROOT_ARCH, required: amd64 or arm64). rustup provides the target's std, so the
 # only missing pieces are FreeBSD's link inputs -- crt*.o and the
 # libc/libm/... archives, extracted from the official base.txz -- and a cc
 # driver to order them on the link line; clang is inherently a
@@ -8,12 +8,15 @@
 # wrapper is the entire toolchain. Same recipe rust-lang's CI uses to build
 # the official freebsd dist artifacts.
 #
-# The release + base.txz hash pins live in ci/freebsd.env (Renovate bumps the
+# The release + base.txz hash pins live in ci/freebsd<major>.env (Renovate bumps the
 # release, ci/freebsd-pin.sh refreshes the hashes).
 set -euo pipefail
 
-. "$(dirname "$0")/freebsd.env"
-ARCH=${1:?usage: freebsd-sysroot.sh amd64|arm64}
+# FREEBSD_SYSROOT_VERSION picks the pinned release (major) the sysroot is built from;
+# each has a freebsd<major>.env.
+VERSION=${FREEBSD_SYSROOT_VERSION:?set FREEBSD_SYSROOT_VERSION to a pinned major, e.g. 14 or 15}
+. "$(dirname "$0")/freebsd${VERSION}.env"
+ARCH=${FREEBSD_SYSROOT_ARCH:?set FREEBSD_SYSROOT_ARCH to amd64 or arm64}
 case "$ARCH" in
 amd64)
     BASE_URL=$BASE_URL_AMD64
@@ -26,11 +29,11 @@ arm64)
     TRIPLE=aarch64-unknown-freebsd
     ;;
 *)
-    echo "error: unknown arch '$ARCH' (amd64|arm64)" >&2
+    echo "error: unknown FREEBSD_SYSROOT_ARCH '$ARCH' (amd64|arm64)" >&2
     exit 64
     ;;
 esac
-SYSROOT=${FREEBSD_SYSROOT:-$HOME/freebsd-sysroot}
+SYSROOT=$HOME/freebsd-sysroot
 
 mkdir -p "$SYSROOT"
 curl -fsSL "$BASE_URL" -o "$SYSROOT/base.txz"

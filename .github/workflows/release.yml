@@ -63,7 +63,7 @@ jobs:
   # macOS native dynamic (no static libSystem). armv7/armv5 have no native runner, so they
   # cross-compile on the amd64 runner with lld; both FreeBSD arches likewise (clang+lld against a
   # base.txz sysroot -- the exact configurations CI's freebsd lanes build AND run on every PR;
-  # freebsd-arm64 on the pinned nightly from ci/freebsd.env until stable 1.98 ships its std).
+  # freebsd-arm64 on the pinned nightly from ci/freebsd-nightly.env until stable 1.98 ships its std).
   binaries:
     name: Binary (${{ matrix.variant }})
     needs: verify-ci
@@ -116,11 +116,11 @@ jobs:
           sudo apt-get install -y --no-install-recommends clang lld
 
       # aarch64-unknown-freebsd has no stable dist until 1.98: that row installs the pinned dated
-      # nightly from ci/freebsd.env, and the build picks it up via the FREEBSD_TOOLCHAIN selector.
+      # nightly from ci/freebsd-nightly.env, and the build picks it up via the FREEBSD_TOOLCHAIN selector.
       - name: Add the Rust target
         run: |
           if [ '${{ matrix.target }}' = aarch64-unknown-freebsd ]; then
-            . ci/freebsd.env
+            . ci/freebsd-nightly.env
             rustup toolchain install "nightly-${RUST_NIGHTLY}" --profile minimal
             rustup target add --toolchain "nightly-${RUST_NIGHTLY}" aarch64-unknown-freebsd
             echo "FREEBSD_TOOLCHAIN=+nightly-${RUST_NIGHTLY}" >> "$GITHUB_ENV"
@@ -147,8 +147,13 @@ jobs:
       # only these rows ever see it.
       - name: FreeBSD link sysroot
         if: contains(matrix.target, 'freebsd')
+        env:
+          FREEBSD_SYSROOT_ARCH: ${{ matrix.freebsd_arch }}
+          # The shipped static assets link against the oldest supported major, so they run on
+          # every newer release ("14.4 or newer" in the README). This moves when the floor moves.
+          FREEBSD_SYSROOT_VERSION: 14
         run: |
-          ci/freebsd-sysroot.sh ${{ matrix.freebsd_arch }}
+          ci/freebsd-sysroot.sh
           prefix="CARGO_TARGET_$(echo '${{ matrix.target }}' | tr 'a-z-' 'A-Z_')"
           {
             echo "${prefix}_LINKER=$HOME/freebsd-sysroot/bin/freebsd-clang"
