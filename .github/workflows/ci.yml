@@ -305,8 +305,7 @@ jobs:
   # can reach. Same harness as the freebsd test job: cross-build on the runner, the VM only
   # executes; python3 comes from pkg (first-party FreeBSD infrastructure) over the VM's NATed
   # network, and the suite + binary ride in over scp. The arm64 guest runs everything (daemon,
-  # jails, probes) under TCG; the suite's waits are wall-clock, so the emulation slowdown is
-  # bounded rather than multiplicative.
+  # jails, probes) under TCG; the suite mostly waits on wall-clock timers, so emulation adds little.
   freebsd-native-e2e:
     name: Native e2e (freebsd-${{ matrix.arch.name }}, ${{ matrix.linkage.name }})
     needs: gate
@@ -614,35 +613,30 @@ jobs:
         if: failure()
         run: ci/freebsd-vm.sh console
 
-  # The unit suite under Miri, for every shipped target. Valgrind (below) watches the machine: it catches
-  # an access that is actually invalid, but it is blind to UB that performs no invalid access at all -- an
-  # unaligned read the hardware tolerates, or a raw pointer used after a &mut reborrow invalidated its
-  # provenance. Both are UB the optimizer is entitled to act on, and both live in our unsafe: read_unaligned
-  # casts into netlink/BPF byte buffers, StreamBuffer's MaybeUninit tail. Miri interprets the abstract
-  # machine and checks the alignment/aliasing/provenance rules instead, so it covers exactly the class
-  # memcheck cannot. The two lanes are complements, not duplicates.
+  # The unit suite under Miri, for every shipped target. Valgrind (below) catches accesses that are
+  # actually invalid; it is blind to UB that performs no invalid access -- an unaligned read the hardware
+  # tolerates, or a raw pointer used after a &mut reborrow invalidated its provenance. Both live in our
+  # unsafe: read_unaligned casts into netlink/BPF byte buffers, StreamBuffer's MaybeUninit tail. Miri
+  # interprets the abstract machine and checks the alignment/aliasing/provenance rules instead, so it
+  # covers the class memcheck can't.
   #
-  # Miri cannot call foreign functions, so a test needing a real socket, capture device, poll backend,
+  # Miri can't call foreign functions, so a test needing a real socket, capture device, poll backend,
   # interface or signal handler is gated with cfg_attr(miri, ignore = "what it needs"). Everything else
-  # runs UNFILTERED, deliberately: a new test is covered by Miri by default, and one that reaches the
-  # kernel fails loudly until it is gated. A name-filtered allowlist would instead go quietly stale.
+  # runs unfiltered, so a new test is covered by default and one that reaches the kernel fails until it is
+  # gated. A name-filtered allowlist would go stale silently instead.
   #
   # Miri interprets rather than executes, so --target needs no toolchain, emulator or VM for that OS: this
   # one ubuntu runner covers the BSD-only cfg code and the 32-bit ARM layouts (where an alignment bug in
-  # the parsers would actually surface) as well as its own. It needs no privileges either -- Miri's geteuid
-  # is a constant, so the root-gated tests always take their skip branch.
+  # the parsers would surface) as well as its own. It needs no privileges either -- Miri's geteuid is a
+  # constant, so the root-gated tests always take their skip branch.
   #
-  # Toolchain: the latest nightly that actually ships Miri, resolved per run rather than pinned. Floating is
-  # deliberate -- new Miri releases tighten the checks (Tree Borrows) and add shims, and a pin would freeze
-  # us at whatever the lane was born with. Not every nightly ships the component though (it is gated on
-  # Miri's own tests passing), so plain `nightly` hard-fails on a day Miri did not build, which would red
-  # every PR for a reason that has nothing to do with this repo. rust-lang's components-history serves the
-  # most recent date that DID ship it, so float on that.
-  #
-  # The cost of floating, stated plainly: a Miri or rustc regression can red this lane on an unrelated PR.
-  # That is the accepted trade for picking up new checks the day they land. When Miri gains a shim for
-  # something we gate on (kqueue, say), the gate does NOT lift itself -- the cfg_attr has to be deleted by
-  # hand; the lane just makes that possible.
+  # Toolchain: the latest nightly that ships Miri, resolved per run rather than pinned, so the lane picks
+  # up tightened checks (Tree Borrows) and new shims as they land. Not every nightly ships the component
+  # (it is gated on Miri's own tests passing), so plain `nightly` fails on a day Miri didn't build, which
+  # would red every PR for an unrelated reason; rust-lang's components-history serves the most recent date
+  # that did ship it, so float on that. The cost: a Miri or rustc regression can red this lane on an
+  # unrelated PR. When Miri gains a shim for something we gate on (kqueue, say), the cfg_attr still has to
+  # be deleted by hand; the lane just makes that possible.
   miri:
     name: Miri (${{ matrix.target }})
     needs: gate
@@ -695,12 +689,12 @@ jobs:
         run: rustup toolchain install "$MIRI_TOOLCHAIN" --profile minimal --component miri,rust-src
       - name: Show toolchain
         run: rustc "+$MIRI_TOOLCHAIN" -V && cargo "+$MIRI_TOOLCHAIN" miri -V
-      # Both aliasing models. They are different rulesets, not a strictness ordering: Stacked Borrows is
-      # today's default, Tree Borrows is the successor, and each accepts things the other rejects. Code
-      # sound under both stays sound whichever one rustc settles on -- worth having for unsafe that holds
-      # raw pointers into buffers it also hands out as &mut (StreamBuffer's tail, the parsers).
-      # -Zmiri-strict-provenance rejects int-to-pointer casts that launder provenance away, which is a real
-      # hazard in FFI glue: it is what keeps kqueue's udata round-trip on ptr::without_provenance_mut.
+      # Both aliasing models: Stacked Borrows is today's default, Tree Borrows the successor, and each
+      # accepts things the other rejects, so code sound under both stays sound whichever one rustc settles
+      # on. That matters for unsafe holding raw pointers into buffers it also hands out as &mut
+      # (StreamBuffer's tail, the parsers). -Zmiri-strict-provenance rejects int-to-pointer casts that
+      # launder provenance away, a hazard in FFI glue: it keeps kqueue's udata round-trip on
+      # ptr::without_provenance_mut.
       # The two runs share the sysroot, so the second only re-interprets the suite.
       - name: cargo miri test (stacked borrows)
         env:
