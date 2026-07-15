@@ -236,7 +236,8 @@ jobs:
           - { name: arm64, triple: aarch64-unknown-freebsd, kvm: false, packages: qemu-system-arm qemu-efi-aarch64 }
         profile:
           - { name: debug, flags: '', rustflags: '' }
-          - { name: release, flags: '--release', rustflags: '-C target-feature=+crt-static' }
+          - { name: release, flags: '--release', rustflags: '' }
+          - { name: release-static, flags: '--release', rustflags: '-C target-feature=+crt-static' }
     steps:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -307,7 +308,7 @@ jobs:
   # jails, probes) under TCG; the suite's waits are wall-clock, so the emulation slowdown is
   # bounded rather than multiplicative.
   freebsd-native-e2e:
-    name: Native e2e (freebsd-${{ matrix.arch.name }})
+    name: Native e2e (freebsd-${{ matrix.arch.name }}, ${{ matrix.linkage.name }})
     needs: gate
     if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
     runs-on: ubuntu-24.04
@@ -320,6 +321,12 @@ jobs:
         arch:
           - { name: amd64, triple: x86_64-unknown-freebsd, kvm: true, packages: qemu-system-x86 }
           - { name: arm64, triple: aarch64-unknown-freebsd, kvm: false, packages: qemu-system-arm qemu-efi-aarch64 }
+        # Both linkages, because they behave differently at runtime (the static-only environ
+        # crash), and each is shipped: static as the release assets, dynamic as the FreeBSD port.
+        # Cross-built from PR source either way; the VM only executes.
+        linkage:
+          - { name: static, rustflags: '-C target-feature=+crt-static' }
+          - { name: dynamic, rustflags: '' }
     steps:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -331,8 +338,8 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: cargo-freebsd-e2e-${{ matrix.arch.name }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-freebsd-e2e-${{ matrix.arch.name }}-
+          key: cargo-freebsd-e2e-${{ matrix.arch.name }}-${{ matrix.linkage.name }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-freebsd-e2e-${{ matrix.arch.name }}-${{ matrix.linkage.name }}-
       - name: Install clang, lld + QEMU
         run: |
           # A failing third-party repo (packages.microsoft.com flakes) must not kill the step:
@@ -366,16 +373,12 @@ jobs:
         run: ci/freebsd-sysroot.sh ${{ matrix.arch.name }}
       - name: Show toolchain
         run: rustc ${FREEBSD_TOOLCHAIN:-} -V && cargo ${FREEBSD_TOOLCHAIN:-} -V
-      # The shipped FreeBSD configuration exactly: static (+crt-static) on the LTO release
-      # profile, as release.yml publishes it -- runtime behavior differs there (the null
-      # environ that sys::process_env works around, the pair tests' spawn skip), and these
-      # lanes are the only ones that run that artifact.
-      - name: Build the static release binary
+      - name: Build the release binary
         run: |
           triple='${{ matrix.arch.triple }}'
           prefix="CARGO_TARGET_$(echo "$triple" | tr 'a-z-' 'A-Z_')"
           export "${prefix}_LINKER=$HOME/freebsd-sysroot/bin/freebsd-clang"
-          export "${prefix}_RUSTFLAGS=-C target-feature=+crt-static"
+          export "${prefix}_RUSTFLAGS=${{ matrix.linkage.rustflags }}"
           cargo ${FREEBSD_TOOLCHAIN:-} build --release --locked --target "$triple"
       - name: Wait for the VM
         run: ci/freebsd-vm.sh wait
@@ -527,8 +530,11 @@ jobs:
   # package records in ports_top_git_hash. Chasing a branch instead means the tree's lang/rust can be
   # newer than the rust package, the dependency looks unsatisfied, and the build quietly starts compiling
   # the Rust compiler from source for hours.
+  # arm64 stays out of PR CI on purpose: no KVM on any GitHub runner for aarch64 guests, so the
+  # port build runs rustc under TCG emulation, which timing runs put beyond a tolerable PR wait
+  # (the same work is ~4 minutes under hardware virt). The publish workflows own arm64.
   port-build:
-    name: Port builds on FreeBSD
+    name: Port builds and runs on FreeBSD
     needs: gate
     if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
     runs-on: ubuntu-24.04
@@ -582,7 +588,7 @@ jobs:
           ci/freebsd-vm.sh run 'cd /usr/ports/net/netflector && make stage-qa'
           ci/freebsd-vm.sh run 'cd /usr/ports/net/netflector && make check-plist'
           ci/freebsd-vm.sh run 'cd /usr/ports/net/netflector && make package'
-      - name: Install, run, deinstall
+      - name: Install and run
         run: |
           ci/freebsd-vm.sh run 'cd /usr/ports/net/netflector && make install'
           ci/freebsd-vm.sh run '/usr/local/bin/netflector --version'
@@ -591,6 +597,18 @@ jobs:
           ci/freebsd-vm.sh run 'sysrc netflector_enable=YES'
           ci/freebsd-vm.sh run 'printf "[reflectors.bad]\nsource_if = \"em0\"\ntarget_if = \"em0\"\nmdns = true\n" > /usr/local/etc/netflector.toml'
           ci/freebsd-vm.sh run 'service netflector start 2>&1 | grep -q "refusing to start" && echo "rc refused an invalid configuration"'
+          ci/freebsd-vm.sh run 'rm /usr/local/etc/netflector.toml'
+      # The port's binary is the one configuration no other lane executes end to end: release
+      # profile, dynamically linked, built by the ports framework from the release tarball. Run
+      # the full native e2e suite against the INSTALLED binary before deinstalling it.
+      - name: Native e2e against the installed port binary
+        run: |
+          ci/freebsd-vm.sh run 'pkg install -y python3'
+          ci/freebsd-vm.sh run 'mkdir -p /root/netflector'
+          ci/freebsd-vm.sh push e2e /root/netflector/
+          ci/freebsd-vm.sh run 'cd /root/netflector && python3 e2e/run.py --backend native --binary /usr/local/bin/netflector'
+      - name: Deinstall
+        run: |
           ci/freebsd-vm.sh run 'cd /usr/ports/net/netflector && make deinstall'
       - name: Console on failure
         if: failure()
