@@ -58,157 +58,6 @@ jobs:
           echo "No prior passing run for tree $tree; running the full suite."
           echo "run=true" >> "$GITHUB_OUTPUT"
 
-  # rustfmt is target-independent, so run it once.
-  fmt:
-    name: Format
-    needs: gate
-    if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - name: rustfmt
-        run: cargo fmt --check
-
-  # clippy + the rustdoc intra-link gate, per supported target. clippy/build/doc only analyze the code active
-  # for the *target* platform, so each cfg(target_os) backend must be linted under its own --target. Both are
-  # check-only (no link), so every target runs on one Linux runner with just `rustup target add` -- no
-  # macOS/FreeBSD host, no cross-linker, no QEMU (the same mechanism as the `cargo check --target
-  # x86_64-unknown-freebsd` gate). Every shipped target is linted, not one per OS: the source has no
-  # target_arch cfgs, but libc/usize widths differ, so the 32- and 64-bit checks aren't redundant.
-  # (aarch64-unknown-freebsd is tier 3 -- no rustup std -- and is the same 64-bit-LE code as the amd64
-  # FreeBSD lane, which covers it.) The Cargo.toml [lints.rustdoc] denies make `cargo doc` the link gate.
-  lint:
-    name: Lint (${{ matrix.target }})
-    needs: gate
-    if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-musl
-          - armv7-unknown-linux-musleabihf
-          - armv5te-unknown-linux-musleabi
-          - x86_64-unknown-freebsd
-          - aarch64-apple-darwin
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - name: Cache cargo build
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: cargo-lint-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-lint-${{ matrix.target }}-
-      - name: Add the Rust target
-        run: rustup target add ${{ matrix.target }}
-      - name: Show toolchain
-        run: rustc -V && cargo -V && cargo clippy -V
-      - name: clippy
-        run: cargo clippy --locked --target ${{ matrix.target }} --all-targets -- -D warnings
-      - name: rustdoc (intra-doc link gate)
-        run: cargo doc --locked --target ${{ matrix.target }} --no-deps --document-private-items
-
-  # The unit suite in both profiles, per OS/arch/libc. The glibc lanes (triple '') cover the
-  # from-source configuration -- what `cargo build` gives users and contributors, rustc's default
-  # toolchain included; macOS among them exercises the cfg(macos) BSD path. The 64-bit musl lanes
-  # run the shipped-binary configuration (static musl, rustc's default self-contained link, the
-  # same as release.yml's native rows) natively and as root, so the privileged tests also cover
-  # musl's std/libc. armv7/armv5 have no native runner, but 32-bit ARM is a deployment target
-  # (MikroTik), so those lanes run the shipped musl configuration under QEMU rather than only
-  # cross-building it -- catching pointer-width / alignment / cast bugs the 64-bit lanes can't.
-  # There lld cross-links (the same config the Dockerfile uses for cross layers, no per-arch gcc)
-  # and the cargo target runner executes via qemu-arm-static (armv7 = armhf, hard-float; armv5 =
-  # armel, soft-float, the EN7562 boxes).
-  test:
-    name: Test (${{ matrix.target.name }}, ${{ matrix.profile.name }})
-    needs: gate
-    if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
-    runs-on: ${{ matrix.target.runner }}
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        # Both profiles: the shipped binary is release (overflow checks off, debug_assert! compiled
-        # out, LTO) while debug keeps them on, so a test can pass under one and not the other.
-        profile:
-          - { name: debug, flags: '' }
-          - { name: release, flags: '--release' }
-        # triple '' = the runner's native gnu toolchain; a triple without `emulated` is that musl
-        # target built and run natively; `emulated` lanes cross-link and run under qemu-arm-static.
-        target:
-          - { name: linux-amd64-glibc, runner: ubuntu-24.04, triple: '' }
-          - { name: linux-arm64-glibc, runner: ubuntu-24.04-arm, triple: '' }
-          - { name: linux-amd64-musl, runner: ubuntu-24.04, triple: x86_64-unknown-linux-musl }
-          - { name: linux-arm64-musl, runner: ubuntu-24.04-arm, triple: aarch64-unknown-linux-musl }
-          - { name: linux-armv7-musl, runner: ubuntu-24.04, triple: armv7-unknown-linux-musleabihf, emulated: true }
-          - { name: linux-armv5-musl, runner: ubuntu-24.04, triple: armv5te-unknown-linux-musleabi, emulated: true }
-          - { name: macos-arm64, runner: macos-15, triple: '' }
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - name: Cache cargo build
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: cargo-${{ matrix.target.name }}-${{ matrix.profile.name }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-${{ matrix.target.name }}-${{ matrix.profile.name }}-
-      - name: Install lld + QEMU user-mode
-        if: matrix.target.emulated
-        run: |
-          # A failing third-party repo (packages.microsoft.com flakes) must not kill the step:
-          # the packages come from the Ubuntu archive, and a broken archive still fails the
-          # install below loudly.
-          sudo apt-get update || true
-          sudo apt-get install -y --no-install-recommends lld qemu-user-static
-      - name: Add the Rust target
-        if: matrix.target.triple != ''
-        run: rustup target add ${{ matrix.target.triple }}
-      # Link the arm32 musl target with lld (cross-capable, unlike the host gcc) and run the test
-      # binary under QEMU -- the same lld config the Dockerfile writes for cross layers, plus a
-      # qemu-arm-static runner for the target. The cfg(target_env = "musl") scope leaves host
-      # build-scripts/proc-macros on the default linker. The native musl lanes write no config at
-      # all: rustc's default toolchain links them, exactly like the release rows.
-      - name: Configure the cross linker and QEMU runner
-        if: matrix.target.emulated
-        run: |
-          mkdir -p .cargo
-          cat > .cargo/config.toml <<'EOF'
-          [target.'cfg(target_env = "musl")']
-          linker = "ld.lld"
-          rustflags = ["-C", "linker-flavor=ld.lld"]
-
-          [target.${{ matrix.target.triple }}]
-          runner = "qemu-arm-static"
-          EOF
-      - name: Show toolchain
-        run: rustc -V && cargo -V
-      # The native lanes run the whole suite as root so the privileged tests (interface pairs,
-      # BPF/AF_PACKET captures, joins) run instead of skipping -- like the FreeBSD VM suite, which
-      # is root already. The qemu lanes stay unprivileged: their datapath-under-emulation coverage
-      # lives in the native e2e lanes, and they double as the guard that the suite still runs (and
-      # skips its privileged tests) without root, the way contributors run it.
-      - name: cargo test (root)
-        if: ${{ !matrix.target.emulated }}
-        run: |
-          triple='${{ matrix.target.triple }}'
-          sudo -E "$(command -v cargo)" test --locked ${{ matrix.profile.flags }} ${triple:+--target "$triple"}
-      - name: cargo test (under QEMU)
-        if: matrix.target.emulated
-        run: cargo test --locked --target ${{ matrix.target.triple }} ${{ matrix.profile.flags }}
-
   # FreeBSD shares its BSD platform path (kqueue, BPF, route sockets, getifaddrs) with macOS but needs a
   # real FreeBSD kernel to run -- Docker can't provide one, and qemu-user translates architecture, not OS.
   # So: cross-compile on the runner (rustup std; clang+lld against a sysroot from the official base.txz,
@@ -225,7 +74,7 @@ jobs:
     needs: gate
     if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 15
     env:
       FREEBSD_VM_ARCH: ${{ matrix.arch.name }}
     strategy:
@@ -305,14 +154,13 @@ jobs:
   # can reach. Same harness as the freebsd test job: cross-build on the runner, the VM only
   # executes; python3 comes from pkg (first-party FreeBSD infrastructure) over the VM's NATed
   # network, and the suite + binary ride in over scp. The arm64 guest runs everything (daemon,
-  # jails, probes) under TCG; the suite's waits are wall-clock, so the emulation slowdown is
-  # bounded rather than multiplicative.
+  # jails, probes) under TCG; the suite mostly waits on wall-clock timers, so emulation adds little.
   freebsd-native-e2e:
     name: Native e2e (freebsd-${{ matrix.arch.name }}, ${{ matrix.linkage.name }})
     needs: gate
     if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 40
     env:
       FREEBSD_VM_ARCH: ${{ matrix.arch.name }}
     strategy:
@@ -393,135 +241,6 @@ jobs:
         if: failure()
         run: ci/freebsd-vm.sh console
 
-  # Build the scratch image and drive the Docker-bridge e2e suite (the data path: capture -> reflect across
-  # two bridges, multi-protocol). One lane per shipped 64-bit image arch, each on its native runner, so
-  # both released layer sets are executed in exactly the configuration release.yml publishes (native =
-  # default-toolchain link, per the Dockerfile). The cache scopes match the release image jobs', so a
-  # release build reuses layers CI built for the same commit. --skip-build reuses the image built here.
-  docker-e2e:
-    name: Docker e2e (${{ matrix.arch.name }})
-    needs: gate
-    if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
-    runs-on: ${{ matrix.arch.runner }}
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        arch:
-          - { name: amd64, runner: ubuntu-24.04 }
-          - { name: arm64, runner: ubuntu-24.04-arm }
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
-      - name: Build netflector image
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
-        with:
-          context: .
-          tags: netflector:e2e
-          load: true
-          cache-from: type=gha,scope=${{ matrix.arch.name }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.arch.name }}
-      - name: Run e2e
-        run: python3 e2e/run.py --skip-build --image netflector:e2e
-
-  # The same e2e suite without Docker: netns + veth segments and plain processes. The glibc lanes
-  # run a release binary built directly on the runner -- the from-source configuration. The 64-bit
-  # musl lanes run the shipped release-asset configuration: static musl, rustc's default
-  # toolchain, built and run natively. The 32-bit ARM lanes run that shipped configuration too,
-  # lld-cross-linked like the Dockerfile's cross layers, with the daemon executing under qemu-user
-  # via binfmt_misc: the harness, probes, and every kernel primitive (netns, veth, AF_PACKET,
-  # netlink) are native; only netflector is emulated. That puts real 32-bit pointer-width
-  # traffic through the whole capture -> classify -> re-emit path, which the QEMU unit-test lanes
-  # can't (unit-only) and the docker-e2e lanes can't (64-bit images).
-  native-e2e:
-    name: Native e2e (${{ matrix.target.name }})
-    needs: gate
-    if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
-    runs-on: ${{ matrix.target.runner }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        # triple '' = the runner's native gnu toolchain; a triple without `emulated` is that musl
-        # target built and run natively; `emulated` lanes cross-link and run under qemu binfmt.
-        target:
-          - { name: linux-amd64-glibc, runner: ubuntu-24.04, triple: '' }
-          - { name: linux-arm64-glibc, runner: ubuntu-24.04-arm, triple: '' }
-          - { name: linux-amd64-musl, runner: ubuntu-24.04, triple: x86_64-unknown-linux-musl }
-          - { name: linux-arm64-musl, runner: ubuntu-24.04-arm, triple: aarch64-unknown-linux-musl }
-          - { name: linux-armv7-musl, runner: ubuntu-24.04, triple: armv7-unknown-linux-musleabihf, emulated: true }
-          - { name: linux-armv5-musl, runner: ubuntu-24.04, triple: armv5te-unknown-linux-musleabi, emulated: true }
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - name: Cache cargo build
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: cargo-native-e2e-${{ matrix.target.name }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-native-e2e-${{ matrix.target.name }}-
-      - name: Install lld + QEMU user-mode
-        if: matrix.target.emulated
-        run: |
-          # A failing third-party repo (packages.microsoft.com flakes) must not kill the step:
-          # the packages come from the Ubuntu archive, and a broken archive still fails the
-          # install below loudly.
-          sudo apt-get update || true
-          sudo apt-get install -y --no-install-recommends lld qemu-user-static
-      - name: Add the Rust target
-        if: matrix.target.triple != ''
-        run: rustup target add ${{ matrix.target.triple }}
-      # The same lld cross-link config the Dockerfile writes for cross layers; binfmt_misc (from
-      # qemu-user-static) execs the ARM binary under qemu transparently, netns exec included. The
-      # native musl lanes write no config: rustc's default toolchain, like release.yml's rows.
-      - name: Configure the arm32 cross-linker
-        if: matrix.target.emulated
-        run: |
-          mkdir -p .cargo
-          cat > .cargo/config.toml <<'EOF'
-          [target.'cfg(target_env = "musl")']
-          linker = "ld.lld"
-          rustflags = ["-C", "linker-flavor=ld.lld"]
-          EOF
-      - name: Show toolchain
-        run: rustc -V && cargo -V
-      - name: Build release binary
-        run: |
-          triple='${{ matrix.target.triple }}'
-          cargo build --release --locked ${triple:+--target "$triple"}
-      - name: Run e2e natively
-        run: |
-          triple='${{ matrix.target.triple }}'
-          sudo python3 e2e/run.py --backend native --binary "target/${triple:+$triple/}release/netflector"
-
-  # The FreeBSD port pins every byte it builds from: the release tarball and all 20 crates, each with a
-  # SHA256 in distinfo. If Cargo.lock moves and those are not regenerated, the port either fails to build
-  # (a crate it has never heard of) or builds something other than what we released. Cargo.lock already
-  # carries the SHA256 of every .crate file, so this needs no network and no FreeBSD: it is seconds.
-  #
-  # It compares against the lockfile AT THE TAG the port declares, not the working tree: main's version is
-  # bumped to the next patch the moment a release is cut, so comparing against main would fail forever
-  # after. That is also why this needs the tags (fetch-depth 0).
-  port-check:
-    name: Port in sync with Cargo.lock
-    needs: gate
-    if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          fetch-depth: 0
-      - name: Port matches the lockfile of the release it builds
-        run: ci/port-sync.py --check
-
   # Build the port the way FreeBSD would, so a broken port is caught here and not by a reviewer (or by
   # the package cluster, months later). The QA targets are the ones a ports committer runs: portlint,
   # stage-qa (shebangs, stripping, dependencies) and check-plist (installed-but-unlisted files).
@@ -538,7 +257,7 @@ jobs:
     needs: gate
     if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 25
     env:
       FREEBSD_VM_ARCH: amd64
     steps:
@@ -614,41 +333,170 @@ jobs:
         if: failure()
         run: ci/freebsd-vm.sh console
 
-  # The unit suite under Miri, for every shipped target. Valgrind (below) watches the machine: it catches
-  # an access that is actually invalid, but it is blind to UB that performs no invalid access at all -- an
-  # unaligned read the hardware tolerates, or a raw pointer used after a &mut reborrow invalidated its
-  # provenance. Both are UB the optimizer is entitled to act on, and both live in our unsafe: read_unaligned
-  # casts into netlink/BPF byte buffers, StreamBuffer's MaybeUninit tail. Miri interprets the abstract
-  # machine and checks the alignment/aliasing/provenance rules instead, so it covers exactly the class
-  # memcheck cannot. The two lanes are complements, not duplicates.
+  # The e2e suite with netflector under Valgrind memcheck (the runtime-valgrind image: a glibc release
+  # binary with debug symbols). run.py --valgrind SIGTERMs the daemon per case so Valgrind runs its leak
+  # analysis at a clean exit; --error-exitcode=1 fails on any leak, leaked fd, or memcheck error.
+  # --skip-build reuses the image built here.
+  valgrind-e2e:
+    name: Valgrind e2e
+    needs: gate
+    if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+      - name: Build runtime-valgrind image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          target: runtime-valgrind
+          tags: netflector:e2e-valgrind
+          load: true
+          cache-from: type=gha,scope=valgrind
+          cache-to: type=gha,mode=max,scope=valgrind
+      - name: Run e2e under Valgrind memcheck
+        run: python3 e2e/run.py --valgrind --skip-build
+
+  # Build the scratch image and drive the Docker-bridge e2e suite (the data path: capture -> reflect across
+  # two bridges, multi-protocol). One lane per shipped 64-bit image arch, each on its native runner, so
+  # both released layer sets are executed in exactly the configuration release.yml publishes (native =
+  # default-toolchain link, per the Dockerfile). The cache scopes match the release image jobs', so a
+  # release build reuses layers CI built for the same commit. --skip-build reuses the image built here.
+  docker-e2e:
+    name: Docker e2e (${{ matrix.arch.name }})
+    needs: gate
+    if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
+    runs-on: ${{ matrix.arch.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - { name: amd64, runner: ubuntu-24.04 }
+          - { name: arm64, runner: ubuntu-24.04-arm }
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+      - name: Build netflector image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          tags: netflector:e2e
+          load: true
+          cache-from: type=gha,scope=${{ matrix.arch.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch.name }}
+      - name: Run e2e
+        run: python3 e2e/run.py --skip-build --image netflector:e2e
+
+  # The same e2e suite without Docker: netns + veth segments and plain processes. The glibc lanes
+  # run a release binary built directly on the runner -- the from-source configuration. The 64-bit
+  # musl lanes run the shipped release-asset configuration: static musl, rustc's default
+  # toolchain, built and run natively. The 32-bit ARM lanes run that shipped configuration too,
+  # lld-cross-linked like the Dockerfile's cross layers, with the daemon executing under qemu-user
+  # via binfmt_misc: the harness, probes, and every kernel primitive (netns, veth, AF_PACKET,
+  # netlink) are native; only netflector is emulated. That puts real 32-bit pointer-width
+  # traffic through the whole capture -> classify -> re-emit path, which the QEMU unit-test lanes
+  # can't (unit-only) and the docker-e2e lanes can't (64-bit images).
+  native-e2e:
+    name: Native e2e (${{ matrix.target.name }})
+    needs: gate
+    if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
+    runs-on: ${{ matrix.target.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # triple '' = the runner's native gnu toolchain; a triple without `emulated` is that musl
+        # target built and run natively; `emulated` lanes cross-link and run under qemu binfmt.
+        target:
+          - { name: linux-amd64-glibc, runner: ubuntu-24.04, triple: '' }
+          - { name: linux-arm64-glibc, runner: ubuntu-24.04-arm, triple: '' }
+          - { name: linux-amd64-musl, runner: ubuntu-24.04, triple: x86_64-unknown-linux-musl }
+          - { name: linux-arm64-musl, runner: ubuntu-24.04-arm, triple: aarch64-unknown-linux-musl }
+          - { name: linux-armv7-musl, runner: ubuntu-24.04, triple: armv7-unknown-linux-musleabihf, emulated: true }
+          - { name: linux-armv5-musl, runner: ubuntu-24.04, triple: armv5te-unknown-linux-musleabi, emulated: true }
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - name: Cache cargo build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-native-e2e-${{ matrix.target.name }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-native-e2e-${{ matrix.target.name }}-
+      - name: Install lld + QEMU user-mode
+        if: matrix.target.emulated
+        run: |
+          # A failing third-party repo (packages.microsoft.com flakes) must not kill the step:
+          # the packages come from the Ubuntu archive, and a broken archive still fails the
+          # install below loudly.
+          sudo apt-get update || true
+          sudo apt-get install -y --no-install-recommends lld qemu-user-static
+      - name: Add the Rust target
+        if: matrix.target.triple != ''
+        run: rustup target add ${{ matrix.target.triple }}
+      # The same lld cross-link config the Dockerfile writes for cross layers; binfmt_misc (from
+      # qemu-user-static) execs the ARM binary under qemu transparently, netns exec included. The
+      # native musl lanes write no config: rustc's default toolchain, like release.yml's rows.
+      - name: Configure the arm32 cross-linker
+        if: matrix.target.emulated
+        run: |
+          mkdir -p .cargo
+          cat > .cargo/config.toml <<'EOF'
+          [target.'cfg(target_env = "musl")']
+          linker = "ld.lld"
+          rustflags = ["-C", "linker-flavor=ld.lld"]
+          EOF
+      - name: Show toolchain
+        run: rustc -V && cargo -V
+      - name: Build release binary
+        run: |
+          triple='${{ matrix.target.triple }}'
+          cargo build --release --locked ${triple:+--target "$triple"}
+      - name: Run e2e natively
+        run: |
+          triple='${{ matrix.target.triple }}'
+          sudo python3 e2e/run.py --backend native --binary "target/${triple:+$triple/}release/netflector"
+
+  # The unit suite under Miri, for every shipped target. Valgrind (below) catches accesses that are
+  # actually invalid; it is blind to UB that performs no invalid access -- an unaligned read the hardware
+  # tolerates, or a raw pointer used after a &mut reborrow invalidated its provenance. Both live in our
+  # unsafe: read_unaligned casts into netlink/BPF byte buffers, StreamBuffer's MaybeUninit tail. Miri
+  # interprets the abstract machine and checks the alignment/aliasing/provenance rules instead, so it
+  # covers the class memcheck can't.
   #
-  # Miri cannot call foreign functions, so a test needing a real socket, capture device, poll backend,
+  # Miri can't call foreign functions, so a test needing a real socket, capture device, poll backend,
   # interface or signal handler is gated with cfg_attr(miri, ignore = "what it needs"). Everything else
-  # runs UNFILTERED, deliberately: a new test is covered by Miri by default, and one that reaches the
-  # kernel fails loudly until it is gated. A name-filtered allowlist would instead go quietly stale.
+  # runs unfiltered, so a new test is covered by default and one that reaches the kernel fails until it is
+  # gated. A name-filtered allowlist would go stale silently instead.
   #
   # Miri interprets rather than executes, so --target needs no toolchain, emulator or VM for that OS: this
   # one ubuntu runner covers the BSD-only cfg code and the 32-bit ARM layouts (where an alignment bug in
-  # the parsers would actually surface) as well as its own. It needs no privileges either -- Miri's geteuid
-  # is a constant, so the root-gated tests always take their skip branch.
+  # the parsers would surface) as well as its own. It needs no privileges either -- Miri's geteuid is a
+  # constant, so the root-gated tests always take their skip branch.
   #
-  # Toolchain: the latest nightly that actually ships Miri, resolved per run rather than pinned. Floating is
-  # deliberate -- new Miri releases tighten the checks (Tree Borrows) and add shims, and a pin would freeze
-  # us at whatever the lane was born with. Not every nightly ships the component though (it is gated on
-  # Miri's own tests passing), so plain `nightly` hard-fails on a day Miri did not build, which would red
-  # every PR for a reason that has nothing to do with this repo. rust-lang's components-history serves the
-  # most recent date that DID ship it, so float on that.
-  #
-  # The cost of floating, stated plainly: a Miri or rustc regression can red this lane on an unrelated PR.
-  # That is the accepted trade for picking up new checks the day they land. When Miri gains a shim for
-  # something we gate on (kqueue, say), the gate does NOT lift itself -- the cfg_attr has to be deleted by
-  # hand; the lane just makes that possible.
+  # Toolchain: the latest nightly that ships Miri, resolved per run rather than pinned, so the lane picks
+  # up tightened checks (Tree Borrows) and new shims as they land. Not every nightly ships the component
+  # (it is gated on Miri's own tests passing), so plain `nightly` fails on a day Miri didn't build, which
+  # would red every PR for an unrelated reason; rust-lang's components-history serves the most recent date
+  # that did ship it, so float on that. The cost: a Miri or rustc regression can red this lane on an
+  # unrelated PR. When Miri gains a shim for something we gate on (kqueue, say), the cfg_attr still has to
+  # be deleted by hand; the lane just makes that possible.
   miri:
     name: Miri (${{ matrix.target }})
     needs: gate
     if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -695,12 +543,12 @@ jobs:
         run: rustup toolchain install "$MIRI_TOOLCHAIN" --profile minimal --component miri,rust-src
       - name: Show toolchain
         run: rustc "+$MIRI_TOOLCHAIN" -V && cargo "+$MIRI_TOOLCHAIN" miri -V
-      # Both aliasing models. They are different rulesets, not a strictness ordering: Stacked Borrows is
-      # today's default, Tree Borrows is the successor, and each accepts things the other rejects. Code
-      # sound under both stays sound whichever one rustc settles on -- worth having for unsafe that holds
-      # raw pointers into buffers it also hands out as &mut (StreamBuffer's tail, the parsers).
-      # -Zmiri-strict-provenance rejects int-to-pointer casts that launder provenance away, which is a real
-      # hazard in FFI glue: it is what keeps kqueue's udata round-trip on ptr::without_provenance_mut.
+      # Both aliasing models: Stacked Borrows is today's default, Tree Borrows the successor, and each
+      # accepts things the other rejects, so code sound under both stays sound whichever one rustc settles
+      # on. That matters for unsafe holding raw pointers into buffers it also hands out as &mut
+      # (StreamBuffer's tail, the parsers). -Zmiri-strict-provenance rejects int-to-pointer casts that
+      # launder provenance away, a hazard in FFI glue: it keeps kqueue's udata round-trip on
+      # ptr::without_provenance_mut.
       # The two runs share the sysroot, so the second only re-interprets the suite.
       - name: cargo miri test (stacked borrows)
         env:
@@ -710,6 +558,98 @@ jobs:
         env:
           MIRIFLAGS: -Zmiri-tree-borrows -Zmiri-strict-provenance
         run: cargo "+$MIRI_TOOLCHAIN" miri test --locked --target ${{ matrix.target }} --lib
+
+  # The unit suite in both profiles, per OS/arch/libc. The glibc lanes (triple '') cover the
+  # from-source configuration -- what `cargo build` gives users and contributors, rustc's default
+  # toolchain included; macOS among them exercises the cfg(macos) BSD path. The 64-bit musl lanes
+  # run the shipped-binary configuration (static musl, rustc's default self-contained link, the
+  # same as release.yml's native rows) natively and as root, so the privileged tests also cover
+  # musl's std/libc. armv7/armv5 have no native runner, but 32-bit ARM is a deployment target
+  # (MikroTik), so those lanes run the shipped musl configuration under QEMU rather than only
+  # cross-building it -- catching pointer-width / alignment / cast bugs the 64-bit lanes can't.
+  # There lld cross-links (the same config the Dockerfile uses for cross layers, no per-arch gcc)
+  # and the cargo target runner executes via qemu-arm-static (armv7 = armhf, hard-float; armv5 =
+  # armel, soft-float, the EN7562 boxes).
+  test:
+    name: Test (${{ matrix.target.name }}, ${{ matrix.profile.name }})
+    needs: gate
+    if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
+    runs-on: ${{ matrix.target.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both profiles: the shipped binary is release (overflow checks off, debug_assert! compiled
+        # out, LTO) while debug keeps them on, so a test can pass under one and not the other.
+        profile:
+          - { name: debug, flags: '' }
+          - { name: release, flags: '--release' }
+        # triple '' = the runner's native gnu toolchain; a triple without `emulated` is that musl
+        # target built and run natively; `emulated` lanes cross-link and run under qemu-arm-static.
+        target:
+          - { name: linux-amd64-glibc, runner: ubuntu-24.04, triple: '' }
+          - { name: linux-arm64-glibc, runner: ubuntu-24.04-arm, triple: '' }
+          - { name: linux-amd64-musl, runner: ubuntu-24.04, triple: x86_64-unknown-linux-musl }
+          - { name: linux-arm64-musl, runner: ubuntu-24.04-arm, triple: aarch64-unknown-linux-musl }
+          - { name: linux-armv7-musl, runner: ubuntu-24.04, triple: armv7-unknown-linux-musleabihf, emulated: true }
+          - { name: linux-armv5-musl, runner: ubuntu-24.04, triple: armv5te-unknown-linux-musleabi, emulated: true }
+          - { name: macos-arm64, runner: macos-15, triple: '' }
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - name: Cache cargo build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ matrix.target.name }}-${{ matrix.profile.name }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ matrix.target.name }}-${{ matrix.profile.name }}-
+      - name: Install lld + QEMU user-mode
+        if: matrix.target.emulated
+        run: |
+          # A failing third-party repo (packages.microsoft.com flakes) must not kill the step:
+          # the packages come from the Ubuntu archive, and a broken archive still fails the
+          # install below loudly.
+          sudo apt-get update || true
+          sudo apt-get install -y --no-install-recommends lld qemu-user-static
+      - name: Add the Rust target
+        if: matrix.target.triple != ''
+        run: rustup target add ${{ matrix.target.triple }}
+      # Link the arm32 musl target with lld (cross-capable, unlike the host gcc) and run the test
+      # binary under QEMU -- the same lld config the Dockerfile writes for cross layers, plus a
+      # qemu-arm-static runner for the target. The cfg(target_env = "musl") scope leaves host
+      # build-scripts/proc-macros on the default linker. The native musl lanes write no config at
+      # all: rustc's default toolchain links them, exactly like the release rows.
+      - name: Configure the cross linker and QEMU runner
+        if: matrix.target.emulated
+        run: |
+          mkdir -p .cargo
+          cat > .cargo/config.toml <<'EOF'
+          [target.'cfg(target_env = "musl")']
+          linker = "ld.lld"
+          rustflags = ["-C", "linker-flavor=ld.lld"]
+
+          [target.${{ matrix.target.triple }}]
+          runner = "qemu-arm-static"
+          EOF
+      - name: Show toolchain
+        run: rustc -V && cargo -V
+      # The native lanes run the whole suite as root so the privileged tests (interface pairs,
+      # BPF/AF_PACKET captures, joins) run instead of skipping -- like the FreeBSD VM suite, which
+      # is root already. The qemu lanes stay unprivileged: their datapath-under-emulation coverage
+      # lives in the native e2e lanes, and they double as the guard that the suite still runs (and
+      # skips its privileged tests) without root, the way contributors run it.
+      - name: cargo test (root)
+        if: ${{ !matrix.target.emulated }}
+        run: |
+          triple='${{ matrix.target.triple }}'
+          sudo -E "$(command -v cargo)" test --locked ${{ matrix.profile.flags }} ${triple:+--target "$triple"}
+      - name: cargo test (under QEMU)
+        if: matrix.target.emulated
+        run: cargo test --locked --target ${{ matrix.target.triple }} ${{ matrix.profile.flags }}
 
   # The unit suite under Valgrind memcheck. The valgrind-e2e job below only ever sees the daemon's
   # datapath; the unit suite is where the unsafe surface actually executes -- the netlink walk
@@ -728,7 +668,7 @@ jobs:
     needs: gate
     if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 10
     steps:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -756,32 +696,86 @@ jobs:
           export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-fds=yes --num-callers=30 --error-exitcode=1'
           sudo -E "$(command -v cargo)" test --locked
 
-  # The e2e suite with netflector under Valgrind memcheck (the runtime-valgrind image: a glibc release
-  # binary with debug symbols). run.py --valgrind SIGTERMs the daemon per case so Valgrind runs its leak
-  # analysis at a clean exit; --error-exitcode=1 fails on any leak, leaked fd, or memcheck error.
-  # --skip-build reuses the image built here.
-  valgrind-e2e:
-    name: Valgrind e2e
+  # The FreeBSD port pins every byte it builds from: the release tarball and all 20 crates, each with a
+  # SHA256 in distinfo. If Cargo.lock moves and those are not regenerated, the port either fails to build
+  # (a crate it has never heard of) or builds something other than what we released. Cargo.lock already
+  # carries the SHA256 of every .crate file, so this needs no network and no FreeBSD: it is seconds.
+  #
+  # It compares against the lockfile AT THE TAG the port declares, not the working tree: main's version is
+  # bumped to the next patch the moment a release is cut, so comparing against main would fail forever
+  # after. That is also why this needs the tags (fetch-depth 0).
+  port-check:
+    name: Port in sync with Cargo.lock
     needs: gate
     if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 5
     steps:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
-      - name: Build runtime-valgrind image
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
-          context: .
-          target: runtime-valgrind
-          tags: netflector:e2e-valgrind
-          load: true
-          cache-from: type=gha,scope=valgrind
-          cache-to: type=gha,mode=max,scope=valgrind
-      - name: Run e2e under Valgrind memcheck
-        run: python3 e2e/run.py --valgrind --skip-build
+          fetch-depth: 0
+      - name: Port matches the lockfile of the release it builds
+        run: ci/port-sync.py --check
+
+  # clippy + the rustdoc intra-link gate, per supported target. clippy/build/doc only analyze the code active
+  # for the *target* platform, so each cfg(target_os) backend must be linted under its own --target. Both are
+  # check-only (no link), so every target runs on one Linux runner with just `rustup target add` -- no
+  # macOS/FreeBSD host, no cross-linker, no QEMU (the same mechanism as the `cargo check --target
+  # x86_64-unknown-freebsd` gate). Every shipped target is linted, not one per OS: the source has no
+  # target_arch cfgs, but libc/usize widths differ, so the 32- and 64-bit checks aren't redundant.
+  # (aarch64-unknown-freebsd is tier 3 -- no rustup std -- and is the same 64-bit-LE code as the amd64
+  # FreeBSD lane, which covers it.) The Cargo.toml [lints.rustdoc] denies make `cargo doc` the link gate.
+  lint:
+    name: Lint (${{ matrix.target }})
+    needs: gate
+    if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - armv7-unknown-linux-musleabihf
+          - armv5te-unknown-linux-musleabi
+          - x86_64-unknown-freebsd
+          - aarch64-apple-darwin
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - name: Cache cargo build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-lint-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-lint-${{ matrix.target }}-
+      - name: Add the Rust target
+        run: rustup target add ${{ matrix.target }}
+      - name: Show toolchain
+        run: rustc -V && cargo -V && cargo clippy -V
+      - name: clippy
+        run: cargo clippy --locked --target ${{ matrix.target }} --all-targets -- -D warnings
+      - name: rustdoc (intra-doc link gate)
+        run: cargo doc --locked --target ${{ matrix.target }} --no-deps --document-private-items
+
+  # rustfmt is target-independent, so run it once.
+  fmt:
+    name: Format
+    needs: gate
+    if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - name: rustfmt
+        run: cargo fmt --check
 
   # A single aggregate status check: green only when every job above is green (or was legitimately skipped
   # by `gate` because this tree already passed CI). Make THIS the sole required check in branch protection --
