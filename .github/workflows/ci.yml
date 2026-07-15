@@ -65,21 +65,31 @@ jobs:
   # test binary in it as root through cargo's target runner (ci/freebsd-ssh-runner.sh) -- privileged
   # tests run instead of skipping. amd64 rides KVM; arm64 has no KVM on any GitHub runner, so its guest
   # runs under TCG -- compilation stays native-speed on the runner, only test execution is emulated --
-  # and builds with the pinned nightly from ci/freebsd.env until stable 1.98 ships the target's std.
+  # and builds with the pinned nightly from ci/freebsd-nightly.env until stable 1.98 ships the target's std.
   # One VM per lane, the same debug/release split as the native test lanes; the release lanes test the
   # shipped +crt-static configuration (kept off host proc-macros by the target-scoped rustflags).
   # Everything fetched is FreeBSD-project-official and hash-pinned.
-  freebsd:
-    name: Test (freebsd-${{ matrix.arch.name }}, ${{ matrix.profile.name }})
+  freebsd-tests:
+    name: Test (freebsd${{ matrix.os }}-${{ matrix.arch.name }}, ${{ matrix.profile.name }})
     needs: gate
     if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
       FREEBSD_VM_ARCH: ${{ matrix.arch.name }}
+      FREEBSD_VM_VERSION: ${{ matrix.os }}
+      FREEBSD_SYSROOT_ARCH: ${{ matrix.arch.name }}
+      # Dynamic rows link against the sysroot of the release they run on; release-static rows
+      # always use the 14 baseline, because they test the shipped asset configuration
+      # (release.yml links against the 14 pin) wherever it lands.
+      FREEBSD_SYSROOT_VERSION: ${{ matrix.profile.name == 'release-static' && '14' || matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        # Both pinned majors: 14 is the release baseline, 15 is what OPNsense 26.7 (and soon most
+        # deployments) runs. The daemon's kernel surface (kqueue, BPF, routing) is where majors
+        # actually diverge - FreeBSD 15 dropped the broadcast connect the e2e harness relied on.
+        os: [14, 15]
         arch:
           - { name: amd64, triple: x86_64-unknown-freebsd, kvm: true, packages: qemu-system-x86 }
           - { name: arm64, triple: aarch64-unknown-freebsd, kvm: false, packages: qemu-system-arm qemu-efi-aarch64 }
@@ -98,8 +108,8 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: cargo-freebsd-${{ matrix.arch.name }}-${{ matrix.profile.name }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-freebsd-${{ matrix.arch.name }}-${{ matrix.profile.name }}-
+          key: cargo-freebsd${{ matrix.os }}-${{ matrix.arch.name }}-${{ matrix.profile.name }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-freebsd${{ matrix.os }}-${{ matrix.arch.name }}-${{ matrix.profile.name }}-
       - name: Install clang, lld + QEMU
         run: |
           # A failing third-party repo (packages.microsoft.com flakes) must not kill the step:
@@ -119,11 +129,11 @@ jobs:
       - name: Launch the FreeBSD VM
         run: ci/freebsd-vm.sh launch
       # aarch64-unknown-freebsd has no stable dist until 1.98: those lanes install the pinned
-      # dated nightly from ci/freebsd.env instead of the rust-toolchain.toml stable, and every
+      # dated nightly from ci/freebsd-nightly.env instead of the rust-toolchain.toml stable, and every
       # later rustc/cargo call picks it up through the FREEBSD_TOOLCHAIN selector set here.
       - name: Add the Rust target
         run: |
-          . ci/freebsd.env
+          . ci/freebsd-nightly.env
           if [ '${{ matrix.arch.name }}' = arm64 ]; then
             rustup toolchain install "nightly-${RUST_NIGHTLY}" --profile minimal
             rustup target add --toolchain "nightly-${RUST_NIGHTLY}" aarch64-unknown-freebsd
@@ -132,7 +142,7 @@ jobs:
             rustup target add x86_64-unknown-freebsd
           fi
       - name: FreeBSD link sysroot
-        run: ci/freebsd-sysroot.sh ${{ matrix.arch.name }}
+        run: ci/freebsd-sysroot.sh
       - name: Show toolchain
         run: rustc ${FREEBSD_TOOLCHAIN:-} -V && cargo ${FREEBSD_TOOLCHAIN:-} -V
       - name: Wait for the VM
@@ -151,21 +161,30 @@ jobs:
 
   # The native e2e suite on a real FreeBSD kernel: epair segments, every participant in its own
   # vnet jail -- the BPF capture/inject and PF_ROUTE monitor paths end to end, which no Linux lane
-  # can reach. Same harness as the freebsd test job: cross-build on the runner, the VM only
+  # can reach. Same harness as the freebsd-tests job: cross-build on the runner, the VM only
   # executes; python3 comes from pkg (first-party FreeBSD infrastructure) over the VM's NATed
   # network, and the suite + binary ride in over scp. The arm64 guest runs everything (daemon,
   # jails, probes) under TCG; the suite mostly waits on wall-clock timers, so emulation adds little.
   freebsd-native-e2e:
-    name: Native e2e (freebsd-${{ matrix.arch.name }}, ${{ matrix.linkage.name }})
+    name: Native e2e (freebsd${{ matrix.os }}-${{ matrix.arch.name }}, ${{ matrix.linkage.name }})
     needs: gate
     if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     env:
       FREEBSD_VM_ARCH: ${{ matrix.arch.name }}
+      FREEBSD_VM_VERSION: ${{ matrix.os }}
+      FREEBSD_SYSROOT_ARCH: ${{ matrix.arch.name }}
+      # Dynamic rows link against the sysroot of the release they run on (the port's
+      # configuration is built ON its target); static rows keep the 14 baseline the release
+      # assets are linked against.
+      FREEBSD_SYSROOT_VERSION: ${{ matrix.linkage.name == 'static' && '14' || matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        # Same version axis as freebsd-tests: the e2e suite exercises the kernel surface
+        # (epair, vnet, BPF, PF_ROUTE) where the majors actually differ.
+        os: [14, 15]
         arch:
           - { name: amd64, triple: x86_64-unknown-freebsd, kvm: true, packages: qemu-system-x86 }
           - { name: arm64, triple: aarch64-unknown-freebsd, kvm: false, packages: qemu-system-arm qemu-efi-aarch64 }
@@ -186,8 +205,8 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: cargo-freebsd-e2e-${{ matrix.arch.name }}-${{ matrix.linkage.name }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-freebsd-e2e-${{ matrix.arch.name }}-${{ matrix.linkage.name }}-
+          key: cargo-freebsd${{ matrix.os }}-e2e-${{ matrix.arch.name }}-${{ matrix.linkage.name }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-freebsd${{ matrix.os }}-e2e-${{ matrix.arch.name }}-${{ matrix.linkage.name }}-
       - name: Install clang, lld + QEMU
         run: |
           # A failing third-party repo (packages.microsoft.com flakes) must not kill the step:
@@ -205,11 +224,11 @@ jobs:
       - name: Launch the FreeBSD VM
         run: ci/freebsd-vm.sh launch
       # aarch64-unknown-freebsd has no stable dist until 1.98: that lane installs the pinned
-      # dated nightly from ci/freebsd.env instead of the rust-toolchain.toml stable, and every
+      # dated nightly from ci/freebsd-nightly.env instead of the rust-toolchain.toml stable, and every
       # later cargo call picks it up through the FREEBSD_TOOLCHAIN selector set here.
       - name: Add the Rust target
         run: |
-          . ci/freebsd.env
+          . ci/freebsd-nightly.env
           if [ '${{ matrix.arch.name }}' = arm64 ]; then
             rustup toolchain install "nightly-${RUST_NIGHTLY}" --profile minimal
             rustup target add --toolchain "nightly-${RUST_NIGHTLY}" aarch64-unknown-freebsd
@@ -218,7 +237,7 @@ jobs:
             rustup target add x86_64-unknown-freebsd
           fi
       - name: FreeBSD link sysroot
-        run: ci/freebsd-sysroot.sh ${{ matrix.arch.name }}
+        run: ci/freebsd-sysroot.sh
       - name: Show toolchain
         run: rustc ${FREEBSD_TOOLCHAIN:-} -V && cargo ${FREEBSD_TOOLCHAIN:-} -V
       - name: Build the release binary
@@ -249,17 +268,23 @@ jobs:
   # package records in ports_top_git_hash. Chasing a branch instead means the tree's lang/rust can be
   # newer than the rust package, the dependency looks unsatisfied, and the build quietly starts compiling
   # the Rust compiler from source for hours.
-  # arm64 stays out of PR CI on purpose: no KVM on any GitHub runner for aarch64 guests, so the
-  # port build runs rustc under TCG emulation, which timing runs put beyond a tolerable PR wait
-  # (the same work is ~4 minutes under hardware virt). The publish workflows own arm64.
-  port-build:
-    name: Port builds and runs on FreeBSD
+  freebsd-port-build:
+    name: Port builds and runs on FreeBSD ${{ matrix.os }}
     needs: gate
     if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     env:
       FREEBSD_VM_ARCH: amd64
+      FREEBSD_VM_VERSION: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # amd64 only (KVM): an arm64 port build would run rustc under TCG (no KVM on any
+        # GitHub runner for aarch64 guests), which a timing experiment put far beyond a
+        # tolerable PR wait -- the same work is ~4 minutes under hardware virt. The publish
+        # workflows own arm64.
+        os: [14, 15]
     steps:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -704,7 +729,7 @@ jobs:
   # It compares against the lockfile AT THE TAG the port declares, not the working tree: main's version is
   # bumped to the next patch the moment a release is cut, so comparing against main would fail forever
   # after. That is also why this needs the tags (fetch-depth 0).
-  port-check:
+  freebsd-port-check:
     name: Port in sync with Cargo.lock
     needs: gate
     if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
@@ -786,7 +811,7 @@ jobs:
   success:
     name: Success
     if: ${{ !cancelled() }}
-    needs: [gate, fmt, lint, test, freebsd, docker-e2e, native-e2e, freebsd-native-e2e, miri, port-check, port-build, valgrind-test, valgrind-e2e]
+    needs: [gate, fmt, lint, test, freebsd-tests, docker-e2e, native-e2e, freebsd-native-e2e, miri, freebsd-port-check, freebsd-port-build, valgrind-test, valgrind-e2e]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
