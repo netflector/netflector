@@ -1,13 +1,13 @@
 PORTNAME=	netflector
 DISTVERSIONPREFIX=	v
-DISTVERSION=	0.13.0
+DISTVERSION=	0.13.1
 CATEGORIES=	net
 
 MAINTAINER=	sergii@bogomolov.io
 COMMENT=	Reflect link-local service discovery between interfaces
 WWW=		https://github.com/netflector/netflector
 
-LICENSE=	APACHE20
+LICENSE=	BSD2CLAUSE
 LICENSE_FILE=	${WRKSRC}/LICENSE
 
 ONLY_FOR_ARCHS=	aarch64 amd64
