@@ -1846,12 +1846,12 @@ class CaseRunner:
         self.backend.start_netflector(self.config_path)
         self.wait_for_netflector()
 
-    def wait_for_log(self, role: str, marker: str, description: str) -> None:
+    def wait_for_log(self, role: str, marker: str, description: str, count: int = 1) -> None:
         deadline = time.monotonic() + CONTAINER_READY_TIMEOUT_SECONDS
         last_state = "unknown"
         while time.monotonic() < deadline:
             out, err = self.backend.logs(role)
-            if marker in f"{out}{err}":
+            if f"{out}{err}".count(marker) >= count:
                 return
 
             running, state = self.backend.status(role)
@@ -2040,13 +2040,15 @@ class RoundTripRunner(CaseRunner):
 class SearchRecreateRunner(RoundTripRunner):
     # See SearchRecreateCase. Reuses RoundTripRunner's segment/netflector/responder setup (the shim
     # __init__ reads only the fields both cases share), but opens a session, recreates one interface,
-    # and re-searches. A target recreation drops the session (asserted via the cleared-sessions log); a
-    # source recreation leaves it, so the retransmit re-reflects on the same reserved port (asserted
-    # via the re-reflected log). The target retransmit expects the 200 OK (a fresh session carries the
-    # retransmit's own MAC); the source retransmit is fire-and-forget -- it reuses the surviving session
-    # whose cached searcher MAC is the baseline container's, so on docker (a separate retransmit
-    # container / MAC but a reused IP) the reply is routed to the baseline, and survival is proven by the
-    # re-reflected log, not a round trip. The responder is restarted only for the target.
+    # and re-searches. A target recreation drops the session (asserted via the cleared-sessions log). A
+    # source recreation must never clear sessions, but whether the retransmit REUSES the baseline
+    # session is wall-clock luck: the window is MX + grace, MX is spec-capped at 5, and a slow lane
+    # (TCG) can legitimately let it lapse mid-recreation. So the source branch asserts a second
+    # reflected search (reused or fresh, both prove the ingress rebound and re-joined) plus the
+    # absence of the target-change clearing line. The source retransmit is fire-and-forget -- a reused
+    # session routes the reply to the baseline container's MAC, so no round trip is expected; the
+    # target retransmit expects the 200 OK (its fresh session carries the retransmit's own MAC). The
+    # responder is restarted only for the target.
 
     def _search(self, role: str, *, no_wait: bool = False) -> None:
         # One M-SEARCH; with no_wait, send and exit (any reply is routed elsewhere), else assert the
@@ -2097,9 +2099,9 @@ class SearchRecreateRunner(RoundTripRunner):
         print(f"{self.rt.name}: baseline round trip before the recreation", flush=True)
 
         # Destroy + recreate one interface. Target: the reservation + response registration die with it,
-        # so the dispatcher drops the session; a fresh searcher re-opens and round-trips. Source: nothing
-        # session-side lives there, so the session survives and the retransmit re-reflects on the same
-        # reserved port. The wide MX keeps the first session alive across the recreation either way.
+        # so the dispatcher drops the session; a fresh searcher re-opens and round-trips. Source:
+        # nothing session-side lives there, so the session lives out its MX + grace window untouched --
+        # which a fast lane carries across the recreation and a slow one may not.
         self._recreate()
 
         if self.rt.interface == "target":
@@ -2113,12 +2115,18 @@ class SearchRecreateRunner(RoundTripRunner):
             )
             print(f"{self.rt.name}: session cleared, round trip resumed after the target recreation", flush=True)
         else:
-            # Fire-and-forget: the retransmit reuses the surviving session (same reserved port); its
-            # reply routes to the baseline's MAC, so this container needn't receive it. The re-reflected
-            # log proves the session survived and that the source ingress rebound and re-joined its group.
+            # Fire-and-forget: the retransmit must be reflected again, proving the source ingress
+            # rebound and re-joined its group. Both reflect lines contain this marker, and the
+            # baseline contributed one, so a count of two accepts reuse and fresh alike.
             self._search("searcher-retransmit", no_wait=True)
-            self.wait_for_log("netflector", "re-reflected SSDP search", "session reused")
-            print(f"{self.rt.name}: session survived the source recreation", flush=True)
+            self.wait_for_log("netflector", "SSDP search from", "post-recreation reflection", count=2)
+            out, err = self.backend.logs("netflector")
+            if "cleared all sessions after the target interface changed" in f"{out}{err}":
+                raise RuntimeError("a source recreation cleared sessions; only a target change may")
+            mode = ("session reused" if "re-reflected SSDP search" in f"{out}{err}"
+                    else "fresh session, the MX window lapsed")
+            print(f"{self.rt.name}: search reflected after the source recreation ({mode}); "
+                  "sessions never cleared", flush=True)
         print(f"PASS {self.rt.name}", flush=True)
         if self.args.show_netflector_logs:
             time.sleep(0.5)
