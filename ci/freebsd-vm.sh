@@ -124,8 +124,11 @@ launch() {
         # has no CD controller, so the seed rides a read-only virtio disk --
         # nuageinit finds it by filesystem label, not device type.
         cp /usr/share/AAVMF/AAVMF_VARS.fd "$VM_DIR/AAVMF_VARS.fd"
+        # pauth-impdef swaps QARMA for a trivial cipher: the FreeBSD 15 kernel is PAC-built,
+        # and emulating the real cipher on every kernel function prologue tripled exec-heavy
+        # e2e time under TCG. Hardware and the 14 guests are unaffected.
         qemu-system-aarch64 \
-            -machine virt -accel tcg,thread=multi -cpu max \
+            -machine virt -accel tcg,thread=multi -cpu max,pauth-impdef=on \
             -drive "if=pflash,format=raw,readonly=on,file=/usr/share/AAVMF/AAVMF_CODE.fd" \
             -drive "if=pflash,format=raw,file=$VM_DIR/AAVMF_VARS.fd" \
             -drive "file=$VM_DIR/seed.iso,format=raw,if=virtio,readonly=on" \

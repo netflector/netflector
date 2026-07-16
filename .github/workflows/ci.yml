@@ -540,7 +540,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       - name: Resolve the newest nightly that ships Miri
         run: |
-          date=$(curl -fsSL --retry 5 --retry-connrefused https://rust-lang.github.io/rustup-components-history/x86_64-unknown-linux-gnu/miri)
+          date=$(curl -fsSL --retry 5 --retry-all-errors https://rust-lang.github.io/rustup-components-history/x86_64-unknown-linux-gnu/miri)
           # The endpoint serves a bare date. Anything else (an error page, an outage) must fail here
           # rather than turn into a confusing rustup error two steps later.
           case "$date" in
