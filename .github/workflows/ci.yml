@@ -465,12 +465,12 @@ jobs:
           # the packages come from the Ubuntu archive, and a broken archive still fails the
           # install below loudly.
           sudo apt-get update || true
-          sudo apt-get install -y --no-install-recommends lld qemu-user-static
+          sudo apt-get install -y --no-install-recommends lld qemu-user-binfmt
       - name: Add the Rust target
         if: matrix.target.triple != ''
         run: rustup target add ${{ matrix.target.triple }}
       # The same lld cross-link config the Dockerfile writes for cross layers; binfmt_misc (from
-      # qemu-user-static) execs the ARM binary under qemu transparently, netns exec included. The
+      # qemu-user-binfmt) execs the ARM binary under qemu transparently, netns exec included. The
       # native musl lanes write no config: rustc's default toolchain, like release.yml's rows.
       - name: Configure the arm32 cross-linker
         if: matrix.target.emulated
@@ -593,7 +593,7 @@ jobs:
   # (MikroTik), so those lanes run the shipped musl configuration under QEMU rather than only
   # cross-building it -- catching pointer-width / alignment / cast bugs the 64-bit lanes can't.
   # There lld cross-links (the same config the Dockerfile uses for cross layers, no per-arch gcc)
-  # and the cargo target runner executes via qemu-arm-static (armv7 = armhf, hard-float; armv5 =
+  # and the cargo target runner executes via qemu-arm (armv7 = armhf, hard-float; armv5 =
   # armel, soft-float, the EN7562 boxes).
   test:
     name: Test (${{ matrix.target.name }}, ${{ matrix.profile.name }})
@@ -610,7 +610,7 @@ jobs:
           - { name: debug, flags: '' }
           - { name: release, flags: '--release' }
         # triple '' = the runner's native gnu toolchain; a triple without `emulated` is that musl
-        # target built and run natively; `emulated` lanes cross-link and run under qemu-arm-static.
+        # target built and run natively; `emulated` lanes cross-link and run under qemu-arm.
         target:
           - { name: linux-amd64-glibc, runner: ubuntu-24.04, triple: '' }
           - { name: linux-arm64-glibc, runner: ubuntu-24.04-arm, triple: '' }
@@ -639,13 +639,13 @@ jobs:
           # the packages come from the Ubuntu archive, and a broken archive still fails the
           # install below loudly.
           sudo apt-get update || true
-          sudo apt-get install -y --no-install-recommends lld qemu-user-static
+          sudo apt-get install -y --no-install-recommends lld qemu-user-binfmt
       - name: Add the Rust target
         if: matrix.target.triple != ''
         run: rustup target add ${{ matrix.target.triple }}
       # Link the arm32 musl target with lld (cross-capable, unlike the host gcc) and run the test
       # binary under QEMU -- the same lld config the Dockerfile writes for cross layers, plus a
-      # qemu-arm-static runner for the target. The cfg(target_env = "musl") scope leaves host
+      # qemu-arm runner for the target. The cfg(target_env = "musl") scope leaves host
       # build-scripts/proc-macros on the default linker. The native musl lanes write no config at
       # all: rustc's default toolchain links them, exactly like the release rows.
       - name: Configure the cross linker and QEMU runner
@@ -658,7 +658,7 @@ jobs:
           rustflags = ["-C", "linker-flavor=ld.lld"]
 
           [target.${{ matrix.target.triple }}]
-          runner = "qemu-arm-static"
+          runner = "qemu-arm"
           EOF
       - name: Show toolchain
         run: rustc -V && cargo -V
@@ -670,8 +670,10 @@ jobs:
       - name: cargo test (root)
         if: ${{ !matrix.target.emulated }}
         run: |
+          # Not -E: sudo-rs (the default sudo since Ubuntu 25.10) ignores it. HOME is where the
+          # rustup shim finds the toolchain, and the only variable the suite needs.
           triple='${{ matrix.target.triple }}'
-          sudo -E "$(command -v cargo)" test --locked ${{ matrix.profile.flags }} ${triple:+--target "$triple"}
+          sudo --preserve-env=HOME "$(command -v cargo)" test --locked ${{ matrix.profile.flags }} ${triple:+--target "$triple"}
       - name: cargo test (under QEMU)
         if: matrix.target.emulated
         run: cargo test --locked --target ${{ matrix.target.triple }} ${{ matrix.profile.flags }}
@@ -719,7 +721,7 @@ jobs:
       - name: cargo test (under memcheck)
         run: |
           export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-fds=yes --num-callers=30 --error-exitcode=1'
-          sudo -E "$(command -v cargo)" test --locked
+          sudo --preserve-env=HOME,CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER "$(command -v cargo)" test --locked
 
   # The FreeBSD port pins every byte it builds from: the release tarball and all 20 crates, each with a
   # SHA256 in distinfo. If Cargo.lock moves and those are not regenerated, the port either fails to build
