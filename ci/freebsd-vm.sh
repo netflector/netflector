@@ -85,6 +85,18 @@ write_files:
     content: |
       firstboot_pkg_upgrade_enable="NO"
 EOF
+    # TCG only: noble's QEMU 8.2 keys translation blocks by virtual PC (the 8.2.1 stable
+    # revert of PCREL TB sharing), so ASLR makes every short-lived process retranslate
+    # libc at fresh addresses. Pinning layouts restores reuse across the e2e exec storm.
+    # KVM does not translate; the amd64 guest stays production-like.
+    if [ "$ARCH" = arm64 ]; then
+        cat >> "$VM_DIR/user-data" <<EOF
+  - path: /etc/sysctl.conf.local
+    content: |
+      kern.elf64.aslr.enable=0
+      kern.elf64.aslr.pie_enable=0
+EOF
+    fi
     genisoimage -quiet -output "$VM_DIR/seed.iso" -volid cidata -joliet -rock \
         "$VM_DIR/user-data" "$VM_DIR/meta-data"
 }
@@ -107,7 +119,10 @@ launch() {
     # only ever boot from disk anyway.
     common=(
         -smp "$(nproc)" -m 6144
-        -drive "file=$VM_DIR/$IMAGE,format=qcow2,if=virtio"
+        # cache=unsafe: flushes become no-ops (UFS journal commits, pkg's per-package
+        # fsyncs). The failure mode is a stale image after a HOST crash, and these VMs
+        # do not outlive the job.
+        -drive "file=$VM_DIR/$IMAGE,format=qcow2,if=virtio,cache=unsafe"
         -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${SSH_PORT}-:22"
         -device virtio-net-pci,netdev=net0,romfile=
         -display none -serial "file:$VM_DIR/console.log"
@@ -124,11 +139,14 @@ launch() {
         # has no CD controller, so the seed rides a read-only virtio disk --
         # nuageinit finds it by filesystem label, not device type.
         cp /usr/share/AAVMF/AAVMF_VARS.fd "$VM_DIR/AAVMF_VARS.fd"
-        # pauth-impdef swaps QARMA for a trivial cipher: the FreeBSD 15 kernel is PAC-built,
-        # and emulating the real cipher on every kernel function prologue tripled exec-heavy
-        # e2e time under TCG. Hardware and the 14 guests are unaffected.
+        # pauth=off: the FreeBSD 15 kernel is PAC-built, and under TCG even a cheap PAC
+        # helper runs on every kernel function prologue (the real QARMA cipher tripled
+        # exec-heavy e2e time). Without the feature the instructions are hint-space NOPs;
+        # nothing this CI tests is built with PAC. gic-version=3: the default for <= 8
+        # CPUs is GICv2, whose CPU interface is MMIO -- every interrupt ack/EOI takes the
+        # slow path under the global lock; v3 uses system registers.
         qemu-system-aarch64 \
-            -machine virt -accel tcg,thread=multi -cpu max,pauth-impdef=on \
+            -machine virt,gic-version=3 -accel tcg,thread=multi -cpu max,pauth=off \
             -drive "if=pflash,format=raw,readonly=on,file=/usr/share/AAVMF/AAVMF_CODE.fd" \
             -drive "if=pflash,format=raw,file=$VM_DIR/AAVMF_VARS.fd" \
             -drive "file=$VM_DIR/seed.iso,format=raw,if=virtio,readonly=on" \
@@ -148,6 +166,11 @@ wait_ssh() {
         sleep 2
     done
     echo "ssh up after ${SECONDS}s"
+    # async: UFS goes fully write-behind (throwaway disk); noatime: FreeBSD has no
+    # relatime, so without it every binary/library read in the exec storm queues an
+    # atime metadata write.
+    ssh "${SSH_OPTS[@]}" -p "$SSH_PORT" root@127.0.0.1 'mount -u -o async,noatime /'
+    echo "root remounted async,noatime"
     run 'uname -a && freebsd-version'
 }
 
