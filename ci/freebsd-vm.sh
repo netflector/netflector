@@ -138,15 +138,18 @@ launch() {
         # read-only AAVMF code image plus a writable per-VM vars copy) and
         # has no CD controller, so the seed rides a read-only virtio disk --
         # nuageinit finds it by filesystem label, not device type.
+        # neoverse-n1, not max: -cpu max hangs edk2 2025.11 inside the firmware under
+        # QEMU 10 TCG (banner, then silence; A/B'd against the firmware image and
+        # pauth=off -- the CPU model is the trigger), and its optional features only
+        # cost TCG time anyway. The FreeBSD 15 kernel is PAC-built, and under TCG even
+        # a cheap PAC helper runs on every kernel function prologue (the real QARMA
+        # cipher tripled exec-heavy e2e time); N1 has no PAuth at all, so those
+        # instructions fall back to hint-space NOPs. gic-version=3: the default for
+        # <= 8 CPUs is GICv2, whose CPU interface is MMIO -- every interrupt ack/EOI
+        # takes the slow path under the global lock; v3 uses system registers.
         cp /usr/share/AAVMF/AAVMF_VARS.fd "$VM_DIR/AAVMF_VARS.fd"
-        # pauth=off: the FreeBSD 15 kernel is PAC-built, and under TCG even a cheap PAC
-        # helper runs on every kernel function prologue (the real QARMA cipher tripled
-        # exec-heavy e2e time). Without the feature the instructions are hint-space NOPs;
-        # nothing this CI tests is built with PAC. gic-version=3: the default for <= 8
-        # CPUs is GICv2, whose CPU interface is MMIO -- every interrupt ack/EOI takes the
-        # slow path under the global lock; v3 uses system registers.
         qemu-system-aarch64 \
-            -machine virt,gic-version=3 -accel tcg,thread=multi -cpu max,pauth=off \
+            -machine virt,gic-version=3 -accel tcg,thread=multi -cpu neoverse-n1 \
             -drive "if=pflash,format=raw,readonly=on,file=/usr/share/AAVMF/AAVMF_CODE.fd" \
             -drive "if=pflash,format=raw,file=$VM_DIR/AAVMF_VARS.fd" \
             -drive "file=$VM_DIR/seed.iso,format=raw,if=virtio,readonly=on" \
