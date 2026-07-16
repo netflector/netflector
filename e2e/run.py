@@ -41,9 +41,12 @@ CONFIGURED_MAC = "02:42:ac:11:00:09"
 # A second address in wol-mac's `macs` allow-set, to prove the list admits every member, not just the first.
 SECOND_CONFIGURED_MAC = "02:42:ac:11:00:0c"
 WRONG_MAC = "02:42:ac:11:00:0a"
-CONFIGURED_PORT = 40009
-UNCONFIGURED_PORT = 40010
-ANY_MAC_PORT = 40011
+# Below every platform's ephemeral range (Linux 32768+, FreeBSD 10000+, macOS 49152+): a fixed
+# test port inside it can collide with a kernel-assigned port in the same namespace -- seen once
+# in CI as EADDRINUSE on the receiver's bind, from an engine-side socket in a fresh container.
+CONFIGURED_PORT = 9009
+UNCONFIGURED_PORT = 9010
+ANY_MAC_PORT = 9011
 MALFORMED_MAGIC_PAYLOAD_HEX = "ff" * 6 + "0242ac11000a" * 15 + "0242ac11000b"
 # --- mDNS (RFC 6762): multicast group 224.0.0.251 / ff02::fb on UDP 5353. ---
 MDNS_GROUP_V4 = "224.0.0.251"
