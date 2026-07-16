@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import binascii
+import errno
 import http.server
 import socket
 import struct
@@ -62,6 +63,22 @@ def is_ipv6(address: str) -> bool:
 
 def is_ipv4_multicast(address: str) -> bool:
     return 224 <= int(address.split(".")[0]) <= 239
+
+
+def bind_reporting_conflict(sock: socket.socket, address: str, port: int) -> None:
+    # A conflict should be impossible (fresh namespace, REUSEADDR set), so name the squatter:
+    # /proc/net/udp* lists every UDP socket in this namespace (Linux only).
+    try:
+        sock.bind((address, port))
+    except OSError as err:
+        if err.errno == errno.EADDRINUSE:
+            for table in ("/proc/net/udp", "/proc/net/udp6"):
+                try:
+                    with open(table) as f:
+                        sys.stderr.write(f"--- {table} ---\n{f.read()}")
+                except OSError:
+                    pass
+        raise
 
 
 def join_group(sock: socket.socket, family: int, group: str, interface: str) -> None:
@@ -119,7 +136,7 @@ def receive(args: argparse.Namespace) -> int:
 
     with socket.socket(family, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((bind_address, args.port))
+        bind_reporting_conflict(sock, bind_address, args.port)
         if args.join_group is not None:
             # Multicast is only delivered to sockets that joined the group on the receiving
             # interface; broadcast/all-nodes (the WoL IPv4 path) needs no join.
@@ -173,7 +190,7 @@ def respond(args: argparse.Namespace) -> int:
 
     with socket.socket(family, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((bind_address, args.port))
+        bind_reporting_conflict(sock, bind_address, args.port)
         if args.join_group is not None:
             join_group(sock, family, args.join_group, args.interface)
         # Readiness marker so run.py can sequence the searcher after the responder is listening.

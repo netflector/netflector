@@ -9,13 +9,13 @@ source_if = "wol_src"
 target_if = "wol_dst"
 macs = ["02:42:ac:11:00:09", "02:42:ac:11:00:0c"]
 wol = true
-wol_ports = [40009]
+wol_ports = [9009]
 
 [reflectors.wol-any]
 source_if = "wol_src"
 target_if = "wol_dst"
 wol = true
-wol_ports = [40011]
+wol_ports = [9011]
 
 [reflectors.discovery]
 source_if = "wol_src"
