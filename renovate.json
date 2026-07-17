@@ -3,7 +3,6 @@
   "extends": [
     "config:recommended"
   ],
-  "dependencyDashboardTitle": "Dependency Dashboard",
   "customManagers": [
     {
       "customType": "regex",
