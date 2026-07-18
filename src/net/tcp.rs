@@ -52,12 +52,16 @@ impl TcpSocket {
 
     /// Accept one pending connection, or `None` if none is pending (the listener is non-blocking, and a
     /// level-triggered reactor re-fires while more wait). The accepted socket is connected,
-    /// non-blocking, and close-on-exec.
+    /// non-blocking, close-on-exec, and `TCP_NODELAY`.
     ///
     /// # Errors
-    /// Propagates a non-`WouldBlock` `accept` failure.
+    /// Propagates a non-`WouldBlock` `accept` failure, or the `setsockopt` failure.
     pub(crate) fn accept(&self) -> io::Result<Option<Self>> {
-        Ok(accept_fd(self.fd.as_raw_fd())?.map(|fd| Self {
+        let Some(fd) = accept_fd(self.fd.as_raw_fd())? else {
+            return Ok(None);
+        };
+        set_nodelay(fd.as_raw_fd())?;
+        Ok(Some(Self {
             fd,
             // inherit the listener's local address rather than re-query it
             local_addr: self.local_addr,
@@ -70,13 +74,15 @@ impl TcpSocket {
     /// [`is_connecting`](Self::is_connecting) until a writable edge and [`finish_connect`](Self::finish_connect).
     ///
     /// # Errors
-    /// Propagates the socket / pin / `bind` / `connect` failure (other than the in-progress sentinel).
+    /// Propagates the socket / `setsockopt` / pin / `bind` / `connect` failure (other than the
+    /// in-progress sentinel).
     pub(crate) fn connect(
         dst: SocketAddrV4,
         source: Ipv4Addr,
         iface: Option<&str>,
     ) -> io::Result<Self> {
         let fd = open_socket(libc::AF_INET, libc::SOCK_STREAM)?;
+        set_nodelay(fd.as_raw_fd())?;
         // FreeBSD has no egress-pin primitive; the source-address bind below steers egress.
         #[cfg(not(target_os = "freebsd"))]
         pin_egress(fd.as_raw_fd(), iface)?;
@@ -278,6 +284,28 @@ fn connect_v4(fd: RawFd, dst: SocketAddrV4) -> io::Result<bool> {
     Err(err)
 }
 
+/// Disable Nagle. The proxy forwards at recv granularity and never re-coalesces, so a message
+/// spanning two writes gets its sub-MSS tail held behind the first write's unacked bytes until the
+/// peer's delayed ACK fires (40-100ms), and the peer can't ACK early: it's mid-body with nothing to
+/// send. Writes are already message-shaped, so Nagle has nothing to usefully coalesce here.
+fn set_nodelay(fd: RawFd) -> io::Result<()> {
+    let on: c_int = 1;
+    // SAFETY: `&on` is a valid `c_int` option value for `fd`.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_NODELAY,
+            (&raw const on).cast::<c_void>(),
+            socklen_of::<c_int>(),
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Constrain `fd`'s egress to the interface named `iface` so a route lookup can't leak the connect
 /// onto the wrong segment; `None` skips the pin. Linux uses `SO_BINDTODEVICE` (needs `CAP_NET_RAW`),
 /// which takes the name directly; macOS resolves the name to its current ifindex for `IP_BOUND_IF`,
@@ -360,6 +388,24 @@ mod tests {
         }
     }
 
+    /// Read back the `TCP_NODELAY` flag via `getsockopt`.
+    fn nodelay(socket: &TcpSocket) -> bool {
+        let mut on: c_int = 0;
+        let mut len = socklen_of::<c_int>();
+        // SAFETY: `on`/`len` are a valid (value, length) out-pair for a `c_int` option on `fd`.
+        let rc = unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_NODELAY,
+                (&raw mut on).cast::<c_void>(),
+                &raw mut len,
+            )
+        };
+        assert_eq!(rc, 0, "getsockopt(TCP_NODELAY) failed");
+        on != 0
+    }
+
     /// Drive a non-blocking op to completion on loopback (no reactor in the test).
     fn spin<T>(mut op: impl FnMut() -> io::Result<Option<T>>) -> T {
         for _ in 0..2000 {
@@ -418,6 +464,17 @@ mod tests {
             IoStatus::WouldBlock => Ok(None),
         });
         assert_eq!(&buf[..n], b"headbody");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "needs a real socket")]
+    fn accepted_and_outbound_sockets_disable_nagle() {
+        let listener = TcpSocket::listen(Ipv4Addr::LOCALHOST).expect("listen on loopback");
+        let client =
+            TcpSocket::connect(listener.local_addr(), Ipv4Addr::LOCALHOST, None).expect("connect");
+        let server = spin(|| listener.accept());
+        assert!(nodelay(&client), "the outbound socket sets TCP_NODELAY");
+        assert!(nodelay(&server), "the accepted socket sets TCP_NODELAY");
     }
 
     #[test]
