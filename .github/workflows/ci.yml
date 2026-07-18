@@ -804,6 +804,36 @@ jobs:
       - name: rustfmt
         run: cargo fmt --check
 
+  man-lint:
+    name: Lint (man pages)
+    needs: gate
+    if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - name: Install mandoc
+        run: |
+          # A failing third-party repo (packages.microsoft.com flakes) must not kill the step:
+          # the packages come from the Ubuntu archive, and a broken archive still fails the
+          # install below loudly.
+          sudo apt-get update || true
+          sudo apt-get install -y --no-install-recommends mandoc
+      - name: mandoc -T lint
+        run: |
+          # The gate: WARNING and up fail via exit status alone -- no output parsing, so
+          # a change in message wording can never mask a real finding.
+          mandoc -T lint -W warning man/*
+          # The polish layer: STYLE findings, minus the cross-reference notice -- Xr can
+          # only resolve where the pages are installed. Text-matching here risks at most
+          # a missed style nit; the release-time in-VM lint re-checks everything strictly.
+          out=$(mandoc -T lint man/* 2>&1 | grep '^mandoc: man/' | grep -v 'STYLE: referenced manual not found') || true
+          if [ -n "$out" ]; then
+            echo "$out"
+            exit 1
+          fi
+
   # A single aggregate status check: green only when every job above is green (or was legitimately skipped
   # by `gate` because this tree already passed CI). Make THIS the sole required check in branch protection --
   # then adding, renaming, or removing a job never means editing the required-checks list; its `needs` below
@@ -813,7 +843,7 @@ jobs:
   success:
     name: Success
     if: ${{ !cancelled() }}
-    needs: [gate, fmt, lint, test, freebsd-tests, docker-e2e, native-e2e, freebsd-native-e2e, miri, freebsd-port-check, freebsd-port-build, valgrind-test, valgrind-e2e]
+    needs: [gate, fmt, man-lint, lint, test, freebsd-tests, docker-e2e, native-e2e, freebsd-native-e2e, miri, freebsd-port-check, freebsd-port-build, valgrind-test, valgrind-e2e]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
