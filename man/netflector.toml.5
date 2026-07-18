@@ -1,0 +1,225 @@
+.Dd July 18, 2026
+.Dt NETFLECTOR.TOML 5
+.Os
+.Sh NAME
+.Nm netflector.toml
+.Nd configuration file for netflector
+.Sh DESCRIPTION
+The configuration for
+.Xr netflector 8
+is TOML: optional top-level settings and at least one reflector entry.
+Every setting has an environment-variable form as well
+.Pq see Sx ENVIRONMENT ;
+the file is optional when the environment carries the whole configuration.
+.Pp
+A reflector entry is a table under
+.Ic reflectors ,
+keyed by a name used as its label in the log
+.Pq Ic \&[reflectors\&. Ns Ar name Ns Ic \&] .
+Each entry exposes the devices on its
+.Ic target_if
+to the clients on its
+.Ic source_if ,
+for any combination of the protocols; the other direction is not exposed.
+No IP addresses appear anywhere in the configuration; interfaces are named,
+and their addresses are resolved at runtime.
+An unknown key, at the top level or in an entry, is rejected at startup.
+.Ss Top-level settings
+.Bl -tag -width Ds
+.It Ic log_level
+Log verbosity, one of
+.Cm off , error , warning , info , debug ,
+or
+.Cm trace .
+Default
+.Cm info .
+.It Ic debug_memory_interval_secs
+Seconds between memory (RSS and peak) diagnostic reports.
+.Cm 0
+or absent disables them.
+Default
+.Cm 0 .
+.It Ic counters_interval_secs
+Seconds between per-interface packet-counter summaries.
+.Cm 0
+or absent disables them.
+Default
+.Cm 0 .
+.El
+.Pp
+Both intervals are capped at one year; a larger value is rejected at startup.
+.Ss Reflector entry
+Keys under
+.Ic \&[reflectors\&. Ns Ar name Ns Ic \&] :
+.Bl -tag -width Ds
+.It Ic source_if
+The interface the clients are on.
+Required; must differ from
+.Ic target_if .
+.It Ic target_if
+The interface the devices are on.
+Required.
+.It Ic macs
+Optional list of MAC addresses limiting the entry to specific devices on
+.Ic target_if :
+only the listed devices are reflected or woken, across every protocol the
+entry enables.
+Omit it to cover the whole segment.
+An empty list is rejected.
+.It Ic address_family
+.Cm default
+(the default) attempts both families, requires IPv4, and treats IPv6 as
+best-effort;
+.Cm dual
+requires both;
+.Cm ipv4
+and
+.Cm ipv6
+use one family only.
+A required family that cannot be initialized fails startup; a best-effort
+one is skipped and the entry runs on the family it has.
+.It Ic wol
+Enable Wake-on-LAN reflection.
+Boolean, default
+.Cm false .
+.It Ic wol_ports
+UDP ports to match Wake-on-LAN magic packets on.
+A list of unique ports in the range 1 to 65535, default
+.Bq Cm 7 , 9 .
+Valid only when
+.Ic wol
+is enabled.
+.It Ic mdns
+Enable mDNS reflection.
+Boolean, default
+.Cm false .
+.It Ic ssdp
+Enable SSDP reflection.
+Boolean, default
+.Cm false .
+.It Ic dial
+Enable the DIAL application proxy.
+Boolean, default
+.Cm false .
+DIAL (Discovery and Launch, the protocol behind
+.Dq cast to TV )
+lets a client find a smart TV and launch an app on it.
+Reflected discovery alone is often not enough to drive the TV: the follow-up
+HTTP requests go to the TV's address on the other segment, which the client
+may not be able to reach, and some TVs refuse off-subnet clients outright.
+.Ic dial
+closes that gap by proxying those requests between the segments.
+Requires
+.Ic ssdp
+and, because the DIAL protocol itself is IPv4-only, an IPv4-capable
+.Ic address_family :
+an
+.Cm ipv6 Ns -only
+entry with
+.Ic dial
+is rejected at startup.
+.It Ic wsd
+Enable WS-Discovery reflection.
+Boolean, default
+.Cm false .
+.El
+.Pp
+An entry must enable at least one protocol.
+.Sh ENVIRONMENT
+Every setting can come from the environment, which suits containers.
+Variables are named
+.Ev NETFLECTOR_ Ns Ao Ar TAG Ac Ns _ Ns Ao Ar PARAM Ac :
+.Bl -tag -width Ds
+.It Aq Ar TAG
+Ties one entry's parameters together: any alphanumeric string.
+It also becomes the entry's name unless a
+.Ic NAME
+parameter overrides it.
+.It Aq Ar PARAM
+.Ic NAME ,
+or any entry field:
+.Ic SOURCE_IF , TARGET_IF , MACS , WOL , MDNS , SSDP , WSD , DIAL ,
+.Ic WOL_PORTS , ADDRESS_FAMILY .
+Case-insensitive.
+.El
+.Pp
+The globals are
+.Ev NETFLECTOR_LOG_LEVEL ,
+.Ev NETFLECTOR_DEBUG_MEMORY_INTERVAL_SECS ,
+and
+.Ev NETFLECTOR_COUNTERS_INTERVAL_SECS ,
+so
+.Cm LOG , DEBUG ,
+and
+.Cm COUNTERS
+are reserved tags.
+Booleans are
+.Cm true Ns / Ns Cm false
+or
+.Cm 1 Ns / Ns Cm 0 ;
+.Ic MACS
+and
+.Ic WOL_PORTS
+are comma-separated.
+An unknown parameter, a non-alphanumeric or reserved tag, and a tag with no
+parameter are all rejected at startup.
+.Pp
+When a file and the environment are both present they merge into one
+configuration.
+Each global variable overrides its file counterpart; entries from each source
+are combined, and
+.Sx DUPLICATE DETECTION
+applies across both.
+.Sh DUPLICATE DETECTION
+Entry names must be unique across the file and the environment; a name that
+appears twice, including the same name from both sources, is rejected at
+startup.
+.Pp
+Beyond names, two entries that enable the same protocol are rejected only when
+they could reflect the same packet twice: same
+.Ic source_if ,
+same
+.Ic target_if ,
+overlapping MAC selection, overlapping address-family handling, and, for
+Wake-on-LAN, at least one shared port.
+MAC selection overlaps when the allow-sets share a device or either entry omits
+its filter.
+Address families overlap when both handle the same IP version:
+.Cm ipv4 Ns -only
+and
+.Cm ipv6 Ns -only
+never overlap, while
+.Cm default
+and
+.Cm dual
+overlap with either.
+Entries that differ in interface, MAC, address family, or Wake-on-LAN ports, or
+that enable different protocols, coexist.
+.Sh EXAMPLES
+One interface pair scoped to a single TV, reflecting several protocols:
+.Bd -literal -offset indent
+log_level = "info"
+
+[reflectors.tv]
+source_if = "em0"
+target_if = "em1"
+macs      = ["B0:37:95:C5:60:BE"]
+wol       = true
+mdns      = true
+ssdp      = true
+dial      = true
+.Ed
+.Pp
+The same entry in the environment:
+.Bd -literal -offset indent
+NETFLECTOR_LOG_LEVEL=info
+NETFLECTOR_TV_SOURCE_IF=em0
+NETFLECTOR_TV_TARGET_IF=em1
+NETFLECTOR_TV_MACS=B0:37:95:C5:60:BE
+NETFLECTOR_TV_WOL=true
+NETFLECTOR_TV_MDNS=true
+NETFLECTOR_TV_SSDP=true
+NETFLECTOR_TV_DIAL=true
+.Ed
+.Sh SEE ALSO
+.Xr netflector 8

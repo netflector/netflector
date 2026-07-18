@@ -1,0 +1,162 @@
+.Dd July 18, 2026
+.Dt NETFLECTOR 8
+.Os
+.Sh NAME
+.Nm netflector
+.Nd reflect link-local service-discovery traffic between two interfaces
+.Sh SYNOPSIS
+.Nm
+.Op Fl -check-config
+.Op Fl -
+.Op Ar config
+.Nm
+.Fl V | Fl -version
+.Nm
+.Fl h | Fl -help
+.Sh DESCRIPTION
+.Nm
+relays link-local service-discovery traffic between two network interfaces:
+clients on the source interface discover, wake, and reach devices on the
+target interface, not the other way around.
+It reflects Wake-on-LAN, mDNS, SSDP, WS-Discovery, and DIAL; each is enabled
+per interface pair in the configuration.
+.Pp
+The daemon runs in the foreground and logs to standard error with UTC
+timestamps.
+It opens raw captures on the configured interfaces, so it normally runs as
+root.
+.Pp
+.Nm
+adapts to interface changes at runtime, with no restart needed.
+Reflection for an address family pauses while a required address is missing
+and resumes when it returns; an interface that is destroyed and recreated is
+picked up again under its new kernel identity.
+.Pp
+Configuration comes from a TOML file, from
+.Ev NETFLECTOR_ Ns *
+environment variables, or from both; see
+.Xr netflector.toml 5 .
+Given a
+.Ar config
+file,
+.Nm
+reads it and merges any environment variables on top of it.
+Given no configuration file, the environment is the whole configuration.
+.Ss Options
+.Bl -tag -width Ds
+.It Fl -check-config
+Load and validate the configuration, then exit.
+This parses only: it opens no interface, so it needs no privileges and cannot
+report that an interface is missing or unreachable.
+On success it prints
+.Ql config ok: N reflector(s)
+and exits 0; on a rejected configuration it prints the reason and exits 1.
+.It Fl V , Fl -version
+Print the version and exit.
+.It Fl h , Fl -help
+Print a usage summary and exit.
+.El
+.Pp
+.Fl -help
+and
+.Fl -version
+are answered before anything else on the command line.
+A lone
+.Ql -
+is read as a path, not an option.
+.Fl -
+ends option parsing, so a configuration file whose name begins with a dash
+stays reachable:
+.Ql netflector \-\- \-\-check-config
+reads a file named
+.Pa \-\-check-config .
+.Sh SIGNALS
+.Bl -tag -width "SIGTERM"
+.It Dv SIGINT , Dv SIGTERM
+Shut down gracefully.
+.It Dv SIGUSR1
+Dump diagnostics to the log: the per-interface packet counters
+.Pq see Sx DIAGNOSTICS
+and a memory report (current and peak RSS).
+This works on demand even when the periodic reports are disabled.
+.El
+.Sh ENVIRONMENT
+Every setting has an environment-variable form, named
+.Ev NETFLECTOR_ Ns Ao Ar TAG Ac Ns _ Ns Ao Ar PARAM Ac ,
+plus the globals
+.Ev NETFLECTOR_LOG_LEVEL ,
+.Ev NETFLECTOR_DEBUG_MEMORY_INTERVAL_SECS ,
+and
+.Ev NETFLECTOR_COUNTERS_INTERVAL_SECS .
+.Xr netflector.toml 5
+documents the grammar and the file/environment merge.
+.Sh FILES
+.Bl -tag -width Ds
+.It Pa /usr/local/etc/netflector.toml
+Configuration file the
+.Xr rc 8
+service reads by default.
+.Nm
+itself has no built-in path; the service supplies one.
+.El
+.Sh EXIT STATUS
+.Ex -std
+The error is reported through the log, so
+.Ql log_level = \&"off\&"
+silences even the failure message.
+.Sh EXAMPLES
+Validate a configuration without starting the daemon:
+.Pp
+.Dl netflector --check-config /usr/local/etc/netflector.toml
+.Pp
+Reflect mDNS between two interfaces, configured from the environment alone:
+.Bd -literal -offset indent
+NETFLECTOR_TV_SOURCE_IF=em0 \e
+NETFLECTOR_TV_TARGET_IF=em1 \e
+NETFLECTOR_TV_MDNS=true \e
+netflector
+.Ed
+.Pp
+Enable and start the service:
+.Bd -literal -offset indent
+sysrc netflector_enable=YES
+service netflector start
+.Ed
+.Pp
+The service reads
+.Va netflector_config
+from
+.Xr rc.conf 5
+for the configuration path.
+.Sh DIAGNOSTICS
+The counter summary, logged periodically when enabled and on
+.Dv SIGUSR1 ,
+tallies per interface what happened to each packet, by message type
+.Pq e.g. Ql mDNS query reflected=42 skipped=10; filtered=2 :
+.Bl -tag -width "recoveries"
+.It Sy reflected
+Re-emitted on the other interface.
+.It Sy skipped
+Recognized, but arrived in a direction the entry does not relay.
+This is normal; it is also what keeps reflected packets from looping.
+.It Sy dropped
+Should have been reflected, but the re-emit failed: a send error or a
+resource cap.
+.It Sy stalled
+Should have been reflected, but the egress interface had no source address
+of the packet's family yet.
+.It Sy filtered
+Not a message
+.Nm
+handles: unrecognized traffic on the group, or an address family the entry
+does not cover.
+.It Sy recoveries
+Times the interface was destroyed and recreated, and its capture re-bound.
+.El
+.Sh SEE ALSO
+.Xr netflector.toml 5 ,
+.Xr rc.conf 5 ,
+.Xr daemon 8 ,
+.Xr service 8
+.Sh AUTHORS
+.An Sergii Bogomolov
