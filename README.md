@@ -13,8 +13,9 @@ It reflects four link-local protocols and layers an optional DIAL proxy on top o
   clients on one segment can discover responders on the other.
 - **SSDP (UPnP/DLNA)**: discovery traffic is relayed both ways, so a caster on one segment can find
   renderers (TVs, media servers) on the other.
-- **DIAL proxy** *(optional, builds on SSDP)*: a "cast to TV" device serves its REST API only to its
-  own subnet; the proxy bridges that gap so a client on the other segment can launch apps on it. It's
+- **DIAL proxy** *(optional, builds on SSDP)*: a "cast to TV" device's REST API lives on its own
+  segment, often unreachable from the client's (and some TVs refuse off-subnet clients); the proxy
+  bridges that gap so a client on the other segment can launch apps on it. It's
   not a separate reflector; it augments an SSDP entry, enabled with `dial = true`. See [DIAL](#dial).
 - **WS-Discovery (WSD)**: SOAP-over-UDP discovery is relayed both ways, so a client on one segment can
   discover ONVIF cameras or Windows devices (printers, scanners) on the other.
@@ -397,9 +398,11 @@ device/printer discovery across segments.
 ### DIAL
 
 DIAL (DIscovery And Launch, the protocol behind "cast to TV" for YouTube, Netflix, etc.) lets a phone
-or laptop find a smart TV and launch an app on it. The catch: a DIAL device restricts its description
-and REST endpoints to its **own subnet**, so a client on a different segment discovers the device but
-cannot drive it. Setting `dial = true` on an SSDP entry makes netflector bridge that gap.
+or laptop find a smart TV and launch an app on it. The catch: the device's description and REST
+endpoints live at its address on the **other segment**, which the client often cannot reach, and some
+devices refuse off-subnet clients outright (the DIAL spec doesn't require that, but Chromecast and
+some Samsung TVs do it). Either way a client on a different segment discovers the device but cannot
+drive it. Setting `dial = true` on an SSDP entry makes netflector bridge that gap.
 
 It is a **terminating HTTP reverse proxy**. When a DIAL `LOCATION` (in a relayed `NOTIFY` or `M-SEARCH`
 `200 OK`) crosses target→source, netflector mints a per-device ephemeral TCP listener on
