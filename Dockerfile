@@ -8,7 +8,7 @@
 
 # Pin the shared base image by digest: reproducible builds, no drift under the floating tag. Renovate
 # keeps it current. Referenced by both the builder and the valgrind runtime below so they stay in lockstep.
-ARG RUST_IMAGE=docker.io/library/rust:slim@sha256:466074ef42a9485c726d71017fa629f1954cd5e09b473dcd00467ddc6afdc753
+ARG RUST_IMAGE=docker.io/library/rust:slim@sha256:34fb2f168c432d421a09883c663b275b33cbb30f6b18642fbd09a684c6546d0e
 FROM --platform=$BUILDPLATFORM ${RUST_IMAGE} AS builder
 ARG TARGETARCH
 ARG TARGETVARIANT
