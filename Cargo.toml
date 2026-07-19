@@ -1,6 +1,6 @@
 [package]
 name = "netflector"
-version = "0.13.2"
+version = "0.13.3"
 edition = "2024"
 rust-version = "1.93"
 license = "BSD-2-Clause"
