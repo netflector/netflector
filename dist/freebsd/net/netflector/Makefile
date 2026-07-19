@@ -41,6 +41,12 @@ CARGO_CRATES=	equivalent-1.0.2 \
 		unicode-ident-1.0.24 \
 		winnow-1.0.3
 
-PLIST_FILES=	bin/netflector
+PLIST_FILES=	bin/netflector \
+		share/man/man5/netflector.toml.5.gz \
+		share/man/man8/netflector.8.gz
+
+post-install:
+	${INSTALL_MAN} ${WRKSRC}/man/netflector.8 ${STAGEDIR}${PREFIX}/share/man/man8
+	${INSTALL_MAN} ${WRKSRC}/man/netflector.toml.5 ${STAGEDIR}${PREFIX}/share/man/man5
 
 .include <bsd.port.mk>
