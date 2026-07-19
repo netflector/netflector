@@ -342,6 +342,15 @@ jobs:
           ci/freebsd-vm.sh run 'printf "[reflectors.bad]\nsource_if = \"em0\"\ntarget_if = \"em0\"\nmdns = true\n" > /usr/local/etc/netflector.toml'
           ci/freebsd-vm.sh run 'service netflector start 2>&1 | grep -q "refusing to start" && echo "rc refused an invalid configuration"'
           ci/freebsd-vm.sh run 'rm /usr/local/etc/netflector.toml'
+      # Lint the pages as installed, cross-reference check included: at the default floor
+      # the Xr search is deliberately base-system-only, but -W style (added in mandoc
+      # 1.14.6 for exactly this case) searches the full manpath, which has the port tree.
+      # Order matters: -T lint resets the floor, so -W style must follow it. makewhatis
+      # keeps the port tree's db fresh, else mandoc reports it stale.
+      - name: Lint the installed man pages
+        run: |
+          ci/freebsd-vm.sh run 'makewhatis /usr/local/share/man'
+          ci/freebsd-vm.sh run 'mandoc -T lint -W style /usr/local/share/man/man8/netflector.8.gz /usr/local/share/man/man5/netflector.toml.5.gz'
       # The port's binary is the one configuration no other lane executes end to end: release
       # profile, dynamically linked, built by the ports framework from the release tarball. Run
       # the full native e2e suite against the INSTALLED binary before deinstalling it.
@@ -825,9 +834,10 @@ jobs:
           # The gate: WARNING and up fail via exit status alone -- no output parsing, so
           # a change in message wording can never mask a real finding.
           mandoc -T lint -W warning man/*
-          # The polish layer: STYLE findings, minus the cross-reference notice -- Xr can
-          # only resolve where the pages are installed. Text-matching here risks at most
-          # a missed style nit; the release-time in-VM lint re-checks everything strictly.
+          # The polish layer: STYLE findings, minus the cross-reference notice -- mandoc
+          # verifies Xr targets only against the base system's manpath, which holds none of
+          # the referenced pages here. Text-matching risks at most a missed style nit; the
+          # release-time in-VM lint re-checks everything with zero exclusions.
           out=$(mandoc -T lint man/* 2>&1 | grep '^mandoc: man/' | grep -v 'STYLE: referenced manual not found') || true
           if [ -n "$out" ]; then
             echo "$out"
