@@ -22,7 +22,7 @@ jobs:
       actions: read
     steps:
       - name: Check out repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # A version tag must match the [package] version in Cargo.toml, so the git tag, the published image,
       # and the GitHub release name can never disagree.
@@ -98,7 +98,7 @@ jobs:
             freebsd_arch: arm64
     steps:
       - name: Check out repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # A failing third-party repo (packages.microsoft.com flakes) must not kill a release
       # build; the packages come from the Ubuntu archive, and a broken archive still fails
@@ -230,7 +230,7 @@ jobs:
             platform: linux/arm/v5
     steps:
       - name: Check out repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
