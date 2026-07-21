@@ -1,0 +1,76 @@
+# The heavy half of a daemon publish: build the port's package for every ABI the
+# pkg repository serves. Called by publish-daemon.yml on every port change and by
+# publish-plugin.yml when the tag pins a daemon newer than anything published (a
+# pair publish). One artifact per ABI: daemon-pkg-freebsd-<major>-<arch>.
+name: Build daemon packages
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Package (freebsd${{ matrix.os }}-${{ matrix.arch.name }})
+    runs-on: ubuntu-24.04
+    # KVM lanes take ~7 minutes. The arm64 guests have no KVM on any GitHub
+    # runner, so rustc runs under TCG emulation; the budget is a guess until
+    # the first runs calibrate it.
+    timeout-minutes: ${{ matrix.arch.kvm && 40 || 360 }}
+    env:
+      FREEBSD_VM_ARCH: ${{ matrix.arch.name }}
+      FREEBSD_VM_VERSION: ${{ matrix.os }}
+    strategy:
+      # A publish is all-or-nothing: one failed ABI cancels the rest, and the
+      # deploy tail never runs.
+      fail-fast: true
+      matrix:
+        os: [14, 15]
+        # name is FreeBSD's platform name (MACHINE, what freebsd-vm.sh speaks);
+        # abi is the processor name (MACHINE_ARCH, what pkg ABI strings use).
+        arch:
+          - { name: amd64, abi: amd64, kvm: true, packages: qemu-system-x86 }
+          - { name: arm64, abi: aarch64, kvm: false, packages: qemu-system-arm qemu-efi-aarch64 }
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install QEMU
+        run: |
+          # A failing third-party repo (packages.microsoft.com flakes) must not kill the step:
+          # the packages come from the Ubuntu archive, and a broken archive still fails the
+          # install below loudly.
+          sudo apt-get update || true
+          sudo apt-get install -y --no-install-recommends qemu-utils genisoimage ${{ matrix.arch.packages }}
+      # /dev/kvm exists on the runner but is root:kvm 0660; GitHub's documented udev recipe opens it
+      # (a group add wouldn't apply to the already-running session).
+      - name: Enable KVM
+        if: matrix.arch.kvm
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Launch the FreeBSD VM
+        run: ci/freebsd-vm.sh launch
+      - name: Wait for the VM
+        run: ci/freebsd-vm.sh wait
+      - name: Ports tree, pinned to the commit our packages were built from
+        run: ci/freebsd-ports-tree.sh
+      - name: Build the package
+        run: |
+          ci/freebsd-vm.sh push dist/freebsd/net/netflector /usr/ports/net/netflector
+          ci/freebsd-vm.sh run 'cd /usr/ports/net/netflector && make package'
+      - name: Fetch the package
+        run: |
+          mkdir out
+          ci/freebsd-vm.sh pull '/usr/ports/net/netflector/work/pkg/*.pkg' out/
+          ls -l out/
+      - name: Upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: daemon-pkg-freebsd-${{ matrix.os }}-${{ matrix.arch.abi }}
+          path: out/*.pkg
+          if-no-files-found: error
+      - name: Console on failure
+        if: failure()
+        run: ci/freebsd-vm.sh console

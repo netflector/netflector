@@ -1,0 +1,165 @@
+# Publish the plugin on its release tag. The guard also decides pairing: when
+# the port at the tag pins a daemon that is not yet published (it could not
+# pass its own publish gate against the previous plugin -- a breaking pair --
+# or the repository is empty), this run builds and publishes both from the one
+# tree snapshot the tag names. Whatever lands, the gate validates the newest
+# pair in the tree: the resolution users actually get.
+name: Publish plugin
+
+on:
+  push:
+    tags: ['os-v*']
+
+# Whole publishes serialize, never partially interleave: with the tail split
+# into sign/gate/push jobs, a job-level group could let two publishes overlap
+# stage-wise and the later push would drop the earlier one's packages.
+# GitHub holds at most ONE pending run per group: a third publish queuing up
+# displaces the pending one, which is cancelled with no failure signal. A
+# displaced run needs a manual "Re-run all jobs" (re-runs keep their original
+# snapshot); nothing re-triggers it, so watch for cancelled runs here.
+concurrency:
+  group: pkg-publish
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # os-release.sh waits for CI before pushing the tag; this is the
+  # authoritative re-check, and it covers tags pushed by hand.
+  verify-ci:
+    permissions:
+      actions: read
+    uses: ./.github/workflows/verify-ci.yml
+
+  guard:
+    name: Check the tag and decide pairing
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      pair: ${{ steps.decide.outputs.pair }}
+      port: ${{ steps.decide.outputs.port }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Verify the tag and compare daemon versions
+        id: decide
+        run: |
+          tag='${{ github.ref_name }}'
+          plugin=$(sed -n 's/^PLUGIN_VERSION=[[:space:]]*//p' dist/opnsense/net/netflector/Makefile)
+          if [ "$tag" != "os-v${plugin}" ]; then
+            echo "tag ${tag} does not match PLUGIN_VERSION ${plugin}" >&2
+            exit 1
+          fi
+          port=$(sed -n 's/^DISTVERSION=[[:space:]]*//p' dist/freebsd/net/netflector/Makefile)
+          revision=$(sed -n 's/^PORTREVISION=[[:space:]]*//p' dist/freebsd/net/netflector/Makefile)
+          if [ -n "$revision" ] && [ "$revision" != 0 ]; then
+            port="${port}_${revision}"
+          fi
+          git clone -q --depth 1 https://github.com/netflector/pkg pkg-repo
+          echo "port=${port}" >> "$GITHUB_OUTPUT"
+          if [ -e "pkg-repo/opnsense/FreeBSD:14:amd64/latest/netflector-${port}.pkg" ]; then
+            echo "daemon ${port} is already published; plugin-only publish"
+            echo "pair=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "daemon ${port} is not published; publishing daemon and plugin together"
+            echo "pair=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-plugin:
+    name: Package plugin (freebsd${{ matrix.os }})
+    # On a pair publish the freshly built daemon package satisfies the
+    # plugin's dependency below; build-daemon is skipped on plugin-only
+    # publishes, so run unless something actually failed or was cancelled.
+    needs: [guard, verify-ci, build-daemon]
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      FREEBSD_VM_ARCH: amd64
+      FREEBSD_VM_VERSION: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        # One build per FreeBSD major on the matching OPNsense plugins branch;
+        # the package is no-arch (PHP/XML), so it serves every arch tree of
+        # its major.
+        include:
+          - { os: 14, plugins_branch: stable/26.1 }
+          - { os: 15, plugins_branch: stable/26.7 }
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install QEMU
+        run: |
+          # A failing third-party repo (packages.microsoft.com flakes) must not kill the step:
+          # the packages come from the Ubuntu archive, and a broken archive still fails the
+          # install below loudly.
+          sudo apt-get update || true
+          sudo apt-get install -y --no-install-recommends qemu-utils qemu-system-x86 genisoimage
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Launch the FreeBSD VM
+        run: ci/freebsd-vm.sh launch
+      - name: Wait for the VM
+        run: ci/freebsd-vm.sh wait
+      - name: Download the paired daemon package
+        if: needs.guard.outputs.pair == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: daemon-pkg-freebsd-${{ matrix.os }}-amd64
+          path: daemon-pkg
+      # plugins.mk resolves PLUGIN_DEPENDS with `pkg install`, and no repo the
+      # VM knows carries netflector: the daemon must already be installed when
+      # `make package` runs. pkg add, not our published repo: on a pair
+      # publish the pinned daemon is not published yet (publishing it is this
+      # run's job), and on a plugin-only publish `pkg install` would take the
+      # tree's newest, which the port's pin may trail.
+      - name: Install the daemon the plugin depends on
+        run: |
+          if [ '${{ needs.guard.outputs.pair }}' = 'true' ]; then
+            ci/freebsd-vm.sh push daemon-pkg/*.pkg /tmp/netflector.pkg
+            ci/freebsd-vm.sh run 'pkg add /tmp/netflector.pkg'
+          else
+            ci/freebsd-vm.sh run 'pkg add https://netflector.github.io/pkg/opnsense/FreeBSD:${{ matrix.os }}:amd64/latest/netflector-${{ needs.guard.outputs.port }}.pkg'
+          fi
+      - name: Build the plugin package
+        run: |
+          ci/freebsd-vm.sh run 'pkg install -y git'
+          ci/freebsd-vm.sh run 'git clone -q --depth 1 -b ${{ matrix.plugins_branch }} https://github.com/opnsense/plugins /plugins'
+          ci/freebsd-vm.sh push dist/opnsense/net/netflector /plugins/net/netflector
+          ci/freebsd-vm.sh run 'cd /plugins/net/netflector && make package'
+      - name: Fetch the package
+        run: |
+          mkdir out
+          ci/freebsd-vm.sh run 'find /plugins/net/netflector/work -name "*.pkg"'
+          # The package lands in every arch tree of its major, so it must
+          # carry the wildcard ABI (PLUGIN_NO_ABI), not the build host's amd64.
+          ci/freebsd-vm.sh run 'pkg query -F /plugins/net/netflector/work/pkg/*.pkg %q | grep -Fx "FreeBSD:*:*"'
+          ci/freebsd-vm.sh pull '/plugins/net/netflector/work/pkg/*.pkg' out/
+          ls -l out/
+      - name: Upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: plugin-pkg-freebsd-${{ matrix.os }}
+          path: out/*.pkg
+          if-no-files-found: error
+      - name: Console on failure
+        if: failure()
+        run: ci/freebsd-vm.sh console
+
+  build-daemon:
+    needs: [guard, verify-ci]
+    if: needs.guard.outputs.pair == 'true'
+    uses: ./.github/workflows/build-daemon-pkgs.yml
+
+  deploy:
+    needs: [build-plugin, build-daemon]
+    # build-daemon is skipped on plugin-only publishes; run unless something
+    # actually failed or was cancelled.
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/pkg-deploy.yml
+    secrets: inherit

@@ -1,0 +1,308 @@
+# The shared publish logic: take whatever package artifacts the caller built
+# (daemon set, plugin, or both), advance netflector/pkg by exactly one commit,
+# and let Pages serve it. Trees keep every version ever published -- filenames
+# carry versions, `pkg install netflector` resolves the newest, an explicit
+# netflector-X.Y.Z pins -- so placing packages is add-only. Signing is at the
+# catalogue level: `pkg repo` signs packagesite, which carries every package's
+# SHA256, so one signature per tree covers daemon and plugin alike.
+#
+# The gate runs on real OPNsense, one VM per supported release, each consuming
+# its own ABI tree: opnsense-bootstrap converts the stock FreeBSD VM of the
+# matching major, then the plugin installs from the freshly signed tree and
+# configd renders the config the way a user's firewall would.
+#
+# Serialization note: the pkg-publish concurrency group lives at the TOP level
+# of both caller workflows, not here -- job-level groups cannot stop the
+# stages of two publishes from interleaving.
+name: Publish to the pkg repository
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  sign:
+    name: Place and sign
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: pkg-publish
+    env:
+      FREEBSD_VM_ARCH: amd64
+      FREEBSD_VM_VERSION: '14'
+    outputs:
+      message: ${{ steps.place.outputs.message }}
+      snapshot: ${{ steps.snapshot.outputs.sha }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Check out netflector/pkg
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: netflector/pkg
+          path: pkg-repo
+          persist-credentials: false
+      - name: Record the tree snapshot
+        id: snapshot
+        run: echo "sha=$(git -C pkg-repo rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Download the built packages
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: incoming
+      - name: Place packages into the ABI trees
+        id: place
+        run: |
+          shopt -s nullglob
+          # Every artifact must hold exactly one package, and all ABIs must
+          # agree on its version: the builds ran from one ref, so a mismatch
+          # means something went badly wrong upstream.
+          one_pkg() {
+            local pkgs=("$1"/*.pkg)
+            if [ ${#pkgs[@]} -ne 1 ]; then
+              echo "expected exactly one package in $1, found ${#pkgs[@]}" >&2
+              return 1
+            fi
+            printf '%s\n' "${pkgs[0]}"
+          }
+          daemon_version=''
+          plugin_version=''
+          for dir in incoming/daemon-pkg-freebsd-*; do
+            pkg=$(one_pkg "$dir")
+            base=${dir##*/daemon-pkg-freebsd-}
+            os=${base%%-*}
+            arch=${base#*-}
+            tree="pkg-repo/opnsense/FreeBSD:${os}:${arch}/latest"
+            mkdir -p "$tree"
+            cp "$pkg" "$tree/"
+            version=$(basename "$pkg" .pkg)
+            version=${version#netflector-}
+            if [ -n "$daemon_version" ] && [ "$version" != "$daemon_version" ]; then
+              echo "daemon version mismatch across ABIs: ${daemon_version} vs ${version}" >&2
+              exit 1
+            fi
+            daemon_version=$version
+          done
+          for dir in incoming/plugin-pkg-freebsd-*; do
+            pkg=$(one_pkg "$dir")
+            os=${dir##*-}
+            for arch in amd64 aarch64; do
+              tree="pkg-repo/opnsense/FreeBSD:${os}:${arch}/latest"
+              mkdir -p "$tree"
+              cp "$pkg" "$tree/"
+            done
+            version=$(basename "$pkg" .pkg)
+            version=${version#os-netflector-}
+            if [ -n "$plugin_version" ] && [ "$version" != "$plugin_version" ]; then
+              echo "plugin version mismatch across majors: ${plugin_version} vs ${version}" >&2
+              exit 1
+            fi
+            plugin_version=$version
+          done
+          if [ -z "${daemon_version}${plugin_version}" ]; then
+            echo "no package artifacts to publish" >&2
+            exit 1
+          fi
+          message=''
+          [ -n "$daemon_version" ] && message="daemon ${daemon_version}"
+          [ -n "$plugin_version" ] && message="${message:+${message} + }plugin ${plugin_version}"
+          echo "message=$message" >> "$GITHUB_OUTPUT"
+      - name: Install QEMU
+        run: |
+          # A failing third-party repo (packages.microsoft.com flakes) must not kill the step:
+          # the packages come from the Ubuntu archive, and a broken archive still fails the
+          # install below loudly.
+          sudo apt-get update || true
+          sudo apt-get install -y --no-install-recommends qemu-utils qemu-system-x86 genisoimage
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Launch the FreeBSD VM
+        run: ci/freebsd-vm.sh launch
+      - name: Wait for the VM
+        run: ci/freebsd-vm.sh wait
+      - name: Sign the catalogues
+        env:
+          PKG_REPO_SIGNING_KEY: ${{ secrets.PKG_REPO_SIGNING_KEY }}
+        run: |
+          umask 077
+          printf '%s\n' "$PKG_REPO_SIGNING_KEY" > repo.key
+          ci/freebsd-vm.sh push repo.key /tmp/repo.key
+          rm repo.key
+          ci/freebsd-vm.sh push pkg-repo/opnsense /repo
+          ci/freebsd-vm.sh run '
+            set -e
+            chmod 400 /tmp/repo.key
+            openssl rsa -in /tmp/repo.key -pubout -out /tmp/repo.pub 2>/dev/null
+            for tree in /repo/FreeBSD:*/latest; do
+              pkg repo "$tree" /tmp/repo.key
+            done
+          '
+      - name: Collect the signed trees
+        run: |
+          mkdir signed
+          ci/freebsd-vm.sh pull /repo signed/opnsense
+          ci/freebsd-vm.sh pull /tmp/repo.pub signed/netflector-pkg.pub
+          # upload-artifact rejects ':' in any file path inside the artifact,
+          # and the tree directories are ABI-named (FreeBSD:14:amd64); a tar
+          # crosses the boundary intact.
+          tar -cf signed-trees.tar -C signed .
+      - name: Upload the signed trees
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: signed-trees
+          path: signed-trees.tar
+          if-no-files-found: error
+      - name: Console on failure
+        if: failure()
+        run: ci/freebsd-vm.sh console
+
+  gate:
+    name: Gate on OPNsense ${{ matrix.opnsense }}
+    needs: sign
+    runs-on: ubuntu-24.04
+    # opnsense-bootstrap downloads OPNsense's packages plus base and kernel
+    # sets from their mirrors and reboots into them.
+    timeout-minutes: 60
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { opnsense: '26.1', os: 14, abi: 'FreeBSD:14:amd64' }
+          - { opnsense: '26.7', os: 15, abi: 'FreeBSD:15:amd64' }
+    env:
+      FREEBSD_VM_ARCH: amd64
+      FREEBSD_VM_VERSION: '${{ matrix.os }}'
+      FREEBSD_VM_EXTRA_NICS: '2'
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Download the signed trees
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: signed-trees
+      - name: Unpack the signed trees
+        run: |
+          mkdir signed
+          tar -xf signed-trees.tar -C signed
+      - name: Install QEMU
+        run: |
+          # A failing third-party repo (packages.microsoft.com flakes) must not kill the step:
+          # the packages come from the Ubuntu archive, and a broken archive still fails the
+          # install below loudly.
+          sudo apt-get update || true
+          sudo apt-get install -y --no-install-recommends qemu-utils qemu-system-x86 genisoimage
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Launch the FreeBSD VM
+        run: ci/freebsd-vm.sh launch
+      - name: Wait for the VM
+        run: ci/freebsd-vm.sh wait
+      - name: Convert the VM to OPNsense ${{ matrix.opnsense }}
+        run: |
+          # Seed /conf/config.xml before the conversion reboot: OPNsense
+          # regenerates root's authorized_keys from it on every boot, so
+          # without this the reboot locks us out.
+          b64=$(base64 < "${FREEBSD_VM_DIR:-$HOME/.freebsd-vm}/id_ed25519.pub" | tr -d '\n')
+          sed "s|__SSH_PUBKEY_B64__|$b64|" \
+            dist/opnsense/net/netflector/test/gate-config.xml > config.xml
+          ci/freebsd-vm.sh run 'mkdir -p /conf'
+          ci/freebsd-vm.sh push config.xml /conf/config.xml
+          ci/freebsd-vm.sh run 'fetch -qo /tmp/bootstrap.sh https://raw.githubusercontent.com/opnsense/update/master/src/bootstrap/opnsense-bootstrap.sh.in'
+          # The conversion ends in a reboot that kills the ssh session.
+          ci/freebsd-vm.sh run 'sh /tmp/bootstrap.sh -y -r ${{ matrix.opnsense }}' || true
+          FREEBSD_VM_SSH_WAIT_SECS=900 ci/freebsd-vm.sh wait
+          ci/freebsd-vm.sh run 'opnsense-version'
+      - name: Configure the netflector repository
+        run: |
+          # Only after the conversion: opnsense-bootstrap wipes /usr/local/etc/pkg.
+          ci/freebsd-vm.sh push 'signed/opnsense/${{ matrix.abi }}/latest' /repo
+          ci/freebsd-vm.sh run 'mkdir -p /usr/local/etc/pkg/repos /usr/local/etc/pkg/keys'
+          ci/freebsd-vm.sh push signed/netflector-pkg.pub /usr/local/etc/pkg/keys/netflector-pkg.pub
+          ci/freebsd-vm.sh run '
+            set -e
+            cat > /usr/local/etc/pkg/repos/netflector.conf <<EOF
+          netflector: {
+            url: "file:///repo",
+            signature_type: "pubkey",
+            pubkey: "/usr/local/etc/pkg/keys/netflector-pkg.pub",
+            enabled: yes
+          }
+          EOF
+            pkg update -r netflector
+          '
+      # The full user journey against the exact pair the tree offers: install
+      # the plugin (its OPNsense dependencies come from their mirrors, the
+      # daemon from ours), let real configd render the configuration, have the
+      # daemon validate it, and start the service on the dummy interfaces.
+      - name: Install and exercise the pair
+        run: |
+          ci/freebsd-vm.sh run 'pkg install -y os-netflector'
+          ci/freebsd-vm.sh run 'configctl template reload OPNsense/Netflector'
+          ci/freebsd-vm.sh run 'test -s /usr/local/etc/netflector.toml'
+          ci/freebsd-vm.sh run 'cat /usr/local/etc/netflector.toml'
+          ci/freebsd-vm.sh run 'netflector --check-config /usr/local/etc/netflector.toml'
+          # No sysrc here: the seeded config.xml arms the service through the
+          # plugin's rc.conf.d template, the same path a user's firewall takes
+          # (and /etc/rc.conf.d overrides rc.conf anyway).
+          ci/freebsd-vm.sh run 'service netflector start && sleep 2 && service netflector status'
+      - name: Console on failure
+        if: failure()
+        run: ci/freebsd-vm.sh console
+
+  push:
+    name: Push the snapshot
+    needs: [sign, gate]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: pkg-publish
+    steps:
+      # Pinned to the commit sign snapshotted: if anything else lands on
+      # netflector/pkg while the gate runs, the push below is a rejected
+      # non-fast-forward instead of a silent clobber of that commit.
+      - name: Check out netflector/pkg
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: netflector/pkg
+          ref: ${{ needs.sign.outputs.snapshot }}
+          path: pkg-repo
+          ssh-key: ${{ secrets.PKG_REPO_DEPLOY_KEY }}
+      - name: Download the signed trees
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: signed-trees
+      - name: Unpack the signed trees
+        run: |
+          mkdir signed
+          tar -xf signed-trees.tar -C signed
+      # Client bootstrap files at the site root, regenerated every publish so
+      # there is no hand-maintained copy: the public key (derived from the
+      # signing key) and a ready-made repo configuration.
+      - name: Advance the tree
+        run: |
+          rm -rf pkg-repo/opnsense
+          cp -R signed/opnsense pkg-repo/opnsense
+          cp signed/netflector-pkg.pub pkg-repo/netflector-pkg.pub
+          cat > pkg-repo/netflector.conf <<'EOF'
+          netflector: {
+            url: "https://netflector.github.io/pkg/opnsense/${ABI}/latest",
+            signature_type: "pubkey",
+            pubkey: "/usr/local/etc/pkg/keys/netflector-pkg.pub",
+            enabled: yes
+          }
+          EOF
+      - name: Commit and push
+        env:
+          MESSAGE: ${{ needs.sign.outputs.message }}
+        run: |
+          cd pkg-repo
+          git add -A
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -m "$MESSAGE"
+          git push origin HEAD:main
