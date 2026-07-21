@@ -1,0 +1,40 @@
+# Wait for ci.yml to succeed on the commit the caller runs for. The release
+# scripts gate on CI locally before pushing their tag; this is the
+# authoritative re-check, and it also covers tags pushed by hand.
+name: Verify CI
+
+on:
+  workflow_call:
+
+permissions:
+  actions: read
+
+jobs:
+  verify:
+    name: Wait for CI on this commit
+    runs-on: ubuntu-24.04
+    # A publish triggered by a push waits out the full CI run, not just the
+    # usually-short tail release tags see.
+    timeout-minutes: 45
+    steps:
+      - name: Wait for CI to pass on this commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sha='${{ github.sha }}'
+          wf=ci.yml
+          ok=
+          for _ in $(seq 1 135); do  # job timeout-minutes is the real ceiling
+            run=$(gh api "repos/${{ github.repository }}/actions/workflows/$wf/runs?head_sha=$sha&per_page=1" \
+              --jq '.workflow_runs[0] | "\(.status)|\(.conclusion // "")"')
+            case "${run%%|*}" in
+              completed)
+                if [ "${run##*|}" = success ]; then ok=1; break; fi
+                echo "::error::$wf concluded '${run##*|}' on $sha"; exit 1 ;;
+              "") echo "No $wf run for $sha yet; waiting..." ;;
+              *)  echo "$wf is '${run%%|*}'; waiting..." ;;
+            esac
+            sleep 20
+          done
+          [ -n "$ok" ] || { echo "::error::Timed out waiting for $wf on $sha"; exit 1; }
+          echo "$wf passed on $sha."
