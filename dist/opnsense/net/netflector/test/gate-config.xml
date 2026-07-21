@@ -1,0 +1,143 @@
+<?xml version="1.0"?>
+<!--
+  Seed configuration for the publish gate's OPNsense VM, derived from
+  OPNsense's factory config.xml.sample. Written to /conf/config.xml before
+  opnsense-bootstrap reboots the FreeBSD VM into OPNsense, so the first
+  OPNsense boot comes up with ssh reachable (OPNsense regenerates root's
+  authorized_keys from <authorizedkeys> on every boot; a key written to the
+  filesystem is discarded) and with the Netflector model populated for the
+  template-render and service checks. The packet filter is off: the VM's only
+  ingress is QEMU's ssh port forward, and pf would block it on WAN.
+
+  __SSH_PUBKEY_B64__ is replaced with the base64 of the VM's per-run ssh
+  public key. opt1/opt2 sit on the FREEBSD_VM_EXTRA_NICS dummy devices with
+  static addresses, giving the daemon real capture interfaces with IPv4.
+-->
+<opnsense>
+  <theme>opnsense</theme>
+  <system>
+    <optimization>normal</optimization>
+    <hostname>netflector-gate</hostname>
+    <domain>internal</domain>
+    <dnsallowoverride>1</dnsallowoverride>
+    <disablefilter>1</disablefilter>
+    <group>
+      <name>admins</name>
+      <description>System Administrators</description>
+      <scope>system</scope>
+      <gid>1999</gid>
+      <member>0</member>
+      <priv>page-all</priv>
+    </group>
+    <user>
+      <name>root</name>
+      <descr>System Administrator</descr>
+      <scope>system</scope>
+      <groupname>admins</groupname>
+      <password>$2y$10$YRVoF4SgskIsrXOvOQjGieB9XqHPRra9R7d80B3BZdbY/j21TwBfS</password>
+      <uid>0</uid>
+      <authorizedkeys>__SSH_PUBKEY_B64__</authorizedkeys>
+    </user>
+    <timezone>Etc/UTC</timezone>
+    <webgui>
+      <protocol>https</protocol>
+    </webgui>
+    <usevirtualterminal>1</usevirtualterminal>
+    <disableconsolemenu/>
+    <ipv6allow>1</ipv6allow>
+    <ssh>
+      <enabled>enabled</enabled>
+      <permitrootlogin>1</permitrootlogin>
+      <group>admins</group>
+    </ssh>
+  </system>
+  <interfaces>
+    <wan>
+      <enable>1</enable>
+      <if>vtnet0</if>
+      <ipaddr>dhcp</ipaddr>
+      <subnet/>
+      <gateway/>
+      <dhcphostname/>
+      <media/>
+      <mediaopt/>
+    </wan>
+    <opt1>
+      <enable>1</enable>
+      <descr>SOURCE</descr>
+      <if>vtnet1</if>
+      <ipaddr>10.10.1.1</ipaddr>
+      <subnet>24</subnet>
+      <media/>
+      <mediaopt/>
+    </opt1>
+    <opt2>
+      <enable>1</enable>
+      <descr>TARGET</descr>
+      <if>vtnet2</if>
+      <ipaddr>10.10.2.1</ipaddr>
+      <subnet>24</subnet>
+      <media/>
+      <mediaopt/>
+    </opt2>
+  </interfaces>
+  <nat>
+    <outbound>
+      <mode>automatic</mode>
+    </outbound>
+  </nat>
+  <filter/>
+  <OPNsense>
+    <Netflector>
+      <general>
+        <enabled>1</enabled>
+        <log_level>info</log_level>
+        <counters_interval_secs>60</counters_interval_secs>
+      </general>
+      <reflectors>
+        <reflector uuid="9a1b0c62-4c58-4b2e-9a41-6f2f5d7a0001">
+          <enabled>1</enabled>
+          <name>tv</name>
+          <source_if>opt1</source_if>
+          <target_if>opt2</target_if>
+          <wol>1</wol>
+          <wol_ports>7,9</wol_ports>
+          <mdns>1</mdns>
+          <ssdp>1</ssdp>
+          <dial>1</dial>
+          <wsd>0</wsd>
+          <macs>B0:37:95:C5:60:BE,C4:9D:8F:11:22:33</macs>
+          <address_family>ipv4</address_family>
+        </reflector>
+        <reflector uuid="9a1b0c62-4c58-4b2e-9a41-6f2f5d7a0002">
+          <enabled>1</enabled>
+          <name>cameras</name>
+          <source_if>opt2</source_if>
+          <target_if>opt1</target_if>
+          <wol>0</wol>
+          <wol_ports/>
+          <mdns>0</mdns>
+          <ssdp>0</ssdp>
+          <dial>0</dial>
+          <wsd>1</wsd>
+          <macs/>
+          <address_family>default</address_family>
+        </reflector>
+        <reflector uuid="9a1b0c62-4c58-4b2e-9a41-6f2f5d7a0003">
+          <enabled>0</enabled>
+          <name>off</name>
+          <source_if>opt1</source_if>
+          <target_if>opt2</target_if>
+          <wol>0</wol>
+          <wol_ports/>
+          <mdns>1</mdns>
+          <ssdp>0</ssdp>
+          <dial>0</dial>
+          <wsd>0</wsd>
+          <macs/>
+          <address_family>default</address_family>
+        </reflector>
+      </reflectors>
+    </Netflector>
+  </OPNsense>
+</opnsense>
