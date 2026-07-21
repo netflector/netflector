@@ -1,0 +1,76 @@
+# Publish the daemon package when the port changes. That is the moment the
+# package definition moves: at release-tag time main's port still pins the
+# previous version (the re-pin PR lands after the tag), and PORTREVISION-only
+# bumps must republish too. The paths: filter is safe here because publish is
+# not a required check; the no-path-filters rule guards ci.yml's Success only.
+name: Publish daemon
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'dist/freebsd/net/netflector/**'
+
+# Whole publishes serialize, never partially interleave: with the tail split
+# into sign/gate/push jobs, a job-level group could let two publishes overlap
+# stage-wise and the later push would drop the earlier one's packages.
+# GitHub holds at most ONE pending run per group: a third publish queuing up
+# displaces the pending one, which is cancelled with no failure signal. A
+# displaced run needs a manual "Re-run all jobs" (re-runs keep their original
+# snapshot); nothing re-triggers it, so watch for cancelled runs here.
+concurrency:
+  group: pkg-publish
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # ci.yml runs on this same push; wait for it. Nothing broken can publish
+  # without this (the port build and the OPNsense gate fail first), but a red
+  # main should not spend hours of VM time finding that out.
+  verify-ci:
+    permissions:
+      actions: read
+    uses: ./.github/workflows/verify-ci.yml
+
+  guard:
+    name: Skip if this port version is already published
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      publish: ${{ steps.decide.outputs.publish }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Compare the port against the published trees
+        id: decide
+        run: |
+          version=$(sed -n 's/^DISTVERSION=[[:space:]]*//p' dist/freebsd/net/netflector/Makefile)
+          revision=$(sed -n 's/^PORTREVISION=[[:space:]]*//p' dist/freebsd/net/netflector/Makefile)
+          if [ -n "$revision" ] && [ "$revision" != 0 ]; then
+            version="${version}_${revision}"
+          fi
+          git clone -q --depth 1 https://github.com/netflector/pkg pkg-repo
+          if [ -e "pkg-repo/opnsense/FreeBSD:14:amd64/latest/netflector-${version}.pkg" ]; then
+            echo "netflector-${version} is already published; nothing to do."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publishing netflector-${version}"
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: [guard, verify-ci]
+    if: needs.guard.outputs.publish == 'true'
+    uses: ./.github/workflows/build-daemon-pkgs.yml
+
+  # If the gate in the tail fails here, the new daemon is incompatible with the
+  # published plugin. That is a signal, not an incident: release a bridge plugin
+  # first when the config change allows one, or tag the new plugin release --
+  # publish-plugin.yml detects the unpublished daemon and carries both out
+  # atomically.
+  deploy:
+    needs: build
+    uses: ./.github/workflows/pkg-deploy.yml
+    secrets: inherit
