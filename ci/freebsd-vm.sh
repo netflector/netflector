@@ -119,7 +119,9 @@ launch() {
     # in ipxe-qemu, which qemu-system-arm does not pull in, and these guests
     # only ever boot from disk anyway.
     common=(
-        -smp "$(nproc)" -m 6144
+        # 8 GB: pkg's catalogue processing OOM-killed twice at 6 (the cloud
+        # images carry no swap, so any memory spike kills); runners have 16.
+        -smp "$(nproc)" -m 8192
         # cache=unsafe: flushes become no-ops (UFS journal commits, pkg's per-package
         # fsyncs). The failure mode is a stale image after a HOST crash, and these VMs
         # do not outlive the job.
