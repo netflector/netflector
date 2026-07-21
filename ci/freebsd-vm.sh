@@ -11,6 +11,7 @@
 #   ci/freebsd-vm.sh wait      block until root ssh answers
 #   ci/freebsd-vm.sh run CMD   run CMD in the VM as root
 #   ci/freebsd-vm.sh push SRC... DEST   copy files/dirs to DEST in the VM
+#   ci/freebsd-vm.sh pull SRC DEST      copy a file/dir from the VM to DEST
 #   ci/freebsd-vm.sh console   dump the serial console (boot diagnostics)
 #
 # State (disk, seed, per-run ssh key, console log) lives in $FREEBSD_VM_DIR,
@@ -128,6 +129,16 @@ launch() {
         -display none -serial "file:$VM_DIR/console.log"
         -pidfile "$VM_DIR/qemu.pid" -daemonize
     )
+    # FREEBSD_VM_EXTRA_NICS isolated dummy NICs (vtnet1..vtnetN) for tests
+    # that need real capture devices beyond the ssh NIC. restrict=on cuts
+    # them off from the host and each other.
+    nics=${FREEBSD_VM_EXTRA_NICS:-0}
+    i=1
+    while [ "$i" -le "$nics" ]; do
+        common+=(-netdev "user,id=extra$i,restrict=on"
+            -device "virtio-net-pci,netdev=extra$i,romfile=")
+        i=$((i + 1))
+    done
     if [ "$ARCH" = amd64 ]; then
         qemu-system-x86_64 \
             -machine q35 -accel kvm -cpu host \
@@ -190,6 +201,10 @@ push() {
     scp -qr "${SSH_OPTS[@]}" -P "$SSH_PORT" "${@:1:$#-1}" "root@127.0.0.1:${!#}"
 }
 
+pull() {
+    scp -qr "${SSH_OPTS[@]}" -P "$SSH_PORT" "root@127.0.0.1:$1" "$2"
+}
+
 case "${1:-}" in
 launch) launch ;;
 wait) wait_ssh ;;
@@ -201,9 +216,13 @@ push)
     shift
     push "$@"
     ;;
+pull)
+    shift
+    pull "$@"
+    ;;
 console) cat "$VM_DIR/console.log" ;;
 *)
-    echo "usage: $0 launch|wait|run CMD|push SRC... DEST|console" >&2
+    echo "usage: $0 launch|wait|run CMD|push SRC... DEST|pull SRC DEST|console" >&2
     exit 64
     ;;
 esac
