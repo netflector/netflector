@@ -526,6 +526,12 @@ into one manifest), and creates the GitHub release
 with the binaries and their `SHA256SUMS` attached and generated notes. `release.sh` needs only the GitHub
 CLI (`gh`, authenticated) for its CI check; nothing else runs locally.
 
+The OPNsense plugin releases separately: bump `PLUGIN_VERSION` in
+`dist/opnsense/net/netflector/Makefile`, merge, then run `./os-release.sh` from a clean synced `main`.
+It does the same local half and tags `os-v<version>`; the tag hands off to `publish-plugin.yml`, which
+packages the plugin for each supported FreeBSD major (plus the daemon when the version the port pins is
+not yet published) and publishes everything to the [package repository](https://github.com/netflector/pkg).
+
 ## License
 
 Copyright 2026 Sergii Bogomolov.
