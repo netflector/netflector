@@ -27,7 +27,7 @@ these. The same shape serves one or a few specific devices (`macs`) or a whole n
 
 - [Platform support](#platform-support)
 - [Build](#build)
-- [Run](#run): [privileges](#runtime-privileges), [Docker](#run-in-docker), [MikroTik](#on-mikrotik-routeros)
+- [Run](#run): [privileges](#runtime-privileges), [Docker](#run-in-docker), [MikroTik](#on-mikrotik-routeros), [FreeBSD/OPNsense packages](#install-on-freebsd-and-opnsense)
 - [Configuration](#configuration): [env vars](#environment-variables), [`macs`](#the-macs-field), [`address_family`](#address_family), [per-protocol behavior](#per-protocol-behavior), [DIAL](#dial), [duplicate detection](#duplicate-detection)
 - [Tests](#tests)
 - [Release](#release)
@@ -239,6 +239,34 @@ entry above becomes `NETFLECTOR_TV_SOURCE_IF=veth-lan`, `NETFLECTOR_TV_TARGET_IF
 `/etc/netflector/config.toml` and set that path as the container's command argument. For the RouterOS
 side (enabling container mode, creating the `veth`s, and attaching each to its VLAN), see MikroTik's
 [Container documentation](https://help.mikrotik.com/docs/spaces/ROS/pages/84901929/Container).
+
+### Install on FreeBSD and OPNsense
+
+Signed packages for FreeBSD 14 and 15 (amd64 and aarch64) are served from a
+[package repository](https://github.com/netflector/pkg) built for OPNsense and usable on any FreeBSD.
+Two fetches enable it; the catalogue is signed, and pkg verifies it against the public key on every update:
+
+```sh
+mkdir -p /usr/local/etc/pkg/keys /usr/local/etc/pkg/repos
+fetch -o /usr/local/etc/pkg/keys/netflector-pkg.pub https://netflector.github.io/pkg/netflector-pkg.pub
+fetch -o /usr/local/etc/pkg/repos/netflector.conf https://netflector.github.io/pkg/netflector.conf
+```
+
+On plain FreeBSD, install `netflector` (man pages and the rc service included), write
+`/usr/local/etc/netflector.toml` (netflector.toml(5) documents it), and start:
+
+```sh
+pkg install netflector
+sysrc netflector_enable=YES
+service netflector start
+```
+
+On OPNsense, install the plugin instead. It pulls in the daemon and owns the configuration and the
+service from its GUI page under Services > Netflector:
+
+```sh
+pkg install os-netflector
+```
 
 ## Configuration
 
