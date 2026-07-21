@@ -302,21 +302,7 @@ jobs:
       - name: Wait for the VM
         run: ci/freebsd-vm.sh wait
       - name: Ports tree, pinned to the commit our packages were built from
-        # shellcheck disable=SC2016  # the single quotes are the point: $hash expands in the guest
-        run: |
-          ci/freebsd-vm.sh run 'pkg install -y git rust ports-mgmt/portlint'
-          ci/freebsd-vm.sh run '
-            set -e
-            hash=$(pkg info -A rust | sed -n "s/.*ports_top_git_hash:[[:space:]]*//p")
-            [ -n "$hash" ] || { echo "rust package records no ports_top_git_hash"; exit 1; }
-            echo "ports tree at $hash (the commit our rust package was built from)"
-            mkdir -p /usr/ports && cd /usr/ports
-            git init -q .
-            git remote add origin https://git.FreeBSD.org/ports.git
-            git fetch -q --depth 1 origin "$hash"
-            git checkout -q FETCH_HEAD
-            [ "$(git rev-parse HEAD)" = "$hash" ] || { echo "tree is not at the pinned commit"; exit 1; }
-          '
+        run: ci/freebsd-ports-tree.sh
       - name: Install the port into the tree
         run: |
           ci/freebsd-vm.sh push dist/freebsd/net/netflector /usr/ports/net/netflector
@@ -324,6 +310,7 @@ jobs:
           ci/freebsd-vm.sh run 'cd /usr/ports/net && awk "/^ *SUBDIR \+= / && !ins && \$3 > \"netflector\" { print \"    SUBDIR += netflector\"; ins = 1 } { print } END { if (!ins) print \"    SUBDIR += netflector\" }" Makefile > Makefile.new && mv Makefile.new Makefile && grep -n "SUBDIR += netflector" Makefile'
       - name: portlint
         run: |
+          ci/freebsd-vm.sh run 'pkg install -y ports-mgmt/portlint'
           ci/freebsd-vm.sh run 'cd /usr/ports && git add -f net/netflector net/Makefile'
           ci/freebsd-vm.sh run 'cd /usr/ports/net/netflector && portlint -AC'
       - name: Build, and run the QA a ports committer runs
