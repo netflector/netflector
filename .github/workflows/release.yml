@@ -49,7 +49,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         include:
           - variant: linux-amd64
@@ -192,7 +192,7 @@ jobs:
       contents: read
       packages: write
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         include:
           - arch: amd64
@@ -253,10 +253,31 @@ jobs:
     needs: image
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    outputs:
+      latest: ${{ steps.ord.outputs.latest }}
     permissions:
       contents: read
       packages: write
     steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-tags: true
+
+      # Everything else in a release is per-tag, but `latest` and the
+      # major.minor image tag are shared state: only the run for the newest
+      # tag (of the repo, and of its patch line) may move them, or an older
+      # run finishing late drags them backwards. A concurrency group would
+      # not do: it holds one pending run at most, so a third tag pushed
+      # while one builds silently cancels the second's release.
+      - name: Which shared tags may move
+        id: ord
+        run: |
+          newest=$(git tag --list 'v*' --sort=-v:refname | head -1)
+          line=$(git tag --list "${GITHUB_REF_NAME%.*}.*" --sort=-v:refname | head -1)
+          echo "latest=$([ "$GITHUB_REF_NAME" = "$newest" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "minor=$([ "$GITHUB_REF_NAME" = "$line" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
       - name: Download digests
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -281,8 +302,12 @@ jobs:
           images: ghcr.io/${{ github.repository }}
           tags: |
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest
+            type=semver,pattern={{major}}.{{minor}},enable=${{ steps.ord.outputs.minor }}
+            type=raw,value=latest,enable=${{ steps.ord.outputs.latest }}
+          # The default latest=auto emits :latest from the {{version}} entry,
+          # bypassing the gate on the raw entry above.
+          flavor: |
+            latest=false
 
       - name: Create and push the manifest list
         working-directory: /tmp/digests
@@ -330,3 +355,6 @@ jobs:
             dist/SHA256SUMS
           generate_release_notes: true
           fail_on_unmatched_files: true
+          # The API default (true for new releases) would let an old tag's run
+          # finishing late steal the Latest marker; same predicate as :latest.
+          make_latest: ${{ needs.manifest.outputs.latest }}
