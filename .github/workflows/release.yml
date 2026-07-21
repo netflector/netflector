@@ -11,21 +11,15 @@ permissions:
   contents: read
 
 jobs:
-  # Fail fast on a version mismatch before the (possibly long) CI wait: check the tag matches the project
-  # version first, then gate the release on ci.yml being green for this commit (poll it, waiting if the tag
-  # was pushed before CI finished).
-  verify-ci:
-    name: Verify CI + tag check
+  # A version tag must match the [package] version in Cargo.toml, so the git tag, the published image,
+  # and the GitHub release name can never disagree. Fails within a minute while verify-ci still waits.
+  tag-check:
+    name: Tag matches Cargo.toml
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    permissions:
-      actions: read
+    timeout-minutes: 5
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-
-      # A version tag must match the [package] version in Cargo.toml, so the git tag, the published image,
-      # and the GitHub release name can never disagree.
       - name: Verify tag matches Cargo.toml version
         run: |
           version="$(./version.sh)"
@@ -36,27 +30,12 @@ jobs:
           fi
           echo "Tag ${GITHUB_REF_NAME} matches Cargo.toml version ${version}."
 
-      - name: Wait for CI to pass on this commit
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          sha='${{ github.sha }}'
-          wf=ci.yml
-          ok=
-          for _ in $(seq 1 90); do  # job timeout-minutes is the real ceiling
-            run=$(gh api "repos/${{ github.repository }}/actions/workflows/$wf/runs?head_sha=$sha&per_page=1" \
-              --jq '.workflow_runs[0] | "\(.status)|\(.conclusion // "")"')
-            case "${run%%|*}" in
-              completed)
-                if [ "${run##*|}" = success ]; then ok=1; break; fi
-                echo "::error::$wf concluded '${run##*|}' on $sha"; exit 1 ;;
-              "") echo "No $wf run for $sha yet; waiting..." ;;
-              *)  echo "$wf is '${run%%|*}'; waiting..." ;;
-            esac
-            sleep 20
-          done
-          [ -n "$ok" ] || { echo "::error::Timed out waiting for $wf on $sha"; exit 1; }
-          echo "$wf passed on $sha."
+  # Gate the release on ci.yml being green for this commit (poll it, waiting if the tag was pushed
+  # before CI finished).
+  verify-ci:
+    permissions:
+      actions: read
+    uses: ./.github/workflows/verify-ci.yml
 
   # Downloadable binaries, built with rustc's default toolchain wherever one exists: amd64 and
   # arm64 are static musl on their native runners (the self-contained default, gcc-driven link),
@@ -66,7 +45,7 @@ jobs:
   # freebsd-arm64 on the pinned nightly from ci/freebsd-nightly.env until stable 1.98 ships its std).
   binaries:
     name: Binary (${{ matrix.variant }})
-    needs: verify-ci
+    needs: [tag-check, verify-ci]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     strategy:
@@ -206,7 +185,7 @@ jobs:
   # the arm32 pair, which have no native runner and cross-compile on the amd64 host (no QEMU).
   image:
     name: Image (${{ matrix.arch }})
-    needs: verify-ci
+    needs: [tag-check, verify-ci]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     permissions:
