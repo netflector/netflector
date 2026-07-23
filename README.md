@@ -243,8 +243,10 @@ side (enabling container mode, creating the `veth`s, and attaching each to its V
 ### Install on FreeBSD and OPNsense
 
 Signed packages for FreeBSD 14 and 15 (amd64 and aarch64) are served from a
-[package repository](https://github.com/netflector/pkg) built for OPNsense and usable on any FreeBSD.
-Two fetches enable it; the catalogue is signed, and pkg verifies it against the public key on every update:
+[package repository](https://github.com/netflector/pkg) that tracks the OPNsense releases upstream
+supports, currently 26.1 and 26.7. Each package is built on its target's FreeBSD base, so plain
+FreeBSD works too, from that base up (14.3+ and 15.1+). Two fetches enable it; the catalogue is
+signed, and pkg verifies it against the public key on every update:
 
 ```sh
 mkdir -p /usr/local/etc/pkg/keys /usr/local/etc/pkg/repos
