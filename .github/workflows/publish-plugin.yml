@@ -81,9 +81,11 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        # One build per FreeBSD major on the matching OPNsense plugins branch;
-        # the package is no-arch (PHP/XML), so it serves every arch tree of
-        # its major.
+        # One build per OPNsense SERIES, on its plugins branch: plugins.mk
+        # stamps product_abi from the branch, and the branch is where any
+        # series-specific divergence would land. The package is no-arch
+        # (PHP/XML), so it serves every arch tree of its major; the VM's
+        # FreeBSD version never enters the artifact.
         include:
           - { os: 14, plugins_branch: stable/26.1 }
           - { os: 15, plugins_branch: stable/26.7 }
@@ -138,6 +140,9 @@ jobs:
           ci/freebsd-vm.sh run 'find /plugins/net/netflector/work -name "*.pkg"'
           # The package lands in every arch tree of its major, so it must
           # carry the wildcard ABI (PLUGIN_NO_ABI), not the build host's amd64.
+          # The declared abi also keeps pkg create from stamping a
+          # FreeBSD_version annotation, which is why this VM, unlike the
+          # daemon builds, need not run the OPNsense base release.
           ci/freebsd-vm.sh run 'pkg query -F /plugins/net/netflector/work/pkg/*.pkg %q | grep -Fx "FreeBSD:*:*"'
           ci/freebsd-vm.sh pull '/plugins/net/netflector/work/pkg/*.pkg' out/
           ls -l out/

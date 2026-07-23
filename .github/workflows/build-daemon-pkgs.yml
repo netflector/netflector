@@ -2,6 +2,23 @@
 # pkg repository serves. Called by publish-daemon.yml on every port change and by
 # publish-plugin.yml when the tag pins a daemon newer than anything published (a
 # pair publish). One artifact per ABI: daemon-pkg-freebsd-<major>-<arch>.
+#
+# The VMs run the FreeBSD BASE of the OPNsense series each major serves, not the
+# newest point release: pkg stamps every package with the build host's
+# __FreeBSD_version, and pkg on the target rejects anything newer than its own
+# userland. The base releases are pinned in ci/freebsd<major>-opnsense.env; the
+# series each major serves is named by the plugins_branch matrix in
+# publish-plugin.yml and the gate matrix in pkg-deploy.yml; the authoritative
+# base number is __FreeBSD_version in opnsense/src stable/<series>
+# sys/sys/param.h.
+#
+# Policy: we publish for exactly the OPNsense series upstream still maintains.
+# When a new series lands (~Jan/Jul), add its knobs: the pin here (repin via
+# `ci/freebsd-pin.sh <base> opnsense`), the plugins_branch matrix in
+# publish-plugin.yml, the gate matrix in pkg-deploy.yml, and the ABI trees.
+# Retire a series' knobs when upstream ends it; keep-all retention leaves its
+# published packages downloadable. A stale pin cannot ship: the gate installs
+# from the signed tree on real OPNsense and rejects the mismatch.
 name: Build daemon packages
 
 on:
@@ -20,7 +37,7 @@ jobs:
     timeout-minutes: ${{ matrix.arch.kvm && 40 || 360 }}
     env:
       FREEBSD_VM_ARCH: ${{ matrix.arch.name }}
-      FREEBSD_VM_VERSION: ${{ matrix.os }}
+      FREEBSD_VM_VERSION: ${{ matrix.os }}-opnsense
     strategy:
       # A publish is all-or-nothing: one failed ABI cancels the rest, and the
       # deploy tail never runs.
@@ -54,12 +71,21 @@ jobs:
         run: ci/freebsd-vm.sh launch
       - name: Wait for the VM
         run: ci/freebsd-vm.sh wait
+      # Official FreeBSD packages are built on the newest supported release of
+      # the major, so on this older base pkg would refuse the toolchain (git,
+      # rust) as "Newer FreeBSD version". Safe to ignore here: the stamp our
+      # own package gets at `pkg create` comes from the base system, not from
+      # anything installed.
+      - name: Accept toolchain packages newer than the base
+        run: ci/freebsd-vm.sh run 'echo IGNORE_OSVERSION=yes >> /usr/local/etc/pkg.conf'
       - name: Ports tree, pinned to the commit our packages were built from
         run: ci/freebsd-ports-tree.sh
       - name: Build the package
         run: |
           ci/freebsd-vm.sh push dist/freebsd/net/netflector /usr/ports/net/netflector
-          ci/freebsd-vm.sh run 'cd /usr/ports/net/netflector && make package'
+          # The pinned ports tree floors OSVERSION at the newest supported
+          # release and errors out on the EOL base this VM deliberately runs.
+          ci/freebsd-vm.sh run 'cd /usr/ports/net/netflector && make ALLOW_UNSUPPORTED_SYSTEM=yes package'
       - name: Fetch the package
         run: |
           mkdir out
