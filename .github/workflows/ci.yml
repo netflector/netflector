@@ -86,9 +86,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Both pinned majors: 14 is the release baseline, 15 is what OPNsense 26.7 (and soon most
-        # deployments) runs. The daemon's kernel surface (kqueue, BPF, routing) is where majors
-        # actually diverge - FreeBSD 15 dropped the broadcast connect the e2e harness relied on.
+        # Both pinned majors: 14 is the release baseline, 15 is what current OPNsense (and soon
+        # most deployments) runs. The daemon's kernel surface (kqueue, BPF, routing) is where
+        # majors actually diverge - FreeBSD 15 dropped the broadcast connect the e2e harness
+        # relied on.
         os: [14, 15]
         arch:
           - { name: amd64, triple: x86_64-unknown-freebsd, kvm: true, packages: qemu-system-x86 }
