@@ -54,21 +54,39 @@ SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
     -o LogLevel=ERROR -i "$VM_DIR/id_ed25519")
 
 # NoCloud seed for nuageinit(7), the in-base cloud-init shim the
-# BASIC-CLOUDINIT image enables. The root entry appends our key to the
-# existing root user; the sshd_config append permits key-only root login
-# before sshd first starts (FreeBSD's sshd defaults root login off, and sshd
-# takes the first uncommented value -- the stock file has none). The rc.conf.d
-# drop-ins disable the image's first-boot updaters (freebsd-update on 14,
-# pkgbase's firstboot_pkg_upgrade on 15), an unpinned fetch
-# plus reboot that cost 4 minutes per lane. It must be rc.conf.d, NOT
+# BASIC-CLOUDINIT image enables. Whatever the flavor below, the seed does
+# three things: appends our key for root, appends a key-only root login to
+# sshd_config before sshd first starts (FreeBSD's sshd defaults root login
+# off, and sshd takes the first uncommented value -- the stock file has
+# none), and disables the image's first-boot updaters (freebsd-update on 14,
+# pkgbase's firstboot_pkg_upgrade on 15), an unpinned fetch plus reboot that
+# cost 4 minutes per lane. The updater knobs must be rc.conf.d, NOT
 # rc.conf.local: /etc/rc loads the rc.conf files once at boot start and every
 # rc.d script inherits that snapshot (rc.subr _rc_conf_loaded), so a same-boot
 # rc.conf.local write is never re-read; the per-service /etc/rc.conf.d/<name>
 # file is the one rc knob each script sources fresh.
+#
+# Two flavors because nuageinit's abilities flipped at 14.4: the 14.3 one
+# (the OPNsense 26.1 base) has no write_files but executes #! user-data
+# inline in its own early rc stage (BEFORE NETWORKING, ahead of sshd and the
+# updaters), while 14.4+ have write_files and defer #! scripts to rc.local
+# time, far too late for any of the above. Same payload either way.
 seed_iso() {
     printf 'instance-id: netflector-ci\nlocal-hostname: netflector-freebsd\n' \
         > "$VM_DIR/meta-data"
-    cat > "$VM_DIR/user-data" <<EOF
+    if [ "$RELEASE" = 14.3 ]; then
+        seed_script > "$VM_DIR/user-data"
+        # Executed straight off the seed; Rock Ridge carries the exec bit.
+        chmod 755 "$VM_DIR/user-data"
+    else
+        seed_cloud_config > "$VM_DIR/user-data"
+    fi
+    genisoimage -quiet -output "$VM_DIR/seed.iso" -volid cidata -joliet -rock \
+        "$VM_DIR/user-data" "$VM_DIR/meta-data"
+}
+
+seed_cloud_config() {
+    cat <<EOF
 #cloud-config
 users:
   - name: root
@@ -91,15 +109,34 @@ EOF
     # libc at fresh addresses. Pinning layouts restores reuse across the e2e exec storm.
     # KVM does not translate; the amd64 guest stays production-like.
     if [ "$ARCH" = arm64 ]; then
-        cat >> "$VM_DIR/user-data" <<EOF
+        cat <<EOF
   - path: /etc/sysctl.conf.local
     content: |
       kern.elf64.aslr.enable=0
       kern.elf64.aslr.pie_enable=0
 EOF
     fi
-    genisoimage -quiet -output "$VM_DIR/seed.iso" -volid cidata -joliet -rock \
-        "$VM_DIR/user-data" "$VM_DIR/meta-data"
+}
+
+seed_script() {
+    cat <<EOF
+#!/bin/sh
+mkdir -p /root/.ssh
+chmod 700 /root/.ssh
+echo '$(cat "$VM_DIR/id_ed25519.pub")' >> /root/.ssh/authorized_keys
+chmod 600 /root/.ssh/authorized_keys
+echo 'PermitRootLogin prohibit-password' >> /etc/ssh/sshd_config
+echo 'firstboot_freebsd_update_enable="NO"' > /etc/rc.conf.d/firstboot_freebsd_update
+echo 'firstboot_pkg_upgrade_enable="NO"' > /etc/rc.conf.d/firstboot_pkg_upgrade
+EOF
+    # Same ASLR pin as the cloud-config flavor, applied immediately as well:
+    # rc.d/sysctl has already run by the time this script executes.
+    if [ "$ARCH" = arm64 ]; then
+        cat <<EOF
+sysctl kern.elf64.aslr.enable=0 kern.elf64.aslr.pie_enable=0
+printf 'kern.elf64.aslr.enable=0\nkern.elf64.aslr.pie_enable=0\n' >> /etc/sysctl.conf.local
+EOF
+    fi
 }
 
 launch() {
