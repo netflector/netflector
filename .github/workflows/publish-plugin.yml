@@ -74,7 +74,7 @@ jobs:
     needs: [guard, verify-ci, build-daemon]
     if: ${{ !failure() && !cancelled() }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 15
     env:
       FREEBSD_VM_ARCH: amd64
       FREEBSD_VM_VERSION: ${{ matrix.os }}
