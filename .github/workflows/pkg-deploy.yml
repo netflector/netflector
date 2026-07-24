@@ -175,7 +175,7 @@ jobs:
           - { opnsense: '26.7', os: 15, abi: 'FreeBSD:15:amd64' }
     env:
       FREEBSD_VM_ARCH: amd64
-      FREEBSD_VM_VERSION: '${{ matrix.os }}'
+      FREEBSD_VM_VERSION: '${{ matrix.os }}-opnsense'
       FREEBSD_VM_EXTRA_NICS: '2'
     steps:
       - name: Check out repository
