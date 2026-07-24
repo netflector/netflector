@@ -26,7 +26,7 @@ jobs:
   sign:
     name: Place and sign
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 15
     environment: pkg-publish
     env:
       FREEBSD_VM_ARCH: amd64
@@ -164,8 +164,9 @@ jobs:
     needs: sign
     runs-on: ubuntu-24.04
     # opnsense-bootstrap downloads OPNsense's packages plus base and kernel
-    # sets from their mirrors and reboots into them.
-    timeout-minutes: 60
+    # sets from their mirrors and reboots into them: measured at ~2 minutes,
+    # and the whole gate at ~3.
+    timeout-minutes: 30
     strategy:
       fail-fast: true
       matrix:

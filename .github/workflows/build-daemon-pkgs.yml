@@ -31,10 +31,9 @@ jobs:
   package:
     name: Package (freebsd${{ matrix.os }}-${{ matrix.arch.name }})
     runs-on: ubuntu-24.04
-    # KVM lanes take ~7 minutes. The arm64 guests have no KVM on any GitHub
-    # runner, so rustc runs under TCG emulation; the budget is a guess until
-    # the first runs calibrate it.
-    timeout-minutes: ${{ matrix.arch.kvm && 40 || 360 }}
+    # Measured across publish runs: KVM lanes 2-5 minutes, arm64 13-14 (no
+    # GitHub runner offers KVM for aarch64 guests, so rustc runs under TCG).
+    timeout-minutes: ${{ matrix.arch.kvm && 15 || 40 }}
     env:
       FREEBSD_VM_ARCH: ${{ matrix.arch.name }}
       FREEBSD_VM_VERSION: ${{ matrix.os }}-opnsense
