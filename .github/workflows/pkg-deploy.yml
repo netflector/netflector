@@ -277,6 +277,7 @@ jobs:
       - name: Install and exercise the pair
         run: |
           ci/freebsd-vm.sh run 'pkg install -y os-netflector'
+          ci/freebsd-vm.sh run 'php /usr/local/opnsense/scripts/netflector/modelcheck.php'
           ci/freebsd-vm.sh run 'configctl template reload OPNsense/Netflector'
           ci/freebsd-vm.sh run 'test -s /usr/local/etc/netflector.toml'
           ci/freebsd-vm.sh run 'cat /usr/local/etc/netflector.toml'
