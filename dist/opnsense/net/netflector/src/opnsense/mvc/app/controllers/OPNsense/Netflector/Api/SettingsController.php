@@ -73,10 +73,9 @@ class SettingsController extends ApiMutableModelControllerBase
     /**
      * Toggle an entry, validating before the save.
      *
-     * toggleBase() saves with validation disabled, which is fine for most models but not for ours: the
-     * daemon will not run with no reflector at all. Toggling the last one off would persist a config
-     * that can never be applied, and at the next boot the service is left unarmed and the daemon quietly
-     * stops while the GUI still says "Enabled".
+     * toggleBase() saves with validation disabled, which is fine for most models but not for ours:
+     * enabling an entry can collide with an already-active one (same interface pair, overlapping
+     * protocols or devices), and that pair rule lives in the model's validation.
      */
     public function toggleReflectorAction($uuid, $enabled = null)
     {
