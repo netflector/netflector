@@ -7,33 +7,25 @@ counters_interval_secs = {{ OPNsense.Netflector.general.counters_interval_secs|d
 {%     if entry.enabled|default('0') == '1' %}
 
 {#     The GUI stores OPNsense's logical names (lan, opt1); the daemon needs the device (vtnet0). #}
+{#     Every switch is written out, false and "default" included: the file states what the GUI
+       showed, so a later change to a daemon default cannot silently flip a plugin user. Only
+       wol_ports and macs may be absent -- there absence is itself the setting (the daemon's
+       default ports; all devices). #}
 [reflectors.{{ entry.name }}]
 source_if = "{{ physical_interface(entry.source_if) }}"
 target_if = "{{ physical_interface(entry.target_if) }}"
-{%       if entry.wol|default('0') == '1' %}
-wol = true
-{%         if entry.wol_ports %}
+wol = {{ 'true' if entry.wol|default('0') == '1' else 'false' }}
+{%       if entry.wol|default('0') == '1' and entry.wol_ports %}
 wol_ports = [{{ entry.wol_ports.split(',') | join(', ') }}]
-{%         endif %}
 {%       endif %}
-{%       if entry.mdns|default('0') == '1' %}
-mdns = true
-{%       endif %}
-{%       if entry.ssdp|default('0') == '1' %}
-ssdp = true
-{%       endif %}
-{%       if entry.dial|default('0') == '1' %}
-dial = true
-{%       endif %}
-{%       if entry.wsd|default('0') == '1' %}
-wsd = true
-{%       endif %}
+mdns = {{ 'true' if entry.mdns|default('0') == '1' else 'false' }}
+ssdp = {{ 'true' if entry.ssdp|default('0') == '1' else 'false' }}
+dial = {{ 'true' if entry.dial|default('0') == '1' else 'false' }}
+wsd = {{ 'true' if entry.wsd|default('0') == '1' else 'false' }}
 {%       if entry.macs %}
 macs = [{% for mac in entry.macs.split(',') %}"{{ mac }}"{% if not loop.last %}, {% endif %}{% endfor %}]
 {%       endif %}
-{%       if entry.address_family and entry.address_family != 'default' %}
-address_family = "{{ entry.address_family }}"
-{%       endif %}
+address_family = "{{ entry.address_family|default('default') }}"
 {%     endif %}
 {%   endfor %}
 {% endif %}
