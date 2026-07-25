@@ -78,17 +78,10 @@ class Netflector extends BaseModel
             }
         }
 
-        // Switched on with nothing to reflect is a contradiction: the daemon refuses to start with no
-        // reflector at all, so the service is left unarmed and the GUI shows "Enabled" over a daemon
-        // that is quietly not running. Rejecting it here is what makes Save, Apply and Validate agree;
-        // without it, Validate calls this state an error while Apply accepts it without a word.
-        if ((string)$this->general->enabled === '1' && empty($active)) {
-            $messages->appendMessage(new Message(
-                gettext('Enable at least one reflector, or switch Netflector off. It cannot run with nothing to reflect.'),
-                'general.enabled'
-            ));
-        }
-
+        // Nothing enabled is a legal configuration, not an error: the rc.conf.d template arms the
+        // service only when the switch is on AND an entry is on, so Apply stops the daemon and the
+        // status widget reads "disabled". Rejecting it here instead would mean the last reflector
+        // could not be removed without switching the whole service off first.
         return $messages;
     }
 

@@ -55,15 +55,6 @@ def report(status, message):
     print(json.dumps({'status': status, 'message': message}))
 
 
-def service_enabled(cnf):
-    node = cnf
-    for key in ('OPNsense', 'Netflector', 'general', 'enabled'):
-        if not isinstance(node, dict) or key not in node:
-            return False
-        node = node[key]
-    return str(node) == '1'
-
-
 def main():
     with tempfile.TemporaryDirectory() as root:
         conf = config.Config(CONFIG_XML)
@@ -81,12 +72,12 @@ def main():
         with open(candidate) as handle:
             generated = handle.read()
 
-        # Switched off with nothing enabled is not a broken configuration, it is an off one, and the
-        # daemon's "must define at least one reflector" is an alarming way to say so. With the service on
-        # it is a real problem, and worth the daemon's own words, though the model refuses to save that
-        # state so it only arrives here from a restored or hand-edited config.
-        if '[reflectors.' not in generated and not service_enabled(cnf):
-            report('idle', 'Nothing to validate (service is switched off, no enabled reflectors)')
+        # Nothing enabled is an off configuration, not a broken one, whichever way the service switch
+        # points: the template arms the daemon only when both are on, so this state stops it rather
+        # than starting it. Handing the file to the daemon anyway would answer with its "must define
+        # at least one reflector", which reads as a fault when nothing is wrong.
+        if '[reflectors.' not in generated:
+            report('idle', 'Nothing to validate (no enabled reflectors, the service will not run)')
             return
 
         proc = subprocess.run(

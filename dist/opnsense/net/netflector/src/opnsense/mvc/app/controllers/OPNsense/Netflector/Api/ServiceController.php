@@ -29,7 +29,6 @@
 namespace OPNsense\Netflector\Api;
 
 use OPNsense\Base\ApiMutableServiceControllerBase;
-use OPNsense\Base\UserException;
 use OPNsense\Core\Backend;
 use OPNsense\Netflector\Netflector;
 
@@ -41,38 +40,11 @@ class ServiceController extends ApiMutableServiceControllerBase
     protected static $internalServiceName = 'netflector';
 
     /**
-     * Refuse to apply a configuration that is switched on with nothing to reflect.
-     *
-     * The model rejects that state too, but the grid's toggle reaches around it: OPNsense's
-     * toggleBase() saves with `$disable_validation = true`, on purpose, so a toggle is never blocked by
-     * validation. Unchecking the last reflector therefore lands in the saved model regardless, and
-     * without this the GUI would go on showing "Enabled" over a daemon that is quietly not running,
-     * because the daemon cannot start with no reflector at all. Apply is the last gate that sees every
-     * path, so it is where this has to be caught.
-     */
-    public function reconfigureAction()
-    {
-        if ($this->request->isPost() && !$this->serviceEnabled()) {
-            $model = new Netflector();
-            if ((string)$model->general->enabled === '1') {
-                throw new UserException(
-                    gettext(
-                        'Enable at least one reflector, or switch Netflector off. ' .
-                        'It cannot run with nothing to reflect.'
-                    ),
-                    gettext('Netflector')
-                );
-            }
-        }
-
-        return parent::reconfigureAction();
-    }
-
-    /**
      * The base class reads a single model path, but the daemon refuses to start with no reflector to
      * run. "Enabled" therefore has to mean the same thing here as in netflector_enabled() and in the
-     * rc.conf.d template: the service switch is on AND at least one entry is on. Without this override
-     * Apply would try to start a daemon whose generated configuration has no reflectors at all.
+     * rc.conf.d template: the service switch is on AND at least one entry is on. That makes Apply stop
+     * the daemon once the last reflector goes, rather than starting one on a configuration it would
+     * reject, and the status widget reports "disabled" for the same reason.
      */
     protected function serviceEnabled()
     {
