@@ -205,53 +205,7 @@ jobs:
       - name: Wait for the VM
         run: ci/freebsd-vm.sh wait
       - name: Convert the VM to OPNsense ${{ matrix.opnsense }}
-        run: |
-          # Seed /conf/config.xml before the conversion reboot: OPNsense
-          # regenerates root's authorized_keys from it on every boot, so
-          # without this the reboot locks us out.
-          b64=$(base64 < "${FREEBSD_VM_DIR:-$HOME/.freebsd-vm}/id_ed25519.pub" | tr -d '\n')
-          sed "s|__SSH_PUBKEY_B64__|$b64|" \
-            dist/opnsense/net/netflector/test/gate-config.xml > config.xml
-          ci/freebsd-vm.sh run 'mkdir -p /conf'
-          ci/freebsd-vm.sh push config.xml /conf/config.xml
-          # From the series tag, not master: this script is destructive, its
-          # content differs per series, and an unpinned fetch means two runs of
-          # the same tag can convert differently.
-          ci/freebsd-vm.sh run 'fetch -qo /tmp/bootstrap.sh https://raw.githubusercontent.com/opnsense/update/${{ matrix.opnsense }}/src/bootstrap/opnsense-bootstrap.sh.in'
-          # opnsense-bootstrap clears the way with `pkg unlock -ya; pkg delete -fa`,
-          # guarded only by `pkg -N`, and knows nothing about pkgbase. FreeBSD 15
-          # VM images install base as ~500 FreeBSD-* packages, and -f overrides
-          # pkg's vital flag, so on that lane the command deletes the running
-          # userland: FreeBSD-ssh takes /usr/libexec/sshd-session, so the live
-          # sshd accepts TCP and then fatals on every session, and FreeBSD-runtime
-          # takes /bin/rm, so the script dies on its own next line and never
-          # reaches opnsense-update or reboot. FreeBSD 14 images are
-          # installworld-built, base is registered nowhere, and the same command
-          # only reaps the image's couple of ports packages -- which is all this
-          # conversion has ever done on that lane, and the state bootstrap
-          # actually supports. Put a pkgbase guest into it: drop the ports
-          # packages (pkg included, so bootstrap re-bootstraps OPNsense's own),
-          # then remove the database so `pkg -N` fails and the delete is skipped.
-          # Base files stay on disk for OPNsense's base.txz to overwrite.
-          ci/freebsd-vm.sh run '
-            if pkg -N >/dev/null 2>&1 && pkg query %n | grep -qx FreeBSD-runtime; then
-              ports=$(pkg query %n | grep -v "^FreeBSD-") || true
-              if [ -n "$ports" ]; then
-                pkg delete -fy $ports
-              fi
-              rm -rf /var/db/pkg
-              # Upstream guards the delete on `pkg -N` alone; if that ever
-              # changes, fail here rather than losing the base system again.
-              if pkg -N >/dev/null 2>&1; then
-                echo "pkg -N still succeeds; bootstrap would delete the base system" >&2
-                exit 1
-              fi
-            fi
-          '
-          # The conversion ends in a reboot that kills the ssh session.
-          ci/freebsd-vm.sh run 'sh /tmp/bootstrap.sh -y -r ${{ matrix.opnsense }}' || true
-          ci/freebsd-vm.sh wait
-          ci/freebsd-vm.sh run 'opnsense-version'
+        run: ci/freebsd-to-opnsense.sh '${{ matrix.opnsense }}'
       - name: Configure the netflector repository
         run: |
           # Only after the conversion: opnsense-bootstrap wipes /usr/local/etc/pkg.
@@ -270,22 +224,13 @@ jobs:
           EOF
             pkg update -r netflector
           '
-      # The full user journey against the exact pair the tree offers: install
-      # the plugin (its OPNsense dependencies come from their mirrors, the
-      # daemon from ours), let real configd render the configuration, have the
-      # daemon validate it, and start the service on the dummy interfaces.
+      # The exact pair the tree offers, installed the way users install it:
+      # the plugin's OPNsense dependencies come from their mirrors, the daemon
+      # from our signed repo.
       - name: Install and exercise the pair
         run: |
           ci/freebsd-vm.sh run 'pkg install -y os-netflector'
-          ci/freebsd-vm.sh run 'php /usr/local/opnsense/scripts/netflector/modelcheck.php'
-          ci/freebsd-vm.sh run 'configctl template reload OPNsense/Netflector'
-          ci/freebsd-vm.sh run 'test -s /usr/local/etc/netflector.toml'
-          ci/freebsd-vm.sh run 'cat /usr/local/etc/netflector.toml'
-          ci/freebsd-vm.sh run 'netflector --check-config /usr/local/etc/netflector.toml'
-          # No sysrc here: the seeded config.xml arms the service through the
-          # plugin's rc.conf.d template, the same path a user's firewall takes
-          # (and /etc/rc.conf.d overrides rc.conf anyway).
-          ci/freebsd-vm.sh run 'service netflector start && sleep 2 && service netflector status'
+          ci/opnsense-exercise.sh
       - name: Console on failure
         if: failure()
         run: ci/freebsd-vm.sh console
