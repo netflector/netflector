@@ -1,7 +1,9 @@
 PLUGIN_NAME=		netflector
-PLUGIN_VERSION=		0.1.1
+PLUGIN_VERSION=		0.1.2
 PLUGIN_COMMENT=		Reflect link-local service discovery between interfaces
 PLUGIN_MAINTAINER=	sergii@bogomolov.io
+PLUGIN_WWW=			https://github.com/netflector/netflector
+PLUGIN_LICENSE=		BSD2CLAUSE
 PLUGIN_DEPENDS=		netflector
 
 # One package serves every arch tree (PHP/XML only); without this the
