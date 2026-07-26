@@ -25,13 +25,6 @@ permissions:
   contents: read
 
 jobs:
-  # os-release.sh waits for CI before pushing the tag; this is the
-  # authoritative re-check, and it covers tags pushed by hand.
-  verify-ci:
-    permissions:
-      actions: read
-    uses: ./.github/workflows/verify-ci.yml
-
   guard:
     name: Check the tag and decide pairing
     runs-on: ubuntu-24.04
@@ -65,6 +58,13 @@ jobs:
             echo "daemon ${port} is not published; publishing daemon and plugin together"
             echo "pair=true" >> "$GITHUB_OUTPUT"
           fi
+
+  verify-ci:
+    needs: guard
+    uses: ./.github/workflows/ci-opnsense.yml
+    with:
+      # pkg-deploy's gate runs the same journey on the signed artifacts.
+      skip_exercise: true
 
   build-plugin:
     name: Package plugin (freebsd${{ matrix.os }})
@@ -129,21 +129,10 @@ jobs:
             ci/freebsd-vm.sh run 'pkg add https://netflector.github.io/pkg/opnsense/FreeBSD:${{ matrix.os }}:amd64/latest/netflector-${{ needs.guard.outputs.port }}.pkg'
           fi
       - name: Build the plugin package
-        run: |
-          ci/freebsd-vm.sh run 'pkg install -y git'
-          ci/freebsd-vm.sh run 'git clone -q --depth 1 -b ${{ matrix.plugins_branch }} https://github.com/opnsense/plugins /plugins'
-          ci/freebsd-vm.sh push dist/opnsense/net/netflector /plugins/net/netflector
-          ci/freebsd-vm.sh run 'cd /plugins/net/netflector && make package'
+        run: ci/freebsd-plugin-package.sh '${{ matrix.plugins_branch }}'
       - name: Fetch the package
         run: |
           mkdir out
-          ci/freebsd-vm.sh run 'find /plugins/net/netflector/work -name "*.pkg"'
-          # The package lands in every arch tree of its major, so it must
-          # carry the wildcard ABI (PLUGIN_NO_ABI), not the build host's amd64.
-          # The declared abi also keeps pkg create from stamping a
-          # FreeBSD_version annotation, which is why this VM, unlike the
-          # daemon builds, need not run the OPNsense base release.
-          ci/freebsd-vm.sh run 'pkg query -F /plugins/net/netflector/work/pkg/*.pkg %q | grep -Fx "FreeBSD:*:*"'
           ci/freebsd-vm.sh pull '/plugins/net/netflector/work/pkg/*.pkg' out/
           ls -l out/
       - name: Upload

@@ -1,6 +1,11 @@
 # shellcheck shell=sh
-# Shared checks for release.sh and os-release.sh. Sourced, not executed; the
+# Shared checks for release.sh and release-os.sh. Sourced, not executed; the
 # callers run `set -eu` and cd to the repo root first.
+
+# The GitHub owner/repo, for the callers' hand-off messages.
+repo_slug() {
+    git config --get remote.origin.url | sed -e 's#^.*github\.com[:/]##' -e 's#\.git$##'
+}
 
 # Refuse to release from a dirty tree, off main, or out of sync with origin.
 ensure_releasable() {
@@ -29,40 +34,6 @@ ensure_tag_absent() {
         echo "Tag $1 already exists; $2." >&2
         exit 1
     fi
-}
-
-# Gate on CI being green for HEAD before the irreversible tag push -- the tag-triggered workflows
-# re-check this, but only after the tag is pushed, so bring the check forward. ci.yml runs on the
-# push to main; we poll its run for this commit (~30 min ceiling, matching verify-ci.yml). Sets
-# $slug (owner/repo) for the caller's hand-off message.
-wait_for_ci() {
-    if ! command -v gh >/dev/null 2>&1; then
-        echo "gh CLI is required to verify CI before releasing (install it, or push the tag manually)." >&2
-        exit 1
-    fi
-
-    slug=$(git config --get remote.origin.url | sed -e 's#^.*github\.com[:/]##' -e 's#\.git$##')
-    sha=$(git rev-parse HEAD)
-    echo "Waiting for CI (ci.yml) to pass on ${sha}..."
-    ci_ok=
-    i=0
-    while [ "$i" -lt 90 ]; do
-        i=$((i + 1))
-        run=$(gh api "repos/${slug}/actions/workflows/ci.yml/runs?head_sha=${sha}&per_page=1" \
-            --jq '.workflow_runs[0] | "\(.status)|\(.conclusion // "")"' 2>/dev/null || true)
-        case "${run%%|*}" in
-            completed)
-                if [ "${run##*|}" = success ]; then ci_ok=1; break; fi
-                echo "CI concluded '${run##*|}' on ${sha}; not releasing." >&2
-                exit 1
-                ;;
-            "" | null) echo "  no CI run for ${sha} yet; waiting..." ;;
-            *) echo "  CI is '${run%%|*}'; waiting..." ;;
-        esac
-        sleep 20
-    done
-    [ -n "$ci_ok" ] || { echo "Timed out waiting for CI on ${sha}; not releasing." >&2; exit 1; }
-    echo "CI passed on ${sha}."
 }
 
 # confirm_and_push_tag <tag>: ask, then tag and push. A non-interactive run (no stdin) reads EOF

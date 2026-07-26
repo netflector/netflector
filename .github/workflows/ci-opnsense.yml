@@ -1,0 +1,146 @@
+# The plugin exercised the way a user gets it: installed with the daemon on a
+# real converted OPNsense of each supported series. publish-plugin runs this
+# before packaging.
+#
+# One of three path-filtered pipelines that must partition the tree: every PR
+# that keeps all three fires at least one, and each reports the required check
+# "Success" (duplicate names are all-must-pass, proven in PR #103).
+name: OPNsense CI
+
+on:
+  pull_request:
+    paths:
+      - 'dist/opnsense/**'
+      # The pipeline itself: changing it runs it.
+      - '.github/workflows/ci-opnsense.yml'
+      # The OPNsense-base pins and the VM scripts: consumed only here and in
+      # the publish flows.
+      - 'ci/freebsd14-opnsense.env'
+      - 'ci/freebsd15-opnsense.env'
+      - 'ci/freebsd-port-package.sh'
+      - 'ci/freebsd-plugin-package.sh'
+      - 'ci/freebsd-to-opnsense.sh'
+      - 'ci/opnsense-exercise.sh'
+  workflow_call:
+    inputs:
+      # For publish-plugin: pkg-deploy's gate runs the same journey against
+      # the signed artifacts, so the exercise would only duplicate it.
+      skip_exercise:
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint the plugin sources
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install xmllint
+        run: |
+          sudo apt-get update || true
+          sudo apt-get install -y --no-install-recommends libxml2-utils
+      - name: PHP syntax
+        run: find dist/opnsense -name '*.php' -exec php -l {} +
+      - name: Python syntax
+        run: |
+          python3 -m py_compile dist/opnsense/net/netflector/src/opnsense/scripts/netflector/check.py
+          rm -rf dist/opnsense/net/netflector/src/opnsense/scripts/netflector/__pycache__
+      - name: XML well-formed
+        run: find dist/opnsense -name '*.xml' -exec xmllint --noout {} +
+
+  # One VM per series: build the plugin package on stock FreeBSD, then convert
+  # the VM to OPNsense and put the package through the whole user journey. The
+  # daemon is the published package the port pins; when that version is not
+  # published yet (the pair state), it is built from the port instead.
+  exercise:
+    name: Package and exercise on OPNsense ${{ matrix.opnsense }}
+    if: ${{ !inputs.skip_exercise }}
+    runs-on: ubuntu-24.04
+    # Sized for the pair-state daemon build on top of the conversion.
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { opnsense: '26.1', os: 14, plugins_branch: stable/26.1, abi: 'FreeBSD:14:amd64' }
+          - { opnsense: '26.7', os: 15, plugins_branch: stable/26.7, abi: 'FreeBSD:15:amd64' }
+    env:
+      FREEBSD_VM_ARCH: amd64
+      FREEBSD_VM_VERSION: '${{ matrix.os }}-opnsense'
+      FREEBSD_VM_EXTRA_NICS: '2'
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install QEMU
+        run: |
+          sudo apt-get update || true
+          sudo apt-get install -y --no-install-recommends qemu-utils qemu-system-x86 genisoimage
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Launch the FreeBSD VM
+        run: ci/freebsd-vm.sh launch
+      - name: Wait for the VM
+        run: ci/freebsd-vm.sh wait
+      # Official packages are built on a newer release than this EOL OPNsense
+      # base, so pkg refuses them ("Newer FreeBSD version"). Safe to ignore:
+      # the daemon pkg gets its stamp from the base system and the plugin
+      # carries no FreeBSD_version stamp at all.
+      - name: Accept packages newer than the base
+        run: ci/freebsd-vm.sh run 'echo IGNORE_OSVERSION=yes >> /usr/local/etc/pkg.conf'
+      - name: Build the plugin package
+        run: |
+          # The daemon the port pins; kept as a file in /root so the same
+          # package can be re-added after the conversion wipes pkg's world.
+          version=$(sed -n 's/^DISTVERSION=[[:space:]]*//p' dist/freebsd/net/netflector/Makefile)
+          revision=$(sed -n 's/^PORTREVISION=[[:space:]]*//p' dist/freebsd/net/netflector/Makefile)
+          if [ -n "$revision" ] && [ "$revision" != 0 ]; then
+            version="${version}_${revision}"
+          fi
+          url="https://netflector.github.io/pkg/opnsense/${{ matrix.abi }}/latest/netflector-${version}.pkg"
+          if ! ci/freebsd-vm.sh run "fetch -qo /root/netflector.pkg '$url'"; then
+            # Pair state: the pinned version is not published yet. Build it
+            # from the port, the same way build-daemon-pkgs.yml will.
+            echo "daemon ${version} not published; building it from the port"
+            ci/freebsd-port-package.sh
+            ci/freebsd-vm.sh run 'cp /usr/ports/net/netflector/work/pkg/netflector-*.pkg /root/netflector.pkg'
+          fi
+          ci/freebsd-vm.sh run 'pkg add /root/netflector.pkg'
+          ci/freebsd-plugin-package.sh '${{ matrix.plugins_branch }}'
+          ci/freebsd-vm.sh run 'cp /plugins/net/netflector/work/pkg/os-netflector-*.pkg /root/'
+      - name: Convert the VM to OPNsense ${{ matrix.opnsense }}
+        run: ci/freebsd-to-opnsense.sh '${{ matrix.opnsense }}'
+      - name: Install and exercise the plugin
+        run: |
+          ci/freebsd-vm.sh run 'pkg add /root/netflector.pkg'
+          ci/freebsd-vm.sh run 'pkg add /root/os-netflector-*.pkg'
+          ci/opnsense-exercise.sh
+      - name: Console on failure
+        if: failure()
+        run: ci/freebsd-vm.sh console
+
+  # The aggregate the ruleset requires: green only when every job above is.
+  # Without !cancelled() a failed job would skip this one, and a skipped
+  # required check counts as passing.
+  success:
+    name: Success
+    if: ${{ !cancelled() }}
+    needs: [lint, exercise]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Report upstream results
+        run: |
+          echo "Upstream job results: ${{ join(needs.*.result, ', ') }}"
+      - name: Fail if any required job did not succeed
+        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: |
+          echo "::error::One or more required jobs failed or were cancelled."
+          exit 1

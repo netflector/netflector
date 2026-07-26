@@ -1,63 +1,31 @@
 name: CI
 
+# The code pipeline: everything except the two dist/ subtrees, which have
+# their own pipelines (ci-port.yml, ci-opnsense.yml).
 on:
-  push:
-    branches:
-      - main
   pull_request:
+    paths-ignore:
+      - 'dist/freebsd/**'
+      - 'dist/opnsense/**'
+      # A sibling pipeline fires on each of these instead; the publish flows
+      # consume them too. A PR that deletes a sibling workflow and touches
+      # only ignored paths fires nothing and stays blocked; workflow_dispatch
+      # ci.yml unsticks it.
+      - '.github/workflows/ci-port.yml'
+      - '.github/workflows/ci-opnsense.yml'
+      - 'ci/freebsd14-opnsense.env'
+      - 'ci/freebsd15-opnsense.env'
+      - 'ci/freebsd-port-package.sh'
+      - 'ci/freebsd-plugin-package.sh'
+      - 'ci/freebsd-to-opnsense.sh'
+      - 'ci/opnsense-exercise.sh'
+  workflow_call:
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  # "Rebase and merge" rewrites the committer, so the commit that lands on main gets a fresh SHA even when
-  # its tree (the file snapshot) and parent are identical to the PR head CI already validated -- matching on
-  # the commit SHA therefore never skips. This gate matches on the tree instead: on push only, if a
-  # pull_request CI run already passed for a commit with the same tree, the result is guaranteed identical,
-  # so it skips the heavy jobs below. The gate itself still succeeds, so release.yml's wait for a green
-  # ci.yml run on the commit still holds. A merge rebased onto a moved main (different tree) and direct
-  # pushes to main match no prior tree, so the full suite runs. The gate runs only on push, so pull_request
-  # CI is never delayed by it.
-  gate:
-    name: Gate (skip if this tree already passed CI)
-    if: github.event_name == 'push'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions:
-      actions: read
-      contents: read
-    outputs:
-      run: ${{ steps.decide.outputs.run }}
-    steps:
-      - name: Decide whether the heavy jobs should run
-        id: decide
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          repo="${{ github.repository }}"
-          tree=$(gh api "repos/$repo/git/commits/${{ github.sha }}" --jq '.tree.sha' 2>/dev/null || true)
-          if [ -z "$tree" ]; then
-            echo "Could not resolve the tree for ${{ github.sha }}; running the full suite."
-            echo "run=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          # Distinct head SHAs of recent successful pull_request CI runs, most-recent first (so a just-merged
-          # PR matches on the first iteration). The PR head commit stays fetchable as refs/pull/<n>/head.
-          candidates=$(gh api \
-            "repos/$repo/actions/workflows/ci.yml/runs?status=success&event=pull_request&per_page=50" \
-            --jq '.workflow_runs[].head_sha' 2>/dev/null | awk 'NF && !seen[$0]++' || true)
-          for sha in $candidates; do
-            t=$(gh api "repos/$repo/git/commits/$sha" --jq '.tree.sha' 2>/dev/null || true)
-            if [ -n "$t" ] && [ "$t" = "$tree" ]; then
-              echo "Tree $tree already passed CI via pull-request commit $sha; skipping the heavy jobs."
-              echo "run=false" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-          done
-          echo "No prior passing run for tree $tree; running the full suite."
-          echo "run=true" >> "$GITHUB_OUTPUT"
-
   # FreeBSD shares its BSD platform path (kqueue, BPF, route sockets, getifaddrs) with macOS but needs a
   # real FreeBSD kernel to run -- Docker can't provide one, and qemu-user translates architecture, not OS.
   # So: cross-compile on the runner (rustup std; clang+lld against a sysroot from the official base.txz,
@@ -71,8 +39,6 @@ jobs:
   # Everything fetched is FreeBSD-project-official and hash-pinned.
   freebsd-tests:
     name: Test (freebsd${{ matrix.os }}-${{ matrix.arch.name }}, ${{ matrix.profile.name }})
-    needs: gate
-    if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
@@ -168,8 +134,6 @@ jobs:
   # jails, probes) under TCG; the suite mostly waits on wall-clock timers, so emulation adds little.
   freebsd-native-e2e:
     name: Native e2e (freebsd${{ matrix.os }}-${{ matrix.arch.name }}, ${{ matrix.linkage.name }})
-    needs: gate
-    if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     env:
@@ -261,18 +225,18 @@ jobs:
         if: failure()
         run: ci/freebsd-vm.sh console
 
-  # Build the port the way FreeBSD would, so a broken port is caught here and not by a reviewer (or by
-  # the package cluster, months later). The QA targets are the ones a ports committer runs: portlint,
-  # stage-qa (shebangs, stripping, dependencies) and check-plist (installed-but-unlisted files).
+  # The port built from this commit's source instead of the pinned release
+  # tarball: crates regenerated from the working tree's Cargo.lock, the tarball
+  # packed locally under the name the port expects (hence NO_CHECKSUM; cargo
+  # still checks every crate against Cargo.lock). Packaging QA lives in
+  # ci-port.yml.
   #
   # The ports tree is checked out at the exact commit the installed packages were built from, which every
   # package records in ports_top_git_hash. Chasing a branch instead means the tree's lang/rust can be
   # newer than the rust package, the dependency looks unsatisfied, and the build quietly starts compiling
   # the Rust compiler from source for hours.
-  freebsd-port-build:
-    name: Port builds and runs on FreeBSD ${{ matrix.os }}
-    needs: gate
-    if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
+  freebsd-port-build-src:
+    name: Port builds from this commit on FreeBSD ${{ matrix.os }}
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     env:
@@ -281,14 +245,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # amd64 only (KVM): an arm64 port build would run rustc under TCG (no KVM on any
-        # GitHub runner for aarch64 guests), which a timing experiment put far beyond a
-        # tolerable PR wait -- the same work is ~4 minutes under hardware virt. The publish
-        # workflows own arm64.
+        # amd64 only: arm64 already runs in this PR's FreeBSD test/e2e lanes,
+        # and ci-port.yml builds the port itself on arm64.
         os: [14, 15]
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Regenerate the crate list from this tree's Cargo.lock
+        run: ci/port-sync.py --local
       - name: Install QEMU
         run: |
           sudo apt-get update || true
@@ -304,53 +268,30 @@ jobs:
         run: ci/freebsd-vm.sh wait
       - name: Ports tree, pinned to the commit our packages were built from
         run: ci/freebsd-ports-tree.sh
-      - name: Install the port into the tree
+      - name: Build and install from this commit
         run: |
           ci/freebsd-vm.sh push dist/freebsd/net/netflector /usr/ports/net/netflector
-          # net/Makefile's SUBDIR list is a deliverable of the submission, and portlint checks it.
-          ci/freebsd-vm.sh run 'cd /usr/ports/net && awk "/^ *SUBDIR \+= / && !ins && \$3 > \"netflector\" { print \"    SUBDIR += netflector\"; ins = 1 } { print } END { if (!ins) print \"    SUBDIR += netflector\" }" Makefile > Makefile.new && mv Makefile.new Makefile && grep -n "SUBDIR += netflector" Makefile'
-      - name: portlint
+          # DISTFILES lists the cargo crates first and the GH tarball last;
+          # provide this commit under the tarball and WRKSRC names the port expects.
+          distfile=$(ci/freebsd-vm.sh run 'cd /usr/ports/net/netflector && make -V DISTFILES' | tr ' ' '\n' | grep '_GH0' | cut -d: -f1)
+          case "$distfile" in
+            *_GH0.tar.gz) ;;
+            *) echo "unexpected GH distfile: '$distfile'" >&2; exit 1 ;;
+          esac
+          wrksrc=$(ci/freebsd-vm.sh run 'cd /usr/ports/net/netflector && make -V WRKSRC')
+          echo "distfile=${distfile} wrksrc=${wrksrc}"
+          git archive --format=tar.gz --prefix="$(basename "$wrksrc")/" -o "$distfile" HEAD
+          ci/freebsd-vm.sh run 'mkdir -p /usr/ports/distfiles'
+          ci/freebsd-vm.sh push "$distfile" "/usr/ports/distfiles/$distfile"
+          ci/freebsd-vm.sh run 'cd /usr/ports/net/netflector && make NO_CHECKSUM=yes package install'
+      - name: Run the installed binary
         run: |
-          ci/freebsd-vm.sh run 'pkg install -y ports-mgmt/portlint'
-          ci/freebsd-vm.sh run 'cd /usr/ports && git add -f net/netflector net/Makefile'
-          ci/freebsd-vm.sh run 'cd /usr/ports/net/netflector && portlint -AC'
-      - name: Build, and run the QA a ports committer runs
-        run: |
-          ci/freebsd-vm.sh run 'cd /usr/ports/net/netflector && make stage'
-          ci/freebsd-vm.sh run 'cd /usr/ports/net/netflector && make stage-qa'
-          ci/freebsd-vm.sh run 'cd /usr/ports/net/netflector && make check-plist'
-          ci/freebsd-vm.sh run 'cd /usr/ports/net/netflector && make package'
-      - name: Install and run
-        run: |
-          ci/freebsd-vm.sh run 'cd /usr/ports/net/netflector && make install'
           ci/freebsd-vm.sh run '/usr/local/bin/netflector --version'
           # The rc script must refuse a configuration the daemon would reject, rather than launching a
           # service that dies a second later.
           ci/freebsd-vm.sh run 'sysrc netflector_enable=YES'
           ci/freebsd-vm.sh run 'printf "[reflectors.bad]\nsource_if = \"em0\"\ntarget_if = \"em0\"\nmdns = true\n" > /usr/local/etc/netflector.toml'
           ci/freebsd-vm.sh run 'service netflector start 2>&1 | grep -q "refusing to start" && echo "rc refused an invalid configuration"'
-          ci/freebsd-vm.sh run 'rm /usr/local/etc/netflector.toml'
-      # Lint the pages as installed, cross-reference check included: at the default floor
-      # the Xr search is deliberately base-system-only, but -W style (added in mandoc
-      # 1.14.6 for exactly this case) searches the full manpath, which has the port tree.
-      # Order matters: -T lint resets the floor, so -W style must follow it. makewhatis
-      # keeps the port tree's db fresh, else mandoc reports it stale.
-      - name: Lint the installed man pages
-        run: |
-          ci/freebsd-vm.sh run 'makewhatis /usr/local/share/man'
-          ci/freebsd-vm.sh run 'mandoc -T lint -W style /usr/local/share/man/man8/netflector.8.gz /usr/local/share/man/man5/netflector.toml.5.gz'
-      # The port's binary is the one configuration no other lane executes end to end: release
-      # profile, dynamically linked, built by the ports framework from the release tarball. Run
-      # the full native e2e suite against the INSTALLED binary before deinstalling it.
-      - name: Native e2e against the installed port binary
-        run: |
-          ci/freebsd-vm.sh run 'pkg install -y python3'
-          ci/freebsd-vm.sh run 'mkdir -p /root/netflector'
-          ci/freebsd-vm.sh push e2e /root/netflector/
-          ci/freebsd-vm.sh run 'cd /root/netflector && python3 e2e/run.py --backend native --binary /usr/local/bin/netflector'
-      - name: Deinstall
-        run: |
-          ci/freebsd-vm.sh run 'cd /usr/ports/net/netflector && make deinstall'
       - name: Console on failure
         if: failure()
         run: ci/freebsd-vm.sh console
@@ -361,8 +302,6 @@ jobs:
   # --skip-build reuses the image built here.
   valgrind-e2e:
     name: Valgrind e2e
-    needs: gate
-    if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -389,8 +328,6 @@ jobs:
   # release build reuses layers CI built for the same commit. --skip-build reuses the image built here.
   docker-e2e:
     name: Docker e2e (${{ matrix.arch.name }})
-    needs: gate
-    if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
     runs-on: ${{ matrix.arch.runner }}
     timeout-minutes: 20
     strategy:
@@ -426,8 +363,6 @@ jobs:
   # can't (unit-only) and the docker-e2e lanes can't (64-bit images).
   native-e2e:
     name: Native e2e (${{ matrix.target.name }})
-    needs: gate
-    if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
     runs-on: ${{ matrix.target.runner }}
     timeout-minutes: 15
     strategy:
@@ -515,8 +450,6 @@ jobs:
   # be deleted by hand; the lane just makes that possible.
   miri:
     name: Miri (${{ matrix.target }})
-    needs: gate
-    if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     strategy:
@@ -594,8 +527,6 @@ jobs:
   # armel, soft-float, the EN7562 boxes).
   test:
     name: Test (${{ matrix.target.name }}, ${{ matrix.profile.name }})
-    needs: gate
-    if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
     runs-on: ${{ matrix.target.runner }}
     timeout-minutes: 20
     strategy:
@@ -689,8 +620,6 @@ jobs:
   # process-lifetime statics live to exit by design.
   valgrind-test:
     name: Valgrind test
-    needs: gate
-    if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -720,28 +649,6 @@ jobs:
           export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-fds=yes --num-callers=30 --error-exitcode=1'
           sudo --preserve-env=HOME,CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER "$(command -v cargo)" test --locked
 
-  # The FreeBSD port pins every byte it builds from: the release tarball and all 20 crates, each with a
-  # SHA256 in distinfo. If Cargo.lock moves and those are not regenerated, the port either fails to build
-  # (a crate it has never heard of) or builds something other than what we released. Cargo.lock already
-  # carries the SHA256 of every .crate file, so this needs no network and no FreeBSD: it is seconds.
-  #
-  # It compares against the lockfile AT THE TAG the port declares, not the working tree: main's version is
-  # bumped to the next patch the moment a release is cut, so comparing against main would fail forever
-  # after. That is also why this needs the tags (fetch-depth 0).
-  freebsd-port-check:
-    name: Port in sync with Cargo.lock
-    needs: gate
-    if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          fetch-depth: 0
-      - name: Port matches the lockfile of the release it builds
-        run: ci/port-sync.py --check
-
   # clippy + the rustdoc intra-link gate, per supported target. clippy/build/doc only analyze the code active
   # for the *target* platform, so each cfg(target_os) backend must be linted under its own --target. Both are
   # check-only (no link), so every target runs on one Linux runner with just `rustup target add` -- no
@@ -752,8 +659,6 @@ jobs:
   # FreeBSD lane, which covers it.) The Cargo.toml [lints.rustdoc] denies make `cargo doc` the link gate.
   lint:
     name: Lint (${{ matrix.target }})
-    needs: gate
-    if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     strategy:
@@ -791,8 +696,6 @@ jobs:
   # rustfmt is target-independent, so run it once.
   fmt:
     name: Format
-    needs: gate
-    if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -803,8 +706,6 @@ jobs:
 
   man-lint:
     name: Lint (man pages)
-    needs: gate
-    if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -832,16 +733,13 @@ jobs:
             exit 1
           fi
 
-  # A single aggregate status check: green only when every job above is green (or was legitimately skipped
-  # by `gate` because this tree already passed CI). Make THIS the sole required check in branch protection --
-  # then adding, renaming, or removing a job never means editing the required-checks list; its `needs` below
-  # is the one place that set is maintained. `if: !cancelled()` forces it to run even when upstream jobs were
-  # skipped (a skipped dependency would otherwise skip this job too); the failure step then treats only real
-  # failures / cancellations as fatal, so a gate-driven skip still passes.
+  # The pipeline's aggregate, and the shared required check name: green only when
+  # every job above is green. Without `!cancelled()` a failed job would skip this
+  # one, and the ruleset counts a skipped required check as passing.
   success:
     name: Success
     if: ${{ !cancelled() }}
-    needs: [gate, fmt, man-lint, lint, test, freebsd-tests, docker-e2e, native-e2e, freebsd-native-e2e, miri, freebsd-port-check, freebsd-port-build, valgrind-test, valgrind-e2e]
+    needs: [fmt, man-lint, lint, test, freebsd-tests, docker-e2e, native-e2e, freebsd-native-e2e, miri, freebsd-port-build-src, valgrind-test, valgrind-e2e]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
