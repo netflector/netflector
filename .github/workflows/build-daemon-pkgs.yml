@@ -15,7 +15,8 @@
 # Policy: we publish for exactly the OPNsense series upstream still maintains.
 # When a new series lands (~Jan/Jul), add its knobs: the pin here (repin via
 # `ci/freebsd-pin.sh <base> opnsense`), the plugins_branch matrix in
-# publish-plugin.yml, the gate matrix in pkg-deploy.yml, and the ABI trees.
+# publish-plugin.yml, the gate matrix in pkg-deploy.yml, the exercise matrix
+# and pin paths in ci-opnsense.yml, and the ABI trees.
 # Retire a series' knobs when upstream ends it; keep-all retention leaves its
 # published packages downloadable. A stale pin cannot ship: the gate installs
 # from the signed tree on real OPNsense and rejects the mismatch.
@@ -70,21 +71,10 @@ jobs:
         run: ci/freebsd-vm.sh launch
       - name: Wait for the VM
         run: ci/freebsd-vm.sh wait
-      # Official FreeBSD packages are built on the newest supported release of
-      # the major, so on this older base pkg would refuse the toolchain (git,
-      # rust) as "Newer FreeBSD version". Safe to ignore here: the stamp our
-      # own package gets at `pkg create` comes from the base system, not from
-      # anything installed.
-      - name: Accept toolchain packages newer than the base
+      - name: Accept packages newer than the base
         run: ci/freebsd-vm.sh run 'echo IGNORE_OSVERSION=yes >> /usr/local/etc/pkg.conf'
-      - name: Ports tree, pinned to the commit our packages were built from
-        run: ci/freebsd-ports-tree.sh
-      - name: Build the package
-        run: |
-          ci/freebsd-vm.sh push dist/freebsd/net/netflector /usr/ports/net/netflector
-          # The pinned ports tree floors OSVERSION at the newest supported
-          # release and errors out on the EOL base this VM deliberately runs.
-          ci/freebsd-vm.sh run 'cd /usr/ports/net/netflector && make ALLOW_UNSUPPORTED_SYSTEM=yes package'
+      - name: Build the package from the port
+        run: ci/freebsd-port-package.sh
       - name: Fetch the package
         run: |
           mkdir out
