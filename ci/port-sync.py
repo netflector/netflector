@@ -12,6 +12,7 @@ patch the moment a release is cut, and comparing against main would fail forever
 
   ci/port-sync.py --check              verify the port against the tag it declares
   ci/port-sync.py --update 0.13.0      point the port at v0.13.0 and regenerate the hashes
+  ci/port-sync.py --local              crate list from the working tree, for CI's from-source build
 """
 
 import argparse
@@ -160,7 +161,7 @@ def check():
             problems.append(f'distinfo has no SIZE for {name}')
 
     # The tarball's hash cannot be checked here: it is not in Cargo.lock, and GitHub generates that
-    # archive server-side. The freebsd-port-build job verifies it (and every SIZE) by fetching for real.
+    # archive server-side. ci-port.yml's port-build job verifies it (and every SIZE) by fetching for real.
     for name, ver, sha in crates:
         crate = f'rust/crates/{name}-{ver}.crate'
         if crate in hashes and hashes[crate] != sha:
@@ -205,16 +206,36 @@ def update(version):
     return 0
 
 
+def local():
+    """Rewrite CARGO_CRATES from the working tree's Cargo.lock, nothing else.
+
+    For CI's from-source port build only: main's lockfile drifts from the release's between
+    re-pins, and a port building this commit needs this commit's crates. distinfo is left
+    stale on purpose -- that build runs with NO_CHECKSUM, and hashing here would imply a
+    supply-chain property this mode does not have.
+    """
+    lock = (PORT.parent.parent.parent.parent / 'Cargo.lock').read_text()
+    crates = crates_from(lock)
+    makefile = MAKEFILE.read_text()
+    makefile = re.sub(r'^CARGO_CRATES=\t(?:.*\\\n)*.*$', render_crates(crates), makefile, flags=re.M)
+    MAKEFILE.write_text(makefile)
+    print(f'port now lists the working tree\'s {len(crates)} crates (distinfo untouched)')
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument('--check', action='store_true')
     group.add_argument('--update', metavar='VERSION', nargs='?', const='', default=None,
                        help='version to build; defaults to the newest release')
+    group.add_argument('--local', action='store_true')
     args = parser.parse_args()
 
     if args.check:
         return check()
+    if args.local:
+        return local()
 
     version = args.update or latest_release()
     if not args.update:
