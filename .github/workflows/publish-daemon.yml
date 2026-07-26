@@ -1,8 +1,8 @@
 # Publish the daemon package when the port changes. That is the moment the
 # package definition moves: at release-tag time main's port still pins the
 # previous version (the re-pin PR lands after the tag), and PORTREVISION-only
-# bumps must republish too. The paths: filter is safe here because publish is
-# not a required check; the no-path-filters rule guards ci.yml's Success only.
+# bumps must republish too. The paths: filter is safe here: publish is not a
+# required check, so the pipelines' partition rule does not apply.
 name: Publish daemon
 
 on:
@@ -26,14 +26,6 @@ permissions:
   contents: read
 
 jobs:
-  # ci.yml runs on this same push; wait for it. Nothing broken can publish
-  # without this (the port build and the OPNsense gate fail first), but a red
-  # main should not spend hours of VM time finding that out.
-  verify-ci:
-    permissions:
-      actions: read
-    uses: ./.github/workflows/verify-ci.yml
-
   guard:
     name: Skip if this port version is already published
     runs-on: ubuntu-24.04
@@ -60,9 +52,17 @@ jobs:
             echo "publish=true" >> "$GITHUB_OUTPUT"
           fi
 
-  build:
-    needs: [guard, verify-ci]
+  verify-ci:
+    needs: guard
     if: needs.guard.outputs.publish == 'true'
+    uses: ./.github/workflows/ci-port.yml
+    with:
+      # The build half re-validates what the merged PR already ran;
+      # build-daemon-pkgs and the gate cover the artifact.
+      skip_build: true
+
+  build:
+    needs: verify-ci
     uses: ./.github/workflows/build-daemon-pkgs.yml
 
   # If the gate in the tail fails here, the new daemon is incompatible with the

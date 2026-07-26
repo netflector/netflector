@@ -519,20 +519,20 @@ cut a release:
   entry; CI builds `--locked`, so a stale lockfile fails the release), and merge it to `origin/main`.
 - From a clean `main` in sync with `origin/main`, run `./release.sh`.
 
-`./release.sh` does only the local half: it waits for CI (`ci.yml`) to pass on the release commit, prints
-the detected version and asks for confirmation, then tags `v<version>` and pushes it. Pushing the tag
-hands off to the `release.yml` workflow, which does everything else: it re-checks CI and that the tag
-matches `Cargo.toml`, builds the per-arch binaries (Linux amd64/arm64/armv7/armv5, macOS arm64, FreeBSD
+`./release.sh` does only the local half: it prints the detected version and asks for confirmation, then
+tags `v<version>` and pushes it. Pushing the tag hands off to the `release.yml` workflow, which does
+everything else: it runs the full CI pipeline on the tagged commit and checks that the tag matches
+`Cargo.toml`, builds the per-arch binaries (Linux amd64/arm64/armv7/armv5, macOS arm64, FreeBSD
 amd64/arm64), publishes the multi-arch image to GHCR (each arch built on its own runner and stitched
 into one manifest), and creates the GitHub release
-with the binaries and their `SHA256SUMS` attached and generated notes. `release.sh` needs only the GitHub
-CLI (`gh`, authenticated) for its CI check; nothing else runs locally.
+with the binaries and their `SHA256SUMS` attached and generated notes.
 
 The OPNsense plugin releases separately: bump `PLUGIN_VERSION` in
-`dist/opnsense/net/netflector/Makefile`, merge, then run `./os-release.sh` from a clean synced `main`.
+`dist/opnsense/net/netflector/Makefile`, merge, then run `./release-os.sh` from a clean synced `main`.
 It does the same local half and tags `os-v<version>`; the tag hands off to `publish-plugin.yml`, which
-packages the plugin for each supported FreeBSD major (plus the daemon when the version the port pins is
-not yet published) and publishes everything to the [package repository](https://github.com/netflector/pkg).
+runs the OPNsense pipeline on the tagged commit, packages the plugin for each supported FreeBSD major
+(plus the daemon when the version the port pins is not yet published) and publishes everything to the
+[package repository](https://github.com/netflector/pkg).
 
 ## License
 

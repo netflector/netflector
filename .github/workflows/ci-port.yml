@@ -1,0 +1,150 @@
+# The port as shipped: built from the pinned release tarball and QA'd the way
+# a ports committer would. publish-daemon runs this before packaging; code
+# changes are covered by ci.yml's from-source port build.
+#
+# One of three path-filtered pipelines that must partition the tree: every PR
+# that keeps all three fires at least one, and each reports the required check
+# "Success" (duplicate names are all-must-pass, proven in PR #103).
+name: Port CI
+
+on:
+  pull_request:
+    paths:
+      - 'dist/freebsd/**'
+      # The pipeline itself: changing it runs it.
+      - '.github/workflows/ci-port.yml'
+      # --check runs only here; ci.yml exercises just --local.
+      - 'ci/port-sync.py'
+  workflow_call:
+    inputs:
+      # For publish-daemon: build-daemon-pkgs builds the port on every ABI
+      # right after and the gate runs the artifact, so port-build would only
+      # re-validate what the merged PR already ran. port-check still runs.
+      skip_build:
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  # The port pins every crate with a SHA256 in distinfo, and Cargo.lock carries
+  # the same hashes, so the comparison needs no network and no FreeBSD. It runs
+  # against the lockfile AT THE TAG the port declares, not the working tree
+  # (main's version is bumped past the release the moment it is cut) -- hence
+  # fetch-depth 0.
+  port-check:
+    name: Port in sync with Cargo.lock
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - name: Port matches the lockfile of the release it builds
+        run: ci/port-sync.py --check
+
+  port-build:
+    name: Port builds and runs (freebsd${{ matrix.os }}-${{ matrix.arch.name }})
+    if: ${{ !inputs.skip_build }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ matrix.arch.kvm && 25 || 50 }}
+    env:
+      FREEBSD_VM_ARCH: ${{ matrix.arch.name }}
+      FREEBSD_VM_VERSION: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [14, 15]
+        arch:
+          - { name: amd64, kvm: true, packages: qemu-system-x86 }
+          - { name: arm64, kvm: false, packages: qemu-system-arm qemu-efi-aarch64 }
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install QEMU
+        run: |
+          sudo apt-get update || true
+          sudo apt-get install -y --no-install-recommends qemu-utils genisoimage ${{ matrix.arch.packages }}
+      - name: Enable KVM
+        if: matrix.arch.kvm
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Launch the FreeBSD VM
+        run: ci/freebsd-vm.sh launch
+      - name: Wait for the VM
+        run: ci/freebsd-vm.sh wait
+      - name: Ports tree, pinned to the commit our packages were built from
+        run: ci/freebsd-ports-tree.sh
+      - name: Install the port into the tree
+        run: |
+          ci/freebsd-vm.sh push dist/freebsd/net/netflector /usr/ports/net/netflector
+          # net/Makefile's SUBDIR list is a deliverable of the submission, and portlint checks it.
+          ci/freebsd-vm.sh run 'cd /usr/ports/net && awk "/^ *SUBDIR \+= / && !ins && \$3 > \"netflector\" { print \"    SUBDIR += netflector\"; ins = 1 } { print } END { if (!ins) print \"    SUBDIR += netflector\" }" Makefile > Makefile.new && mv Makefile.new Makefile && grep -n "SUBDIR += netflector" Makefile'
+      - name: portlint
+        run: |
+          ci/freebsd-vm.sh run 'pkg install -y ports-mgmt/portlint'
+          ci/freebsd-vm.sh run 'cd /usr/ports && git add -f net/netflector net/Makefile'
+          ci/freebsd-vm.sh run 'cd /usr/ports/net/netflector && portlint -AC'
+      - name: Build, and run the QA a ports committer runs
+        run: |
+          ci/freebsd-vm.sh run 'cd /usr/ports/net/netflector && make stage'
+          ci/freebsd-vm.sh run 'cd /usr/ports/net/netflector && make stage-qa'
+          ci/freebsd-vm.sh run 'cd /usr/ports/net/netflector && make check-plist'
+          ci/freebsd-vm.sh run 'cd /usr/ports/net/netflector && make package'
+      - name: Install and run
+        run: |
+          ci/freebsd-vm.sh run 'cd /usr/ports/net/netflector && make install'
+          ci/freebsd-vm.sh run '/usr/local/bin/netflector --version'
+          # The rc script must refuse a configuration the daemon would reject, rather than launching a
+          # service that dies a second later.
+          ci/freebsd-vm.sh run 'sysrc netflector_enable=YES'
+          ci/freebsd-vm.sh run 'printf "[reflectors.bad]\nsource_if = \"em0\"\ntarget_if = \"em0\"\nmdns = true\n" > /usr/local/etc/netflector.toml'
+          ci/freebsd-vm.sh run 'service netflector start 2>&1 | grep -q "refusing to start" && echo "rc refused an invalid configuration"'
+          ci/freebsd-vm.sh run 'rm /usr/local/etc/netflector.toml'
+      # Lint the pages as installed, cross-reference check included: at the default floor
+      # the Xr search is deliberately base-system-only, but -W style (added in mandoc
+      # 1.14.6 for exactly this case) searches the full manpath, which has the port tree.
+      # Order matters: -T lint resets the floor, so -W style must follow it. makewhatis
+      # keeps the port tree's db fresh, else mandoc reports it stale.
+      - name: Lint the installed man pages
+        run: |
+          ci/freebsd-vm.sh run 'makewhatis /usr/local/share/man'
+          ci/freebsd-vm.sh run 'mandoc -T lint -W style /usr/local/share/man/man8/netflector.8.gz /usr/local/share/man/man5/netflector.toml.5.gz'
+      # The port's binary is the one configuration no other lane executes end to end: release
+      # profile, dynamically linked, built by the ports framework from the release tarball. Run
+      # the full native e2e suite against the INSTALLED binary before deinstalling it.
+      - name: Native e2e against the installed port binary
+        run: |
+          ci/freebsd-vm.sh run 'pkg install -y python3'
+          ci/freebsd-vm.sh run 'mkdir -p /root/netflector'
+          ci/freebsd-vm.sh push e2e /root/netflector/
+          ci/freebsd-vm.sh run 'cd /root/netflector && python3 e2e/run.py --backend native --binary /usr/local/bin/netflector'
+      - name: Deinstall
+        run: |
+          ci/freebsd-vm.sh run 'cd /usr/ports/net/netflector && make deinstall'
+      - name: Console on failure
+        if: failure()
+        run: ci/freebsd-vm.sh console
+
+  # The aggregate the ruleset requires: green only when every job above is.
+  # Without !cancelled() a failed job would skip this one, and a skipped
+  # required check counts as passing.
+  success:
+    name: Success
+    if: ${{ !cancelled() }}
+    needs: [port-check, port-build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Report upstream results
+        run: |
+          echo "Upstream job results: ${{ join(needs.*.result, ', ') }}"
+      - name: Fail if any required job did not succeed
+        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: |
+          echo "::error::One or more required jobs failed or were cancelled."
+          exit 1
