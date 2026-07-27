@@ -137,7 +137,8 @@ impl DirectionContext<'_> {
                 }
             };
             // Learn the device REST base from a response's Application-URL; a later description fetch can
-            // move it, so the latest wins.
+            // move it, so the latest wins. Only the response framer reports that header, so this can't
+            // fire on the client→device side, where the endpoint would be the client's to choose.
             if let Some(AuthorityHeader::ApplicationUrl(ep)) = framed.authority {
                 *self.learned_rest = Some(ep);
             }
@@ -686,6 +687,37 @@ mod tests {
             "the device's Application-URL endpoint is learned for the REST connection"
         );
         assert!(got.ends_with(b"hello"), "body forwarded: {got:?}");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "needs a real socket")]
+    fn forward_dir_never_learns_a_rest_endpoint_from_a_client_request() {
+        let (peer_in, from) = connected_pair();
+        let (to, peer_out) = connected_pair();
+        // The client side must not be able to name the proxy's REST upstream: whatever is learned here
+        // becomes the address every later REST client is spliced to, on the target segment. Pinned at
+        // this layer too, since `learned_rest` is shared by both directions and only the framer's
+        // `Kind` keeps the request side out of it.
+        let device = SocketAddrV4::new(std::net::Ipv4Addr::new(10, 0, 0, 5), 8008);
+        let request = "GET /dd.xml HTTP/1.1\r\nHost: 192.168.1.2:80\r\n\
+             Application-URL: http://192.168.9.9:22/\r\n\r\n";
+        assert!(matches!(
+            peer_in.send(request.as_bytes()).expect("send the request"),
+            IoStatus::Ready(_)
+        ));
+        let rewrite = RewritePolicy {
+            host: Some(device),
+            application_url: None,
+            location: None,
+        };
+        let mut flow = Flow::new(Kind::Request, rewrite);
+        let (got, learned) = drive_forward(&from, &to, &mut flow, &peer_out);
+        assert_eq!(learned, None, "a client cannot name the REST endpoint");
+        assert!(
+            contains(&got, b"Application-URL: http://192.168.9.9:22/\r\n"),
+            "the unrecognized header still reaches the device verbatim: {:?}",
+            String::from_utf8_lossy(&got)
+        );
     }
 
     #[test]

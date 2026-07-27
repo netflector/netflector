@@ -288,7 +288,7 @@ impl HttpFraming {
             self.copy_line(line);
             return Ok(None);
         }
-        if let Some((value_off, found, header)) = rewritable_authority(line) {
+        if let Some((value_off, found, header)) = rewritable_authority(line, self.kind) {
             // Rewrite to wherever the policy points this header, but report the header either way so the
             // owner learns the endpoint it named (it acts on `Application-URL` only).
             if let Some(repl) = self.rewrite.target(header) {
@@ -432,19 +432,30 @@ fn value_has_chunked(value: &[u8]) -> bool {
         .any(|coding| coding.trim_ascii().eq_ignore_ascii_case(b"chunked"))
 }
 
-/// If `line` is a `Host` / `Application-URL` / `Location` header, parse its authority, returning the
-/// value's offset within `line`, the [`Authority`] (the span to rewrite, whose own offset is relative to
-/// that value), and the header it was (carrying the endpoint it named).
-fn rewritable_authority(line: &[u8]) -> Option<(usize, Authority, AuthorityHeader)> {
-    let (value, bare, wrap): (&[u8], bool, fn(SocketAddrV4) -> AuthorityHeader) =
-        if let Some(rest) = strip_prefix_ignore_ascii_case(line, b"Host:") {
-            (rest, true, AuthorityHeader::Host)
-        } else if let Some(rest) = strip_prefix_ignore_ascii_case(line, b"Application-URL:") {
-            (rest, false, AuthorityHeader::ApplicationUrl)
-        } else {
-            let rest = strip_prefix_ignore_ascii_case(line, b"Location:")?;
-            (rest, false, AuthorityHeader::Location)
-        };
+/// If `line` is an authority header of `kind`'s message, parse its authority, returning the value's
+/// offset within `line`, the [`Authority`] (the span to rewrite, whose own offset is relative to that
+/// value), and the header it was (carrying the endpoint it named).
+///
+/// Each header is recognized only on the side that defines it: `Host` on a request, `Application-URL`
+/// and `Location` on a response. A peer that sends one on the wrong side gets it forwarded verbatim
+/// like any other header, never reported. Without that gate a client could send `Application-URL`
+/// and name the endpoint the proxy dials for every later REST request.
+fn rewritable_authority(line: &[u8], kind: Kind) -> Option<(usize, Authority, AuthorityHeader)> {
+    let (value, bare, wrap): (&[u8], bool, fn(SocketAddrV4) -> AuthorityHeader) = match kind {
+        Kind::Request => (
+            strip_prefix_ignore_ascii_case(line, b"Host:")?,
+            true,
+            AuthorityHeader::Host,
+        ),
+        Kind::Response => {
+            if let Some(rest) = strip_prefix_ignore_ascii_case(line, b"Application-URL:") {
+                (rest, false, AuthorityHeader::ApplicationUrl)
+            } else {
+                let rest = strip_prefix_ignore_ascii_case(line, b"Location:")?;
+                (rest, false, AuthorityHeader::Location)
+            }
+        }
+    };
     let trimmed = value.trim_ascii_start();
     let value_off = line.len() - trimmed.len();
     let found = parse_authority(trimmed, bare)?;
@@ -597,6 +608,33 @@ mod tests {
             framed.authority,
             Some(AuthorityHeader::Location(_))
         ));
+    }
+
+    #[test]
+    fn ignores_response_authority_headers_on_a_request() {
+        // A client naming `Application-URL` would otherwise be reported to the owner, which learns it as
+        // the device's REST base and dials it for every later REST client: a relay to any address the
+        // target interface reaches. The request framer recognizes `Host` only, so both lines here are
+        // neither reported nor rewritten, even under a policy that targets every header.
+        let repl: SocketAddrV4 = "10.1.1.5:44747".parse().unwrap();
+        let request = b"GET /dd.xml HTTP/1.1\r\n\
+                         Application-URL: http://192.168.9.9:22/\r\n\
+                         Location: http://192.168.9.9:23/\r\n\r\n";
+        let mut f = HttpFraming::new(Kind::Request, rewrite_all(repl));
+        let framed = f.feed(request).unwrap();
+        assert_eq!(framed.authority, None);
+        assert_eq!(framed.header, request);
+    }
+
+    #[test]
+    fn ignores_a_host_header_on_a_response() {
+        // The mirror of the request-side gate: the device can't steer the proxy's `Host` rewrite target.
+        let repl: SocketAddrV4 = "10.1.1.5:44747".parse().unwrap();
+        let mut f = HttpFraming::new(Kind::Response, rewrite_all(repl));
+        let request = b"HTTP/1.1 200 OK\r\nHost: 192.168.9.9:22\r\nContent-Length: 0\r\n\r\n";
+        let framed = f.feed(request).unwrap();
+        assert_eq!(framed.authority, None);
+        assert_eq!(framed.header, request);
     }
 
     #[test]
