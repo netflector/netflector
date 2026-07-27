@@ -27,7 +27,7 @@ mod multicast;
 mod pair_tests;
 
 pub(crate) use self::counters::{MessageType, Outcome};
-pub(crate) use self::dial_context::DialContext;
+pub(crate) use self::dial_context::{DialContext, DialProxyKey};
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
