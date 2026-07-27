@@ -201,6 +201,21 @@ pub(crate) fn if_index(name: &str) -> Option<u32> {
     (index != 0).then_some(index)
 }
 
+/// The name of interface `index`, or `None` if it names no interface. The reverse of [`if_index`],
+/// so a diagnostic can say `em0` rather than `3`.
+#[cfg(target_os = "freebsd")]
+pub(crate) fn if_name(index: u32) -> Option<String> {
+    let mut buf = [0u8; libc::IF_NAMESIZE];
+    // SAFETY: `buf` is IF_NAMESIZE bytes, the size `if_indextoname` documents it writes into; it
+    // returns NULL on failure without writing.
+    let name = unsafe { libc::if_indextoname(index, buf.as_mut_ptr().cast()) };
+    if name.is_null() {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    std::str::from_utf8(&buf[..end]).ok().map(str::to_owned)
+}
+
 /// Log a single source field's transition at `info`, so the address churn is visible to an operator
 /// and the address-change e2e. Returns whether it changed at all, so the caller acts on exactly the
 /// families that moved. Nothing is logged when the field is unchanged.
