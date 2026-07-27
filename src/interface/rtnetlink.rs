@@ -7,6 +7,7 @@ use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::ptr;
+use std::time::{Duration, Instant};
 
 use libc::{c_int, socklen_t};
 
@@ -16,9 +17,17 @@ use crate::libcex::{
     SockAddrNl, nl_align,
 };
 use crate::net::mac::MacAddr;
+use crate::sys::IoStatus;
 
 /// `IFA_F_*` bits that disqualify an address as a source.
 const IFA_F_UNUSABLE: u32 = libc::IFA_F_TENTATIVE | libc::IFA_F_DEPRECATED | libc::IFA_F_DADFAILED;
+
+/// Bound on one blocking read, and on a whole dump. The kernel builds every chunk inside our own
+/// `sendmsg`/`recvmsg`, so neither is a normal wait: they cap the cases where a reply is dropped
+/// (the socket's `ENOBUFS` state) or another local process feeds us datagrams we discard, either of
+/// which would otherwise park the single-threaded reactor for good.
+const READ_TIMEOUT: Duration = Duration::from_secs(1);
+const DUMP_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Iterator over the `rtattr` TLVs of a message: yields `(attr_type, value)`, stopping at the
 /// first malformed length (as the kernel's own walk does).
@@ -101,13 +110,15 @@ pub(super) fn resolve(if_name: &str, ifindex: u32) -> io::Result<InterfaceAddres
 
 fn netlink_socket() -> io::Result<OwnedFd> {
     // SAFETY: `socket` returns a fresh fd or -1.
-    crate::sys::owned_fd_from(unsafe {
+    let sock = crate::sys::owned_fd_from(unsafe {
         libc::socket(
             libc::AF_NETLINK,
             libc::SOCK_RAW | libc::SOCK_CLOEXEC,
             NETLINK_ROUTE,
         )
-    })
+    })?;
+    crate::sys::set_recv_timeout(sock.as_raw_fd(), READ_TIMEOUT)?;
+    Ok(sock)
 }
 
 /// Send a dump request (`request_type` + `body`) and feed every reply of `reply_type` to
@@ -150,7 +161,13 @@ fn dump<B>(
     // Grows to whatever the largest datagram needs (see the peek below); reused across
     // datagrams, so it reallocates at most a few times over a dump.
     let mut buf: Vec<u8> = Vec::new();
+    let deadline = Instant::now() + DUMP_DEADLINE;
     loop {
+        if Instant::now() >= deadline {
+            return Err(io::Error::other(
+                "the netlink dump did not finish within its deadline",
+            ));
+        }
         // Size the next datagram before reading it: MSG_PEEK leaves it queued while MSG_TRUNC
         // reports its true length. Reading into a zero-length buffer learns the size; an
         // oversized message then grows `buf` rather than being silently truncated.
@@ -163,12 +180,10 @@ fn dump<B>(
                 libc::MSG_PEEK | libc::MSG_TRUNC,
             )
         };
-        if size < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // Infallible: the negative (error) case returned above, and a non-negative `isize`
-        // always fits `usize`.
-        let size = usize::try_from(size).expect("recv count is non-negative");
+        // A blocking read only reports would-block once READ_TIMEOUT expires.
+        let IoStatus::Ready(size) = IoStatus::from_syscall(size)? else {
+            return Err(io::Error::other("the netlink dump went unanswered"));
+        };
         buf.resize(size, 0);
 
         let mut src = SockAddrNl::default();
@@ -186,9 +201,9 @@ fn dump<B>(
                 &raw mut addrlen,
             )
         };
-        if received < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let IoStatus::Ready(received) = IoStatus::from_syscall(received)? else {
+            return Err(io::Error::other("the netlink dump went unanswered"));
+        };
         // Only the kernel (nl_pid == 0) may answer the dump; a local process could unicast a spoofed
         // reply to inject a bogus address. Discard anything else and read the next datagram.
         if src.pid != 0 {
@@ -198,7 +213,6 @@ fn dump<B>(
             );
             continue;
         }
-        let received = usize::try_from(received).expect("recv count is non-negative");
 
         match walk_dump(&buf[..received], reply_type, &mut on_msg) {
             DumpStep::Done => return Ok(()),
