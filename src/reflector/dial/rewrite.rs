@@ -9,7 +9,7 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
-use crate::dispatch::{CaptureKey, DialContext};
+use crate::dispatch::{CaptureKey, DialContext, DialProxyKey};
 use crate::net::ssdp::dial::{
     dial_location_value, is_dial_service_message, parse_cache_control_max_age,
     parse_dial_location_authority,
@@ -81,18 +81,18 @@ pub(crate) fn rewrite_location(
         Duration::from_secs(u64::from(seconds)).min(MAX_DESC_GRACE)
     });
     let desc_grace = Instant::now() + max_age;
-    let desc_addr = if let Some(addr) = ctx.lookup(
-        placement.source_capture,
-        location.endpoint,
-        reactor,
-        desc_grace,
-    ) {
+    let key = DialProxyKey {
+        source: placement.source_capture,
+        target: placement.target_capture,
+        endpoint: location.endpoint,
+    };
+    let desc_addr = if let Some(addr) = ctx.lookup(key, reactor, desc_grace) {
         log::trace!(
             "dial: reusing the proxy for {}; grace refreshed to {max_age:?}",
             location.endpoint
         );
         addr
-    } else if let Some(addr) = mint_proxy(ctx, reactor, placement, location.endpoint, desc_grace) {
+    } else if let Some(addr) = mint_proxy(ctx, reactor, placement, key, desc_grace) {
         addr
     } else {
         return false;
@@ -120,9 +120,10 @@ fn mint_proxy(
     ctx: &mut DialContext,
     reactor: &mut Reactor,
     placement: ProxyPlacement<'_>,
-    endpoint: SocketAddrV4,
+    key: DialProxyKey,
     desc_grace: Instant,
 ) -> Option<SocketAddrV4> {
+    let endpoint = key.endpoint;
     if !ctx.has_capacity(reactor) {
         log::warn!("dial: proxy cap reached; reflecting {endpoint}'s LOCATION unchanged");
         return None;
@@ -145,14 +146,7 @@ fn mint_proxy(
             return None; // the proxy drops, closing both listeners
         }
     };
-    ctx.insert(
-        placement.source_capture,
-        placement.target_capture,
-        endpoint,
-        handler,
-        desc_addr,
-        desc_grace,
-    );
+    ctx.insert(key, handler, desc_addr, desc_grace);
     log::debug!("dial: minted a proxy for {endpoint} via description listener {desc_addr}");
     Some(desc_addr)
 }
@@ -181,6 +175,15 @@ mod tests {
 
     /// The device endpoint `DIAL_ADVERT` resolves to (with [`advert_source`], the `DialContext` key).
     const ADVERT_ENDPOINT: &str = "10.0.0.5:8008";
+
+    /// The key `rewrite_advert`'s proxy is recorded under.
+    fn advert_key(endpoint: SocketAddrV4) -> DialProxyKey {
+        DialProxyKey {
+            source: advert_source(),
+            target: advert_target(),
+            endpoint,
+        }
+    }
 
     /// The source capture `rewrite_advert` keys its proxy under.
     fn advert_source() -> CaptureKey {
@@ -252,13 +255,13 @@ mod tests {
         let endpoint = ADVERT_ENDPOINT.parse().unwrap();
         assert!(rewrite_advert(&mut ctx, &mut reactor, DIAL_ADVERT).is_some());
         let first_grace = ctx
-            .grace_of(advert_source(), endpoint)
+            .grace_of(advert_key(endpoint))
             .expect("a grace was recorded");
         sleep(Duration::from_millis(5)); // let the monotonic clock advance
         // A re-advertisement reuses the proxy but pushes its grace forward.
         assert!(rewrite_advert(&mut ctx, &mut reactor, DIAL_ADVERT).is_some());
         let second_grace = ctx
-            .grace_of(advert_source(), endpoint)
+            .grace_of(advert_key(endpoint))
             .expect("grace still recorded");
         assert!(
             second_grace > first_grace,
@@ -385,7 +388,7 @@ mod tests {
         assert!(rewrite_advert(&mut ctx, &mut reactor, advert).is_some());
         let ceiling = Instant::now() + MAX_DESC_GRACE;
         let grace = ctx
-            .grace_of(advert_source(), ADVERT_ENDPOINT.parse().unwrap())
+            .grace_of(advert_key(ADVERT_ENDPOINT.parse().unwrap()))
             .expect("a grace was recorded");
         assert!(
             grace <= ceiling,

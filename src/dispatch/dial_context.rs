@@ -11,18 +11,26 @@ use super::CaptureKey;
 /// Cap on concurrent minted DIAL proxies (daemon-wide), so a burst of advertised devices can't exhaust
 /// source-side listeners or reactor slots. At the cap a new device's `LOCATION` is reflected unchanged
 /// (visible but unproxied) rather than evicting a live proxy.
+/// Not capped per device: the endpoint comes from the advertisement's own `LOCATION`, so an attacker
+/// names a fresh address per mint and clears any per-identity quota.
 const MAX_DIAL_PROXIES: usize = 64;
 
-/// One minted DIAL description proxy, keyed by `(source, endpoint)`:
-/// - `target`: capture the device connections egress on; a change on either interface evicts the proxy.
+/// What identifies a minted proxy. The target is in the key because two pairs sharing a source both
+/// see this endpoint when their target segments overlap.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct DialProxyKey {
+    pub(crate) source: CaptureKey,
+    pub(crate) target: CaptureKey,
+    pub(crate) endpoint: SocketAddrV4,
+}
+
+/// One minted DIAL description proxy:
 /// - `handler`: the proxy's reactor key; goes stale once the proxy is evicted.
 /// - `desc_addr`: source-side description-listener spliced into the device's `LOCATION`.
 /// - `desc_grace`: eviction deadline, refreshed to each advertisement's `max-age` so a cached
 ///   `LOCATION` keeps resolving while the device is advertised.
 struct DialEntry {
-    source: CaptureKey,
-    target: CaptureKey,
-    endpoint: SocketAddrV4,
+    key: DialProxyKey,
     handler: HandlerKey,
     desc_addr: SocketAddrV4,
     desc_grace: Instant,
@@ -43,26 +51,21 @@ impl DialContext {
         }
     }
 
-    /// The live proxy's description-listener address for `(source, endpoint)`, refreshing its grace to
-    /// `desc_grace` (a re-advertisement extends the device's validity). `None` if none is registered. A
-    /// stale entry, whose proxy was evicted so its [`HandlerKey`] no longer resolves, is pruned and
-    /// treated as absent.
+    /// The live proxy's description-listener address for `key`, refreshing its grace to `desc_grace`
+    /// (a re-advertisement extends the device's validity). `None` if none is registered. A stale entry,
+    /// whose proxy was evicted so its [`HandlerKey`] no longer resolves, is pruned and treated as absent.
     pub(crate) fn lookup(
         &mut self,
-        source: CaptureKey,
-        endpoint: SocketAddrV4,
+        key: DialProxyKey,
         reactor: &Reactor,
         desc_grace: Instant,
     ) -> Option<SocketAddrV4> {
-        let pos = self
-            .proxies
-            .iter()
-            .position(|p| p.source == source && p.endpoint == endpoint)?;
+        let pos = self.proxies.iter().position(|p| p.key == key)?;
         if reactor.is_registered(self.proxies[pos].handler) {
             self.proxies[pos].desc_grace = desc_grace;
             Some(self.proxies[pos].desc_addr)
         } else {
-            log::trace!("dial: pruning the stale proxy entry for {endpoint}");
+            log::trace!("dial: pruning the stale proxy entry for {}", key.endpoint);
             self.proxies.swap_remove(pos);
             None
         }
@@ -74,31 +77,22 @@ impl DialContext {
         self.proxies.len() < MAX_DIAL_PROXIES
     }
 
-    /// Record a freshly-minted proxy and its grace, replacing any prior entry for `(source, endpoint)`
+    /// Record a freshly-minted proxy and its grace, replacing any prior entry for the same key
     /// (a re-mint after the old proxy was evicted).
     pub(crate) fn insert(
         &mut self,
-        source: CaptureKey,
-        target: CaptureKey,
-        endpoint: SocketAddrV4,
+        key: DialProxyKey,
         handler: HandlerKey,
         desc_addr: SocketAddrV4,
         desc_grace: Instant,
     ) {
-        if let Some(entry) = self
-            .proxies
-            .iter_mut()
-            .find(|p| p.source == source && p.endpoint == endpoint)
-        {
-            entry.target = target;
+        if let Some(entry) = self.proxies.iter_mut().find(|p| p.key == key) {
             entry.handler = handler;
             entry.desc_addr = desc_addr;
             entry.desc_grace = desc_grace;
         } else {
             self.proxies.push(DialEntry {
-                source,
-                target,
-                endpoint,
+                key,
                 handler,
                 desc_addr,
                 desc_grace,
@@ -124,11 +118,11 @@ impl DialContext {
         self.proxies.retain(|p| {
             if evict(p) {
                 match reactor.unregister(p.handler) {
-                    Ok(_) => log::debug!("dial: evicted the proxy for {} {reason}", p.endpoint),
+                    Ok(_) => log::debug!("dial: evicted the proxy for {} {reason}", p.key.endpoint),
                     Err(e) => {
                         log::warn!(
                             "dial: evicting the proxy for {} {reason} failed: {e}",
-                            p.endpoint
+                            p.key.endpoint
                         );
                     }
                 }
@@ -155,7 +149,7 @@ impl DialContext {
         reason: &str,
     ) {
         self.evict_where(reactor, reason, |p| {
-            changed.contains(&p.source) || changed.contains(&p.target)
+            changed.contains(&p.key.source) || changed.contains(&p.key.target)
         });
     }
 }
@@ -175,15 +169,11 @@ mod tests {
             self.proxies.iter().map(|p| p.handler).collect()
         }
 
-        /// The recorded grace for `(source, endpoint)`: a seam to assert a re-advertisement refreshed it.
-        pub(crate) fn grace_of(
-            &self,
-            source: CaptureKey,
-            endpoint: SocketAddrV4,
-        ) -> Option<Instant> {
+        /// The recorded grace for `key`: a seam to assert a re-advertisement refreshed it.
+        pub(crate) fn grace_of(&self, key: DialProxyKey) -> Option<Instant> {
             self.proxies
                 .iter()
-                .find(|p| p.source == source && p.endpoint == endpoint)
+                .find(|p| p.key == key)
                 .map(|p| p.desc_grace)
         }
     }
@@ -201,6 +191,14 @@ mod tests {
         SocketAddrV4::new(std::net::Ipv4Addr::new(10, 0, 0, n), 8008)
     }
 
+    fn key(s: u32, t: u32, e: SocketAddrV4) -> DialProxyKey {
+        DialProxyKey {
+            source: CaptureKey(s),
+            target: CaptureKey(t),
+            endpoint: e,
+        }
+    }
+
     #[test]
     #[cfg_attr(all(miri, not(target_os = "linux")), ignore = "needs a real kqueue")]
     fn next_grace_reports_the_soonest_or_none_when_empty() {
@@ -210,23 +208,9 @@ mod tests {
 
         let base = Instant::now();
         let hk1 = reactor.register(Box::new(Dummy));
-        ctx.insert(
-            CaptureKey(0),
-            CaptureKey(1),
-            ep(1),
-            hk1,
-            ep(9),
-            base + Duration::from_secs(10),
-        );
+        ctx.insert(key(0, 1, ep(1)), hk1, ep(9), base + Duration::from_secs(10));
         let hk2 = reactor.register(Box::new(Dummy));
-        ctx.insert(
-            CaptureKey(0),
-            CaptureKey(1),
-            ep(2),
-            hk2,
-            ep(9),
-            base + Duration::from_secs(5),
-        );
+        ctx.insert(key(0, 1, ep(2)), hk2, ep(9), base + Duration::from_secs(5));
         assert_eq!(ctx.next_grace(), Some(base + Duration::from_secs(5)));
     }
 
@@ -237,19 +221,84 @@ mod tests {
         let mut ctx = DialContext::new();
         let hk = reactor.register(Box::new(Dummy));
         let base = Instant::now();
-        ctx.insert(CaptureKey(0), CaptureKey(1), ep(1), hk, ep(9), base);
+        ctx.insert(key(0, 1, ep(1)), hk, ep(9), base);
 
         // Live: found, and its grace is refreshed to the new deadline.
         let refreshed = base + Duration::from_secs(30);
         assert_eq!(
-            ctx.lookup(CaptureKey(0), ep(1), &reactor, refreshed),
+            ctx.lookup(key(0, 1, ep(1)), &reactor, refreshed),
             Some(ep(9))
         );
-        assert_eq!(ctx.grace_of(CaptureKey(0), ep(1)), Some(refreshed));
+        assert_eq!(ctx.grace_of(key(0, 1, ep(1))), Some(refreshed));
 
         // Evicted: the stale entry is pruned and reported absent.
         reactor.unregister(hk).unwrap();
-        assert_eq!(ctx.lookup(CaptureKey(0), ep(1), &reactor, base), None);
+        assert_eq!(ctx.lookup(key(0, 1, ep(1)), &reactor, base), None);
         assert_eq!(ctx.proxy_count(), 0);
+    }
+
+    #[test]
+    #[cfg_attr(all(miri, not(target_os = "linux")), ignore = "needs a real kqueue")]
+    fn lookup_does_not_cross_targets() {
+        // Only reachable when the two target segments carry the same address.
+        let mut reactor = Reactor::new().unwrap();
+        let mut ctx = DialContext::new();
+        let base = Instant::now();
+        let hk = reactor.register(Box::new(Dummy));
+        ctx.insert(key(0, 1, ep(1)), hk, ep(9), base);
+
+        assert_eq!(ctx.lookup(key(0, 1, ep(1)), &reactor, base), Some(ep(9)));
+        assert_eq!(
+            ctx.lookup(key(0, 2, ep(1)), &reactor, base),
+            None,
+            "a different target is a different proxy"
+        );
+    }
+
+    /// Insert a live proxy per index in `which`, each with its own endpoint.
+    fn fill(ctx: &mut DialContext, reactor: &mut Reactor, which: std::ops::Range<usize>) {
+        let grace = Instant::now() + Duration::from_mins(1);
+        for i in which {
+            let hk = reactor.register(Box::new(Dummy));
+            let ep = SocketAddrV4::new(
+                std::net::Ipv4Addr::new(10, 0, 0, u8::try_from(i).unwrap()),
+                8008,
+            );
+            ctx.insert(key(0, 1, ep), hk, ep, grace);
+        }
+    }
+
+    #[test]
+    #[cfg_attr(all(miri, not(target_os = "linux")), ignore = "needs a real kqueue")]
+    fn the_cap_refuses_a_further_mint() {
+        let mut reactor = Reactor::new().unwrap();
+        let mut ctx = DialContext::new();
+        fill(&mut ctx, &mut reactor, 0..MAX_DIAL_PROXIES - 1);
+        assert!(ctx.has_capacity(&reactor));
+
+        fill(
+            &mut ctx,
+            &mut reactor,
+            MAX_DIAL_PROXIES - 1..MAX_DIAL_PROXIES,
+        );
+        assert_eq!(ctx.proxy_count(), MAX_DIAL_PROXIES);
+        assert!(!ctx.has_capacity(&reactor));
+    }
+
+    #[test]
+    #[cfg_attr(all(miri, not(target_os = "linux")), ignore = "needs a real kqueue")]
+    fn capacity_prunes_evicted_entries_before_checking() {
+        let mut reactor = Reactor::new().unwrap();
+        let mut ctx = DialContext::new();
+        fill(&mut ctx, &mut reactor, 0..MAX_DIAL_PROXIES);
+        assert!(!ctx.has_capacity(&reactor));
+
+        reactor.unregister(ctx.handler_keys()[0]).unwrap();
+        assert!(ctx.has_capacity(&reactor));
+        assert_eq!(
+            ctx.proxy_count(),
+            MAX_DIAL_PROXIES - 1,
+            "the dead entry is gone, not merely skipped"
+        );
     }
 }
