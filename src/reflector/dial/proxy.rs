@@ -60,10 +60,11 @@ pub(super) struct DialDeviceProxy {
     /// opens.
     key: Option<HandlerKey>,
     /// The target-interface address device connections bind, so the device sees a same-segment peer
-    /// and replies via the target interface (on the BSDs the bind is the only egress steer).
+    /// and replies via the target interface. The bind picks the source address only; what keeps the
+    /// connection on that segment is `target_iface`.
     target: Ipv4Addr,
-    /// The target interface's name, egress-pinning device connections to that segment (`None` skips
-    /// the pin). The name, not an ifindex: `SO_BINDTODEVICE` wants it directly, and a name stays
+    /// The target interface's name, confining device connections to that segment (`None` skips the
+    /// confinement). The name, not an ifindex: `SO_BINDTODEVICE` wants it directly, and a name stays
     /// valid across an interface recreation where a cached index would not.
     target_iface: Option<String>,
     /// The description listener (source side); its connections proxy to `desc_endpoint`.

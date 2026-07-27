@@ -1,6 +1,7 @@
 //! A non-blocking IPv4 TCP socket for the DIAL application proxy: listen on the source interface,
-//! accept, egress-pinned connect to a device on the target interface, and stream bytes. The reactor
-//! watches its fd; all operations are non-blocking and the socket is close-on-exec.
+//! accept, connect to a device on the target interface, and stream bytes. The reactor watches its
+//! fd; all operations are non-blocking and the socket is close-on-exec. Outbound connections are
+//! confined to the target interface: see [`TcpSocket::connect`].
 
 use std::io;
 use std::mem::MaybeUninit;
@@ -69,25 +70,28 @@ impl TcpSocket {
         }))
     }
 
-    /// Open a connection to `dst`, egress-pinned to the target interface (`source` address + the
-    /// `iface` name) so the route can't leak onto the wrong segment. Non-blocking: the socket is
+    /// Open a connection to `dst`, confined to the target interface (`source` address + the `iface`
+    /// name) so the route can't leak onto the wrong segment. Non-blocking: the socket is
     /// [`is_connecting`](Self::is_connecting) until a writable edge and [`finish_connect`](Self::finish_connect).
+    ///
+    /// Linux and macOS pin the interface; FreeBSD has no such primitive and checks the route
+    /// instead. The `source` bind confines nothing on its own: `ip_output` picks the interface from
+    /// the destination alone.
     ///
     /// # Errors
     /// Propagates the socket / `setsockopt` / pin / `bind` / `connect` failure (other than the
-    /// in-progress sentinel).
+    /// in-progress sentinel), or, on FreeBSD, a destination that does not route via `iface`.
     pub(crate) fn connect(
         dst: SocketAddrV4,
         source: Ipv4Addr,
         iface: Option<&str>,
     ) -> io::Result<Self> {
+        #[cfg(target_os = "freebsd")]
+        verify_egress(dst, iface)?;
         let fd = open_socket(libc::AF_INET, libc::SOCK_STREAM)?;
         set_nodelay(fd.as_raw_fd())?;
-        // FreeBSD has no egress-pin primitive; the source-address bind below steers egress.
         #[cfg(not(target_os = "freebsd"))]
         pin_egress(fd.as_raw_fd(), iface)?;
-        #[cfg(target_os = "freebsd")]
-        let _ = iface;
         bind_v4(fd.as_raw_fd(), source, 0)?;
         let local_addr = local_addr_v4(fd.as_raw_fd())?;
         let connecting = connect_v4(fd.as_raw_fd(), dst)?;
@@ -309,8 +313,8 @@ fn set_nodelay(fd: RawFd) -> io::Result<()> {
 /// Constrain `fd`'s egress to the interface named `iface` so a route lookup can't leak the connect
 /// onto the wrong segment; `None` skips the pin. Linux uses `SO_BINDTODEVICE` (needs `CAP_NET_RAW`),
 /// which takes the name directly; macOS resolves the name to its current ifindex for `IP_BOUND_IF`,
-/// so the pin follows the name across an interface recreation. FreeBSD has no pin primitive, so the
-/// caller skips it and relies on the source-address bind.
+/// so the pin follows the name across an interface recreation. FreeBSD has no equivalent and checks
+/// the route instead.
 #[cfg(not(target_os = "freebsd"))]
 fn pin_egress(fd: RawFd, iface: Option<&str>) -> io::Result<()> {
     let Some(name) = iface else {
@@ -363,6 +367,31 @@ fn pin_egress(fd: RawFd, iface: Option<&str>) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Refuse a connect whose route would leave by an interface other than `iface`; `None` skips the
+/// check.
+#[cfg(target_os = "freebsd")]
+fn verify_egress(dst: SocketAddrV4, iface: Option<&str>) -> io::Result<()> {
+    let Some(name) = iface else {
+        return Ok(());
+    };
+    let want = crate::interface::if_index(name).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("interface {name} not found"),
+        )
+    })?;
+    let got = super::route_query::egress_ifindex(*dst.ip())?;
+    if got == want {
+        log::trace!("{} is reachable via {name}", dst.ip());
+        return Ok(());
+    }
+    let via = crate::interface::if_name(got).unwrap_or_else(|| format!("interface {got}"));
+    let ip = dst.ip();
+    Err(io::Error::other(format!(
+        "{ip} routes via {via}, not {name}"
+    )))
 }
 
 #[cfg(test)]
