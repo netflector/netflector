@@ -128,6 +128,55 @@ pub(crate) fn set_recv_timeout(fd: RawFd, timeout: std::time::Duration) -> io::R
     Ok(())
 }
 
+/// Raise the open-file soft limit to the hard one: a DIAL proxy costs two listener fds plus two per
+/// proxied connection, and each search session holds a port reservation. Best-effort, and only the
+/// soft limit moves, which needs no privilege.
+pub(crate) fn raise_file_limit() {
+    // SAFETY: an all-zero `rlimit` is a valid value for `getrlimit` to overwrite.
+    let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+    // SAFETY: `&limit` is a valid out-param for the given resource.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } != 0 {
+        log::warn!(
+            "could not read the open-file limit: {}",
+            io::Error::last_os_error()
+        );
+        return;
+    }
+    if limit.rlim_cur >= limit.rlim_max {
+        log::debug!("open-file limit already {}", show_limit(limit.rlim_cur));
+        return;
+    }
+    let raised = libc::rlimit {
+        rlim_cur: limit.rlim_max,
+        rlim_max: limit.rlim_max,
+    };
+    // SAFETY: `&raised` is a valid `rlimit` for the given resource.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const raised) } != 0 {
+        log::warn!(
+            "could not raise the open-file limit from {} to {}: {}",
+            limit.rlim_cur,
+            show_limit(limit.rlim_max),
+            io::Error::last_os_error()
+        );
+        return;
+    }
+    log::debug!(
+        "raised the open-file limit from {} to {}",
+        limit.rlim_cur,
+        show_limit(limit.rlim_max)
+    );
+}
+
+/// An open-file limit for the log: macOS reports an infinite hard limit, and the number for that is
+/// noise.
+fn show_limit(limit: libc::rlim_t) -> String {
+    if limit == libc::RLIM_INFINITY {
+        "unlimited".to_owned()
+    } else {
+        limit.to_string()
+    }
+}
+
 /// Ask the kernel to report a receive-queue overflow (`SO_RERROR`) instead of dropping it silently:
 /// the next `recv` then fails with `ENOBUFS`, so a caller can tell "nothing arrived" from "something
 /// was thrown away". A FreeBSD 13.0+ option; macOS has the same silent drop and no equivalent, and
@@ -427,6 +476,29 @@ mod tests {
         assert_eq!(scope_written_for("fd00::1"), 0);
         assert_eq!(scope_written_for("ff05::c"), 0);
         assert_eq!(scope_written_for("::1"), 0);
+    }
+
+    /// The process's current open-file limits.
+    fn file_limit() -> (libc::rlim_t, libc::rlim_t) {
+        // SAFETY: an all-zero `rlimit` is a valid value for `getrlimit` to overwrite.
+        let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+        // SAFETY: `&limit` is a valid out-param for the given resource.
+        let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) };
+        assert_eq!(rc, 0, "getrlimit failed");
+        (limit.rlim_cur, limit.rlim_max)
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "needs a real getrlimit")]
+    fn raising_the_file_limit_reaches_the_hard_limit() {
+        let (before, hard) = file_limit();
+        raise_file_limit();
+        let (after, _) = file_limit();
+        assert!(
+            after >= before,
+            "the soft limit was lowered: {after} < {before}"
+        );
+        assert_eq!(after, hard, "the soft limit ends at the hard limit");
     }
 
     #[test]

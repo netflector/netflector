@@ -97,6 +97,8 @@ fn reflect(path: Option<&Path>) -> Result<()> {
         log::debug!("loading configuration from NETFLECTOR_* environment only");
     }
 
+    sys::raise_file_limit();
+
     let config = Config::from_sources(toml_text.as_deref(), env)?;
     let count = config.reflectors.len();
     log::info!(
