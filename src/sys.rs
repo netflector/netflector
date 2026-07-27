@@ -95,7 +95,7 @@ pub(crate) fn so_error(fd: RawFd) -> io::Result<c_int> {
 ///
 /// # Errors
 /// Returns the OS error if the option can't be set.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub(crate) fn set_recv_timeout(fd: RawFd, timeout: std::time::Duration) -> io::Result<()> {
     // `tv_usec` is a `suseconds_t`, whose width varies by target: musl deprecates the name and
     // widens it to 64-bit, so the conversion has to be fallible to compile where it is still 32-bit.
@@ -128,12 +128,68 @@ pub(crate) fn set_recv_timeout(fd: RawFd, timeout: std::time::Duration) -> io::R
     Ok(())
 }
 
-/// Best-effort: request a larger `SO_RCVBUF` so a burst can't overflow the kernel receive queue as
-/// easily. The kernel clamps it to its own maximum, and a failure is logged and ignored (the default
-/// buffer still works), so this never fails the caller. Only the BSD route socket needs it (Linux
+/// Ask the kernel to report a receive-queue overflow (`SO_RERROR`) instead of dropping it silently:
+/// the next `recv` then fails with `ENOBUFS`, so a caller can tell "nothing arrived" from "something
+/// was thrown away". A FreeBSD 13.0+ option; macOS has the same silent drop and no equivalent, and
+/// Linux netlink reports overflow already.
+///
+/// # Errors
+/// Returns the OS error if the option can't be set.
+#[cfg(target_os = "freebsd")]
+pub(crate) fn set_recv_error_reporting(fd: RawFd) -> io::Result<()> {
+    let on: c_int = 1;
+    // SAFETY: setsockopt reads `on` (a c_int of the given length) on a valid socket fd.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            crate::libcex::SO_RERROR,
+            (&raw const on).cast(),
+            socklen_of::<c_int>(),
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Best-effort: grow the kernel receive queue to `bytes` so a burst can't overflow it as easily,
+/// leaving an already-larger one alone. `SO_RCVBUF` sets an absolute size, so an operator who raised
+/// the default would otherwise have it silently cut back. Only the BSD route sockets need this (Linux
 /// netlink already defaults to the system max).
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-pub(crate) fn set_recv_buffer(fd: RawFd, bytes: c_int) {
+pub(crate) fn increase_recv_buffer(fd: RawFd, bytes: c_int) {
+    let mut current: c_int = 0;
+    let mut len = socklen_of::<c_int>();
+    // SAFETY: `&current`/`&len` are a valid (value, length) out-pair of `c_int` size for `fd`.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            (&raw mut current).cast::<c_void>(),
+            &raw mut len,
+        )
+    };
+    if rc != 0 {
+        log::warn!(
+            "could not read the socket receive buffer size, requesting {bytes} bytes anyway: {}",
+            io::Error::last_os_error()
+        );
+    } else if current >= bytes {
+        log::trace!(
+            "socket receive buffer already {current} bytes, at or above the {bytes} wanted; leaving it"
+        );
+        return;
+    }
+    set_recv_buffer(fd, bytes);
+}
+
+/// Request `bytes` of receive queue. The kernel clamps it to its own maximum, and a failure is
+/// logged and ignored (the default buffer still works), so this never fails the caller.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn set_recv_buffer(fd: RawFd, bytes: c_int) {
     // SAFETY: setsockopt reads `bytes` (a c_int of the given length) on a valid socket fd.
     let rc = unsafe {
         libc::setsockopt(
