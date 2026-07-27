@@ -89,6 +89,45 @@ pub(crate) fn so_error(fd: RawFd) -> io::Result<c_int> {
     Ok(err)
 }
 
+/// Bound a blocking socket's reads with `SO_RCVTIMEO`: an answer that never arrives then surfaces as
+/// would-block instead of parking the single-threaded reactor forever. Only the synchronous
+/// request/reply sockets need it; everything the reactor polls is non-blocking already.
+///
+/// # Errors
+/// Returns the OS error if the option can't be set.
+#[cfg(target_os = "linux")]
+pub(crate) fn set_recv_timeout(fd: RawFd, timeout: std::time::Duration) -> io::Result<()> {
+    // `tv_usec` is a `suseconds_t`, whose width varies by target: musl deprecates the name and
+    // widens it to 64-bit, so the conversion has to be fallible to compile where it is still 32-bit.
+    // Where it is already 64-bit the conversion can't fail, which is what clippy objects to.
+    #[allow(clippy::unnecessary_fallible_conversions)]
+    let tv_usec = timeout
+        .subsec_micros()
+        .try_into()
+        .expect("a sub-second microsecond count fits tv_usec");
+    let tv = libc::timeval {
+        tv_sec: timeout
+            .as_secs()
+            .try_into()
+            .expect("the timeout's seconds fit tv_sec"),
+        tv_usec,
+    };
+    // SAFETY: setsockopt reads `tv` (a timeval of the given length) on a valid socket fd.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            (&raw const tv).cast(),
+            socklen_of::<libc::timeval>(),
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Best-effort: request a larger `SO_RCVBUF` so a burst can't overflow the kernel receive queue as
 /// easily. The kernel clamps it to its own maximum, and a failure is logged and ignored (the default
 /// buffer still works), so this never fails the caller. Only the BSD route socket needs it (Linux
