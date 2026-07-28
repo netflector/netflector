@@ -155,8 +155,8 @@ jobs:
           name: signed-trees
           path: signed-trees.tar
           if-no-files-found: error
-      - name: Console on failure
-        if: failure()
+      - name: VM console log
+        if: always()
         run: ci/freebsd-vm.sh console
 
   gate:
@@ -231,8 +231,8 @@ jobs:
         run: |
           ci/freebsd-vm.sh run 'pkg install -y os-netflector'
           ci/opnsense-exercise.sh
-      - name: Console on failure
-        if: failure()
+      - name: VM console log
+        if: always()
         run: ci/freebsd-vm.sh console
 
   push:

@@ -259,7 +259,11 @@ pull)
     shift
     pull "$@"
     ;;
-console) cat "$VM_DIR/console.log" ;;
+console)
+    # Dumped unconditionally by the workflows, including on a job the runner cancels, so a run that
+    # never got as far as launching the VM must not fail the step.
+    cat "$VM_DIR/console.log" 2>/dev/null || echo "no console log: the VM was never launched"
+    ;;
 *)
     echo "usage: $0 launch|wait|run CMD|push SRC... DEST|pull SRC DEST|console" >&2
     exit 64

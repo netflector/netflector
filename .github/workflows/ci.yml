@@ -123,7 +123,7 @@ jobs:
           export "${prefix}_RUSTFLAGS=${{ matrix.profile.rustflags }}"
           cargo ${FREEBSD_TOOLCHAIN:-} test --locked --target "$triple" ${{ matrix.profile.flags }}
       - name: VM console log
-        if: failure()
+        if: always()
         run: ci/freebsd-vm.sh console
 
   # The native e2e suite on a real FreeBSD kernel: epair segments, every participant in its own
@@ -222,7 +222,7 @@ jobs:
           ci/freebsd-vm.sh push e2e target/${{ matrix.arch.triple }}/release/netflector /root/netflector/
           ci/freebsd-vm.sh run 'cd /root/netflector && python3 e2e/run.py --backend native --binary ./netflector'
       - name: VM console log
-        if: failure()
+        if: always()
         run: ci/freebsd-vm.sh console
 
   # The port built from this commit's source instead of the pinned release
@@ -292,8 +292,8 @@ jobs:
           ci/freebsd-vm.sh run 'sysrc netflector_enable=YES'
           ci/freebsd-vm.sh run 'printf "[reflectors.bad]\nsource_if = \"em0\"\ntarget_if = \"em0\"\nmdns = true\n" > /usr/local/etc/netflector.toml'
           ci/freebsd-vm.sh run 'service netflector start 2>&1 | grep -q "refusing to start" && echo "rc refused an invalid configuration"'
-      - name: Console on failure
-        if: failure()
+      - name: VM console log
+        if: always()
         run: ci/freebsd-vm.sh console
 
   # The e2e suite with netflector under Valgrind memcheck (the runtime-valgrind image: a glibc release

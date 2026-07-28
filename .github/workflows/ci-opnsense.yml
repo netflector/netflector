@@ -122,8 +122,8 @@ jobs:
           ci/freebsd-vm.sh run 'pkg add /root/netflector.pkg'
           ci/freebsd-vm.sh run 'pkg add /root/os-netflector-*.pkg'
           ci/opnsense-exercise.sh
-      - name: Console on failure
-        if: failure()
+      - name: VM console log
+        if: always()
         run: ci/freebsd-vm.sh console
 
   # The aggregate the ruleset requires: green only when every job above is.
