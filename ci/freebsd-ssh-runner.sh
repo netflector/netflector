@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# cargo target runner for x86_64-unknown-freebsd: cargo hands it the host path
-# of each cross-built test executable plus libtest args; copy the binary into
-# the VM ci/freebsd-vm.sh booted and run it there as root (the privileged
-# tests -- interface pairs, BPF captures, joins -- run instead of skipping).
-# The remote exit status is the runner's, which cargo treats as the test
-# result. cargo runs test binaries serially, so one ssh session at a time.
+# cargo target runner for the <arch>-unknown-freebsd targets: cargo hands it
+# the host path of each cross-built test executable plus libtest args; copy the
+# binary into the VM ci/freebsd-vm.sh booted and run it there as root (the
+# privileged tests -- interface pairs, BPF captures, joins -- run instead of
+# skipping). The remote exit status is the runner's, which cargo treats as the
+# test result. cargo runs test binaries serially, so one ssh session at a time.
 set -euo pipefail
 
 VM_DIR=${FREEBSD_VM_DIR:-$HOME/.freebsd-vm}
