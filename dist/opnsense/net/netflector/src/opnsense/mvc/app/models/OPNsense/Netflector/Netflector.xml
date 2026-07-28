@@ -17,7 +17,6 @@
                     <warn>Warning</warn>
                     <info>Info</info>
                     <debug>Debug</debug>
-                    <trace>Trace</trace>
                 </OptionValues>
             </log_level>
             <carp_depend_on type="VirtualIPField">

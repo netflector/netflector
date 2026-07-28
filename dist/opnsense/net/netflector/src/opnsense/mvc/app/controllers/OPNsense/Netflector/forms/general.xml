@@ -12,7 +12,7 @@
         <id>netflector.general.log_level</id>
         <label>Log level</label>
         <type>dropdown</type>
-        <help><![CDATA[Verbosity of the daemon's log, under Services > Netflector > Log File. Every line is recorded at the same syslog priority, so filter on the level in the message text. "Debug" and "Trace" are noisy and are meant for diagnosing a problem, not for running.]]></help>
+        <help><![CDATA[Verbosity of the daemon's log, under Services > Netflector > Log File. Every line is recorded at the same syslog priority, so filter on the level in the message text. "Debug" is noisy and is meant for diagnosing a problem, not for running.]]></help>
     </field>
     <field>
         <id>netflector.general.carp_depend_on</id>
