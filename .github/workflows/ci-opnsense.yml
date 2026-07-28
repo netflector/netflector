@@ -21,6 +21,10 @@ on:
       - 'ci/freebsd-plugin-package.sh'
       - 'ci/freebsd-to-opnsense.sh'
       - 'ci/opnsense-exercise.sh'
+      # Shared with ci.yml rather than exclusive to this pipeline, so both fire
+      # on it: the 14.3 cloud-init seed and the extra-NIC setup are reached
+      # only under the OPNsense pins, which ci.yml's lanes never use.
+      - 'ci/freebsd-vm.sh'
   workflow_call:
     inputs:
       # For publish-plugin: pkg-deploy's gate runs the same journey against
