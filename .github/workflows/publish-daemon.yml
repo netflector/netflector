@@ -44,7 +44,7 @@ jobs:
             version="${version}_${revision}"
           fi
           git clone -q --depth 1 https://github.com/netflector/pkg pkg-repo
-          if [ -e "pkg-repo/opnsense/FreeBSD:14:amd64/latest/netflector-${version}.pkg" ]; then
+          if [ "$(ci/pkg-published.sh pkg-repo "$version")" = true ]; then
             echo "netflector-${version} is already published; nothing to do."
             echo "publish=false" >> "$GITHUB_OUTPUT"
           else
