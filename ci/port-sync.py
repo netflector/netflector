@@ -199,7 +199,17 @@ def update(version):
     print(f'  {tarball_name(version)}: {len(tarball)} bytes')
 
     makefile = MAKEFILE.read_text()
+    previous = re.search(r'^DISTVERSION=\t(.+)$', makefile, re.M)
     makefile = re.sub(r'^DISTVERSION=\t.+$', f'DISTVERSION=\t{version}', makefile, flags=re.M)
+    # PORTREVISION counts port-only changes against one DISTVERSION, so moving the version
+    # retires it: kept, it would publish netflector-<new>_<n>, claiming a revision of a
+    # version that has only just appeared. Guarded on the version actually moving, because
+    # --update is also how hashes get regenerated at the current version, and that must not
+    # undo a deliberate bump.
+    if previous and previous.group(1).strip() != version:
+        makefile, dropped = re.subn(r'^PORTREVISION=[^\n]*\n', '', makefile, flags=re.M)
+        if dropped:
+            print(f'  dropped PORTREVISION (it counted revisions of {previous.group(1).strip()})')
     makefile = re.sub(r'^CARGO_CRATES=\t(?:.*\\\n)*.*$', render_crates(crates), makefile, flags=re.M)
     MAKEFILE.write_text(makefile)
     DISTINFO.write_text(render_distinfo(crates, sizes, tarball_sha, len(tarball), version))
