@@ -131,8 +131,14 @@ impl HttpFraming {
         let mut header_complete = false;
         let mut authority = None;
         if matches!(self.phase, Phase::Header) {
-            let Some(end) = find_header_end(input) else {
-                if input.len() > MAX_HEADER {
+            // RFC 9112 §2.2: empty lines before a start line belong to no message. Skipped here
+            // rather than in the scan: find_header_end reads a pair of them as a header block's end.
+            while input[pos..].starts_with(CRLF) {
+                pos += CRLF.len();
+            }
+            let rest = &input[pos..];
+            let Some(end) = find_header_end(rest) else {
+                if rest.len() > MAX_HEADER {
                     return Err(FramingError::HeaderTooLong);
                 }
                 return Ok(Framed {
@@ -145,8 +151,8 @@ impl HttpFraming {
             if end > MAX_HEADER {
                 return Err(FramingError::HeaderTooLong);
             }
-            authority = self.scan_and_rewrite_header(&input[..end])?;
-            pos = end;
+            authority = self.scan_and_rewrite_header(&rest[..end])?;
+            pos += end;
             header_complete = true;
         }
         // Forward as much of the body as arrived (a zero-copy slice of `input`), stopping at the message
@@ -518,6 +524,42 @@ mod tests {
             f.header,
             b"GET /apps/YouTube HTTP/1.1\r\nHost: 10.1.3.80:36866\r\n\r\n"
         );
+    }
+
+    #[test]
+    fn refuses_a_head_request_behind_a_leading_empty_line() {
+        // The device ignores the empty line and answers the HEAD, so the proxy must see what it sees.
+        let mut f = HttpFraming::new(Kind::Request, RewritePolicy::NONE);
+        assert_eq!(
+            f.feed(b"\r\nHEAD /dd.xml HTTP/1.1\r\nHost: 10.0.0.1:80\r\n\r\n")
+                .err(),
+            Some(FramingError::UnsupportedMethod)
+        );
+    }
+
+    #[test]
+    fn does_not_forward_leading_empty_lines() {
+        // Normalized away, so the device never has to decide whether to tolerate it.
+        let input = b"\r\n\r\nGET /dd.xml HTTP/1.1\r\nHost: 10.0.0.1:80\r\n\r\n";
+        let mut f = HttpFraming::new(Kind::Request, RewritePolicy::NONE);
+        let framed = f.feed(input).unwrap();
+        assert_eq!(
+            framed.header,
+            b"GET /dd.xml HTTP/1.1\r\nHost: 10.0.0.1:80\r\n\r\n"
+        );
+        assert_eq!(
+            framed.consumed,
+            input.len(),
+            "the skipped bytes are consumed too"
+        );
+    }
+
+    #[test]
+    fn reads_the_status_line_behind_leading_empty_lines() {
+        let mut f = HttpFraming::new(Kind::Response, RewritePolicy::NONE);
+        f.feed(b"\r\n\r\n\r\nHTTP/1.1 204 No Content\r\nContent-Length: 100\r\n\r\n")
+            .unwrap();
+        assert_eq!(f.phase, Phase::Header, "204 is bodyless despite the length");
     }
 
     #[test]
