@@ -91,7 +91,7 @@
     <Netflector>
       <general>
         <enabled>1</enabled>
-        <log_level>info</log_level>
+        <log_level>warn</log_level>
         <counters_interval_secs>60</counters_interval_secs>
       </general>
       <reflectors>
