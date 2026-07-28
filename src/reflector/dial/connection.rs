@@ -15,7 +15,7 @@ use std::net::SocketAddrV4;
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::{Duration, Instant};
 
-use crate::net::http::framing::{AuthorityHeader, HttpFraming, Kind, RewritePolicy};
+use crate::net::http::framing::{HttpFraming, Kind, RewritePolicy};
 use crate::net::stream_buffer::StreamBuffer;
 use crate::net::tcp::TcpSocket;
 use crate::reactor::{Reactor, RegKey};
@@ -137,9 +137,9 @@ impl DirectionContext<'_> {
                 }
             };
             // Learn the device REST base from a response's Application-URL; a later description fetch can
-            // move it, so the latest wins. Only the response framer reports that header, so this can't
+            // move it, so the latest message wins. Only the response framer reports it, so this can't
             // fire on the client→device side, where the endpoint would be the client's to choose.
-            if let Some(AuthorityHeader::ApplicationUrl(ep)) = framed.authority {
+            if let Some(ep) = framed.application_url {
                 *self.learned_rest = Some(ep);
             }
             if framed.consumed == 0 {

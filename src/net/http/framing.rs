@@ -77,15 +77,15 @@ pub(crate) enum FramingError {
 /// One [`feed`](HttpFraming::feed) call's forwardable output: the rewritten `header` (a view into the
 /// framer's scratch, empty while a body streams across feeds), the `body` (a zero-copy slice of the fed
 /// input, possibly empty), and `consumed`, how many fed bytes to drop. `consumed == 0` means an
-/// incomplete header: read more and feed again. `authority` is the authority header this message carried
-/// (with the endpoint it named, *before* the rewrite), reported on the feed that completes the header;
-/// the DIAL proxy acts on `Application-URL` to learn and re-learn the device's REST target. `None` when
-/// the header carried no rewritable authority.
+/// incomplete header: read more and feed again. `application_url` is the device REST base the message's
+/// first `Application-URL` named, *before* the rewrite, reported on the feed that completes the header;
+/// the DIAL proxy dials it and re-learns it from a later description fetch. Only that header is
+/// reported: the others are rewritten per the policy, and nothing dials them.
 pub(crate) struct Framed<'a> {
     pub(crate) header: &'a [u8],
     pub(crate) body: &'a [u8],
     pub(crate) consumed: usize,
-    pub(crate) authority: Option<AuthorityHeader>,
+    pub(crate) application_url: Option<SocketAddrV4>,
 }
 
 /// Per-direction incremental HTTP/1.1 framing with an authority-header rewrite. Buffers only the header
@@ -129,7 +129,7 @@ impl HttpFraming {
     pub(crate) fn feed<'a>(&'a mut self, input: &'a [u8]) -> Result<Framed<'a>, FramingError> {
         let mut pos = 0;
         let mut header_complete = false;
-        let mut authority = None;
+        let mut application_url = None;
         if matches!(self.phase, Phase::Header) {
             // RFC 9112 §2.2: empty lines before a start line belong to no message. Skipped here
             // rather than in the scan: find_header_end reads a pair of them as a header block's end.
@@ -145,13 +145,13 @@ impl HttpFraming {
                     header: &[],
                     body: &[],
                     consumed: 0,
-                    authority: None,
+                    application_url: None,
                 }); // incomplete: read more
             };
             if end > MAX_HEADER {
                 return Err(FramingError::HeaderTooLong);
             }
-            authority = self.scan_and_rewrite_header(&rest[..end])?;
+            application_url = self.scan_and_rewrite_header(&rest[..end])?;
             pos += end;
             header_complete = true;
         }
@@ -227,7 +227,7 @@ impl HttpFraming {
             header: if header_complete { &self.header } else { &[] },
             body: &input[body_start..pos],
             consumed: pos,
-            authority,
+            application_url,
         })
     }
 
@@ -240,11 +240,11 @@ impl HttpFraming {
     fn scan_and_rewrite_header(
         &mut self,
         block: &[u8],
-    ) -> Result<Option<AuthorityHeader>, FramingError> {
+    ) -> Result<Option<SocketAddrV4>, FramingError> {
         self.header.clear();
         let mut content_length = None;
         let mut chunked = false;
-        let mut authority = None;
+        let mut application_url = None;
         let mut status = 0;
         let mut pos = 0;
         let mut first = true;
@@ -263,10 +263,12 @@ impl HttpFraming {
                 }
                 self.copy_line(line);
                 first = false;
-            } else if let Some(found) =
+            } else if let Some(AuthorityHeader::ApplicationUrl(ep)) =
                 self.inspect_and_emit(line, &mut content_length, &mut chunked)?
             {
-                authority = Some(found);
+                // First wins: a client reads the first of a repeated field (RFC 9110 §5.3), so the
+                // proxy has to dial that same one. Every occurrence is still rewritten above.
+                application_url.get_or_insert(ep);
             }
             pos = line_end + CRLF.len();
         }
@@ -274,7 +276,7 @@ impl HttpFraming {
             return Err(FramingError::ContentLengthWithChunked);
         }
         self.set_body_phase(status, content_length, chunked);
-        Ok(authority)
+        Ok(application_url)
     }
 
     /// Detect the framing headers (`Content-Length` / `Transfer-Encoding`), rewrite a `Host` /
@@ -302,8 +304,8 @@ impl HttpFraming {
             return Ok(None);
         }
         if let Some((value_off, found, header)) = rewritable_authority(line, self.kind) {
-            // Rewrite to wherever the policy points this header, but report the header either way so the
-            // owner learns the endpoint it named (it acts on `Application-URL` only).
+            // Rewrite to wherever the policy points this header, and report it either way: the caller
+            // keeps the first `Application-URL` and discards the rest.
             if let Some(repl) = self.rewrite.target(header) {
                 let auth_start = value_off + found.offset;
                 self.header.extend_from_slice(&line[..auth_start]);
@@ -636,10 +638,8 @@ mod tests {
             .unwrap();
         // The owner learns the device's REST base (to dial it) even as the header is rewritten to the proxy.
         assert_eq!(
-            framed.authority,
-            Some(AuthorityHeader::ApplicationUrl(
-                "10.0.0.7:8008".parse().unwrap()
-            ))
+            framed.application_url,
+            Some("10.0.0.7:8008".parse().unwrap())
         );
         assert_eq!(
             framed.header,
@@ -653,10 +653,55 @@ mod tests {
                 b"HTTP/1.1 201 Created\r\nLocation: http://10.0.0.7:8008/apps/X/run\r\nContent-Length: 0\r\n\r\n",
             )
             .unwrap();
-        assert!(matches!(
-            framed.authority,
-            Some(AuthorityHeader::Location(_))
-        ));
+        // Rewritten per the policy, but never reported: nothing dials a Location.
+        assert_eq!(framed.application_url, None);
+    }
+
+    #[test]
+    fn reports_the_first_application_url_of_a_repeated_field() {
+        // Both lines rewrite to the same listener, so the client cannot tell them apart; it uses the
+        // first, and an appended duplicate must not steer the proxy somewhere else.
+        let repl: SocketAddrV4 = "10.1.1.5:44747".parse().unwrap();
+        let mut f = HttpFraming::new(Kind::Response, rewrite_all(repl));
+        let framed = f
+            .feed(
+                b"HTTP/1.1 200 OK\r\nApplication-URL: http://10.0.0.7:8008/apps\r\nApplication-URL: http://10.0.0.9:9/x\r\nContent-Length: 0\r\n\r\n",
+            )
+            .unwrap();
+        assert_eq!(
+            framed.application_url,
+            Some("10.0.0.7:8008".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn a_trailing_location_does_not_displace_the_application_url() {
+        let repl: SocketAddrV4 = "10.1.1.5:44747".parse().unwrap();
+        let mut f = HttpFraming::new(Kind::Response, rewrite_all(repl));
+        let framed = f
+            .feed(
+                b"HTTP/1.1 200 OK\r\nApplication-URL: http://10.0.0.7:8008/apps\r\nLocation: http://10.0.0.7:8008/apps/X/run\r\nContent-Length: 0\r\n\r\n",
+            )
+            .unwrap();
+        assert_eq!(
+            framed.application_url,
+            Some("10.0.0.7:8008".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn a_leading_location_does_not_hide_a_later_application_url() {
+        let repl: SocketAddrV4 = "10.1.1.5:44747".parse().unwrap();
+        let mut f = HttpFraming::new(Kind::Response, rewrite_all(repl));
+        let framed = f
+            .feed(
+                b"HTTP/1.1 200 OK\r\nLocation: http://10.0.0.7:8008/apps/X/run\r\nApplication-URL: http://10.0.0.7:8008/apps\r\nContent-Length: 0\r\n\r\n",
+            )
+            .unwrap();
+        assert_eq!(
+            framed.application_url,
+            Some("10.0.0.7:8008".parse().unwrap())
+        );
     }
 
     #[test]
@@ -671,7 +716,7 @@ mod tests {
                          Location: http://192.168.9.9:23/\r\n\r\n";
         let mut f = HttpFraming::new(Kind::Request, rewrite_all(repl));
         let framed = f.feed(request).unwrap();
-        assert_eq!(framed.authority, None);
+        assert_eq!(framed.application_url, None);
         assert_eq!(framed.header, request);
     }
 
@@ -682,7 +727,7 @@ mod tests {
         let mut f = HttpFraming::new(Kind::Response, rewrite_all(repl));
         let request = b"HTTP/1.1 200 OK\r\nHost: 192.168.9.9:22\r\nContent-Length: 0\r\n\r\n";
         let framed = f.feed(request).unwrap();
-        assert_eq!(framed.authority, None);
+        assert_eq!(framed.application_url, None);
         assert_eq!(framed.header, request);
     }
 
