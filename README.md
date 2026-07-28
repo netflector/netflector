@@ -278,7 +278,7 @@ describing one `source_if` → `target_if` bridge that enables any combination o
 top-level settings are `log_level`, `debug_memory_interval_secs`, and `counters_interval_secs`:
 
 ```toml
-log_level = "info"                 # optional; one of off | error | warning | info | debug | trace (default: info)
+log_level = "info"                 # optional; one of off | error | warn | info | debug | trace (default: info)
 debug_memory_interval_secs = 0     # optional; seconds between memory (RSS/peak) diagnostic reports; 0 disables (default 0)
 counters_interval_secs = 0         # optional; seconds between per-interface packet-counter summaries; 0 disables (default 0)
 
