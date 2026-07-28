@@ -113,10 +113,11 @@ impl DialDeviceProxy {
     /// is always taken (draining the readiness) even at the shared connection cap, where the client is
     /// then dropped.
     ///
-    /// A failed accept tears the proxy down. `accept` is the only way to drain a pending connection, so
-    /// under `EMFILE` it stays queued and this level-triggered listener re-fires on it without end;
-    /// shedding the proxy stops that and hands its fds back. The device re-mints on its next
-    /// advertisement, as it would after any eviction.
+    /// A failed accept tears the proxy down. `accept` fails only once the connection is stuck in the
+    /// queue -- a client that dies before we reach it arrives as `None` instead -- so under `EMFILE` it
+    /// stays queued and this level-triggered listener re-fires on it without end; shedding the proxy
+    /// stops that and hands its fds back. The device re-mints on its next advertisement, as it would
+    /// after any eviction.
     fn accept_client(
         &self,
         listener: &TcpSocket,
@@ -125,7 +126,7 @@ impl DialDeviceProxy {
     ) -> Option<TcpSocket> {
         let client = match listener.accept() {
             Ok(Some(client)) => client,
-            Ok(None) => return None, // spurious / already taken
+            Ok(None) => return None, // the client died before we reached it, or a spurious readiness
             Err(e) => {
                 log::error!(
                     "dial: accept on the {what} listener failed: {e}; tearing the proxy down, \
