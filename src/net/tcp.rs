@@ -51,12 +51,13 @@ impl TcpSocket {
         self.local_addr
     }
 
-    /// Accept one pending connection, or `None` if none is pending (the listener is non-blocking, and a
-    /// level-triggered reactor re-fires while more wait). The accepted socket is connected,
+    /// Accept one pending connection, or `None` if there is none to take: either nothing is pending
+    /// (the listener is non-blocking, and a level-triggered reactor re-fires while more wait) or the
+    /// connection that was pending died before we reached it. The accepted socket is connected,
     /// non-blocking, close-on-exec, and `TCP_NODELAY`.
     ///
     /// # Errors
-    /// Propagates a non-`WouldBlock` `accept` failure, or the `setsockopt` failure.
+    /// Propagates an `accept` failure that leaves the connection queued, or the `setsockopt` failure.
     pub(crate) fn accept(&self) -> io::Result<Option<Self>> {
         let Some(fd) = accept_fd(self.fd.as_raw_fd())? else {
             return Ok(None);
@@ -260,7 +261,7 @@ fn accept_fd(fd: RawFd) -> io::Result<Option<OwnedFd>> {
     let raw = unsafe { libc::accept(fd, std::ptr::null_mut(), std::ptr::null_mut()) };
     if raw < 0 {
         let err = io::Error::last_os_error();
-        if would_block(&err) {
+        if nothing_to_accept(&err) {
             return Ok(None);
         }
         return Err(err);
@@ -270,6 +271,32 @@ fn accept_fd(fd: RawFd) -> io::Result<Option<OwnedFd>> {
     #[cfg(target_os = "macos")]
     crate::sys::set_cloexec_nonblock(fd.as_raw_fd())?;
     Ok(Some(fd))
+}
+
+/// Whether a failed `accept` leaves nothing to take rather than reporting a failure to take one.
+/// Either nothing was pending (`EAGAIN`), or the connection that was pending is already gone: the
+/// peer aborted after the handshake (`ECONNABORTED`), or an error queued against that one connection
+/// surfaced here. The kernel drops it either way, so there is nothing to retry and the readiness
+/// clears without us; `accept(2)` says to treat these like `EAGAIN`.
+///
+/// Not a catch-all, and the distinction is the point: `EMFILE`/`ENFILE` and friends fail before a
+/// descriptor exists, leaving the connection queued for a level-triggered listener to re-fire on
+/// without end. Those must reach the caller so it can shed the listener instead of spinning on it.
+fn nothing_to_accept(err: &io::Error) -> bool {
+    would_block(err)
+        || matches!(
+            err.raw_os_error(),
+            Some(
+                libc::ECONNABORTED
+                    | libc::EPROTO
+                    | libc::ENETDOWN
+                    | libc::ENETUNREACH
+                    | libc::EHOSTDOWN
+                    | libc::EHOSTUNREACH
+                    | libc::ENOPROTOOPT
+                    | libc::EOPNOTSUPP
+            )
+        )
 }
 
 /// Start a non-blocking connect to `dst`. `true` if it is still in progress (`EINPROGRESS`), `false` if
@@ -504,6 +531,40 @@ mod tests {
         let server = spin(|| listener.accept());
         assert!(nodelay(&client), "the outbound socket sets TCP_NODELAY");
         assert!(nodelay(&server), "the accepted socket sets TCP_NODELAY");
+    }
+
+    #[test]
+    fn nothing_pending_and_a_client_that_died_first_both_read_as_no_connection() {
+        for errno in [
+            libc::EAGAIN,
+            libc::EWOULDBLOCK,
+            libc::ECONNABORTED,
+            libc::EPROTO,
+            libc::ENETDOWN,
+            libc::ENETUNREACH,
+            libc::EHOSTDOWN,
+            libc::EHOSTUNREACH,
+            libc::ENOPROTOOPT,
+            libc::EOPNOTSUPP,
+        ] {
+            assert!(
+                nothing_to_accept(&io::Error::from_raw_os_error(errno)),
+                "errno {errno} leaves no connection to take, so accept reports None"
+            );
+        }
+    }
+
+    #[test]
+    fn an_accept_that_leaves_the_connection_queued_reaches_the_caller() {
+        // Nothing drained the connection on these, so a level-triggered readiness re-fires on it
+        // forever; the caller has to see the error and shed the listener.
+        for errno in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::EINVAL] {
+            assert!(
+                !nothing_to_accept(&io::Error::from_raw_os_error(errno)),
+                "errno {errno} leaves the connection queued and must not be swallowed"
+            );
+        }
+        assert!(!nothing_to_accept(&io::Error::other("not an errno")));
     }
 
     #[test]
