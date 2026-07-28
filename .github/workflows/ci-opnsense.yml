@@ -109,10 +109,13 @@ jobs:
             version="${version}_${revision}"
           fi
           url="https://netflector.github.io/pkg/opnsense/${{ matrix.abi }}/latest/netflector-${version}.pkg"
-          if ! ci/freebsd-vm.sh run "fetch -qo /root/netflector.pkg '$url'"; then
-            # Pair state: the pinned version is not published yet. Build it
-            # from the port, the same way build-daemon-pkgs.yml will.
-            echo "daemon ${version} not published; building it from the port"
+          # PRs always build from the port: this pipeline is the only one that fires on
+          # ci/freebsd-port-package.sh, and once the pinned version is published the fetch
+          # succeeds and the script never runs. A publish prefers the published package and
+          # falls back to the port only in the pair state, as build-daemon-pkgs.yml does.
+          if [ '${{ github.event_name }}' = pull_request ] \
+              || ! ci/freebsd-vm.sh run "fetch -qo /root/netflector.pkg '$url'"; then
+            echo "building the daemon ${version} from the port"
             ci/freebsd-port-package.sh
             ci/freebsd-vm.sh run 'cp /usr/ports/net/netflector/work/pkg/netflector-*.pkg /root/netflector.pkg'
           fi
