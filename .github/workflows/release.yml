@@ -125,8 +125,8 @@ jobs:
         if: contains(matrix.target, 'freebsd')
         env:
           FREEBSD_SYSROOT_ARCH: ${{ matrix.freebsd_arch }}
-          # The shipped static assets link against the oldest supported major, so they run on
-          # every newer release ("14.4 or newer" in the README). This moves when the floor moves.
+          # The oldest supported major, so the static assets reach the widest range of releases.
+          # Which point release that is comes from ci/freebsd14.env.
           FREEBSD_SYSROOT_VERSION: 14
         run: |
           ci/freebsd-sysroot.sh
