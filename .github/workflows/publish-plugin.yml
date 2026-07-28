@@ -141,8 +141,8 @@ jobs:
           name: plugin-pkg-freebsd-${{ matrix.os }}
           path: out/*.pkg
           if-no-files-found: error
-      - name: Console on failure
-        if: failure()
+      - name: VM console log
+        if: always()
         run: ci/freebsd-vm.sh console
 
   build-daemon:
