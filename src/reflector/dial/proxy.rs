@@ -10,7 +10,7 @@
 use std::fmt;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::os::fd::{AsRawFd, RawFd};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::net::tcp::TcpSocket;
 use crate::reactor::{Arena, Handler, HandlerKey, Key, Reactor, ReadyEvent};
@@ -19,6 +19,10 @@ use super::connection::{Connection, Outcome};
 
 /// Cap on concurrent proxied connections (drop-new past it).
 const MAX_CONNECTIONS: usize = 64;
+
+/// How often saturation is reported while it lasts. A source-side host can reach the cap on its own,
+/// so a line per rejected client would hand it the log; silence would hide an outage in progress.
+const CAP_WARN_INTERVAL: Duration = Duration::from_mins(1);
 
 /// A `Copy` handle into the proxy's connection [`Arena`]: a newtype over the arena [`Key`] so it
 /// can't be confused with the reactor's keys. Round-trips through a watched fd's `user_data`: the
@@ -77,6 +81,9 @@ pub(super) struct DialDeviceProxy {
     /// The device's REST endpoint, learned (and re-learned) from a description response's `Application-URL`;
     /// `None` until the first description fetch reveals it. REST connections proxy here.
     rest_endpoint: Option<SocketAddrV4>,
+    /// When saturation was last reported, so it repeats at [`CAP_WARN_INTERVAL`] rather than per
+    /// rejected client.
+    last_cap_warn: Option<Instant>,
     conns: Arena<Connection>,
 }
 
@@ -98,6 +105,7 @@ impl DialDeviceProxy {
             desc_endpoint,
             rest,
             rest_endpoint: None,
+            last_cap_warn: None,
             conns: Arena::new(),
         }
     }
@@ -118,12 +126,11 @@ impl DialDeviceProxy {
     /// stays queued and this level-triggered listener re-fires on it without end; shedding the proxy
     /// stops that and hands its fds back. The device re-mints on its next advertisement, as it would
     /// after any eviction.
-    fn accept_client(
-        &self,
-        listener: &TcpSocket,
-        what: Listener,
-        reactor: &mut Reactor,
-    ) -> Option<TcpSocket> {
+    fn accept_client(&mut self, what: Listener, reactor: &mut Reactor) -> Option<TcpSocket> {
+        let listener = match what {
+            Listener::Description => &self.desc,
+            Listener::Rest => &self.rest,
+        };
         let client = match listener.accept() {
             Ok(Some(client)) => client,
             Ok(None) => return None, // the client died before we reached it, or a spurious readiness
@@ -138,7 +145,17 @@ impl DialDeviceProxy {
             }
         };
         if self.conns.iter().count() >= MAX_CONNECTIONS {
-            log::warn!("dial: connection cap ({MAX_CONNECTIONS}) reached; dropping a new client");
+            let now = Instant::now();
+            if self
+                .last_cap_warn
+                .is_none_or(|t| now - t >= CAP_WARN_INTERVAL)
+            {
+                self.last_cap_warn = Some(now);
+                log::warn!(
+                    "dial: connection cap ({MAX_CONNECTIONS}) reached for {}; dropping new clients",
+                    self.desc_endpoint
+                );
+            }
             return None; // `client` drops here, closing it
         }
         Some(client)
@@ -146,7 +163,7 @@ impl DialDeviceProxy {
 
     /// Accept a client on the description listener and proxy it to the device's description endpoint.
     fn accept_desc(&mut self, reactor: &mut Reactor) {
-        if let Some(client) = self.accept_client(&self.desc, Listener::Description, reactor) {
+        if let Some(client) = self.accept_client(Listener::Description, reactor) {
             self.start_connection(client, self.desc_endpoint, self.desc.local_addr(), reactor);
         }
     }
@@ -155,7 +172,7 @@ impl DialDeviceProxy {
     /// description fetch. A client reaching here before that fetch is dropped (the proxy minted the
     /// listener's address into the description's `Application-URL`, so this is unexpected).
     fn accept_rest(&mut self, reactor: &mut Reactor) {
-        let Some(client) = self.accept_client(&self.rest, Listener::Rest, reactor) else {
+        let Some(client) = self.accept_client(Listener::Rest, reactor) else {
             return;
         };
         let Some(device) = self.rest_endpoint else {
@@ -407,20 +424,16 @@ mod tests {
     #[cfg_attr(miri, ignore = "needs a real poll backend")]
     fn a_failed_accept_sheds_the_proxy() {
         let mut reactor = Reactor::new().expect("reactor");
-        let (proxy, rest_addr) = watched_proxy(&mut reactor);
+        let (mut proxy, rest_addr) = watched_proxy(&mut reactor);
         let key = proxy.own_key();
         assert!(reactor.is_registered(key));
 
         // Accepting on a connected socket fails with EINVAL, standing in for the EMFILE the proxy
         // cannot drain. Either way it must not stay registered and re-firing on a readiness it
         // will never consume.
-        let connected =
+        proxy.rest =
             TcpSocket::connect(rest_addr, Ipv4Addr::LOCALHOST, None).expect("client connect");
-        assert!(
-            proxy
-                .accept_client(&connected, Listener::Rest, &mut reactor)
-                .is_none()
-        );
+        assert!(proxy.accept_client(Listener::Rest, &mut reactor).is_none());
         assert!(
             !reactor.is_registered(key),
             "the proxy unregisters itself rather than spin on a listener it cannot drain"
