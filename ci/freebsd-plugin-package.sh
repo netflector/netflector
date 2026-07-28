@@ -13,6 +13,10 @@ HERE="$(dirname "$0")"
 
 "$HERE"/freebsd-vm.sh run 'pkg install -y git'
 "$HERE"/freebsd-vm.sh run "git clone -q --depth 1 -b $branch https://github.com/opnsense/plugins /plugins"
+# scp -r copies INTO an existing directory, so the day net/netflector lands in
+# opnsense/plugins this push starts nesting ours a level down and make below builds
+# the branch's plugin instead: green, and testing nothing of the change.
+"$HERE"/freebsd-vm.sh run 'rm -rf /plugins/net/netflector'
 "$HERE"/freebsd-vm.sh push dist/opnsense/net/netflector /plugins/net/netflector
 "$HERE"/freebsd-vm.sh run 'cd /plugins/net/netflector && make package'
 "$HERE"/freebsd-vm.sh run 'find /plugins/net/netflector/work -name "*.pkg"'
