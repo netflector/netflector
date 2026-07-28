@@ -28,8 +28,11 @@ cd "$(dirname "$0")"
 [ "$#" -eq 0 ] && set -- test
 
 IMAGE=netflector-devtest
-docker build -q -t "$IMAGE" - >/dev/null <<'DOCKERFILE'
-FROM rust:slim
+rust_version=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+[ -n "$rust_version" ] || { echo "rust-toolchain.toml has no channel" >&2; exit 1; }
+docker build -q -t "$IMAGE" --build-arg RUST_VERSION="$rust_version" - >/dev/null <<'DOCKERFILE'
+ARG RUST_VERSION
+FROM rust:${RUST_VERSION}-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends iproute2 \
     && rm -rf /var/lib/apt/lists/*
