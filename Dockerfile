@@ -6,9 +6,12 @@
 # a layer built on its own arch uses rustc's default toolchain, following upstream defaults
 # where one exists.
 
-# Pin the shared base image by digest: reproducible builds, no drift under the floating tag. Renovate
-# keeps it current. Referenced by both the builder and the valgrind runtime below so they stay in lockstep.
-ARG RUST_IMAGE=docker.io/library/rust:slim@sha256:5c6f46a6e4472ab1ca7ba7d494e6677f2f219ebc02f32025d3986f057635ec9c
+# Pin the shared base image by digest for reproducible builds, with the rustc version in the tag:
+# Renovate re-pins the digest to whatever the tag resolves to, so an unversioned tag lets the image's
+# compiler drift off rust-toolchain.toml while the diff shows only a new hash. Keep this version equal
+# to rust-toolchain.toml's channel. Referenced by both the builder and the valgrind runtime below so
+# they stay in lockstep.
+ARG RUST_IMAGE=docker.io/library/rust:1.97.1-slim@sha256:5c6f46a6e4472ab1ca7ba7d494e6677f2f219ebc02f32025d3986f057635ec9c
 FROM --platform=$BUILDPLATFORM ${RUST_IMAGE} AS builder
 ARG TARGETARCH
 ARG TARGETVARIANT
