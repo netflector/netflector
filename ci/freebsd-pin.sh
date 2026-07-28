@@ -16,16 +16,17 @@ cd "$(dirname "$0")"
 
 [ $# -le 2 ] || { echo "usage: freebsd-pin.sh [release [opnsense]]" >&2; exit 64; }
 
-# The CI pins track current releases and stay on the download CDN. The
-# OPNsense-base pins freeze a release for a whole series and outlive its EOL,
-# when download.freebsd.org drops it; the archive keeps every release forever,
-# byte-identical, so they prefer it (falling back only while a base is too
-# young to have been archived).
+# The CI pins track current releases and stay on the download CDN, which is
+# geo-distributed where the archive is a single US host. The OPNsense-base pins freeze
+# a release for a whole series and outlive its EOL, when download.freebsd.org drops it,
+# so they take the archive unconditionally: it carries every release byte-identical,
+# current ones included, and nothing on the CDN is missing from it (checked 2026-07-28:
+# 27 releases against the CDN's 4, no gaps). There is no fallback to make -- a base too
+# new to be archived fails the checksum fetch below, rather than pinning a CDN URL that
+# expires with the release.
 mirror_for() { # $1 = release, $2 = variant; prints the mirror root
-    local archive="https://archive.freebsd.org/old-releases"
-    if [ "${2:-}" = opnsense ] &&
-            curl -fsIL -o /dev/null "$archive/VM-IMAGES/${1}-RELEASE/amd64/Latest/CHECKSUM.SHA512"; then
-        echo "$archive"
+    if [ "${2:-}" = opnsense ]; then
+        echo "https://archive.freebsd.org/old-releases"
     else
         echo "https://download.freebsd.org/releases"
     fi
