@@ -43,11 +43,11 @@ netflector runs on **Linux, macOS, and FreeBSD**.
 router that bridges the two segments.
 
 **FreeBSD** isn't a Docker target (Docker shares the host's Linux kernel), so each release also ships
-a standalone **static** binary for `amd64` and `arm64`, cross-built against a FreeBSD 14.4 base and
-running on 14.4 or newer.
+a standalone **static** binary for `amd64` and `arm64`, cross-built against the FreeBSD 14 base
+pinned in `ci/freebsd14.env` and running on that release or newer.
 
 CI runs the unit suite on Ubuntu 24.04 (amd64 and arm64, both glibc and the shipped static musl),
-macOS 15, FreeBSD 14.4 and 15.1 (amd64 and arm64, cross-compiled on the runner and executed in QEMU VMs), and
+macOS 15, FreeBSD 14 and 15 (amd64 and arm64, cross-compiled on the runner and executed in QEMU VMs), and
 the cross-compiled `linux/arm/v7` and `linux/arm/v5` builds whose suites run under QEMU, each in both
 debug and release. `clippy` and the rustdoc link gate run per target. The e2e suite runs on the
 Docker backend for both image arches (plus a Valgrind memcheck job) and natively on linux amd64/arm64
