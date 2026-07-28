@@ -52,7 +52,17 @@ sed "s|__SSH_PUBKEY_B64__|$b64|" \
     fi
 '
 
-# The conversion ends in a reboot that kills the ssh session.
+# The conversion ends in a reboot that kills the ssh session, so the exit status says
+# nothing and has to be discarded. opnsense-version is no post-condition either:
+# bootstrap pkg-installs it before the base swap, so it answers happily on a VM that
+# never rebooted. The kernel string is what the swap actually replaces.
+kernel_before=$("$HERE"/freebsd-vm.sh run 'uname -v')
 "$HERE"/freebsd-vm.sh run "sh /tmp/bootstrap.sh -y -r $series" || true
 "$HERE"/freebsd-vm.sh wait
+kernel_after=$("$HERE"/freebsd-vm.sh run 'uname -v')
+if [ "$kernel_after" = "$kernel_before" ]; then
+    echo "opnsense-bootstrap left the kernel at: $kernel_after" >&2
+    echo "it died before the base swap and reboot" >&2
+    exit 1
+fi
 "$HERE"/freebsd-vm.sh run 'opnsense-version'
