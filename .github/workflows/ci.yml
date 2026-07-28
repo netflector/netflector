@@ -19,6 +19,7 @@ on:
       - 'ci/freebsd-plugin-package.sh'
       - 'ci/freebsd-to-opnsense.sh'
       - 'ci/opnsense-exercise.sh'
+      - 'ci/pkg-published.sh'
   workflow_call:
   workflow_dispatch:
 

@@ -25,6 +25,7 @@ on:
       # on it: the 14.3 cloud-init seed and the extra-NIC setup are reached
       # only under the OPNsense pins, which ci.yml's lanes never use.
       - 'ci/freebsd-vm.sh'
+      - 'ci/pkg-published.sh'
   workflow_call:
     inputs:
       # For publish-plugin: pkg-deploy's gate runs the same journey against
@@ -56,6 +57,31 @@ jobs:
           rm -rf dist/opnsense/net/netflector/src/opnsense/scripts/netflector/__pycache__
       - name: XML well-formed
         run: find dist/opnsense -name '*.xml' -exec xmllint --noout {} +
+      # The publish guards read this; nothing else would run it before a publish does.
+      - name: Published-probe answers both ways
+        run: |
+          abis=$(ci/pkg-published.sh --abis)
+          echo "probes:"; echo "$abis" | sed 's/^/  /'
+          # Rebuilt a second way, so a wrong sort or a dropped arch is caught.
+          expected=$(for m in $(ls ci/freebsd*-opnsense.env \
+                                | sed 's|.*freebsd\([0-9]*\)-opnsense\.env|\1|' | sort -n); do
+                       printf 'FreeBSD:%s:amd64\nFreeBSD:%s:aarch64\n' "$m" "$m"
+                     done)
+          [ "$abis" = "$expected" ] \
+            || { echo "::error::probed trees do not match the served pins"; exit 1; }
+
+          probe=$(mktemp -d)
+          [ "$(ci/pkg-published.sh "$probe" 9.9.9)" = false ] \
+            || { echo "::error::empty catalogue reported as published"; exit 1; }
+          while read -r abi; do
+            mkdir -p "$probe/opnsense/$abi/latest"
+            touch "$probe/opnsense/$abi/latest/netflector-9.9.9.pkg"
+          done <<< "$abis"
+          [ "$(ci/pkg-published.sh "$probe" 9.9.9)" = true ] \
+            || { echo "::error::complete catalogue not reported as published"; exit 1; }
+          rm "$probe/opnsense/$(echo "$abis" | tail -1)/latest/netflector-9.9.9.pkg"
+          [ "$(ci/pkg-published.sh "$probe" 9.9.9)" = false ] \
+            || { echo "::error::half-finished publish reported as published"; exit 1; }
 
   # One VM per series: build the plugin package on stock FreeBSD, then convert
   # the VM to OPNsense and put the package through the whole user journey. The

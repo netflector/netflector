@@ -51,7 +51,7 @@ jobs:
           fi
           git clone -q --depth 1 https://github.com/netflector/pkg pkg-repo
           echo "port=${port}" >> "$GITHUB_OUTPUT"
-          if [ -e "pkg-repo/opnsense/FreeBSD:14:amd64/latest/netflector-${port}.pkg" ]; then
+          if [ "$(ci/pkg-published.sh pkg-repo "$port")" = true ]; then
             echo "daemon ${port} is already published; plugin-only publish"
             echo "pair=false" >> "$GITHUB_OUTPUT"
           else
