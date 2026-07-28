@@ -136,7 +136,7 @@ impl From<LogLevel> for LevelFilter {
         match level {
             LogLevel::Off => LevelFilter::Off,
             LogLevel::Error => LevelFilter::Error,
-            LogLevel::Warning => LevelFilter::Warn,
+            LogLevel::Warn => LevelFilter::Warn,
             LogLevel::Info => LevelFilter::Info,
             LogLevel::Debug => LevelFilter::Debug,
             LogLevel::Trace => LevelFilter::Trace,
@@ -180,7 +180,7 @@ mod tests {
     fn log_levels_map_to_filters() {
         assert_eq!(LevelFilter::from(LogLevel::Off), LevelFilter::Off);
         assert_eq!(LevelFilter::from(LogLevel::Error), LevelFilter::Error);
-        assert_eq!(LevelFilter::from(LogLevel::Warning), LevelFilter::Warn);
+        assert_eq!(LevelFilter::from(LogLevel::Warn), LevelFilter::Warn);
         assert_eq!(LevelFilter::from(LogLevel::Info), LevelFilter::Info);
         assert_eq!(LevelFilter::from(LogLevel::Debug), LevelFilter::Debug);
         assert_eq!(LevelFilter::from(LogLevel::Trace), LevelFilter::Trace);

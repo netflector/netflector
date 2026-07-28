@@ -19,7 +19,7 @@ use thiserror::Error;
 pub(crate) enum LogLevel {
     Off,
     Error,
-    Warning,
+    Warn,
     #[default]
     Info,
     Debug,
@@ -27,7 +27,7 @@ pub(crate) enum LogLevel {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
-#[error("expected one of: off, error, warning, info, debug, trace")]
+#[error("expected one of: off, error, warn, info, debug, trace")]
 pub(crate) struct ParseLogLevelError;
 
 impl FromStr for LogLevel {
@@ -37,7 +37,7 @@ impl FromStr for LogLevel {
         match s.to_ascii_lowercase().as_str() {
             "off" => Ok(Self::Off),
             "error" => Ok(Self::Error),
-            "warning" => Ok(Self::Warning),
+            "warn" => Ok(Self::Warn),
             "info" => Ok(Self::Info),
             "debug" => Ok(Self::Debug),
             "trace" => Ok(Self::Trace),
@@ -303,7 +303,7 @@ mod tests {
     fn log_level_parses_via_fromstr() {
         assert_eq!("off".parse::<LogLevel>().unwrap(), LogLevel::Off);
         assert_eq!("ERROR".parse::<LogLevel>().unwrap(), LogLevel::Error);
-        assert_eq!("Warning".parse::<LogLevel>().unwrap(), LogLevel::Warning);
+        assert_eq!("Warn".parse::<LogLevel>().unwrap(), LogLevel::Warn);
         assert_eq!("INFO".parse::<LogLevel>().unwrap(), LogLevel::Info);
         assert_eq!("debug".parse::<LogLevel>().unwrap(), LogLevel::Debug);
         assert_eq!("Trace".parse::<LogLevel>().unwrap(), LogLevel::Trace);
