@@ -28,10 +28,17 @@ ensure_releasable() {
 }
 
 # ensure_tag_absent <tag> <bump hint>: fail if the tag exists locally or on origin.
+# Origin first: once the tag is published the version is spent whatever the local tree
+# says, and the bump hint is the right advice.
 ensure_tag_absent() {
-    if git rev-parse -q --verify "refs/tags/$1" >/dev/null 2>&1 \
-            || git ls-remote --exit-code --tags origin "refs/tags/$1" >/dev/null 2>&1; then
-        echo "Tag $1 already exists; $2." >&2
+    if git ls-remote --exit-code --tags origin "refs/tags/$1" >/dev/null 2>&1; then
+        echo "Tag $1 is already on origin; $2." >&2
+        exit 1
+    fi
+    if git rev-parse -q --verify "refs/tags/$1" >/dev/null 2>&1; then
+        # confirm_and_push_tag cleans up after itself, so this means an interrupted run or a
+        # tag made by hand. The version is unspent either way, and bumping it would be wrong.
+        echo "Tag $1 exists locally but not on origin; push it or delete it." >&2
         exit 1
     fi
 }
@@ -48,5 +55,13 @@ confirm_and_push_tag() {
 
     echo "Tagging and pushing $1..."
     git tag -a "$1" -m "Release $1"
-    git push origin "$1"
+    # Leave nothing behind if the push fails -- an ssh agent waiting on approval is the usual
+    # cause. The version is unspent, so a bare re-run should just work rather than land on a
+    # stale local tag. If origin took the tag but the ack never arrived, deleting here is
+    # still right: the next run sees it on origin and says so.
+    if ! git push origin "$1"; then
+        git tag -d "$1" >/dev/null
+        echo "Push failed; removed the local tag $1. Fix the cause and re-run." >&2
+        exit 1
+    fi
 }
