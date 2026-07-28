@@ -16,7 +16,11 @@
 # When a new series lands (~Jan/Jul), add its knobs: the pin here (repin via
 # `ci/freebsd-pin.sh <base> opnsense`), the plugins_branch matrix in
 # publish-plugin.yml, the gate matrix in pkg-deploy.yml, the exercise matrix
-# and pin paths in ci-opnsense.yml, and the ABI trees.
+# and pin paths in ci-opnsense.yml together with the matching paths-ignore
+# entries in ci.yml (the two lists are one partition), and the ABI trees. A
+# series on a FreeBSD major we do not build yet needs ci/freebsd<major>.env
+# and its renovate.json manager and packageRule as well, plus the os matrix
+# in ci.yml, ci-port.yml and here.
 # Retire a series' knobs when upstream ends it; keep-all retention leaves its
 # published packages downloadable. A stale pin cannot ship: the gate installs
 # from the signed tree on real OPNsense and rejects the mismatch.
