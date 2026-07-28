@@ -112,12 +112,27 @@ impl DialDeviceProxy {
     /// Accept one pending client on `listener` if there is connection capacity, else `None`. An accept
     /// is always taken (draining the readiness) even at the shared connection cap, where the client is
     /// then dropped.
-    fn accept_client(&self, listener: &TcpSocket, what: Listener) -> Option<TcpSocket> {
+    ///
+    /// A failed accept tears the proxy down. `accept` is the only way to drain a pending connection, so
+    /// under `EMFILE` it stays queued and this level-triggered listener re-fires on it without end;
+    /// shedding the proxy stops that and hands its fds back. The device re-mints on its next
+    /// advertisement, as it would after any eviction.
+    fn accept_client(
+        &self,
+        listener: &TcpSocket,
+        what: Listener,
+        reactor: &mut Reactor,
+    ) -> Option<TcpSocket> {
         let client = match listener.accept() {
             Ok(Some(client)) => client,
             Ok(None) => return None, // spurious / already taken
             Err(e) => {
-                log::warn!("dial: accept on the {what} listener failed: {e}");
+                log::error!(
+                    "dial: accept on the {what} listener failed: {e}; tearing the proxy down, \
+                     {} is unproxied until it advertises again",
+                    self.desc_endpoint
+                );
+                reactor.unregister(self.own_key()).ok();
                 return None;
             }
         };
@@ -130,7 +145,7 @@ impl DialDeviceProxy {
 
     /// Accept a client on the description listener and proxy it to the device's description endpoint.
     fn accept_desc(&mut self, reactor: &mut Reactor) {
-        if let Some(client) = self.accept_client(&self.desc, Listener::Description) {
+        if let Some(client) = self.accept_client(&self.desc, Listener::Description, reactor) {
             self.start_connection(client, self.desc_endpoint, self.desc.local_addr(), reactor);
         }
     }
@@ -139,7 +154,7 @@ impl DialDeviceProxy {
     /// description fetch. A client reaching here before that fetch is dropped (the proxy minted the
     /// listener's address into the description's `Application-URL`, so this is unexpected).
     fn accept_rest(&mut self, reactor: &mut Reactor) {
-        let Some(client) = self.accept_client(&self.rest, Listener::Rest) else {
+        let Some(client) = self.accept_client(&self.rest, Listener::Rest, reactor) else {
             return;
         };
         let Some(device) = self.rest_endpoint else {
@@ -384,6 +399,30 @@ mod tests {
             conn.device_endpoint(),
             device_endpoint,
             "the REST connection targets the learned REST endpoint, not the description endpoint"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "needs a real poll backend")]
+    fn a_failed_accept_sheds_the_proxy() {
+        let mut reactor = Reactor::new().expect("reactor");
+        let (proxy, rest_addr) = watched_proxy(&mut reactor);
+        let key = proxy.own_key();
+        assert!(reactor.is_registered(key));
+
+        // Accepting on a connected socket fails with EINVAL, standing in for the EMFILE the proxy
+        // cannot drain. Either way it must not stay registered and re-firing on a readiness it
+        // will never consume.
+        let connected =
+            TcpSocket::connect(rest_addr, Ipv4Addr::LOCALHOST, None).expect("client connect");
+        assert!(
+            proxy
+                .accept_client(&connected, Listener::Rest, &mut reactor)
+                .is_none()
+        );
+        assert!(
+            !reactor.is_registered(key),
+            "the proxy unregisters itself rather than spin on a listener it cannot drain"
         );
     }
 
