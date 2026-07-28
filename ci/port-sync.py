@@ -81,7 +81,8 @@ def lockfile_at(tag):
             capture_output=True, text=True, check=True,
         ).stdout
     except subprocess.CalledProcessError:
-        sys.exit(f'no tag {tag}: the port declares a version that was never released')
+        sys.exit(f'no tag {tag} in this clone: either the port declares a version that was never '
+                 f'released, or the checkout is shallow and needs fetch-depth: 0')
 
 
 def crates_from(lock):
