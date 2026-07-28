@@ -58,6 +58,10 @@ pub(crate) enum FramingError {
     /// Multiple `Content-Length` header fields with differing values: RFC 9112 §6.3 treats a message with
     /// conflicting Content-Lengths as unrecoverable (a request-smuggling vector), so the proxy refuses it.
     ConflictingContentLength,
+    /// Both a `Content-Length` and a chunked `Transfer-Encoding`. The same §6.3 lets an intermediary
+    /// forward one only after stripping the `Content-Length`; forwarding both leaves the proxy and the
+    /// device free to disagree about where the message ends. Refused rather than stripped.
+    ContentLengthWithChunked,
     /// A chunk-size line that isn't a hex integer.
     MalformedChunkSize,
     /// A chunk size so large that adding its terminating CRLF would overflow `usize`. No legitimate
@@ -259,6 +263,9 @@ impl HttpFraming {
                 authority = Some(found);
             }
             pos = line_end + CRLF.len();
+        }
+        if content_length.is_some() && chunked {
+            return Err(FramingError::ContentLengthWithChunked);
         }
         self.set_body_phase(status, content_length, chunked);
         Ok(authority)
@@ -893,13 +900,33 @@ mod tests {
     }
 
     #[test]
-    fn chunked_takes_precedence_over_content_length() {
-        let mut f = HttpFraming::new(Kind::Response, RewritePolicy::NONE);
-        f.scan_and_rewrite_header(
-            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nTransfer-Encoding: chunked\r\n\r\n",
-        )
-        .unwrap();
-        assert_eq!(f.phase, Phase::BodyChunked);
+    fn rejects_a_content_length_beside_a_chunked_encoding() {
+        // Both kinds in both orders: the check runs once the whole block is scanned, so neither
+        // the side nor the header order should reach it.
+        for (kind, block) in [
+            (
+                Kind::Response,
+                &b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nTransfer-Encoding: chunked\r\n\r\n"[..],
+            ),
+            (
+                Kind::Response,
+                &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 100\r\n\r\n"[..],
+            ),
+            (
+                Kind::Request,
+                &b"POST /apps/X HTTP/1.1\r\nContent-Length: 6\r\nTransfer-Encoding: chunked\r\n\r\n"[..],
+            ),
+            (
+                Kind::Request,
+                &b"POST /apps/X HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 6\r\n\r\n"[..],
+            ),
+        ] {
+            let mut f = HttpFraming::new(kind, RewritePolicy::NONE);
+            assert_eq!(
+                f.scan_and_rewrite_header(block),
+                Err(FramingError::ContentLengthWithChunked)
+            );
+        }
     }
 
     #[test]
