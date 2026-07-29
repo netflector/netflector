@@ -16,36 +16,28 @@ pub(crate) fn is_dial_service_message(payload: &[u8]) -> bool {
 /// mapped into the whole `payload` so the SSDP path splices a netflector authority over it. The
 /// `LOCATION` must be a rewritable `http://ipv4[:port]` URL; `None` otherwise (forward unchanged).
 pub(crate) fn parse_dial_location_authority(payload: &[u8]) -> Option<Authority> {
-    for line in payload.split(|&b| b == b'\n') {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        let Some(url) = strip_prefix_ignore_ascii_case(line, b"LOCATION:") else {
-            continue;
-        };
-        let url = url.trim_ascii_start();
-        if url.is_empty() {
-            return None;
-        }
-        let found = parse_authority(url, false)?;
-        // `url` is a subslice of `payload`, so the distance between their starts is `url`'s offset
-        // within `payload`; add the authority's offset within `url`.
-        let url_offset = url.as_ptr().addr() - payload.as_ptr().addr();
-        return Some(Authority {
-            endpoint: found.endpoint,
-            offset: url_offset + found.offset,
-            len: found.len,
-        });
-    }
-    None
+    let url = dial_location_value(payload)?;
+    let found = parse_authority(url, false)?;
+    // `url` is a subslice of `payload`, so the distance between their starts is `url`'s offset
+    // within `payload`; add the authority's offset within `url`.
+    let url_offset = url.as_ptr().addr() - payload.as_ptr().addr();
+    Some(Authority {
+        endpoint: found.endpoint,
+        offset: url_offset + found.offset,
+        len: found.len,
+    })
 }
 
-/// The raw, trimmed `LOCATION:` header value (the URL), or `None` if the message carries none. For the
-/// debug log when [`parse_dial_location_authority`] rejects the URL as non-rewritable.
+/// The raw, trimmed value of the first `LOCATION:` header, or `None` if the message carries none or
+/// it is empty. Both the rewrite decision and the debug log that reports a rejection read this, so
+/// the log can't name a header the rewrite never looked at.
 pub(crate) fn dial_location_value(payload: &[u8]) -> Option<&[u8]> {
-    payload.split(|&b| b == b'\n').find_map(|line| {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        let url = strip_prefix_ignore_ascii_case(line, b"LOCATION:")?.trim_ascii_start();
-        (!url.is_empty()).then_some(url)
-    })
+    let url = payload
+        .split(|&b| b == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+        .find_map(|line| strip_prefix_ignore_ascii_case(line, b"LOCATION:"))?
+        .trim_ascii_start();
+    (!url.is_empty()).then_some(url)
 }
 
 /// The advertisement's freshness lifetime from a `CACHE-CONTROL: max-age=<seconds>` header: how long
@@ -142,6 +134,14 @@ mod tests {
             Some(&b"https://tv.local/x"[..])
         );
         assert!(dial_location_value(b"NOTIFY * HTTP/1.1\r\nNT: foo\r\n\r\n").is_none());
+    }
+
+    #[test]
+    fn an_empty_location_does_not_fall_through_to_a_later_one() {
+        let payload =
+            b"NOTIFY * HTTP/1.1\r\nLOCATION:\r\nLOCATION: http://10.0.0.5:8008/dd.xml\r\n\r\n";
+        assert!(parse_dial_location_authority(payload).is_none());
+        assert!(dial_location_value(payload).is_none());
     }
 
     #[test]
