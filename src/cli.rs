@@ -21,9 +21,10 @@ pub(crate) enum Invocation<'a> {
 
 /// Parse `args` (with `argv[0]` already stripped).
 ///
-/// `--help` and `--version` win over everything else, so they answer even when the rest of the
-/// line is nonsense. Otherwise netflector takes at most one positional; extras are rejected
-/// rather than ignored, since a second path is far more likely a typo than an intent.
+/// `--help` and `--version` win over anything after them on the line, so they answer even when
+/// the rest is nonsense; an unknown option before them still errors, first bad token wins.
+/// Otherwise netflector takes at most one positional; extras are rejected rather than ignored,
+/// since a second path is far more likely a typo than an intent.
 ///
 /// `--` ends option parsing, so a config file whose name begins with a dash is still reachable
 /// (`netflector -- --check-config` reads a file called `--check-config`). Without it such a path
