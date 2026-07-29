@@ -15,13 +15,12 @@ pub(crate) use search::SearchReflector;
 pub(crate) use simple::SimpleReflector;
 
 use std::fmt;
-use std::io;
 use std::net::{IpAddr, SocketAddr};
 
 use thiserror::Error;
 
 use crate::config::AddressFamily;
-use crate::dispatch::{CaptureKey, MessageType, PacketDispatcher};
+use crate::dispatch::{CaptureKey, MessageType, PacketDispatcher, join_deferrable};
 use crate::interface::InterfaceAddresses;
 use crate::reactor::Reactor;
 
@@ -186,17 +185,10 @@ fn require_bidirectional_families(
     Ok(())
 }
 
-/// Whether a group-join failure is deferrable: `EADDRNOTAVAIL` means the interface has no address of the
-/// group's family yet, so the joiner records the group and retries on the next address change. Every
-/// other error is a hard failure that will not self-heal.
-fn join_deferrable(e: &io::Error) -> bool {
-    e.raw_os_error() == Some(libc::EADDRNOTAVAIL)
-}
-
 /// Join `group` on `capture` for `protocol`'s `side` leg (`"source"`/`"target"`), logging the outcome.
 /// A [deferrable](join_deferrable) failure logs at debug (it retries on the next address change); any
-/// other failure is a warning, since that group's traffic won't be reflected and won't self-heal — a
-/// dead reflector must not hide behind a debug line.
+/// other failure is a warning, matching its re-join sibling — a dead reflector must not hide behind
+/// a debug line.
 fn join_group_logged(
     dispatcher: &mut PacketDispatcher,
     capture: CaptureKey,
@@ -213,7 +205,7 @@ fn join_group_logged(
         }
         Err(e) => {
             log::warn!(
-                "{protocol}: join {group} on {side} failed; its traffic will not be reflected: {e}"
+                "{protocol}: join {group} on {side} failed; its traffic is not reflected: {e}"
             );
         }
     }
@@ -224,14 +216,6 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use super::*;
-
-    #[test]
-    fn only_eaddrnotavail_is_a_deferrable_join() {
-        let of = io::Error::from_raw_os_error;
-        assert!(join_deferrable(&of(libc::EADDRNOTAVAIL))); // no address of this family yet; retried
-        assert!(!join_deferrable(&of(libc::ENODEV))); // a hard failure: warn, don't hide
-        assert!(!join_deferrable(&of(libc::EINVAL)));
-    }
 
     #[test]
     fn missing_required_family_enforces_the_requires_policy() {

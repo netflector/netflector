@@ -637,8 +637,8 @@ fn pair_interface_table_recovers_after_interface_recreation() -> io::Result<()> 
         let counts = table.rebind_interface(s.key, s.cur)?;
         let expected_joined = if s.key == receive_key { 2 } else { 0 };
         assert_eq!(
-            (counts.joined, counts.deferred),
-            (expected_joined, 0),
+            (counts.joined, counts.deferred, counts.failed),
+            (expected_joined, 0, 0),
             "the interface re-joined its recorded groups on the fresh socket, none deferred"
         );
         for capture in table.captures_of(s.key) {

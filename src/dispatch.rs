@@ -28,6 +28,7 @@ mod pair_tests;
 
 pub(crate) use self::counters::{MessageType, Outcome};
 pub(crate) use self::dial_context::{DialContext, DialProxyKey};
+pub(crate) use self::multicast::join_deferrable;
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -848,16 +849,24 @@ impl PacketDispatcher {
                 }
             }
             match self.table.rebind_interface(stale.key, stale.cur) {
-                // Deferred joins are usually "no address yet" and heal on the interface's next
-                // address event, but after a recreation a deaf group is a real outage: warn.
-                Ok(counts) if counts.deferred > 0 => {
-                    log::warn!(
-                        "{} group membership(s) on {name} not re-joined yet; retrying \
-                         on its next address event",
-                        counts.deferred
-                    );
+                // Both kinds are retried on every later address event, but only a deferral has a
+                // trigger that will resolve it, so only that one may promise a retry.
+                Ok(counts) => {
+                    if counts.failed > 0 {
+                        log::warn!(
+                            "{} group membership(s) on {name} did not re-join; that traffic is \
+                             not reflected until they do",
+                            counts.failed
+                        );
+                    }
+                    if counts.deferred > 0 {
+                        log::warn!(
+                            "{} group membership(s) on {name} not re-joined yet; retrying \
+                             on its next address event",
+                            counts.deferred
+                        );
+                    }
                 }
-                Ok(_) => {}
                 Err(e) => {
                     log::warn!("re-resolving {name} failed: {e}; will retry");
                     failed = true;
