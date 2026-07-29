@@ -301,7 +301,7 @@ impl PacketHandler for SearchReflector {
         };
         let expiry = Instant::now() + (self.window)(packet.payload);
 
-        // A retransmit from a known searcher to the same group reuses its session: refresh the window
+        // A retransmit from a known searcher to the same group reuses its session: extend the window
         // and re-reflect from the same reserved port. A new searcher, or the same searcher to a
         // different group (a different reply scope), opens a fresh session. No staleness check here:
         // an interface recreation or address change orphans a session's reservation, but the dispatcher
@@ -318,7 +318,9 @@ impl PacketHandler for SearchReflector {
                 packet.payload,
             ) {
                 Ok(()) => {
-                    session.expiry = expiry;
+                    // Extend, never shorten: devices answering an earlier search may use its whole
+                    // MX window, so a retransmit with a smaller MX must not cut their replies off.
+                    session.expiry = session.expiry.max(expiry);
                     log::debug!(
                         "re-reflected {} search from {} to {} on reserved port {port}",
                         self.name,
@@ -609,6 +611,38 @@ mod tests {
         assert!(
             reflector.sessions[0].expiry > base,
             "the session's window is refreshed"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "needs a real socket")]
+    fn a_retransmit_with_a_smaller_window_does_not_shorten_the_session() {
+        let mut dispatcher = PacketDispatcher::new();
+        let mut reactor = Reactor::new().unwrap();
+        let mut reflector = test_reflector();
+        // Well past anything the retransmit's own window can reach.
+        let far = Instant::now() + Duration::from_hours(1);
+        push_session(
+            &mut reflector,
+            &mut dispatcher,
+            "10.0.0.7:50000",
+            "239.255.255.250:1900",
+            far,
+        );
+
+        let packet = Packet {
+            source: "10.0.0.7:50000".parse().unwrap(),
+            dest: "239.255.255.250:1900".parse().unwrap(),
+            ttl: TEST_TTL,
+            dst_mac: None,
+            src_mac: Some(MacAddr::from([0x02, 0, 0, 0, 0, 1])),
+            payload: b"a search",
+        };
+        reflector.on_packet(&packet, &mut dispatcher, &mut reactor);
+
+        assert_eq!(
+            reflector.sessions[0].expiry, far,
+            "replies promised by the earlier window are still collected"
         );
     }
 
