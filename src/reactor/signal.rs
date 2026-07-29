@@ -37,6 +37,12 @@ static DUMP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// The signal handler: async-signal-safe, so it only records intent and wakes the loop.
 extern "C" fn on_signal(signum: c_int) {
+    // The handler can land between a failed syscall and the `errno` read that reports it, so the
+    // write below must leave no errno of its own behind.
+    let location = crate::libcex::errno_location();
+    // SAFETY: the calling thread's `errno` cell; reading and writing it is async-signal-safe.
+    let saved = unsafe { *location };
+
     // The pipe byte is a pure wakeup; its value carries nothing, the atomic flags carry the intent.
     if signum == DUMP_SIGNAL {
         DUMP_REQUESTED.store(true, Ordering::Relaxed);
@@ -53,6 +59,9 @@ extern "C" fn on_signal(signum: c_int) {
             libc::write(fd, (&raw const byte).cast(), 1);
         }
     }
+
+    // SAFETY: as above.
+    unsafe { *location = saved };
 }
 
 /// An installed self-pipe with the previous signal dispositions saved. Dropping it
@@ -276,6 +285,30 @@ mod tests {
         assert!(SignalGuard::install().is_err());
 
         drop(guard); // restores the previous dispositions
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "needs a real write(2) failure")]
+    fn the_handler_leaves_errno_alone() {
+        let _serialized = SIGNAL_STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A pipe's read end refuses a write (EBADF), so the handler's write fails the way it would
+        // on a full pipe. No handler is installed: `on_signal` is called directly.
+        let (read, _write) = self_pipe().unwrap();
+        let previous = WRITE_FD.swap(read.as_raw_fd(), Ordering::SeqCst);
+
+        let location = crate::libcex::errno_location();
+        // SAFETY: the calling thread's errno cell.
+        let observed = unsafe {
+            *location = libc::EEXIST;
+            on_signal(DUMP_SIGNAL);
+            *location
+        };
+
+        WRITE_FD.store(previous, Ordering::SeqCst);
+        DUMP_REQUESTED.store(false, Ordering::Relaxed);
+        assert_eq!(observed, libc::EEXIST);
     }
 
     #[test]
