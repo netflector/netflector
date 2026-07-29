@@ -17,4 +17,4 @@ mod connection;
 mod proxy;
 mod rewrite;
 
-pub(crate) use self::rewrite::{ProxyPlacement, REWRITE_BUF_LEN, rewrite_location};
+pub(crate) use self::rewrite::{ProxyPlacement, rewrite_location};

@@ -13,6 +13,7 @@ use std::time::Duration;
 use crate::config::{AddressFamily, Reflector};
 use crate::dispatch::{CaptureKey, Filter, IpSet, MessageType, PacketDispatcher};
 use crate::interface::InterfaceAddresses;
+use crate::net::MAX_UDP_PAYLOAD_LEN;
 use crate::net::ssdp::{
     MSEARCH_MX_DEFAULT, SSDP_GROUP_V4, SSDP_GROUP_V6_LINK_LOCAL, SSDP_GROUP_V6_SITE_LOCAL,
     SSDP_PORT, SSDP_TTL, SsdpKind, classify, parse_msearch_mx,
@@ -20,7 +21,7 @@ use crate::net::ssdp::{
 use crate::net::uninit_buf::UninitBuf;
 use crate::reactor::Reactor;
 
-use super::dial::{ProxyPlacement, REWRITE_BUF_LEN, rewrite_location};
+use super::dial::{ProxyPlacement, rewrite_location};
 use super::{
     BuildError, InterfaceMap, NoRewrite, ReplyRewrite, SearchReflector, SimpleReflector, Verdict,
     join_group_logged, require_bidirectional_families,
@@ -32,7 +33,9 @@ use super::{
 /// (the advertisement direction, and one per M-SEARCH session's response reflector), so it isn't `Copy`.
 struct DialRewrite {
     target: CaptureKey,
-    /// Reused sink for the rewritten datagram; see the [`ReplyRewrite`] impl.
+    /// Reused sink for the rewritten datagram; see the [`ReplyRewrite`] impl. Bounded by the
+    /// payload that still frames within [`MAX_FRAME_LEN`](crate::net::MAX_FRAME_LEN), so a rewrite
+    /// that fits is always sendable.
     scratch: UninitBuf,
 }
 
@@ -41,7 +44,7 @@ impl DialRewrite {
     fn new(target: CaptureKey) -> Self {
         Self {
             target,
-            scratch: UninitBuf::with_capacity(REWRITE_BUF_LEN),
+            scratch: UninitBuf::with_capacity(MAX_UDP_PAYLOAD_LEN),
         }
     }
 }
