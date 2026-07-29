@@ -94,6 +94,12 @@ pub(crate) enum ConfigError {
     #[error("environment variable \"{var}\" sets unknown parameter \"{param}\"")]
     EnvUnknownParam { var: String, param: String },
 
+    #[error(
+        "environment variable \"{var}\" sets \"{param}\", which another variable already set \
+         (names are case-insensitive)"
+    )]
+    EnvDuplicateParam { var: String, param: String },
+
     #[error("environment variable \"{var}\" has invalid value \"{value}\": {source}")]
     EnvBadValue {
         var: String,
