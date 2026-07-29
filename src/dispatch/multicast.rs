@@ -16,14 +16,25 @@ use crate::libcex::{GroupReq, MCAST_JOIN_GROUP};
 use crate::sys::{open_socket, sockaddr_for, socklen_of};
 
 /// How a [`rejoin`](MulticastJoiner::rejoin) replay landed: `joined` groups are members after the
-/// call (freshly re-joined, or already member), `deferred` groups could not join yet and wait for
-/// the next address event. The two sum to the desired-group count. `joined` (not "rejoined": the
-/// parked-return replay is a first join) is the signal a caller uses to tell a real replay from a
-/// vacuous one over an empty desired list.
+/// call (freshly re-joined, or already member), `deferred` groups have no address of their family
+/// yet, `failed` groups hit something else. The three sum to the desired-group count. Every desired
+/// group is re-applied on every call, so both failure kinds are retried alike; the split is about
+/// what to expect, since only a deferral has a known trigger that resolves it. `joined` (not
+/// "rejoined": the parked-return replay is a first join) is the signal a caller uses to tell a real
+/// replay from a vacuous one over an empty desired list.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub(crate) struct RejoinCounts {
     pub(crate) joined: usize,
     pub(crate) deferred: usize,
+    pub(crate) failed: usize,
+}
+
+/// One recorded membership: the group wanted on this interface, and whether its current failure has
+/// been reported, so a group that can't join logs once per failure episode rather than on every
+/// replay. Cleared when the group joins, so a later relapse reports again.
+struct Desired {
+    group: IpAddr,
+    reported: bool,
 }
 
 /// One capture interface's multicast memberships: one unbound `SOCK_DGRAM` fd per family, opened on
@@ -34,7 +45,7 @@ pub(crate) struct RejoinCounts {
 pub(crate) struct MulticastJoiner {
     v4: Option<OwnedFd>,
     v6: Option<OwnedFd>,
-    desired: Vec<IpAddr>,
+    desired: Vec<Desired>,
 }
 
 impl MulticastJoiner {
@@ -48,11 +59,16 @@ impl MulticastJoiner {
 
     /// Record `group` for a later [`rejoin`](Self::rejoin) without joining now: the
     /// parked-interface path, where no live index exists to join on. Deduped, like
-    /// [`join`](Self::join)'s own recording.
-    pub(crate) fn record(&mut self, group: IpAddr) {
-        if !self.desired.contains(&group) {
-            self.desired.push(group);
+    /// [`join`](Self::join)'s own recording. Returns the group's index in the desired list.
+    pub(crate) fn record(&mut self, group: IpAddr) -> usize {
+        if let Some(index) = self.desired.iter().position(|d| d.group == group) {
+            return index;
         }
+        self.desired.push(Desired {
+            group,
+            reported: false,
+        });
+        self.desired.len() - 1
     }
 
     /// Join `group` on the interface `ifindex` and record it, so a later interface change
@@ -63,10 +79,17 @@ impl MulticastJoiner {
     /// # Errors
     /// The OS error if the socket can't open or the membership can't be added. `EADDRNOTAVAIL` (no
     /// address of that family yet) is deferrable: the group is recorded and [`rejoin`](Self::rejoin)
-    /// retries it on the next address-up event.
+    /// retries it on the next address-up event. Any other error is marked reported before it
+    /// returns -- the caller's log is the report, and the replay repeats it at debug only.
     pub(crate) fn join(&mut self, group: IpAddr, ifindex: NonZeroU32) -> io::Result<()> {
-        self.record(group);
-        self.apply(group, ifindex)
+        let index = self.record(group);
+        let result = self.apply(group, ifindex);
+        if let Err(e) = &result
+            && !join_deferrable(e)
+        {
+            self.desired[index].reported = true;
+        }
+        result
     }
 
     /// Drop the per-family sockets, so the next join starts from fresh ones. For an interface
@@ -81,22 +104,45 @@ impl MulticastJoiner {
     }
 
     /// Re-attempt every recorded membership after the interface re-resolves, returning the
-    /// [`RejoinCounts`] split of joined vs deferred. A group not joinable before its address
-    /// existed succeeds now; an already-held one is a no-op that still counts as joined.
-    /// Best-effort: a still-unavailable family logs at debug and waits for the next change
-    /// (routine on the address-up path; the recreation rebuild warns on a nonzero deferred count
-    /// instead). `NonZeroU32` makes the parked case unrepresentable: `MCAST_JOIN_GROUP` on index 0
+    /// [`RejoinCounts`] split of joined, deferred and failed. A group not joinable before its
+    /// address existed succeeds now; an already-held one is a no-op that still counts as joined.
+    /// Best-effort: a [deferrable](join_deferrable) failure logs at debug, since the address event
+    /// that resolves it is coming. Anything else logs at warn once per failure episode -- repeats
+    /// at debug, since the replay runs on every address event -- and at info when the group
+    /// finally joins.
+    /// `NonZeroU32` makes the parked case unrepresentable: `MCAST_JOIN_GROUP` on index 0
     /// would let the kernel pick an arbitrary interface by route lookup and advertise our groups
     /// there, so callers skip explicitly while parked.
     pub(crate) fn rejoin(&mut self, ifindex: NonZeroU32) -> RejoinCounts {
         let mut counts = RejoinCounts::default();
         for i in 0..self.desired.len() {
-            let group = self.desired[i];
+            let group = self.desired[i].group;
             match self.apply(group, ifindex) {
-                Ok(()) => counts.joined += 1,
-                Err(e) => {
+                Ok(()) => {
+                    counts.joined += 1;
+                    if self.desired[i].reported {
+                        self.desired[i].reported = false;
+                        log::info!(
+                            "re-join of {group} on ifindex {ifindex} succeeded after an \
+                             earlier failure"
+                        );
+                    }
+                }
+                Err(e) if join_deferrable(&e) => {
                     log::debug!("re-join of {group} on ifindex {ifindex} deferred: {e}");
                     counts.deferred += 1;
+                }
+                Err(e) => {
+                    counts.failed += 1;
+                    if self.desired[i].reported {
+                        log::debug!("re-join of {group} on ifindex {ifindex} still failing: {e}");
+                    } else {
+                        self.desired[i].reported = true;
+                        log::warn!(
+                            "re-join of {group} on ifindex {ifindex} failed; its traffic is \
+                             not reflected: {e}"
+                        );
+                    }
                 }
             }
         }
@@ -159,11 +205,27 @@ pub(crate) fn join_unsupported(err: &io::Error) -> bool {
     )
 }
 
+/// Whether a group-join failure is deferrable: `EADDRNOTAVAIL` means the interface has no address of
+/// the group's family yet, so the group joins on the address event that supplies one. Every other
+/// error is replayed just the same, but has no trigger anyone can name, so it reports as a failure
+/// rather than a wait.
+pub(crate) fn join_deferrable(e: &io::Error) -> bool {
+    e.raw_os_error() == Some(libc::EADDRNOTAVAIL)
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     use super::*;
+
+    #[test]
+    fn only_eaddrnotavail_is_a_deferrable_join() {
+        let of = io::Error::from_raw_os_error;
+        assert!(join_deferrable(&of(libc::EADDRNOTAVAIL))); // an address event will fix it
+        assert!(!join_deferrable(&of(libc::ENODEV))); // nothing in particular will
+        assert!(!join_deferrable(&of(libc::EINVAL)));
+    }
 
     impl MulticastJoiner {
         /// Whether no family socket is open (nothing joined since the last reset). Reachable
@@ -219,6 +281,54 @@ mod tests {
             joiner.v4.is_some(),
             "rejoin re-opens a fresh socket and re-joins"
         );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "needs a real socket")]
+    fn a_replayed_hard_failure_reports_once() {
+        let mut joiner = MulticastJoiner::new();
+        // A unicast address can never join, so every replay fails hard (EINVAL) deterministically.
+        joiner.record(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let first = joiner.rejoin(loopback_ifindex());
+        assert_eq!((first.joined, first.deferred, first.failed), (0, 0, 1));
+        assert!(joiner.desired[0].reported, "the first failure is reported");
+        let second = joiner.rejoin(loopback_ifindex());
+        assert_eq!(second.failed, 1, "the group is still retried");
+        assert!(joiner.desired[0].reported);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "needs a real socket")]
+    fn join_marks_a_hard_failure_reported() {
+        let mut joiner = MulticastJoiner::new();
+        let err = joiner
+            .join(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), loopback_ifindex())
+            .expect_err("a unicast address cannot join");
+        assert!(!join_deferrable(&err));
+        assert!(
+            joiner.desired[0].reported,
+            "the caller logs this error; the replay must not re-report it"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "resolves a real interface")]
+    fn a_join_clears_the_reported_mark() {
+        let mut joiner = MulticastJoiner::new();
+        let ifindex = loopback_ifindex();
+        match joiner.join(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)), ifindex) {
+            Ok(()) => {}
+            Err(e) if join_unsupported(&e) => {
+                eprintln!("skip a_join_clears_the_reported_mark: unsupported here ({e})");
+                return;
+            }
+            Err(e) => panic!("kernel must accept the loopback join: {e}"),
+        }
+        // As if an earlier replay failed: the next success closes the episode.
+        joiner.desired[0].reported = true;
+        let counts = joiner.rejoin(ifindex);
+        assert_eq!((counts.joined, counts.failed), (1, 0));
+        assert!(!joiner.desired[0].reported, "the join cleared the mark");
     }
 
     // The parked-interface path: record keeps the group for the rebuild's replay without
