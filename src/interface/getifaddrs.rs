@@ -18,11 +18,12 @@ use crate::net::mac::MacAddr;
 /// Resolve `if_name`'s current source addresses in one `getifaddrs` pass.
 ///
 /// # Errors
-/// Returns an error only if `getifaddrs` fails; an unknown interface (or one with no
-/// addresses yet) yields an all-absent [`InterfaceAddresses`].
+/// Returns an error if `getifaddrs` fails or the v6 flag socket can't open; an unknown
+/// interface (or one with no addresses yet) yields an all-absent [`InterfaceAddresses`],
+/// as does a host with no IPv6 stack.
 pub(super) fn resolve(if_name: &str) -> io::Result<InterfaceAddresses> {
-    // One socket for the per-v6 `SIOCGIFAFLAG_IN6` ioctl; no IPv6 stack just means no v6.
-    let v6_sock = inet6_socket();
+    // One socket for the per-v6 `SIOCGIFAFLAG_IN6` ioctl.
+    let v6_sock = inet6_socket()?;
 
     let mut head: *mut libc::ifaddrs = ptr::null_mut();
     // SAFETY: `getifaddrs` writes a freshly-allocated linked list into `head` (or returns
@@ -156,13 +157,32 @@ fn canonical_v6(mut octets: [u8; 16]) -> Ipv6Addr {
 }
 
 /// An `AF_INET6` datagram socket for the flag ioctl, or `None` if the host has no IPv6.
-fn inet6_socket() -> Option<OwnedFd> {
+///
+/// # Errors
+/// Any other `socket` failure. Under fd or memory pressure the host still has IPv6, and
+/// reading that as "no v6" would filter every candidate and commit the false loss; the error
+/// fails the whole resolve instead, which the caller retries.
+fn inet6_socket() -> io::Result<Option<OwnedFd>> {
     // SAFETY: `socket` returns a fresh fd or -1.
     let raw = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0) };
-    (raw >= 0).then(|| {
+    if raw >= 0 {
         // SAFETY: `raw` is a fresh owned socket fd.
-        unsafe { OwnedFd::from_raw_fd(raw) }
-    })
+        return Ok(Some(unsafe { OwnedFd::from_raw_fd(raw) }));
+    }
+    let err = io::Error::last_os_error();
+    if no_ipv6_stack(&err) {
+        return Ok(None);
+    }
+    Err(err)
+}
+
+/// Whether a `socket(AF_INET6, ...)` failure means the host has no IPv6 stack, the one case
+/// where an absent socket is the truth rather than a transient failure.
+fn no_ipv6_stack(e: &io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::EAFNOSUPPORT | libc::EPROTONOSUPPORT)
+    )
 }
 
 /// The `IN6_IFF_*` flags of `addr` on `if_name`, queried via `SIOCGIFAFLAG_IN6`, or `None`
@@ -189,6 +209,16 @@ mod tests {
     use std::mem::offset_of;
 
     use super::*;
+
+    #[test]
+    fn only_a_missing_ipv6_stack_reads_as_no_v6() {
+        let of = io::Error::from_raw_os_error;
+        assert!(no_ipv6_stack(&of(libc::EAFNOSUPPORT)));
+        assert!(no_ipv6_stack(&of(libc::EPROTONOSUPPORT)));
+        // Pressure errnos fail the resolve instead of committing a false v6 loss.
+        assert!(!no_ipv6_stack(&of(libc::EMFILE)));
+        assert!(!no_ipv6_stack(&of(libc::ENOBUFS)));
+    }
 
     #[test]
     fn canonical_v6_strips_the_embedded_scope_from_link_local() {
