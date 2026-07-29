@@ -9,7 +9,8 @@
 //! Records go to stderr (stdout is left for program output) as
 //! `<utc> <LEVEL> <target>: <message>` with a UTC ISO-8601 timestamp.
 
-use std::fmt;
+use std::cell::RefCell;
+use std::fmt::{self, Write as _};
 use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -33,16 +34,18 @@ impl Log for StderrLogger {
         if !self.enabled(record.metadata()) {
             return;
         }
-        let mut stderr = std::io::stderr();
-        writeln!(
-            stderr,
-            "{} {:>5} {}: {}",
-            Utc::now(),
-            record.level(),
-            record.target(),
-            record.args(),
-        )
-        .ok();
+        // Build the line first and write it whole. Stderr is unbuffered and its write_fmt issues
+        // one write(2) per formatting fragment (20-30 for a typical record), which matters once
+        // debug/trace logs per frame. The buffer is reused, so no per-record allocation either.
+        thread_local! {
+            static LINE: RefCell<String> = const { RefCell::new(String::new()) };
+        }
+        LINE.with(|line| {
+            let mut line = line.borrow_mut();
+            line.clear();
+            format_record(&mut line, Utc::now(), record);
+            std::io::stderr().write_all(line.as_bytes()).ok();
+        });
     }
 
     fn flush(&self) {
@@ -50,7 +53,21 @@ impl Log for StderrLogger {
     }
 }
 
+/// Format `record`, stamped `now`, as the one-line stderr entry, newline included. The caller
+/// reads the clock, so the formatting is exercisable against a fixed timestamp.
+fn format_record(line: &mut String, now: Utc, record: &Record) {
+    // Formatting into a String is infallible.
+    let _ = writeln!(
+        line,
+        "{now} {:>5} {}: {}",
+        record.level(),
+        record.target(),
+        record.args(),
+    );
+}
+
 /// A civil UTC date-time, rendered as ISO 8601 (e.g. `2026-06-19T18:49:58Z`).
+#[derive(Clone, Copy)]
 struct Utc {
     year: u64,
     month: u64,
@@ -174,6 +191,21 @@ mod tests {
             Utc::from_unix(951_782_400).to_string(),
             "2000-02-29T00:00:00Z"
         );
+    }
+
+    #[test]
+    fn a_record_formats_as_one_stamped_line() {
+        let mut line = String::new();
+        format_record(
+            &mut line,
+            Utc::from_unix(0),
+            &log::Record::builder()
+                .level(log::Level::Info)
+                .target("netflector::test")
+                .args(format_args!("hello"))
+                .build(),
+        );
+        assert_eq!(line, "1970-01-01T00:00:00Z  INFO netflector::test: hello\n");
     }
 
     #[test]
