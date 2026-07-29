@@ -65,12 +65,6 @@ const RECONCILE_TICK: Duration = Duration::from_secs(30);
 /// retry driver that picks up the interface's return and re-attempts failed re-binds.
 const RECONCILE_RETRY: Duration = Duration::from_secs(1);
 
-/// The dispatcher's reused send-buffer size. A standard-MTU datagram fits. One buffer serves
-/// every reflector: the single-threaded loop runs one [`send_udp_group`](PacketDispatcher::send_udp_group)
-/// at a time. An oversized payload is a `BufferTooSmall` error, not a truncation. It also caps a
-/// forwardable datagram, so the DIAL rewrite scratch ([`REWRITE_BUF_LEN`](crate::reflector::dial::REWRITE_BUF_LEN)) anchors to it.
-pub(crate) const SCRATCH_LEN: usize = 2048;
-
 /// A `Copy` handle to a capture the dispatcher owns: an index into the interface table's
 /// captures. A newtype, not a bare alias, so it can't be passed where an [`InterfaceKey`](interface_table::InterfaceKey)
 /// or a reactor key is expected, where it would silently miss instead of failing to
@@ -251,7 +245,8 @@ pub(crate) struct PacketDispatcher {
     /// The DIAL proxy registry, shared across the SSDP advertisement/response reflectors. Empty unless a
     /// DIAL reflector is configured; the dispatcher evicts its past-grace proxies on the deadline sweep.
     dial: DialContext,
-    /// The reused frame-build buffer shared by every reflector's send (see [`SCRATCH_LEN`]).
+    /// The reused frame-build buffer shared by every reflector's send. One buffer serves them all:
+    /// the single-threaded loop runs one `send_udp_group` at a time.
     scratch: Box<[u8]>,
     /// The periodic counter-summary schedule, or `None` when the summary is disabled.
     report: Option<CounterReport>,
@@ -277,7 +272,7 @@ impl PacketDispatcher {
             route_keys: Vec::new(),
             monitor: Self::open_monitor(),
             dial: DialContext::new(),
-            scratch: vec![0u8; SCRATCH_LEN].into_boxed_slice(),
+            scratch: vec![0u8; crate::net::MAX_FRAME_LEN].into_boxed_slice(),
             report: None,
             max_seen_ifindex: 0,
             next_reconcile: Instant::now() + RECONCILE_TICK,
@@ -430,8 +425,8 @@ impl PacketDispatcher {
     /// destination, and inject it on `egress`. The caller supplies the L2 MAC, so this serves
     /// unicast, multicast, and broadcast alike; the link framing (Ethernet vs `DLT_NULL`) follows
     /// the egress's link type, and the source port, `ttl`, and `payload` are carried verbatim.
-    /// Builds into the dispatcher's reused [`scratch`](SCRATCH_LEN) buffer, so the data path never
-    /// allocates. An unknown or draining egress is a logged drop, like [`send`](Self::send).
+    /// Builds into the dispatcher's reused scratch buffer, so the data path never allocates. An
+    /// unknown or draining egress is a logged drop, like [`send`](Self::send).
     ///
     /// # Errors
     /// Propagates a send failure, and reports a frame that can't be built from the egress's

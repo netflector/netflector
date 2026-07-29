@@ -41,3 +41,16 @@ const DLT_NULL_HEADER_SIZE: usize = 4;
 const IPV4_HEADER_SIZE: usize = 20;
 const IPV6_HEADER_SIZE: usize = 40;
 const UDP_HEADER_SIZE: usize = 8;
+
+/// The largest frame the daemon builds, captures or forwards. Every buffer on the frame path is
+/// sized from this: the dispatcher's send scratch, and each capture backend's read buffer, so
+/// anything captured can be re-emitted. Clears a standard 1514-byte Ethernet frame (the FCS is
+/// stripped before capture) with headroom for a baby-jumbo MTU. True 9000-byte jumbo is out of
+/// reach, and no discovery protocol comes near it.
+pub(crate) const MAX_FRAME_LEN: usize = 2048;
+
+/// The largest UDP payload that still fits [`MAX_FRAME_LEN`] once framed, so anything built within
+/// it is forwardable. The worst-case header stack: Ethernet (over `DLT_NULL`) plus IPv6 (over
+/// IPv4, and fixed at 40 since the builders emit no extension headers) plus UDP.
+pub(crate) const MAX_UDP_PAYLOAD_LEN: usize =
+    MAX_FRAME_LEN - (ETHERNET_HEADER_SIZE + IPV6_HEADER_SIZE + UDP_HEADER_SIZE);

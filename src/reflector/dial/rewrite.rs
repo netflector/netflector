@@ -28,12 +28,6 @@ const DEFAULT_DESC_GRACE: Duration = Duration::from_mins(30);
 /// DIAL device's re-advertise interval, so a live device still refreshes its grace in time.
 const MAX_DESC_GRACE: Duration = Duration::from_hours(2);
 
-/// Stack scratch to rewrite one SSDP datagram into. Anchored to the dispatcher's send frame buffer
-/// ([`SCRATCH_LEN`](crate::dispatch::SCRATCH_LEN)): the reflector builds its outgoing frame there, so
-/// anything that doesn't fit can't be forwarded anyway. A `LOCATION` rewrite can grow the datagram;
-/// one that overruns this falls back to verbatim rather than truncating.
-pub(crate) const REWRITE_BUF_LEN: usize = crate::dispatch::SCRATCH_LEN;
-
 /// Where a minted DIAL description proxy sits across the two interfaces: it binds its source-side
 /// listeners on `source`, egress-pins device connections to `target`/`target_iface`, and is evicted if
 /// either `source_capture`'s or `target_capture`'s IPv4 address later changes. Bundling the two
@@ -53,8 +47,8 @@ pub(crate) struct ProxyPlacement<'a> {
 /// On a rewrite the datagram is written to `out` and `true` is returned. `false` means forward `payload`
 /// unchanged: it isn't a DIAL message, its `LOCATION` isn't a rewritable IPv4 `http` URL, the proxy cap
 /// was reached / a mint failed (device stays visible but unproxied), or the rewrite didn't fit `out`.
-/// `out` is the caller's reused sink; a fixed-capacity one (sized [`REWRITE_BUF_LEN`]) makes an
-/// over-long rewrite fail rather than truncate.
+/// `out` is the caller's reused sink; a fixed-capacity one makes an over-long rewrite fail rather
+/// than truncate.
 pub(crate) fn rewrite_location(
     ctx: &mut DialContext,
     reactor: &mut Reactor,
