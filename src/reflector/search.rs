@@ -201,7 +201,7 @@ impl SearchReflector {
             return Err(Outcome::Dropped(message_type));
         };
         let Some(our_addr) = reply_source(dispatcher, self.target, packet.dest.ip()) else {
-            log::warn!(
+            log::debug!(
                 "{}: cannot reflect search from {}: target has no source address for {} yet",
                 self.name,
                 packet.source,
