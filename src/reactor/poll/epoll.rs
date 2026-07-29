@@ -82,8 +82,9 @@ impl Poller {
         Ok(())
     }
 
-    /// Drop all interest on `fd`. An fd the kernel already dropped (e.g. on close)
-    /// reports `ENOENT`, which is benign.
+    /// Drop all interest on `fd`. `ENOENT` (open but not registered, e.g. a repeated remove) is
+    /// benign and swallowed. A closed fd reports `EBADF` instead, which propagates: the reactor
+    /// drops kernel interest before a handler closes its fds, so that would mean the order broke.
     pub(crate) fn remove(&self, fd: RawFd) -> io::Result<()> {
         // SAFETY: poll_fd is our epoll instance; EPOLL_CTL_DEL ignores the event arg.
         let rc = unsafe {
@@ -196,5 +197,15 @@ mod tests {
         // A second add surfaces EEXIST instead of silently modifying.
         let err = poller.add(a.as_raw_fd(), key).unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::EEXIST));
+    }
+
+    #[test]
+    fn remove_of_a_dead_fd_surfaces_ebadf() {
+        let poller = Poller::new(CAPACITY).unwrap();
+        // An fd the process doesn't hold is EBADF, not the ENOENT `remove` swallows, so a removal
+        // ordered after the close still surfaces. The number is far past what the kernel hands out,
+        // so a parallel test can't recycle it into a live fd mid-test.
+        let err = poller.remove(1_000_000).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EBADF));
     }
 }

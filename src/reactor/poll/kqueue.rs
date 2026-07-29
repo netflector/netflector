@@ -85,8 +85,9 @@ impl Poller {
         Ok(())
     }
 
-    /// Drop all interest on `fd`. Filters the kernel already removed (e.g. when
-    /// `fd` was closed) report `ENOENT`, which is benign.
+    /// Drop all interest on `fd`. Both filters are deleted, but [`add`](Self::add) arms only the
+    /// read one, so deleting an unarmed write filter reports `ENOENT`. That is the usual case, not
+    /// an error, so it is swallowed.
     pub(crate) fn remove(&self, fd: RawFd) -> io::Result<()> {
         for filter in [libc::EVFILT_READ, libc::EVFILT_WRITE] {
             match self.change_raw(fd, filter, libc::EV_DELETE, 0) {
