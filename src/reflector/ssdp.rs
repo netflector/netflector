@@ -126,7 +126,7 @@ const SESSION_GRACE: Duration = Duration::from_secs(2);
 /// reply grace. A search with no usable MX falls back to the protocol default.
 fn search_window(payload: &[u8]) -> Duration {
     let mx = parse_msearch_mx(payload).unwrap_or_else(|| {
-        log::info!(
+        log::debug!(
             "SSDP: M-SEARCH has no usable MX; using the default {MSEARCH_MX_DEFAULT}s window"
         );
         MSEARCH_MX_DEFAULT
