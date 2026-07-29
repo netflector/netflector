@@ -141,8 +141,8 @@ impl Capture {
                 // oversized frames. A per-frame warn would both break data-path-quiet and spam the
                 // operator's log. The frame is still correctly dropped.
                 Record::Oversized { datalen } => log::trace!(
-                    "dropping oversized frame: {datalen} bytes exceeds the {}-byte capture buffer",
-                    self.buf.len()
+                    "dropping oversized frame: {datalen} bytes exceeds the {}-byte forwarding limit",
+                    crate::net::MAX_FRAME_LEN
                 ),
             }
         };
@@ -235,8 +235,11 @@ fn parse_record(record: &[u8]) -> io::Result<(Record, usize)> {
         return Err(io::Error::other("BPF record did not advance"));
     }
 
-    if header.bh_datalen > header.bh_caplen {
-        // Captured fewer bytes than the frame's real length; don't parse a partial frame.
+    // Truncated by the kernel, or whole but past what we can re-emit. BPF sizes its buffer from
+    // BIOCGBLEN, not from MAX_FRAME_LEN, so it can hand up frames the send path would go on to
+    // reject once per packet.
+    if header.bh_datalen > header.bh_caplen || header.bh_caplen as usize > crate::net::MAX_FRAME_LEN
+    {
         return Ok((
             Record::Oversized {
                 datalen: header.bh_datalen,
@@ -379,6 +382,31 @@ mod tests {
             offset += advance;
         }
         assert_eq!(frames, vec![vec![0xaa; 3], vec![0xbb; 5], vec![0xcc; 1]]);
+    }
+
+    #[test]
+    fn skips_a_frame_past_the_forwarding_limit() {
+        // Whole, not truncated: this one would otherwise route and then fail in build_udp.
+        let over = u32::try_from(crate::net::MAX_FRAME_LEN + 1).expect("fits u32");
+        let mut batch = Vec::new();
+        push_record(&mut batch, over, over, 0xaa);
+        push_record(&mut batch, 2, 2, 0xbb);
+
+        let (first, advance) = parse_record(&batch).unwrap();
+        assert!(matches!(first, Record::Oversized { datalen } if datalen == over));
+        let (second, _) = parse_record(&batch[advance..]).unwrap();
+        assert!(
+            matches!(second, Record::Frame(_)),
+            "the next record still parses"
+        );
+    }
+
+    #[test]
+    fn keeps_a_frame_at_the_forwarding_limit() {
+        let at = u32::try_from(crate::net::MAX_FRAME_LEN).expect("fits u32");
+        let mut batch = Vec::new();
+        push_record(&mut batch, at, at, 0xaa);
+        assert!(matches!(parse_record(&batch).unwrap().0, Record::Frame(_)));
     }
 
     #[test]
