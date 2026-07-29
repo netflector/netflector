@@ -191,14 +191,35 @@ impl Interface {
     }
 }
 
-/// The kernel ifindex of `name`, or `None` if it names no interface (a NUL in the name, or
-/// an unknown name). Address-change events report an ifindex; an [`Interface`] caches its
-/// own so a notification maps back to it.
+/// The kernel ifindex of `name`, or `None` if it names no interface *or* the lookup itself
+/// failed. Address-change events report an ifindex; an [`Interface`] caches its own so a
+/// notification maps back to it. A caller that acts destructively on absence wants
+/// [`if_index_checked`] instead.
 pub(crate) fn if_index(name: &str) -> Option<u32> {
-    let cname = std::ffi::CString::new(name).ok()?;
+    if_index_checked(name).ok().flatten()
+}
+
+/// The kernel ifindex of `name`, telling "no such interface" apart from a lookup that could not
+/// run. `if_nametoindex` is not a pure lookup: glibc and musl open a socket inside it, so under fd
+/// pressure it reports 0 for a perfectly live interface.
+///
+/// # Errors
+/// Only the resource errnos yield `Err`. Any other failure still reads as absent, so an errno this
+/// list happens to miss can't mask a genuinely removed interface.
+pub(crate) fn if_index_checked(name: &str) -> io::Result<Option<u32>> {
+    let Ok(cname) = std::ffi::CString::new(name) else {
+        return Ok(None); // an interior NUL names no interface
+    };
     // SAFETY: `cname` is a valid NUL-terminated C string for the call's duration.
     let index = unsafe { libc::if_nametoindex(cname.as_ptr()) };
-    (index != 0).then_some(index)
+    if index != 0 {
+        return Ok(Some(index));
+    }
+    let err = io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOMEM | libc::ENOBUFS) => Err(err),
+        _ => Ok(None),
+    }
 }
 
 /// The name of interface `index`, or `None` if it names no interface. The reverse of [`if_index`],
@@ -444,6 +465,19 @@ mod tests {
             Some("fc00::1".parse::<Ipv6Addr>().unwrap()),
             "best non-link-local is the ULA"
         );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "needs a real if_nametoindex")]
+    fn a_name_that_resolves_to_nothing_is_absent_not_an_error() {
+        assert!(matches!(
+            if_index_checked(LOOPBACK_IFACE),
+            Ok(Some(index)) if index != 0
+        ));
+        // The two ways a name can fail to be one: no such interface, and an interior NUL that
+        // can't reach the C call at all. Neither is a lookup failure.
+        assert!(matches!(if_index_checked("nf-no-such-iface"), Ok(None)));
+        assert!(matches!(if_index_checked("lo\0extra"), Ok(None)));
     }
 
     // Opt-in diagnostic: trace-log every address (and each v6's flag status) the resolver

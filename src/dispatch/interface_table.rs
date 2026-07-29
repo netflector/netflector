@@ -7,7 +7,7 @@ use std::num::NonZeroU32;
 use std::os::fd::{AsRawFd, RawFd};
 
 use crate::capture::Capture;
-use crate::interface::{AddressChange, Interface, InterfaceAddresses, if_index};
+use crate::interface::{AddressChange, Interface, InterfaceAddresses, if_index_checked};
 
 use super::CaptureKey;
 use super::counters::{CaptureCounters, Outcome};
@@ -256,7 +256,10 @@ impl InterfaceTable {
             .filter_map(|(index, entry)| {
                 let key = InterfaceKey(u32::try_from(index).expect("interface count fits a u32"));
                 let cached = entry.interface.ifindex;
-                let cur = if_index(&entry.interface.name).unwrap_or(0);
+                // A lookup that couldn't run says nothing about the interface. Reading it as 0
+                // would park a healthy entry: leave it out of this pass and re-scan on the next
+                // tick, by which point whatever exhausted the fds has usually let go.
+                let cur = if_index_checked(&entry.interface.name).ok()?.unwrap_or(0);
                 let dead_capture = |c: &CaptureEntry| {
                     c.interface == key && c.capture.as_ref().is_some_and(|cap| !cap.attached(cur))
                 };
