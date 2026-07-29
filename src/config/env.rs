@@ -32,26 +32,40 @@ struct PartialReflector {
 impl PartialReflector {
     /// `var` is the full variable name, used only to label errors.
     fn set(&mut self, param: &str, value: &str, var: &str) -> Result<(), ConfigError> {
-        match param {
-            "name" => self.name = Some(env_value(value, var)?),
-            "source_if" => self.source_if = Some(env_value(value, var)?),
-            "target_if" => self.target_if = Some(env_value(value, var)?),
-            "macs" => self.macs = Some(env_value(value, var)?),
-            "wol_ports" => self.wol_ports = Some(env_value(value, var)?),
-            "address_family" => self.address_family = Some(env_value(value, var)?),
-            "wol" => self.wol = Some(env_bool(value, var)?),
-            "mdns" => self.mdns = Some(env_bool(value, var)?),
-            "ssdp" => self.ssdp = Some(env_bool(value, var)?),
-            "dial" => self.dial = Some(env_bool(value, var)?),
-            "wsd" => self.wsd = Some(env_bool(value, var)?),
-            _ => {
-                return Err(ConfigError::EnvUnknownParam {
+        // Write-once slots: params fold case-insensitively, so two case-variant variables land in
+        // the same slot, and environ order must not pick a silent winner.
+        fn put<T>(
+            slot: &mut Option<T>,
+            value: T,
+            param: &str,
+            var: &str,
+        ) -> Result<(), ConfigError> {
+            if slot.is_some() {
+                return Err(ConfigError::EnvDuplicateParam {
                     var: var.to_owned(),
                     param: param.to_owned(),
                 });
             }
+            *slot = Some(value);
+            Ok(())
         }
-        Ok(())
+        match param {
+            "name" => put(&mut self.name, env_value(value, var)?, param, var),
+            "source_if" => put(&mut self.source_if, env_value(value, var)?, param, var),
+            "target_if" => put(&mut self.target_if, env_value(value, var)?, param, var),
+            "macs" => put(&mut self.macs, env_value(value, var)?, param, var),
+            "wol_ports" => put(&mut self.wol_ports, env_value(value, var)?, param, var),
+            "address_family" => put(&mut self.address_family, env_value(value, var)?, param, var),
+            "wol" => put(&mut self.wol, env_bool(value, var)?, param, var),
+            "mdns" => put(&mut self.mdns, env_bool(value, var)?, param, var),
+            "ssdp" => put(&mut self.ssdp, env_bool(value, var)?, param, var),
+            "dial" => put(&mut self.dial, env_bool(value, var)?, param, var),
+            "wsd" => put(&mut self.wsd, env_bool(value, var)?, param, var),
+            _ => Err(ConfigError::EnvUnknownParam {
+                var: var.to_owned(),
+                param: param.to_owned(),
+            }),
+        }
     }
 
     /// The two interface fields are required; the rest default.
@@ -218,6 +232,21 @@ mod tests {
         assert_eq!(r.source_if.as_str(), "lan");
         assert_eq!(r.target_if.as_str(), "iot");
         assert!(r.mdns);
+    }
+
+    #[test]
+    fn a_case_variant_env_param_is_rejected_not_last_wins() {
+        let err = from_env(&[
+            ("NETFLECTOR_TV_SOURCE_IF", "eth0"),
+            ("NETFLECTOR_TV_source_if", "eth1"),
+            ("NETFLECTOR_TV_TARGET_IF", "iot"),
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::EnvDuplicateParam { var, param }
+                if var == "NETFLECTOR_TV_source_if" && param == "source_if"
+        ));
     }
 
     #[test]
