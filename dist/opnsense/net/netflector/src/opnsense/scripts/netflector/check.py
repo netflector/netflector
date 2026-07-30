@@ -101,4 +101,9 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except Exception as exc:
+        # configd discards a failing action's output, so an escaping exception reaches the GUI as a
+        # generic error. Catch broadly and answer on stdout with exit 0, like a rejected config.
+        report('failed', f'The validation could not run: {type(exc).__name__}: {exc}')
