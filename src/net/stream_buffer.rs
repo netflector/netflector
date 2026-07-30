@@ -40,9 +40,10 @@ impl StreamBuffer {
     /// The unsent bytes, for one `send`.
     pub(crate) fn pending(&self) -> &[u8] {
         match &self.storage {
-            // SAFETY: bytes enter `[..filled]` only via `append` (which writes them) or `commit` (whose
-            // contract is that `free_tail_mut`'s region was written), so `[consumed..filled]` is
-            // initialized. `MaybeUninit<u8>` and `u8` share layout.
+            // SAFETY: bytes enter `[..filled]` only via `append` (which writes them) or `commit`
+            // (whose contract is that `free_tail_mut`'s region was written and that nothing moved
+            // `filled` in between), so `[consumed..filled]` is initialized. `MaybeUninit<u8>` and
+            // `u8` share layout.
             Some(storage) => unsafe {
                 let live = &storage[self.consumed..self.filled];
                 slice::from_raw_parts(live.as_ptr().cast::<u8>(), live.len())
@@ -108,8 +109,10 @@ impl StreamBuffer {
     ///
     /// # Safety
     /// The first `n` bytes of the most recent [`free_tail_mut`](Self::free_tail_mut) must have been
-    /// initialized (written) before this call. [`pending`](Self::pending) then reads `[consumed..filled]`
-    /// as initialized `u8`, so committing bytes that were never written is undefined behavior.
+    /// initialized (written), and no other `&mut self` method may have run in between: `commit` adds
+    /// `n` to whatever `filled` is now, and `append` or a compaction inside `free_tail_mut` moves it,
+    /// so an interleaved call marks bytes nobody wrote. [`pending`](Self::pending) then reads
+    /// `[consumed..filled]` as initialized `u8`, which is undefined behavior.
     pub(crate) unsafe fn commit(&mut self, n: usize) {
         debug_assert!(self.filled + n <= self.capacity, "commit past the capacity");
         self.filled += n;
