@@ -171,7 +171,11 @@ def receive(args: argparse.Namespace) -> int:
                     return 1
                 return 0
 
-            print("received payload does not match expected magic packet", file=sys.stderr, flush=True)
+            print(
+                f"received payload does not match the expected {packet_hex(expected)}",
+                file=sys.stderr,
+                flush=True,
+            )
             return 1
 
     if args.expect_none:
