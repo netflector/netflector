@@ -338,8 +338,11 @@ impl Reactor {
 
     /// Arm or disarm delivery of read readiness for the fd that `reg_key` addresses (armed at
     /// [`watch`](Self::watch)). Returns whether the registration was live. Disarming stops data and a
-    /// peer's half-close (FIN) from waking the handler; a full hangup/error still surfaces (as readable
-    /// on epoll, via the write filter or the deadline on kqueue), so a closed fd is never silently stuck.
+    /// peer's half-close (FIN) from waking the handler. epoll reports a hangup or error as readable
+    /// whatever the mask says, so it always surfaces there; kqueue does not, since `EV_DISABLE` on the
+    /// read filter suppresses `EV_EOF` and the write filter is deleted when write interest is off. A
+    /// handler that disarms read must therefore keep write interest armed or a `next_deadline` set, or
+    /// it will not hear about the fd again.
     ///
     /// # Errors
     /// Returns an error if updating the kernel's read interest fails.
