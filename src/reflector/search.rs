@@ -3,7 +3,7 @@
 //! A search (SSDP `M-SEARCH`, WSD `Probe` / `Resolve`) is reflected source → target, and each
 //! searcher's *unicast* reply (SSDP `200 OK`, WSD `ProbeMatches` / `ResolveMatches`) is routed back
 //! through a per-searcher session: a reserved ephemeral port on the target with a dedicated response
-//! capture, so a reply reaches only the searcher that asked. [`SearchReflector`] owns the sessions and
+//! registration, so a reply reaches only the searcher that asked. [`SearchReflector`] owns the sessions and
 //! reflects searches; a per-session [`ResponseReflector`] routes each reply back.
 //!
 //! Protocol specifics enter as parameters: the [`Verdict`] classifier (is this payload a search?), the
@@ -32,7 +32,7 @@ const MAX_SESSIONS: usize = 64;
 /// searched: each group's replies arrive at a different scope-matched target address (link-local for
 /// `ff02::c`, routable for `ff05::c`), so one searcher's searches to two scopes need separate sessions.
 /// `expiry` is when the session lapses; `reservation` holds the ephemeral target reply port for the
-/// session's life (dropping it frees the port); `response_key` is the per-session response capture. A
+/// session's life (dropping it frees the port); `response_key` is the per-session response registration. A
 /// `RegistrationKey` is not a RAII guard, so eviction and rollback `unregister` it by hand.
 struct Session {
     searcher: SocketAddr,
@@ -127,7 +127,7 @@ pub(crate) struct SearchReflector {
     source: CaptureKey,
     /// The target capture: where the search is re-emitted and the replies are captured.
     target: CaptureKey,
-    /// The configured device allow-set, scoping the response capture as the announcement direction is.
+    /// The configured device allow-set, scoping the response registration as the announcement direction is.
     device_macs: Option<MacSet>,
     /// Protocol label for logs, e.g. `"SSDP"`.
     name: &'static str,
@@ -253,7 +253,7 @@ impl SearchReflector {
 }
 
 /// The target-side source address replies to `dest` come back to: the same scope-matched pick
-/// `build_udp` makes for the reflected search, so the reserved port and its response capture
+/// `build_udp` makes for the reflected search, so the reserved port and its response registration
 /// watch the address the device actually answers.
 fn reply_source(dispatcher: &PacketDispatcher, target: CaptureKey, dest: IpAddr) -> Option<IpAddr> {
     match dest {
@@ -359,7 +359,7 @@ impl PacketHandler for SearchReflector {
                 Outcome::Reflected(message_type)
             }
             Err(e) => {
-                // Roll back the response capture just registered; the reservation drops with `session`.
+                // Roll back the response registration just made; the reservation drops with `session`.
                 log::warn!(
                     "{}: cannot reflect search from {} to {}: {e}",
                     self.name,
@@ -458,7 +458,7 @@ mod tests {
     }
 
     /// Push a session for `searcher` onto `reflector`: a real loopback port reservation plus a
-    /// registered response capture, so eviction has a registration to tear down. (`PortReservation`
+    /// registered response registration, so eviction has something to tear down. (`PortReservation`
     /// binds a socket directly, so no capture / `CAP_NET_RAW` is needed.)
     fn push_session(
         reflector: &mut SearchReflector,
@@ -527,7 +527,7 @@ mod tests {
 
     #[test]
     #[cfg_attr(miri, ignore = "needs a real socket")]
-    fn on_deadline_evicts_expired_sessions_and_unregisters_their_captures() {
+    fn on_deadline_evicts_expired_sessions_and_unregisters_their_registrations() {
         let mut dispatcher = PacketDispatcher::new();
         let mut reactor = Reactor::new().unwrap();
         let mut reflector = test_reflector();
@@ -562,7 +562,7 @@ mod tests {
         assert_eq!(
             dispatcher.registration_count(),
             1,
-            "its response capture is unregistered with it"
+            "its response registration is removed with it"
         );
         assert_eq!(
             reflector.next_deadline(),
@@ -606,7 +606,7 @@ mod tests {
         assert_eq!(
             dispatcher.registration_count(),
             1,
-            "no second response capture is registered"
+            "no second response registration is made"
         );
         assert!(
             reflector.sessions[0].expiry > base,
@@ -705,7 +705,7 @@ mod tests {
         );
         assert_eq!(dispatcher.registration_count(), 2);
 
-        // The target capture, shared by every session: all cleared, their response captures gone.
+        // The target capture, shared by every session: all cleared, their response registrations gone.
         let target = reflector.target;
         reflector.on_iface_change(&[target], &mut dispatcher, &mut reactor);
         assert!(
@@ -715,7 +715,7 @@ mod tests {
         assert_eq!(
             dispatcher.registration_count(),
             0,
-            "each cleared session's response capture is unregistered"
+            "each cleared session's response registration is removed"
         );
     }
 
@@ -825,7 +825,7 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "needs a real capture device")]
     fn a_failed_reflect_rolls_back_the_session_registration() {
-        // make_session registers the response capture before reflecting; if the reflect then fails, that
+        // make_session makes the response registration before reflecting; if the reflect then fails, that
         // registration must be rolled back, not leaked. A real loopback target lets make_session succeed;
         // an oversized payload then makes build_udp reject the reflect deterministically.
         let Some(target_cap) = open_loopback_or_skip() else {
@@ -866,7 +866,7 @@ mod tests {
         assert_eq!(
             dispatcher.registration_count(),
             before,
-            "make_session's response capture was rolled back"
+            "make_session's response registration was rolled back"
         );
     }
 }

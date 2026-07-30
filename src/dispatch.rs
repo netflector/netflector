@@ -96,7 +96,8 @@ impl CaptureKey {
 /// A `Copy` handle to a routing registration: the generational arena [`Key`] of its slot, newtyped
 /// so it can't be confused with a reactor key or a [`CaptureKey`]. Returned by
 /// [`register`](PacketDispatcher::register); the SSDP search reflector will hold it to
-/// [`unregister`](PacketDispatcher::unregister) a per-searcher capture when its session ends.
+/// [`unregister`](PacketDispatcher::unregister) a per-searcher response registration when its
+/// session ends.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct RegistrationKey(Key);
 
@@ -338,7 +339,7 @@ impl PacketDispatcher {
 
     /// Register `handler`, gated by `filter`, for packets captured on `ingress`. The returned
     /// [`Key`] removes it again via [`unregister`](Self::unregister), for the per-searcher response
-    /// captures the SSDP search reflector creates dynamically; a static reflector ignores it.
+    /// registrations the SSDP search reflector creates dynamically; a static reflector ignores it.
     pub(crate) fn register(
         &mut self,
         ingress: CaptureKey,
@@ -353,7 +354,7 @@ impl PacketDispatcher {
     }
 
     /// Remove the registration `key` addresses, freeing its slot; a stale key is a safe no-op.
-    /// Tears down a per-searcher response capture when its session expires.
+    /// Tears down a per-searcher response registration when its session expires.
     pub(crate) fn unregister(&mut self, key: RegistrationKey) {
         self.registrations.remove(key.0);
     }
@@ -786,7 +787,7 @@ impl PacketDispatcher {
     /// backing `captures`, taking each handler out for its call so `&mut self` is free. Off the data
     /// path (only the interface-change / reconcile path, which allocates anyway), so it snapshots the
     /// live keys into a fresh `Vec` rather than a reused scratch. A handler that unregisters a sibling
-    /// mid-broadcast (a search reflector dropping its sessions' response captures) is fine: the vacated
+    /// mid-broadcast (a search reflector dropping its sessions' response registrations) is fine: the vacated
     /// slot is skipped.
     fn notify_iface_change(&mut self, captures: &[CaptureKey], reactor: &mut Reactor) {
         if captures.is_empty() {
@@ -804,7 +805,7 @@ impl PacketDispatcher {
                 .and_then(|reg| reg.handler.take())
             else {
                 // Expected, not an error: an earlier reflector in this broadcast cleared its sessions
-                // and unregistered their response captures, which are in this snapshot, so they resolve
+                // and unregistered their response registrations, which are in this snapshot, so they resolve
                 // to None here. Mirrors on_deadline's mid-sweep skip.
                 log::trace!(
                     "iface-change broadcast: handler for {key:?} gone mid-broadcast, skipped"
