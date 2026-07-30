@@ -229,6 +229,14 @@ ADDR_CHANGE_REFLECTED_WINDOW = 4.0
 ADDR_CHANGE_SILENCE_WINDOW = 2.5
 ADDR_CHANGE_SILENCE_CONSECUTIVE = 2
 ADDR_CHANGE_POLL_DEADLINE = 60.0
+# An expect-none receiver is stopped once the sender has finished, so its own deadline is only a
+# backstop: it must outlast container startup on the slowest lane, never bound the assertion.
+EXPECT_NONE_BACKSTOP_SECONDS = 60.0
+# After the sender exits, how long the receiver keeps listening before the window is closed --
+# the packet's flight time through the daemon, not a guess at when the sender got around to it.
+EXPECT_NONE_FLIGHT_SECONDS = 1.5
+# SIGTERM grace for a probe the harness stops; it only has to unwind and print.
+PROBE_STOP_GRACE_SECONDS = 5
 # A substring of the line the daemon logs immediately before entering its event loop.
 NETFLECTOR_READY_LOG = "running; press Ctrl-C or send SIGTERM to stop"
 RECEIVER_READY_LOG = "receiver ready: UDP socket bound"
@@ -1281,6 +1289,9 @@ class DockerBackend(Backend):
         docker(["stop", "-t", str(grace_seconds), self.roles["netflector"]])
         return self.wait("netflector")
 
+    def stop_probe(self, role: str, grace_seconds: int) -> None:
+        docker(["stop", "-t", str(grace_seconds), self.roles[role]], check=False, echo=False)
+
     def admin(self, script: str, *, capture: bool = False) -> str:
         # Address/route changes need CAP_NET_ADMIN and a writable /proc/sys, which the netflector
         # container (scratch image, NET_RAW only) has by neither. Run a throwaway privileged
@@ -1501,6 +1512,17 @@ class NativeBackend(Backend):
                 proc.kill()
                 proc.wait()
         return proc.returncode
+
+    def stop_probe(self, role: str, grace_seconds: int) -> None:
+        proc = self.procs.get(role)
+        if proc is None or proc.poll() is not None:
+            return
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=grace_seconds)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
 
     def netflector_ip(self, segment: str) -> str:
         return f"{SEGMENT_V4_SUBNET[segment]}.{NATIVE_NETFLECTOR_HOST}"
@@ -1928,12 +1950,15 @@ class CaseRunner:
     def start_receiver(self, case: TestCase | None = None) -> None:
         case = case or self.case
         ifname = self.backend.helper_ifname(self.receiver_ifname)
+        expect_none = case.expect_payload_hex is None and case.expect_mac is None
         probe_args = [
             "receive",
             "--port",
             str(case.receive_port),
             "--timeout",
-            str(case.timeout_seconds),
+            # A positive receiver exits on its packet, so its window is the failure deadline. A
+            # negative one is closed by the harness at the send instead (see close_expect_none_window).
+            str(EXPECT_NONE_BACKSTOP_SECONDS if expect_none else case.timeout_seconds),
         ]
         if case.expect_payload_hex is not None:
             probe_args.extend(["--expect-payload-hex", case.expect_payload_hex])
@@ -1981,16 +2006,19 @@ class CaseRunner:
             detach=False,
         )
 
-    def assert_receiver_outlived_sender(self) -> None:
-        # An expect-none verdict only means something if the receiver was still listening when the
-        # sender fired: a slow start can otherwise close the window first and turn "nothing arrived"
-        # into a fact about the harness rather than about reflection.
+    def close_expect_none_window(self) -> None:
+        # The sender has exited, so the packet -- if the daemon were going to relay one -- is either
+        # already delivered or in flight. Give it that flight time, then stop the receiver and let it
+        # report. Bounding the window by the send rather than by a fixed timeout is what keeps the
+        # assertion from going vacuous when container startup outruns it, as it does under valgrind.
         running, state = self.backend.status("receiver")
         if not running:
             raise RuntimeError(
                 f"receiver stopped before the sender finished ({state}); the expect-none result "
                 f"would be vacuous"
             )
+        time.sleep(EXPECT_NONE_FLIGHT_SECONDS)
+        self.backend.stop_probe("receiver", PROBE_STOP_GRACE_SECONDS)
 
     def wait_for_result(self) -> None:
         exit_code = self.backend.wait("receiver")
@@ -2032,7 +2060,7 @@ class CaseRunner:
         self.start_receiver()
         self.run_sender()
         if self.case.expect_payload_hex is None and self.case.expect_mac is None:
-            self.assert_receiver_outlived_sender()
+            self.close_expect_none_window()
         self.wait_for_result()
         print(f"PASS {self.case.name}", flush=True)
         if self.args.show_netflector_logs:
@@ -2513,7 +2541,7 @@ class AddressChangeRunner(CaseRunner):
         self.start_receiver(case)
         self.run_sender(case)
         if not expect:
-            self.assert_receiver_outlived_sender()
+            self.close_expect_none_window()
         return self.backend.wait("receiver") == 0
 
     def _poll_reflected(self, phase: Phase) -> bool:

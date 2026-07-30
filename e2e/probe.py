@@ -19,6 +19,7 @@ import argparse
 import binascii
 import errno
 import http.server
+import signal
 import socket
 import struct
 import sys
@@ -52,6 +53,17 @@ def parse_payload_hex(value: str) -> bytes:
         return binascii.unhexlify(value)
     except (binascii.Error, ValueError) as exc:
         raise argparse.ArgumentTypeError(f"invalid hex payload: {value}") from exc
+
+
+class WindowClosed(Exception):
+    """SIGTERM: the harness closed an expect-none window once the sender had finished."""
+
+
+def _close_window(signum, frame):
+    del signum, frame
+    # PEP 475 retries an interrupted recvfrom unless the handler raises, so raising is what
+    # actually breaks the receive loop.
+    raise WindowClosed
 
 
 # How long a receiver keeps listening after its expected packet, to catch a second copy. A duplicate
@@ -141,6 +153,16 @@ def receive(args: argparse.Namespace) -> int:
     family = socket.AF_INET6 if args.family == 6 else socket.AF_INET
     bind_address = "::" if family == socket.AF_INET6 else "0.0.0.0"
 
+    try:
+        return _receive(args, expected, deadline, family, bind_address)
+    except WindowClosed:
+        # Only an expect-none receiver arms the handler, and reaching here means no packet arrived
+        # before the harness closed the window -- which it does only after the sender finished.
+        print("no packets before the harness closed the window", flush=True)
+        return 0
+
+
+def _receive(args, expected, deadline, family, bind_address) -> int:
     with socket.socket(family, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         bind_reporting_conflict(sock, bind_address, args.port)
@@ -149,6 +171,11 @@ def receive(args: argparse.Namespace) -> int:
             # interface; broadcast/all-nodes (the WoL IPv4 path) needs no join.
             join_group(sock, family, args.join_group, args.interface)
         print(f"receiver ready: UDP socket bound on port {args.port}", flush=True)
+
+        # An expect-none receiver outlives its own deadline: the harness stops it once the sender
+        # has finished, so the window provably spans the send instead of racing it.
+        if args.expect_none:
+            signal.signal(signal.SIGTERM, _close_window)
 
         while True:
             remaining = deadline - time.monotonic()
