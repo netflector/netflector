@@ -5,7 +5,7 @@ log_level = "debug"
 # A lone reflector (not sharing the interfaces with the dual "discovery" one in config.toml) so the
 # two mDNS reflectors can't conflict.
 [reflectors.mdns-v4]
-source_if = "wol_src"
-target_if = "wol_dst"
+source_if = "nf_source"
+target_if = "nf_target"
 mdns = true
 address_family = "ipv4"

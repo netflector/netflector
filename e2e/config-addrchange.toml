@@ -5,7 +5,7 @@ log_level = "debug"
 # case then knocks out one (interface, family) source address at a time and proves -- via real
 # traffic -- that only that family's reflection stops, then resumes once the address returns.
 [reflectors.mdns]
-source_if = "wol_src"
-target_if = "wol_dst"
+source_if = "nf_source"
+target_if = "nf_target"
 mdns = true
 address_family = "dual"
