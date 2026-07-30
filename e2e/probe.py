@@ -54,6 +54,12 @@ def parse_payload_hex(value: str) -> bytes:
         raise argparse.ArgumentTypeError(f"invalid hex payload: {value}") from exc
 
 
+# How long a receiver keeps listening after its expected packet, to catch a second copy. A duplicate
+# is near-simultaneous -- a doubled send, or an echo one reactor iteration later -- so this is jitter
+# margin, sized for the emulated lanes where that iteration costs tens of milliseconds.
+DUPLICATE_DRAIN_SECONDS = 0.5
+
+
 def packet_hex(payload: bytes) -> str:
     return binascii.hexlify(payload).decode("ascii")
 
@@ -169,7 +175,7 @@ def receive(args: argparse.Namespace) -> int:
                         flush=True,
                     )
                     return 1
-                return 0
+                return drain_for_duplicate(sock, expected)
 
             print(
                 f"received payload does not match the expected {packet_hex(expected)}",
@@ -184,6 +190,30 @@ def receive(args: argparse.Namespace) -> int:
 
     print(f"timed out waiting for expected packet after {args.timeout:.3f}s", file=sys.stderr, flush=True)
     return 1
+
+
+def drain_for_duplicate(sock: socket.socket, expected: bytes) -> int:
+    # One reflection per packet is the contract, and nothing else in the suite can see a second one:
+    # a doubled emission on the correct egress, or the daemon's own re-emission echoed back to it
+    # (the own-egress drop and the Verdict::Skip loop-breaker both prevent that). Every config keeps
+    # its entries non-overlapping, so a second identical datagram is always a fault.
+    deadline = time.monotonic() + DUPLICATE_DRAIN_SECONDS
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return 0
+        sock.settimeout(remaining)
+        try:
+            payload, peer = sock.recvfrom(4096)
+        except TimeoutError:
+            return 0
+        if payload == expected:
+            print(
+                f"received a second copy from {peer[0]}:{peer[1]}: the packet was reflected twice",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 1
 
 
 def respond(args: argparse.Namespace) -> int:
