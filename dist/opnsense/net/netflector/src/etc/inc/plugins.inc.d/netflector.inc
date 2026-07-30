@@ -50,6 +50,17 @@ function netflector_enabled()
     return false;
 }
 
+/**
+ * Registers the daemon's syslog tag as an application, so remote syslog destinations (System >
+ * Settings > Logging) can forward exactly its lines. The rc script starts the daemon under
+ * `daemon -S -T netflector`, so every line carries this tag; the name here must match that -T,
+ * as must the Syslog/local template filter that routes the tag into /var/log/netflector/.
+ */
+function netflector_syslog()
+{
+    return ['netflector' => ['facility' => ['netflector']]];
+}
+
 function netflector_services()
 {
     $services = [];
