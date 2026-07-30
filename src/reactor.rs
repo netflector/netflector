@@ -508,9 +508,12 @@ impl Reactor {
         }
     }
 
-    /// Ask the run loop to stop once the current dispatch returns. Handlers call this (the self-pipe
-    /// handler does, on a shutdown signal). Calling it outside a run loop has no lasting effect:
-    /// [`run`](Self::run) clears the flag before entering the loop.
+    /// Ask the run loop to stop before its next iteration. The flag is only the `while` condition,
+    /// and a handler sets it mid-body, past this iteration's check, so the iteration underway
+    /// completes: the batch's remaining events, a pending dump broadcast, and a due deadline sweep
+    /// all still dispatch. Handlers call this (the self-pipe handler does, on a shutdown signal).
+    /// Calling it outside a run loop has no lasting effect: [`run`](Self::run) clears the flag
+    /// before entering the loop.
     pub(crate) fn request_shutdown(&mut self) {
         self.shutdown = true;
     }
