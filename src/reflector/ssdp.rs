@@ -135,9 +135,10 @@ fn search_window(payload: &[u8]) -> Duration {
 }
 
 /// Build the SSDP reflector for `reflector` and register both directions on `dispatcher`. A no-op
-/// when SSDP isn't enabled. For each address family in use it joins every group on BOTH interfaces and
-/// registers two handlers per group: advertisements target → source (a [`SimpleReflector`]),
-/// and searches source → target with their unicast 200-OK replies (the shared [`SearchReflector`]). A
+/// when SSDP isn't enabled. It joins every in-use family's group on BOTH interfaces, then registers
+/// two handlers spanning them: advertisements target → source (a [`SimpleReflector`]), and searches
+/// source → target with their unicast 200-OK replies (the shared [`SearchReflector`]). One
+/// [`SearchReflector`] for every group means its sessions share one table and one cap. A
 /// required family must be sendable on BOTH interfaces, since the reflector re-emits on both.
 ///
 /// # Errors

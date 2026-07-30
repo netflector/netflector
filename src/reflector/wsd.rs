@@ -56,8 +56,8 @@ fn window(_: &[u8]) -> Duration {
 }
 
 /// Build the WSD reflector for `reflector` and register both directions on `dispatcher`. A no-op when
-/// WSD isn't enabled. For each address family in use it joins the group on BOTH interfaces and
-/// registers two handlers: `Hello` / `Bye` announcements target → source (a [`SimpleReflector`]), and
+/// WSD isn't enabled. It joins each in-use family's group on BOTH interfaces, then registers two
+/// handlers spanning them: `Hello` / `Bye` announcements target → source (a [`SimpleReflector`]), and
 /// `Probe` / `Resolve` searches source → target with their unicast replies (the shared
 /// [`SearchReflector`]). A required family must be sendable on BOTH interfaces, since both re-emit.
 ///
