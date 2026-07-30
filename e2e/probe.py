@@ -224,7 +224,7 @@ def search(args: argparse.Namespace) -> int:
 
     with socket.socket(family, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((bind_address, args.source_port))  # the searcher's known source port
+        bind_reporting_conflict(sock, bind_address, args.source_port)  # the searcher's known source port
 
         scope_id = 0
         if family == socket.AF_INET6:
@@ -537,7 +537,7 @@ def _dial_discover(args):
             print(f"dial-client: no DIAL NOTIFY for {args.timeout:.3f}s", file=sys.stderr, flush=True)
             return None
         # Active discovery: send the M-SEARCH from a bound source port, await the proxied unicast 200 OK.
-        sock.bind((udp_bind, args.source_port))
+        bind_reporting_conflict(sock, udp_bind, args.source_port)
         if family == socket.AF_INET6:
             scope = socket.if_nametoindex(args.interface)
             sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_IF, scope)

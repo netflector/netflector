@@ -107,7 +107,7 @@ SSDP_OK_HEX = (
     "USN: uuid:device::ssdp:all\r\n"
     "LOCATION: http://device.invalid/desc.xml\r\n\r\n"
 ).encode().hex()
-SEARCHER_SOURCE_PORT = 49152
+SEARCHER_SOURCE_PORT = 9012  # below the ephemeral range, like the WoL ports above
 
 # DIAL discovery: a DIAL-targeted M-SEARCH (ST is the DIAL service type). The emulator answers it with a
 # 200 OK whose LOCATION points at its own target-side HTTP description endpoint.
@@ -119,7 +119,7 @@ SSDP_DIAL_MSEARCH_HEX = (
     "MX: 2\r\n"
     f"ST: {DIAL_SERVICE_TYPE}\r\n\r\n"
 ).encode().hex()
-DIAL_CLIENT_SOURCE_PORT = 49153
+DIAL_CLIENT_SOURCE_PORT = 9013
 # --- WSD (WS-Discovery): SOAP-over-UDP. Groups 239.255.255.250 / ff02::c (shared with SSDP) on UDP
 # 3702 -- the port distinguishes it from SSDP. netflector classifies on the <Action> URI segment and
 # relays the bytes verbatim, so the receiver expects exactly what was sent. Real ONVIF-style envelopes
