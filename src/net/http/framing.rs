@@ -77,7 +77,8 @@ pub(crate) enum FramingError {
 /// One [`feed`](HttpFraming::feed) call's forwardable output: the rewritten `header` (a view into the
 /// framer's scratch, empty while a body streams across feeds), the `body` (a zero-copy slice of the fed
 /// input, possibly empty), and `consumed`, how many fed bytes to drop. `consumed == 0` means an
-/// incomplete header: read more and feed again. `application_url` is the device REST base the message's
+/// incomplete message: read more and feed again. It is the routine end of a multi-recv body, not a
+/// header-only condition. `application_url` is the device REST base the message's
 /// first `Application-URL` named, *before* the rewrite, reported on the feed that completes the header;
 /// the DIAL proxy dials it and re-learns it from a later description fetch. Only that header is
 /// reported: the others are rewritten per the policy, and nothing dials them.
@@ -117,7 +118,7 @@ impl HttpFraming {
     /// Feed a contiguous view of the owner's buffered bytes; returns the forwardable [`Framed`]. Each
     /// call yields at most one message's header plus as much of its body as arrived; the owner forwards
     /// `header` then `body`, drops `consumed` bytes, and feeds again until `consumed` is 0 (an
-    /// incomplete header, read more). `header` borrows the framer's scratch and `body` the input, so
+    /// incomplete message, read more). `header` borrows the framer's scratch and `body` the input, so
     /// the owner forwards both before advancing past `consumed`.
     ///
     /// Each authority header (`Host` on requests, `Application-URL` / `Location` on responses) is
