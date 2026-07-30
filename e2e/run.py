@@ -1660,6 +1660,9 @@ class NativeFreeBSDBackend(NativeBackend):
         self.jails = {"dut": f"{base}_dut", "source": f"{base}_src", "target": f"{base}_dst"}
         # The host-side end of a live decoy epair (see add_decoy_interface), for teardown.
         self._decoy_host_end: str | None = None
+        # Every epair a end ever created, by its raw name, so teardown can reach a pair that a
+        # setup failure stranded before its rename.
+        self._epair_a_ends: list[str] = []
 
     @staticmethod
     def require_available() -> None:
@@ -1685,13 +1688,17 @@ class NativeFreeBSDBackend(NativeBackend):
         run_command(["jexec", jail, "sysctl", "net.inet6.ip6.dad_count=0"])
         run_command(["jexec", jail, "ifconfig", "lo0", "up"])
 
+    def _create_epair(self) -> tuple[str, str]:
+        a_end = run_command(["ifconfig", "epair", "create"]).stdout.strip()
+        if not a_end.endswith("a"):
+            raise RuntimeError(f"unexpected epair name: {a_end}")
+        self._epair_a_ends.append(a_end)
+        return a_end, f"{a_end[:-1]}b"
+
     def setup_segments(self) -> None:
         ends = {}
         for segment in SEGMENTS:
-            a_end = run_command(["ifconfig", "epair", "create"]).stdout.strip()
-            if not a_end.endswith("a"):
-                raise RuntimeError(f"unexpected epair name: {a_end}")
-            ends[segment] = (a_end, f"{a_end[:-1]}b")
+            ends[segment] = self._create_epair()
 
         dut = self.jails["dut"]
         self._make_jail(dut, *(a_end for a_end, _ in ends.values()))
@@ -1726,10 +1733,7 @@ class NativeFreeBSDBackend(NativeBackend):
         # A fresh epair, moved into the LIVE jails -- setup assigns interfaces at jail
         # creation (vnet.interface=...); this is the move-into-a-running-vnet path -- then
         # configured exactly as setup did.
-        a_end = run_command(["ifconfig", "epair", "create"]).stdout.strip()
-        if not a_end.endswith("a"):
-            raise RuntimeError(f"unexpected epair name: {a_end}")
-        b_end = f"{a_end[:-1]}b"
+        a_end, b_end = self._create_epair()
         run_command(["ifconfig", a_end, "vnet", self.jails["dut"]])
         run_command(["ifconfig", b_end, "vnet", self.jails[segment]])
         self._configure_segment(segment, a_end, b_end)
@@ -1738,12 +1742,10 @@ class NativeFreeBSDBackend(NativeBackend):
         # The move into the dut vnet is what occupies the freed index there: FreeBSD's
         # per-vnet allocator hands the mover the lowest free slot, exactly where the deleted
         # interface sat. The b end stays on the host (destroyed with the pair later).
-        a_end = run_command(["ifconfig", "epair", "create"]).stdout.strip()
-        if not a_end.endswith("a"):
-            raise RuntimeError(f"unexpected epair name: {a_end}")
+        a_end, b_end = self._create_epair()
         run_command(["ifconfig", a_end, "vnet", self.jails["dut"]])
         run_command(["jexec", self.jails["dut"], "ifconfig", a_end, "name", DECOY_IFNAME])
-        self._decoy_host_end = f"{a_end[:-1]}b"
+        self._decoy_host_end = b_end
 
     def remove_decoy_interface(self) -> None:
         # Destroying the dut-side end tears down the pair, the host b end included.
@@ -1753,12 +1755,16 @@ class NativeFreeBSDBackend(NativeBackend):
     def _teardown_fabric(self) -> None:
         # Destroy the a ends (from inside the dut jail) first: killing one end tears down the
         # whole pair, including the b end inside its probe jail -- so no jail removal can return
-        # a probe0 to a stack where the other jail's probe0 already sits. The host-side destroy
-        # covers a setup that failed before the interfaces moved into the dut jail.
+        # a probe0 to a stack where the other jail's probe0 already sits.
         for ifname in NETFLECTOR_IFNAMES.values():
             run_command(["jexec", self.jails["dut"], "ifconfig", ifname, "destroy"],
                         check=False, echo=False)
-            run_command(["ifconfig", ifname, "destroy"], check=False, echo=False)
+        # A setup failure before the renames strands pairs under their raw epair names, on the
+        # host or already inside the dut jail; try both, either end tears down the pair.
+        for a_end in self._epair_a_ends:
+            run_command(["jexec", self.jails["dut"], "ifconfig", a_end, "destroy"],
+                        check=False, echo=False)
+            run_command(["ifconfig", a_end, "destroy"], check=False, echo=False)
         if self._decoy_host_end is not None:  # a case failed mid-decoy; free the pair
             run_command(["ifconfig", self._decoy_host_end, "destroy"], check=False, echo=False)
         for jail in self.jails.values():
