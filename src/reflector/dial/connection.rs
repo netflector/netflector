@@ -166,9 +166,11 @@ impl DirectionContext<'_> {
     /// destination stays open and writable, so the reverse direction keeps delivering. `Close` if the
     /// reactor rejects the disarm.
     fn half_close(&mut self, reactor: &mut Reactor) -> Outcome {
+        // Reached only while the flow is Open, and peer_gone marks a flow Done before taking that
+        // side's reg, so this side's is still set.
         let reg = self
             .from_reg
-            .expect("a persisted connection has its registration set");
+            .expect("an open flow's source keeps its registration");
         if reactor.set_read_interest(reg, false).is_err() {
             log::warn!("dial: disarming the half-closed source failed; closing");
             return Outcome::Close;
@@ -223,9 +225,10 @@ impl DirectionContext<'_> {
     /// rejects the change, which would otherwise strand the buffered send with no later re-arm.
     fn sync_write_interest(&self, reactor: &mut Reactor) -> Outcome {
         let armed = !self.flow.send.is_empty() || self.to.is_connecting();
+        // As in half_close: an Open flow means no peer_gone has taken this direction's regs.
         let reg = self
             .to_reg
-            .expect("a persisted connection has its registration set");
+            .expect("an open flow's destination keeps its registration");
         if reactor.set_write_interest(reg, armed).is_err() {
             log::warn!("dial: updating write interest failed; closing");
             return Outcome::Close;
@@ -236,8 +239,10 @@ impl DirectionContext<'_> {
 
 /// One proxied client↔device connection. Each socket is watched under its own reg; `device_endpoint`
 /// is where `device` connects and the `Host` rewrite target. `deadline` is the connect timeout while
-/// the device connect is in flight, then the idle timeout. The regs are `None` only between insert and
-/// watch in [`start_connection`](super::proxy::DialDeviceProxy), before [`attach_registrations`](Self::attach_registrations).
+/// the device connect is in flight, then the idle timeout. A reg is `None` before
+/// [`attach_registrations`](Self::attach_registrations) runs, and again once
+/// [`peer_gone`](Self::peer_gone) takes the hung-up side's: the connection outlives that, and
+/// [`forward`](Self::forward) reads the `None` as "a prior `peer_gone` took it".
 pub(super) struct Connection {
     client: TcpSocket,
     client_reg: Option<RegKey>,
@@ -331,8 +336,8 @@ impl Connection {
         self.on_writable(direction, reactor)
     }
 
-    /// Drop both watched fds' kernel interest, then shut both sockets down. A half-built connection may
-    /// have no registrations yet.
+    /// Drop both watched fds' kernel interest, then shut both sockets down. Either reg may be `None`:
+    /// a half-built connection has neither yet, and a `peer_gone` has taken the hung-up side's.
     pub(super) fn teardown(self, reactor: &mut Reactor) {
         if let Some(reg) = self.client_reg {
             reactor.unwatch(reg).ok();
