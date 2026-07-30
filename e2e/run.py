@@ -242,6 +242,8 @@ PROBE_STOP_GRACE_SECONDS = 5
 NETFLECTOR_READY_LOG = "running; press Ctrl-C or send SIGTERM to stop"
 RECEIVER_READY_LOG = "receiver ready: UDP socket bound"
 CONTAINER_READY_TIMEOUT_SECONDS = 15.0
+# Every resource a run creates is named with this prefix, so a sweep can find what a killed run left.
+E2E_RESOURCE_PREFIX = "netflector-e2e-"
 # A clean SIGTERM exit triggers valgrind's leak analysis; give `docker stop` this much grace before it
 # SIGKILLs, so the analysis (which can take tens of seconds) finishes and its exit code is read.
 VALGRIND_STOP_GRACE_SECONDS = 60
@@ -1044,6 +1046,13 @@ class Backend:
         self.args = args
         self.prefix = prefix
 
+    @staticmethod
+    def preflight_clean() -> None:
+        # Remove what a killed run left behind, before the first case. Only the docker backend needs
+        # it: a leaked netns, jail or epair is untidy but harmless, since every name carries a
+        # per-run uuid and the epair allocator just takes the next free index.
+        pass
+
     def setup_segments(self) -> None:
         raise NotImplementedError
 
@@ -1173,6 +1182,23 @@ class DockerBackend(Backend):
     @staticmethod
     def require_available() -> None:
         require_command("docker")
+
+    @staticmethod
+    def preflight_clean() -> None:
+        # A run killed mid-case -- a crashed engine, a cancelled CI job, a Ctrl-C -- leaves its
+        # containers and networks behind. The names carry a per-run uuid so they never collide, but
+        # the networks pin fixed subnets, so one survivor makes every later run fail at creation
+        # with "Pool overlaps with other one on this address space". Containers go first: a network
+        # with an endpoint still attached refuses to be removed.
+        for kind, listing in (("container", ["ps", "-aq"]), ("network", ["network", "ls", "-q"])):
+            found = docker(
+                [*listing, "--filter", f"name=^{E2E_RESOURCE_PREFIX}"], echo=False
+            ).stdout.split()
+            if not found:
+                continue
+            print(f"preflight: removing {len(found)} stale e2e {kind}(s)", flush=True)
+            remove = ["rm", "-f", *found] if kind == "container" else ["network", "rm", *found]
+            docker(remove, check=False, echo=False)
 
     def setup_segments(self) -> None:
         # Both networks are dual-stack: IPv4 cases are unaffected, and IPv6 cases need the
@@ -1870,7 +1896,7 @@ class CaseRunner:
     def __init__(self, args: argparse.Namespace, case: TestCase) -> None:
         self.args = args
         self.case = case
-        self.prefix = f"netflector-e2e-{case.name.replace('_', '-')}-{uuid.uuid4().hex[:8]}"
+        self.prefix = f"{E2E_RESOURCE_PREFIX}{case.name.replace('_', '-')}-{uuid.uuid4().hex[:8]}"
         self.backend = make_backend(args, self.prefix)
         self.config_path = E2E_DIR / case.config
 
@@ -2784,6 +2810,8 @@ def parse_args() -> argparse.Namespace:
         help="netflector binary to run (native backend, required); build it unprivileged first, "
              "e.g. cargo build --release --locked")
     parser.add_argument("--keep-on-failure", action="store_true", help="leave resources behind after a failure")
+    parser.add_argument("--keep-stale", action="store_true",
+        help="skip the preflight sweep, keeping what an earlier --keep-on-failure run left behind")
     parser.add_argument("--show-netflector-logs", action="store_true", help="print netflector logs after each passing case")
     parser.add_argument(
         "--case",
@@ -2808,13 +2836,14 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    if args.backend == "native":
-        native_backend_class().require_available()
-    else:
-        DockerBackend.require_available()
+    backend_cls = native_backend_class() if args.backend == "native" else DockerBackend
+    backend_cls.require_available()
+    if args.backend == "docker":
         # --valgrind selects the valgrind image unless one was passed explicitly.
         if args.valgrind and args.image == DEFAULT_NETFLECTOR_IMAGE:
             args.image = VALGRIND_NETFLECTOR_IMAGE
+    if not args.keep_stale:
+        backend_cls.preflight_clean()
 
     cases = select_cases(args.case)
     print(f"expected magic payload: {magic_packet_hex(CONFIGURED_MAC)}", flush=True)
