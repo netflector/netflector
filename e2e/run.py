@@ -1981,6 +1981,17 @@ class CaseRunner:
             detach=False,
         )
 
+    def assert_receiver_outlived_sender(self) -> None:
+        # An expect-none verdict only means something if the receiver was still listening when the
+        # sender fired: a slow start can otherwise close the window first and turn "nothing arrived"
+        # into a fact about the harness rather than about reflection.
+        running, state = self.backend.status("receiver")
+        if not running:
+            raise RuntimeError(
+                f"receiver stopped before the sender finished ({state}); the expect-none result "
+                f"would be vacuous"
+            )
+
     def wait_for_result(self) -> None:
         exit_code = self.backend.wait("receiver")
         out, err = self.backend.logs("receiver")
@@ -2020,6 +2031,8 @@ class CaseRunner:
         self.start_netflector()
         self.start_receiver()
         self.run_sender()
+        if self.case.expect_payload_hex is None and self.case.expect_mac is None:
+            self.assert_receiver_outlived_sender()
         self.wait_for_result()
         print(f"PASS {self.case.name}", flush=True)
         if self.args.show_netflector_logs:
@@ -2499,6 +2512,8 @@ class AddressChangeRunner(CaseRunner):
         self._select_direction(case.direction)
         self.start_receiver(case)
         self.run_sender(case)
+        if not expect:
+            self.assert_receiver_outlived_sender()
         return self.backend.wait("receiver") == 0
 
     def _poll_reflected(self, phase: Phase) -> bool:
