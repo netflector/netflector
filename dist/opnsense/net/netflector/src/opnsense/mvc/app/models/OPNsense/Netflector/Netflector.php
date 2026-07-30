@@ -137,6 +137,20 @@ class Netflector extends BaseModel
             ));
         }
 
+        // MacAddressField validates with FILTER_VALIDATE_MAC, which also takes hyphen- and
+        // dot-separated forms; the daemon's parser takes colons only.
+        foreach (self::toSet((string)$entry->macs) as $mac) {
+            if (preg_match('/^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/', $mac) !== 1) {
+                $messages->appendMessage(new Message(
+                    sprintf(
+                        gettext('%s must be written as six colon-separated hex octets.'),
+                        $mac
+                    ),
+                    $ref . '.macs'
+                ));
+            }
+        }
+
         // Per-item validation cannot see this: the tokenizer drops only byte-identical strings, so
         // aa:bb:cc:dd:ee:ff beside AA:BB:CC:DD:EE:FF reaches a daemon that rejects both lists.
         $duplicate = self::firstDuplicate((string)$entry->macs);

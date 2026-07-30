@@ -114,6 +114,9 @@ foreach (
         /* the daemon rejects a repeated value, and only the model can catch a case variant */
         ['aa:bb:cc:dd:ee:ff,AA:BB:CC:DD:EE:FF', '7', false],
         ['aa:bb:cc:dd:ee:ff', '7,7', false],
+        /* FILTER_VALIDATE_MAC takes these separators, the daemon's parser does not */
+        ['aa-bb-cc-dd-ee-ff', '7', false],
+        ['aabb.ccdd.eeff', '7', false],
     ] as [$macs, $wol_ports, $expect_valid]
 ) {
     $messages = validation_messages($macs, $wol_ports);
