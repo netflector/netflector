@@ -70,6 +70,19 @@ stays reachable:
 .Ql netflector \-\- \-\-check-config
 reads a file named
 .Pa \-\-check-config .
+.Pp
+Under the
+.Xr rc 8
+service
+.Nm
+is started by
+.Xr daemon 8
+with
+.Fl S ,
+which routes its standard error into
+.Xr syslogd 8 .
+A record's level does not survive that, so filter on the level in the message
+text; each line also carries two timestamps, syslog's and the daemon's.
 .Sh SIGNALS
 .Bl -tag -width "SIGTERM"
 .It Dv SIGINT , Dv SIGTERM
