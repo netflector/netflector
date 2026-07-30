@@ -936,9 +936,11 @@ impl Handler for PacketDispatcher {
 
     /// The soonest deadline any registered handler keeps; the reactor waits within it.
     fn next_deadline(&self) -> Option<Instant> {
-        // O(registrations) every run-loop iteration. n stays small (a few base handlers plus the
-        // live SSDP sessions, ≤32), so the scan beats a min-heap, whose O(1) peek isn't worth the
-        // entry invalidation a cancelled or moved deadline would force. Revisit if timers grow.
+        // O(registrations) every run-loop iteration. n is bounded by MAX_SESSIONS per search
+        // reflector (SSDP and WSD each, per reflector pair) plus a few base handlers, so a
+        // fan-out config carries hundreds. The scan still beats a min-heap, whose O(1) peek isn't
+        // worth the entry invalidation a cancelled or moved deadline would force. Revisit if
+        // timers grow.
         self.registrations
             .iter()
             .filter_map(|(_, reg)| reg.handler.as_ref().and_then(|h| h.next_deadline()))
