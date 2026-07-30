@@ -215,8 +215,10 @@ impl InterfaceTable {
     /// most one interface (they dedup by name, and the kernel gives each a distinct index), so this
     /// finds rather than scans. Returns the fields that changed if one matched, or `None` for a
     /// change on an interface we don't watch. Log-free, like [`take`](Self::take); the dispatcher
-    /// reports the outcome. The caller routes the `0` overflow-signal to [`refresh_all`], so
-    /// `ifindex` is always a real index here.
+    /// reports the outcome. `ifindex` is always a real index here: both monitor backends drop an
+    /// index-0 notification before forwarding it, and a buffer overflow arrives as its own
+    /// [`InterfaceEvent::Overflow`](crate::interface::InterfaceEvent), which the dispatcher routes
+    /// to [`refresh_all`]. A 0 reaching this would match the first parked entry, which caches 0.
     ///
     /// [`refresh_all`]: Self::refresh_all
     ///
