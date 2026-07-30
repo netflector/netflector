@@ -1,6 +1,6 @@
 //! The mDNS reflector: reflects multicast DNS between the source and target interfaces so service
-//! discovery crosses the link. Per address family it registers two directional
-//! [`SimpleReflector`]s: queries flow source → target, responses target → source. Atop the
+//! discovery crosses the link. It registers two directional [`SimpleReflector`]s, each spanning
+//! every in-use family's group: queries flow source → target, responses target → source. Atop the
 //! capture's own-egress drop, this breaks the reflection loop. Each re-emits to the same group at
 //! TTL 255 (RFC 6762 §11), sourced from the egress interface. The dispatcher's filter pins the
 //! group, so the reflector only gates on the query/response classifier.
@@ -52,8 +52,8 @@ fn response_verdict(payload: &[u8]) -> Verdict {
 }
 
 /// Build the mDNS reflector for `reflector` and register its directional handlers on `dispatcher`.
-/// A no-op when mDNS isn't enabled. For each address family in use it joins the group on both
-/// interfaces (so each capture is admitted the group's frames) and registers two handlers: queries
+/// A no-op when mDNS isn't enabled. It joins each in-use family's group on both interfaces (so each
+/// capture is admitted the group's frames), then registers two handlers spanning them: queries
 /// source → target, responses target → source. A required family must be sendable on BOTH
 /// interfaces, since both re-emit.
 ///
