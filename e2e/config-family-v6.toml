@@ -5,7 +5,7 @@ log_level = "debug"
 # is ignored. A lone reflector so it can't conflict with the dual "discovery" one in config.toml.
 # (Different protocol from the IPv4 case on purpose, so single-family gating is covered for both.)
 [reflectors.ssdp-v6]
-source_if = "wol_src"
-target_if = "wol_dst"
+source_if = "nf_source"
+target_if = "nf_target"
 ssdp = true
 address_family = "ipv6"

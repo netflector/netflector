@@ -3,7 +3,7 @@
 # End-to-end tests for netflector, runnable on two backends.
 #
 # Each case stands up two isolated dual-stack segments (a source and a target), runs netflector
-# straddling both with its interface names pinned to wol_src / wol_dst, then runs a sender prober on
+# straddling both with its interface names pinned to nf_source / nf_target, then runs a sender prober on
 # one segment and a receiver prober on the other and asserts the traffic is (or is not) reflected
 # across. The default docker backend realizes segments as bridge networks and participants as
 # containers (netflector image built from ./Dockerfile, CAP_NET_RAW on that container only; probers
@@ -241,11 +241,11 @@ VALGRIND_STOP_GRACE_SECONDS = 60
 # ~8s), so it only ever fires on a wedge; the emulated arm64 lanes are the slow case to clear.
 COMMAND_TIMEOUT_SECONDS = 120.0
 
-NETFLECTOR_SOURCE_IFNAME = "wol_src"
-NETFLECTOR_TARGET_IFNAME = "wol_dst"
+NETFLECTOR_SOURCE_IFNAME = "nf_source"
+NETFLECTOR_TARGET_IFNAME = "nf_target"
 RECEIVER_IFNAME = "probe0"
 NETFLECTOR_IFNAMES = {"source": NETFLECTOR_SOURCE_IFNAME, "target": NETFLECTOR_TARGET_IFNAME}
-DECOY_IFNAME = "rfxdecoy"
+DECOY_IFNAME = "nf_decoy"
 
 IPV6_ALL_NODES = "ff02::1"
 
@@ -866,7 +866,7 @@ class Phase:
     label: str
     protocol: str  # "wol" | "mdns" -> PROBE_SPECS
     family: int  # 4 | 6
-    interface: str  # "source" (wol_src) | "target" (wol_dst): which netflector interface to toggle
+    interface: str  # "source" (nf_source) | "target" (nf_target): which netflector interface to toggle
     # Recreate cases only: plant a throwaway interface between the delete and the recreate. It
     # occupies the freed slot, so FreeBSD's lowest-free index allocator is forced to hand the
     # recreated interface a DIFFERENT index; without it the same index comes back. The two
@@ -1520,7 +1520,7 @@ class NativeBackend(Backend):
 
 class NativeLinuxBackend(NativeBackend):
     # Segments as veth pairs between per-participant network namespaces: a dut namespace holds
-    # wol_src + wol_dst (so the checked-in configs work unchanged), and one persistent far
+    # nf_source + nf_target (so the checked-in configs work unchanged), and one persistent far
     # namespace per segment holds the peer end, always named probe0. Every participant gets its
     # own namespace for the same reasons Docker gave them one: wildcard binds and --expect-none
     # windows must only see the segment's traffic, unicast to netflector must cross the wire
@@ -1646,7 +1646,7 @@ class NativeLinuxBackend(NativeBackend):
 class NativeFreeBSDBackend(NativeBackend):
     # Segments as epair(4) pairs -- FreeBSD's veth -- between persistent vnet jails, one per
     # participant, mirroring the Linux namespaces: a dut jail holds the renamed a ends
-    # (wol_src/wol_dst), each probe jail owns a b end (renamed probe0). A vnet jail is
+    # (nf_source/nf_target), each probe jail owns a b end (renamed probe0). A vnet jail is
     # FreeBSD's network namespace: its own stack, with interfaces, routes, PF_ROUTE events,
     # and /dev/bpf attachment all per-vnet, and the host filesystem shared via path=/. Per-jail
     # stacks keep every probe packet on the wire (nothing short-circuits over lo0), and jailing

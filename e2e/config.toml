@@ -5,20 +5,20 @@ log_level = "debug"
 # "dual" to also cover the strict require-both-families policy (and its startup check).
 
 [reflectors.wol-mac]
-source_if = "wol_src"
-target_if = "wol_dst"
+source_if = "nf_source"
+target_if = "nf_target"
 macs = ["02:42:ac:11:00:09", "02:42:ac:11:00:0c"]
 wol = true
 wol_ports = [9009]
 
 [reflectors.wol-any]
-source_if = "wol_src"
-target_if = "wol_dst"
+source_if = "nf_source"
+target_if = "nf_target"
 wol = true
 wol_ports = [9011]
 
 [reflectors.discovery]
-source_if = "wol_src"
-target_if = "wol_dst"
+source_if = "nf_source"
+target_if = "nf_target"
 mdns = true
 ssdp = true
