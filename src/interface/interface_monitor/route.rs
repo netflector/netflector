@@ -116,8 +116,11 @@ pub(super) fn for_each_change(buf: &[u8], on_change: &mut impl FnMut(InterfaceEv
     }
 }
 
-/// `PF_ROUTE` messages have no per-message sender identity; every one is the kernel's, so accept all.
-/// (Mirrors the netlink backend's `sender_ok`, which rejects locally-spoofed datagrams.)
+/// `PF_ROUTE` carries no per-message sender identity, and not every message is the kernel's: the
+/// stack echoes a local process's own request to every listener (hence `route monitor` showing other
+/// processes' traffic). Accept all anyway. An injected message only picks which interface to
+/// re-resolve, and the re-resolve reads the kernel, so it buys wasted work and nothing else.
+/// (The netlink backend's `sender_ok` rejects spoofed datagrams; `PF_ROUTE` offers nothing to check.)
 pub(super) fn sender_ok(_src: &libc::sockaddr_storage, _len: libc::socklen_t) -> bool {
     true
 }
