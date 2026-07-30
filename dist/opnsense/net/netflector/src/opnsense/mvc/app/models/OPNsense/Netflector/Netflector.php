@@ -136,6 +136,27 @@ class Netflector extends BaseModel
                 $ref . '.wol_ports'
             ));
         }
+
+        // Per-item validation cannot see this: the tokenizer drops only byte-identical strings, so
+        // aa:bb:cc:dd:ee:ff beside AA:BB:CC:DD:EE:FF reaches a daemon that rejects both lists.
+        $duplicate = self::firstDuplicate((string)$entry->macs);
+        if ($duplicate !== null) {
+            $messages->appendMessage(new Message(
+                sprintf(
+                    gettext('%s is listed twice. Addresses are compared case-insensitive.'),
+                    $duplicate
+                ),
+                $ref . '.macs'
+            ));
+        }
+
+        $duplicate = self::firstDuplicate((string)$entry->wol_ports);
+        if ($duplicate !== null) {
+            $messages->appendMessage(new Message(
+                sprintf(gettext('Port %s is listed twice.'), $duplicate),
+                $ref . '.wol_ports'
+            ));
+        }
     }
 
     /**
@@ -249,6 +270,22 @@ class Netflector extends BaseModel
     private static function canonicalName($entry)
     {
         return strtolower(trim((string)$entry->name));
+    }
+
+    /**
+     * The first value a comma-separated field repeats, or null. Lowercased comparison matches the
+     * daemon: a MAC's hex case is not part of its identity, and the port mask forbids a leading zero.
+     */
+    private static function firstDuplicate($csv)
+    {
+        $seen = [];
+        foreach (self::toSet($csv) as $value) {
+            if (isset($seen[$value])) {
+                return $value;
+            }
+            $seen[$value] = true;
+        }
+        return null;
     }
 
     /** A comma-separated field as a set of trimmed, lowercased values, empties dropped. */
