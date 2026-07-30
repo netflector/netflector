@@ -6,11 +6,12 @@
 # magic packet (broadcast for IPv4, all-nodes multicast for IPv6) toward netflector. The receiver's
 # process exit code is the verdict run.py waits on: 0 = expectation held, non-zero = failed.
 #
-# The send/receive verbs cover WoL and the verbatim-relay protocols (mDNS, one-way SSDP). The
-# respond/search verbs drive the SSDP M-SEARCH round trip: a `respond` device unicasts a 200 OK back to
-# whoever searched, and a `search` searcher awaits that reply proxied across segments by netflector.
-# The DIAL probe verbs (dial-device/dial-client) from the C++ harness are absent because the DIAL cases
-# (see DIAL_CASES in run.py) drive a dedicated HTTP emulator rather than this prober.
+# The send/receive verbs cover WoL and the verbatim-relay protocols (mDNS, one-way SSDP and WSD). The
+# respond/search verbs drive the query/response round trips, SSDP M-SEARCH and WSD Probe/Resolve
+# alike: a `respond` device unicasts a reply back to whoever searched, and a `search` searcher awaits
+# that reply proxied across segments by netflector. The dial-device/dial-client verbs emulate a DIAL
+# device (HTTP description + REST servers behind an SSDP NOTIFY) and a client that follows the
+# rewritten LOCATION through netflector's proxy.
 
 from __future__ import annotations
 
