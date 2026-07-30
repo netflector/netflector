@@ -226,7 +226,8 @@ WSD_RESOLVEMATCHES_HEX = (
 # reflection of that family stops, then restore it and prove it resumes. netflector reacts on
 # its own event loop after the netlink notification, so each check polls across that async window.
 ADDR_CHANGE_REFLECTED_WINDOW = 4.0
-ADDR_CHANGE_SILENCE_WINDOW = 2.5
+# A silence probe is bounded by its send, not by a window, so only the count matters here: one
+# silence proves reflection was down across that send, two proves it stayed down.
 ADDR_CHANGE_SILENCE_CONSECUTIVE = 2
 ADDR_CHANGE_POLL_DEADLINE = 60.0
 # An expect-none receiver is stopped once the sender has finished, so its own deadline is only a
@@ -2552,13 +2553,13 @@ class AddressChangeRunner(CaseRunner):
         return False
 
     def _poll_not_reflected(self, phase: Phase) -> bool:
-        # Require consecutive silent windows: while reflection is still up the probe returns
-        # quickly (the reflected packet arrives, failing --expect-none), resetting the streak;
-        # only a genuine teardown yields an unbroken run of silences before the deadline.
+        # Poll until the daemon has reacted to the address change: while reflection is still up the
+        # probe sees the packet and fails --expect-none, resetting the streak. Each probe now spans
+        # its own send, so a silence is evidence rather than a window that may have missed it.
         deadline = time.monotonic() + ADDR_CHANGE_POLL_DEADLINE
         consecutive = 0
         while time.monotonic() < deadline:
-            if self._probe(phase, expect=False, timeout=ADDR_CHANGE_SILENCE_WINDOW):
+            if self._probe(phase, expect=False, timeout=EXPECT_NONE_BACKSTOP_SECONDS):
                 consecutive += 1
                 if consecutive >= ADDR_CHANGE_SILENCE_CONSECUTIVE:
                     return True
@@ -2673,12 +2674,12 @@ class RecreateRunner(AddressChangeRunner):
                 )
             print(f"{desc}: reflection stopped after interface deletion", flush=True)
         else:
-            # The segment's wire died with the interface, so there is nothing to probe on;
-            # the "is gone" log assertion stands in as the observed-death proof. The pause
-            # lets netflector see the departure and park before the name returns --
-            # otherwise it would (correctly) log only the recreation.
+            # The segment's wire died with the interface, so there is nothing to probe on. Wait
+            # for netflector to say it parked: the name must not return before it noticed the
+            # departure, or it would (correctly) log only the recreation.
             print(f"{desc}: segment wire gone; skipping the silence probe", flush=True)
-            time.sleep(2.0)
+            ifname = NETFLECTOR_IFNAMES[phase.interface]
+            self.wait_for_log("netflector", f"interface {ifname} is gone", f"{phase.interface} parking")
 
         self.backend.recreate_interface(phase.interface)
         if phase.decoy:
