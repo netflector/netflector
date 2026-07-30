@@ -32,7 +32,7 @@ procname="%%PREFIX%%/bin/${name}"
 # inherited: without it the supervisor holds the caller's stdout open for the service's lifetime, so
 # `ssh host service netflector start` never returns. It does not affect -S, which redirects the child.
 command="/usr/sbin/daemon"
-command_args="-f -S -T ${name} -p ${pidfile} ${procname} ${netflector_config}"
+command_args="-f -S -T ${name} -p ${pidfile} ${procname} '${netflector_config}'"
 
 start_precmd="${name}_precmd"
 
