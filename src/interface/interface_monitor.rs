@@ -118,9 +118,9 @@ impl InterfaceMonitor {
                 overflows += 1;
                 if overflows == 1 {
                     // A dropped-notification overflow is abnormal (kernel buffer pressure or an
-                    // event storm): warn here, not just the dispatcher's debug. Signal
-                    // re-resolve-all once per burst; the dispatcher coalesces the 0, so repeating
-                    // it per ENOBUFS is redundant.
+                    // event storm): warn here, not just the dispatcher's debug. Emit Overflow once
+                    // per burst; the dispatcher re-resolves everything on it, so repeating it per
+                    // ENOBUFS is redundant.
                     log::warn!(
                         "interface monitor overflowed; notifications were dropped, re-resolving every interface"
                     );

@@ -219,8 +219,8 @@ mod tests {
 
     #[test]
     fn never_forwards_index_zero() {
-        // 0 names no interface and is the parent's overflow sentinel, so a message carrying it
-        // must not be reported (which would trigger a spurious re-resolve of everything).
+        // Kernel indices start at 1, so a 0 is malformed. Forwarding it would match the first
+        // parked table entry, which caches 0, and re-resolve the wrong interface.
         let buf = message(libc::RTM_NEWADDR, &ifaddrmsg(0));
         let mut seen = Vec::new();
         for_each_change(&buf, &mut |e| seen.push(e));
