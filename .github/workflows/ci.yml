@@ -295,6 +295,14 @@ jobs:
           ci/freebsd-vm.sh run 'sysrc netflector_enable=YES'
           ci/freebsd-vm.sh run 'printf "[reflectors.bad]\nsource_if = \"em0\"\ntarget_if = \"em0\"\nmdns = true\n" > /usr/local/etc/netflector.toml'
           ci/freebsd-vm.sh run 'service netflector start 2>&1 | grep -q "refusing to start" && echo "rc refused an invalid configuration"'
+      - name: Lint the installed man pages
+        run: |
+          # The strict pass needs a real manpath: -W style resolves Xr against the base system and
+          # our own siblings, while on Ubuntu (the man-lint job) every FreeBSD page reads as absent,
+          # so a typo'd reference there is indistinguishable from one that legitimately is not
+          # installed. Order matters: -W style must follow -T lint, which resets the floor.
+          ci/freebsd-vm.sh run 'makewhatis /usr/local/share/man'
+          ci/freebsd-vm.sh run 'mandoc -T lint -W style /usr/local/share/man/man8/netflector.8.gz /usr/local/share/man/man5/netflector.toml.5.gz'
       - name: VM console log
         if: always()
         run: ci/freebsd-vm.sh console
