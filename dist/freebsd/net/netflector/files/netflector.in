@@ -11,7 +11,7 @@
 # Optional:
 #
 #   netflector_config="/path/to/netflector.toml"   # default %%PREFIX%%/etc/netflector.toml
-#   netflector_flags=""                            # extra arguments
+#   netflector_flags="-r"                          # options for daemon(8), e.g. restart on exit
 
 . /etc/rc.subr
 
