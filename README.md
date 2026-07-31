@@ -281,7 +281,8 @@ top-level settings are `log_level`, `debug_memory_interval_secs`, and `counters_
 ```toml
 log_level = "info"                 # optional; one of off | error | warn | info | debug | trace (default: info)
                                    # release builds compile trace out, where it behaves as debug
-debug_memory_interval_secs = 0     # optional; seconds between memory (RSS/peak) diagnostic reports; 0 disables (default 0)
+debug_memory_interval_secs = 0     # optional; seconds between memory diagnostic reports; 0 disables (default 0)
+                                   # reports peak RSS everywhere, current RSS on Linux only
 counters_interval_secs = 0         # optional; seconds between per-interface packet-counter summaries; 0 disables (default 0)
 
 [reflectors.tv]
