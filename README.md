@@ -264,6 +264,9 @@ sysrc netflector_enable=YES
 service netflector start
 ```
 
+On a CARP failover pair, `netflector_carp_vhid` confines the service to the MASTER node so the
+backup does not reflect a second copy of everything; netflector(8) has the details.
+
 On OPNsense, install the plugin instead. It pulls in the daemon and owns the configuration and the
 service from its GUI page under Services > Netflector:
 
