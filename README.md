@@ -55,9 +55,10 @@ Docker backend for both image arches (plus a Valgrind memcheck job) and natively
 
 ## Build
 
-Prerequisites: a Rust toolchain. `rust-toolchain.toml` pins **stable** with the `rustfmt` and `clippy`
-components, so with [`rustup`](https://rustup.rs) the right toolchain (and any missing component) is
-installed on the first `cargo` invocation. The crate is edition 2024 (Rust ≥ 1.85), with a 1.93 MSRV.
+Prerequisites: a Rust toolchain. `rust-toolchain.toml` pins a specific stable release (bumped via
+Renovate) with the `rustfmt` and `clippy` components, so with [`rustup`](https://rustup.rs) the right
+toolchain (and any missing component) is installed on the first `cargo` invocation. The crate is
+edition 2024 (Rust ≥ 1.85), with a 1.93 MSRV.
 
 ```sh
 cargo build            # debug binary at target/debug/netflector
