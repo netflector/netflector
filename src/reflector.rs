@@ -120,7 +120,7 @@ pub(crate) enum BuildError {
     UnknownInterface(String),
     /// An interface can't currently send a family the reflector requires, so it would reflect
     /// nothing for that family. A startup failure rather than a silent half-run. For a
-    /// bidirectional reflector (mDNS/SSDP) the named interface may be the source or the target.
+    /// bidirectional reflector (mDNS/SSDP/WSD) the named interface may be the source or the target.
     #[error("interface \"{interface}\" cannot send {family}, required by the reflector")]
     RequiredFamilyUnavailable { interface: String, family: IpFamily },
 }
@@ -150,7 +150,7 @@ fn missing_required_family(family: AddressFamily, addrs: &InterfaceAddresses) ->
 }
 
 /// Enforce that a bidirectional reflector can source every required family on BOTH interfaces.
-/// mDNS and SSDP re-emit on the source *and* the target, so a family required by `address_family`
+/// mDNS, SSDP and WSD re-emit on the source *and* the target, so a family required by `address_family`
 /// must be sendable on each. Checks each required family on both interfaces (v4 before v6, the
 /// single-interface policy order) and blames the side that actually lacks it: the source when it's
 /// the one missing, otherwise the target.
