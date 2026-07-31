@@ -133,8 +133,8 @@ config ok: 1 reflector
 
 netflector opens one L2 packet-capture socket per interface: it both observes incoming packets and
 re-injects reflected ones through that same socket (the sender doesn't bind a port, so no port
-privileges are involved). mDNS and SSDP additionally join their multicast group(s) on it, which needs
-no privilege beyond opening the socket. That capture socket drives the requirements below.
+privileges are involved). mDNS, SSDP, and WSD additionally join their multicast group(s) on it, which
+needs no privilege beyond opening the socket. That capture socket drives the requirements below.
 
 #### Linux
 
@@ -365,8 +365,9 @@ requires both; `"ipv4"` / `"ipv6"` use only one. It applies to every protocol th
 **required** family that can't be initialized for an entry fails startup; a best-effort one that can't
 (IPv6 under `"default"`) is skipped and the entry keeps running on the family it has.
 
-mDNS and SSDP are bidirectional, so a handled family must have a source address on **both** interfaces
-(the target re-emits relayed queries/searches, the source re-emits relayed responses/advertisements).
+mDNS, SSDP, and WSD are bidirectional, so a handled family must have a source address on **both**
+interfaces (the target re-emits relayed queries/searches, the source re-emits relayed
+responses/advertisements).
 This condition is re-checked continuously at runtime (see
 [Reacting to address changes](#reacting-to-address-changes) below): a family is torn down if either
 interface loses its address and brought back up once both can send it again.
@@ -374,8 +375,9 @@ interface loses its address and brought back up once both can send it again.
 ### Reacting to address changes
 
 netflector watches the kernel for interface address and lifecycle changes (a `NETLINK_ROUTE`
-socket on Linux, a `PF_ROUTE` socket on the BSDs) and adapts at runtime, without a restart. mDNS and SSDP bring a family
-up (joining its multicast group(s) and installing its capture registrations) once that family becomes
+socket on Linux, a `PF_ROUTE` socket on the BSDs) and adapts at runtime, without a restart. mDNS,
+SSDP, and WSD bring a family up (joining its multicast group(s) and installing its capture
+registrations) once that family becomes
 reflectable (a source address for it is present on **both** interfaces), and tear it down when either
 interface loses the address; the family resumes automatically when the address returns. WoL keeps its
 captures installed and instead checks reachability per packet, so it has nothing to join or leave.
