@@ -436,13 +436,14 @@ some Samsung TVs do it). Either way a client on a different segment discovers th
 drive it. Setting `dial = true` on an SSDP entry makes netflector bridge that gap.
 
 It is a **terminating HTTP reverse proxy**. When a DIAL `LOCATION` (in a relayed `NOTIFY` or `M-SEARCH`
-`200 OK`) crosses target→source, netflector mints a per-device ephemeral TCP listener on
-`source_if`'s address and rewrites the `LOCATION` authority to point at that listener. A source-side
-client then connects to netflector, which opens an upstream connection to the device **bound to
-`target_if`'s address**, so the device sees an on-subnet client and serves it. Along the way it
-rewrites the four authority-bearing headers (`LOCATION`, the description's `Application-URL`, request
-`Host`, and response `Location`) from the device's authority to a netflector authority and back; HTTP
-bodies stream through untouched. App launch (`POST`) and stop (`DELETE`) work end to end.
+`200 OK`) crosses target→source, netflector mints a pair of per-device ephemeral TCP listeners on
+`source_if`'s address, one for the device's description and one for its REST endpoints, and rewrites
+the `LOCATION` authority to point at the description listener. A source-side client then connects to
+netflector, which opens an upstream connection to the device **bound to `target_if`'s address**, so the
+device sees an on-subnet client and serves it. Along the way it rewrites the four authority-bearing
+headers (`LOCATION`, the description's `Application-URL`, request `Host`, and response `Location`) from
+the device's authority to a netflector authority and back; HTTP bodies stream through untouched.
+App launch (`POST`) and stop (`DELETE`) work end to end.
 
 `dial = true` requires `ssdp` and is **IPv4-only** (the DIAL spec ties the device authority to an IPv4
 address); an `ipv6`-only entry with `dial = true` is rejected at startup. It is the only DIAL knob;
