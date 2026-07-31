@@ -1,4 +1,4 @@
-.Dd July 18, 2026
+.Dd August 1, 2026
 .Dt NETFLECTOR 8
 .Os
 .Sh NAME
@@ -142,6 +142,19 @@ The service reads
 from
 .Xr rc.conf 5
 for the configuration path.
+.Pp
+On a
+.Xr carp 4
+failover pair, both nodes reflecting would send two copies of every relayed
+packet.
+.Va netflector_carp_vhid
+confines the service to the node holding that virtual host ID: start is
+refused unless the group is in the MASTER state.
+The check runs at start only; a later failover does not stop a running
+service.
+.Va netflector_carp_interface
+scopes the check to the interface carrying the group, needed only when the
+same vhid runs on more than one interface.
 .Sh DIAGNOSTICS
 The counter summary, logged periodically when enabled and on
 .Dv SIGUSR1 ,
@@ -168,6 +181,7 @@ does not cover.
 Times the interface was destroyed and recreated, and its capture re-bound.
 .El
 .Sh SEE ALSO
+.Xr carp 4 ,
 .Xr netflector.toml 5 ,
 .Xr rc.conf 5 ,
 .Xr daemon 8 ,
