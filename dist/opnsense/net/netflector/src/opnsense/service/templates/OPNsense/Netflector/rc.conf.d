@@ -1,3 +1,4 @@
+{% from 'OPNsense/Macros/interface.macro' import physical_interface %}
 {# The daemon refuses to start with no reflector to run, so "enabled" must mean the same thing here as
    in netflector_enabled(): the service is on AND at least one entry is on. Keying only on the global
    switch would arm a service whose generated configuration has no [reflectors.*] table at all. #}
@@ -15,4 +16,17 @@
 netflector_enable="YES"
 {% else %}
 netflector_enable="NO"
+{% endif %}
+{# The rc script gates on a vhid, not on the model's VIP uuid. The interface goes with it because the
+   same vhid can run on several interfaces as unrelated groups. #}
+{% if helpers.exists('OPNsense.Netflector.general.carp_depend_on') and OPNsense.Netflector.general.carp_depend_on != '' %}
+{%   if helpers.exists('virtualip.vip') %}
+{%     for vip in helpers.toList('virtualip.vip') %}
+{%       if vip['@uuid'] == OPNsense.Netflector.general.carp_depend_on and vip.mode == 'carp' %}
+netflector_carp_vhid="{{ vip.vhid }}"
+netflector_carp_interface="{{ physical_interface(vip.interface) }}"
+{%         break %}
+{%       endif %}
+{%     endfor %}
+{%   endif %}
 {% endif %}

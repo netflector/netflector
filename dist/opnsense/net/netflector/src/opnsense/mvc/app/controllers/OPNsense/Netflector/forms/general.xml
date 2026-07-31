@@ -15,6 +15,12 @@
         <help><![CDATA[Verbosity of the daemon's log, under Services > Netflector > Log File. Every line is recorded at the same syslog priority, so filter on the level in the message text. "Debug" and "Trace" are noisy and are meant for diagnosing a problem, not for running.]]></help>
     </field>
     <field>
+        <id>netflector.general.carp_depend_on</id>
+        <label>CARP dependency</label>
+        <type>dropdown</type>
+        <help><![CDATA[Reflect only while this node holds the selected CARP virtual IP. Leave empty on a single firewall. On an HA pair both nodes reflecting would send two copies of every relayed packet.]]></help>
+    </field>
+    <field>
         <id>netflector.general.counters_interval_secs</id>
         <label>Counter interval</label>
         <type>text</type>

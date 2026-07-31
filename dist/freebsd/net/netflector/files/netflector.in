@@ -12,6 +12,8 @@
 #
 #   netflector_config="/path/to/netflector.toml"   # default %%PREFIX%%/etc/netflector.toml
 #   netflector_flags="-r"                          # options for daemon(8), e.g. restart on exit
+#   netflector_carp_vhid="1"                       # only start if this CARP vhid is MASTER
+#   netflector_carp_interface="em0"                # interface holding it; needed if the vhid is reused
 
 . /etc/rc.subr
 
@@ -23,6 +25,8 @@ load_rc_config $name
 
 : ${netflector_enable:="NO"}
 : ${netflector_config:="%%PREFIX%%/etc/netflector.toml"}
+: ${netflector_carp_vhid:=""}
+: ${netflector_carp_interface:=""}
 
 pidfile="/var/run/${name}.pid"
 procname="%%PREFIX%%/bin/${name}"
@@ -51,6 +55,24 @@ netflector_precmd()
         done
         err 1 "refusing to start: ${netflector_config} is not valid"
     fi
+
+    # Checked after the config, not before: on a backup node a bad configuration should still be
+    # reported now, rather than at failover.
+    if [ -n "${netflector_carp_vhid}" ] &&
+        ! carp_is_master "${netflector_carp_vhid}" "${netflector_carp_interface}"; then
+        warn "CARP vhid ${netflector_carp_vhid} is not MASTER here; not starting netflector"
+        return 1
+    fi
+}
+
+# A carp line reads "carp: MASTER vhid 1 advbase 1 advskew 0". Neither field identifies a group on its
+# own: one interface can carry several vhids, and the same vhid can run on several interfaces as
+# unrelated groups. $2 narrows ifconfig to the one that matters, and can be empty for a unique vhid.
+carp_is_master()
+{
+    ifconfig ${2:+"$2"} 2>/dev/null |
+        awk -v vhid="$1" '$1 == "carp:" && $4 == vhid { print $2 }' |
+        grep -q '^MASTER$'
 }
 
 run_rc_command "$1"
