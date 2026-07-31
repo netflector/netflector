@@ -60,7 +60,8 @@ Print a usage summary and exit.
 .Fl -help
 and
 .Fl -version
-are answered before anything else on the command line.
+take precedence over anything after them on the command line; an invalid
+argument before them is reported first.
 A lone
 .Ql -
 is read as a path, not an option.
