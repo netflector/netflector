@@ -20,6 +20,10 @@
                     <trace>Trace</trace>
                 </OptionValues>
             </log_level>
+            <carp_depend_on type="VirtualIPField">
+                <type>carp</type>
+                <key>mvc</key>
+            </carp_depend_on>
             <counters_interval_secs type="IntegerField">
                 <Default>0</Default>
                 <Required>Y</Required>
