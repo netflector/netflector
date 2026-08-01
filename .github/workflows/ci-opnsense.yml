@@ -2,8 +2,8 @@
 # real converted OPNsense of each supported series. publish-plugin runs this
 # before packaging.
 #
-# One of three path-filtered pipelines that must partition the tree: every PR
-# that keeps all three fires at least one, and each reports the required check
+# One of four path-filtered pipelines that must partition the tree: every PR
+# that keeps all four fires at least one, and each reports the required check
 # "Success" (duplicate names are all-must-pass, proven in PR #103).
 name: OPNsense CI
 

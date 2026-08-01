@@ -1,0 +1,26 @@
+# Markdown feeds no build or lint, but the ruleset still requires a green
+# "Success" on every PR, so this posts one.
+#
+# One of four path-filtered pipelines that must partition the tree: every PR
+# that keeps all four fires at least one, and each reports the required check
+# "Success" (duplicate names are all-must-pass, proven in PR #103).
+name: Docs CI
+
+on:
+  pull_request:
+    paths:
+      - '**/*.md'
+      # The pipeline itself: changing it runs it.
+      - '.github/workflows/ci-docs.yml'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  success:
+    name: Success
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Nothing to validate
+        run: 'true'
