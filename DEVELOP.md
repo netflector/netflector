@@ -1,7 +1,39 @@
 # Developing
 
-Working on netflector itself: the test suites, the platform-gated code, and what CI runs. For
-building and running the daemon, see the [README](README.md).
+Working on netflector itself: building from source, the test suites, the platform-gated code, and
+what CI runs. For running the daemon, see the [README](README.md).
+
+## Build
+
+Prerequisites: a Rust toolchain. `rust-toolchain.toml` pins a specific stable release (bumped via
+Renovate) with the `rustfmt` and `clippy` components, so with [`rustup`](https://rustup.rs) the right
+toolchain (and any missing component) is installed on the first `cargo` invocation. The crate is
+edition 2024 (Rust ≥ 1.85), with a 1.93 MSRV.
+
+```sh
+cargo build            # debug binary at target/debug/netflector
+cargo build --release  # optimized binary at target/release/netflector
+```
+
+The release profile enables LTO, a single codegen unit, and symbol stripping for a small footprint
+(the binary targets embedded ARM). The only dependencies are
+`thiserror`, `serde`, `toml`, `log`, and `libc`; cargo fetches them, no system packages needed.
+
+### Docker build
+
+The runtime image is a single static musl binary on `scratch`: no shell, no package manager. A bare
+build produces a single-arch image for the host:
+
+```sh
+docker build -t netflector .
+```
+
+The Dockerfile's builder runs on the build host (no QEMU) and links the cross layers with LLVM's
+`lld`, so a multi-arch image builds on one machine:
+
+```sh
+docker buildx build --platform linux/amd64,linux/arm64,linux/arm/v7,linux/arm/v5 -t netflector .
+```
 
 ## Platform-gated code
 

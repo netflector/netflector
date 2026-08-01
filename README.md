@@ -26,7 +26,6 @@ these.
 ## Contents
 
 - [Platform support](#platform-support)
-- [Build](#build)
 - [Run](#run): [privileges](#runtime-privileges), [Docker](#run-in-docker), [MikroTik](#on-mikrotik-routeros), [FreeBSD/OPNsense packages](#install-on-freebsd-and-opnsense)
 - [Configuration](#configuration): [env vars](#environment-variables), [`macs`](#the-macs-field), [`address_family`](#address_family), [per-protocol behavior](#per-protocol-behavior), [DIAL](#dial), [duplicate detection](#duplicate-detection)
 - [Developing](#developing)
@@ -45,42 +44,10 @@ router that bridges the two segments.
 a standalone static binary for `amd64` and `arm64`, cross-built against the FreeBSD 14 base
 pinned in `ci/freebsd14.env` and running on that release or newer.
 
-## Build
-
-Prerequisites: a Rust toolchain. `rust-toolchain.toml` pins a specific stable release (bumped via
-Renovate) with the `rustfmt` and `clippy` components, so with [`rustup`](https://rustup.rs) the right
-toolchain (and any missing component) is installed on the first `cargo` invocation. The crate is
-edition 2024 (Rust ≥ 1.85), with a 1.93 MSRV.
-
-```sh
-cargo build            # debug binary at target/debug/netflector
-cargo build --release  # optimized binary at target/release/netflector
-```
-
-The release profile enables LTO, a single codegen unit, and symbol stripping for a small footprint
-(the binary targets embedded ARM). The only dependencies are
-`thiserror`, `serde`, `toml`, `log`, and `libc`; cargo fetches them, no system packages needed.
-
-### Docker build
-
-The runtime image is a single static musl binary on `scratch`: no shell, no package manager. A bare
-build produces a single-arch image for the host:
-
-```sh
-docker build -t netflector .
-```
-
-The Dockerfile's builder runs on the build host (no QEMU) and links the cross layers with LLVM's
-`lld`, so a multi-arch image builds on one machine:
-
-```sh
-docker buildx build --platform linux/amd64,linux/arm64,linux/arm/v7,linux/arm/v5 -t netflector .
-```
-
 ## Run
 
 ```sh
-./target/release/netflector [--check-config] [--] [config.toml]
+netflector [--check-config] [--] [config.toml]
 ```
 
 Configuration comes from a TOML file, from environment variables, or from both. With a path argument
@@ -119,7 +86,7 @@ Capture and injection use `AF_PACKET`; the DIAL proxy's TCP connect pins its int
 `SO_BINDTODEVICE`. Both require `CAP_NET_RAW`. Either run as root or grant the capability once:
 
 ```sh
-sudo setcap cap_net_raw=eip ./target/release/netflector
+sudo setcap cap_net_raw=eip /path/to/netflector
 ```
 
 #### macOS
@@ -449,8 +416,8 @@ enable *different* protocols, coexist.
 
 ## Developing
 
-[DEVELOP.md](DEVELOP.md) covers the test suites, the platform-gated code, and what CI runs.
-[RELEASE.md](RELEASE.md) covers the release and packaging process.
+[DEVELOP.md](DEVELOP.md) covers building from source, the test suites, the platform-gated code, and
+what CI runs. [RELEASE.md](RELEASE.md) covers the release and packaging process.
 
 ## License
 
