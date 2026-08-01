@@ -1,18 +1,21 @@
 name: CI
 
-# The code pipeline: everything except the two dist/ subtrees, which have
-# their own pipelines (ci-port.yml, ci-opnsense.yml).
+# The code pipeline: everything except the two dist/ subtrees and markdown,
+# which have their own pipelines (ci-port.yml, ci-opnsense.yml, ci-docs.yml).
 on:
   pull_request:
     paths-ignore:
       - 'dist/freebsd/**'
       - 'dist/opnsense/**'
+      # Markdown feeds no build or lint; ci-docs.yml posts the required check.
+      - '**/*.md'
       # A sibling pipeline fires on each of these instead; the publish flows
       # consume them too. A PR that deletes a sibling workflow and touches
       # only ignored paths fires nothing and stays blocked; workflow_dispatch
       # ci.yml unsticks it.
       - '.github/workflows/ci-port.yml'
       - '.github/workflows/ci-opnsense.yml'
+      - '.github/workflows/ci-docs.yml'
       - 'ci/freebsd14-opnsense.env'
       - 'ci/freebsd15-opnsense.env'
       - 'ci/freebsd-port-package.sh'

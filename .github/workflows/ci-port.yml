@@ -2,8 +2,8 @@
 # a ports committer would. publish-daemon runs this before packaging; code
 # changes are covered by ci.yml's from-source port build.
 #
-# One of three path-filtered pipelines that must partition the tree: every PR
-# that keeps all three fires at least one, and each reports the required check
+# One of four path-filtered pipelines that must partition the tree: every PR
+# that keeps all four fires at least one, and each reports the required check
 # "Success" (duplicate names are all-must-pass, proven in PR #103).
 name: Port CI
 
