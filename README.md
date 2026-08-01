@@ -15,13 +15,13 @@ It reflects four link-local protocols and layers an optional DIAL proxy on top o
   renderers (TVs, media servers) on the other.
 - **DIAL proxy** *(optional, builds on SSDP)*: a "cast to TV" device's REST API lives on its own
   segment, often unreachable from the client's (and some TVs refuse off-subnet clients); the proxy
-  bridges that gap so a client on the other segment can launch apps on it. It's
-  not a separate reflector; it augments an SSDP entry, enabled with `dial = true`. See [DIAL](#dial).
+  bridges that gap so a client on the other segment can launch apps on it. Enabled with
+  `dial = true` on an SSDP entry; see [DIAL](#dial).
 - **WS-Discovery (WSD)**: SOAP-over-UDP discovery is relayed both ways, so a client on one segment can
   discover ONVIF cameras or Windows devices (printers, scanners) on the other.
 
 Each named entry bridges one `source_if` → `target_if` interface pair and enables any combination of
-these. The same shape serves one or a few specific devices (`macs`) or a whole network (omit it).
+these.
 
 ## Contents
 
@@ -42,7 +42,7 @@ netflector runs on **Linux, macOS, and FreeBSD**.
 router that bridges the two segments.
 
 **FreeBSD** isn't a Docker target (Docker shares the host's Linux kernel), so each release also ships
-a standalone **static** binary for `amd64` and `arm64`, cross-built against the FreeBSD 14 base
+a standalone static binary for `amd64` and `arm64`, cross-built against the FreeBSD 14 base
 pinned in `ci/freebsd14.env` and running on that release or newer.
 
 ## Build
@@ -58,7 +58,7 @@ cargo build --release  # optimized binary at target/release/netflector
 ```
 
 The release profile enables LTO, a single codegen unit, and symbol stripping for a small footprint
-(the binary targets embedded ARM, so the data path avoids allocations). The only dependencies are
+(the binary targets embedded ARM). The only dependencies are
 `thiserror`, `serde`, `toml`, `log`, and `libc`; cargo fetches them, no system packages needed.
 
 ### Docker build
@@ -323,8 +323,8 @@ rejected at startup.
 
 ### The `macs` field
 
-`macs` is an optional list naming the device(s) an entry is scoped to, coherently across WoL, mDNS,
-SSDP, and WSD, because a device's NIC MAC is both the target of its Wake-on-LAN magic packet and the L2
+`macs` is an optional list naming the device(s) an entry is scoped to. One field covers WoL, mDNS,
+SSDP, and WSD because a device's NIC MAC is both the target of its Wake-on-LAN magic packet and the L2
 source of its mDNS/SSDP/WSD advertisements. A single device is just a one-entry list
 (`macs = ["B0:37:95:C5:60:BE"]`); list several to scope one entry to a set of devices
 (`macs = ["B0:37:95:C5:60:BE", "C4:9D:8F:11:22:33"]`). Below, "the allow-set" means the configured
@@ -349,7 +349,7 @@ requires both; `"ipv4"` / `"ipv6"` use only one. It applies to every protocol th
 mDNS, SSDP, and WSD are bidirectional, so a handled family must have a source address on **both**
 interfaces (the target re-emits relayed queries/searches, the source re-emits relayed
 responses/advertisements).
-This condition is re-checked continuously at runtime (see
+The condition is re-checked at runtime (see
 [Reacting to address changes](#reacting-to-address-changes) below): a family is torn down if either
 interface loses its address and brought back up once both can send it again.
 
@@ -368,8 +368,8 @@ appears. Gaining a family logs at `info`; losing a *required* family logs at `er
 address refresh.
 
 It also survives an interface being destroyed and recreated (a fresh kernel identity, e.g. a PPPoE
-reconnect or a bridge/VLAN rebuild). Lifecycle events -- backed by a periodic reconcile, so recovery
-never depends on one notification surviving -- detect that the name's kernel identity moved; the
+reconnect or a bridge/VLAN rebuild). Lifecycle events (backed by a periodic reconcile, so recovery
+never depends on one notification surviving) detect that the name's kernel identity moved; the
 captures are then re-bound in place, addresses re-resolved, and multicast groups re-joined on the new
 interface, while its DIAL proxies are evicted to re-mint on the next advertisement. While the
 interface is absent its reflection parks (sends drop quietly, as on an address loss) and resumes when
@@ -414,7 +414,7 @@ device/printer discovery across segments.
 
 DIAL (DIscovery And Launch, the protocol behind "cast to TV" for YouTube, Netflix, etc.) lets a phone
 or laptop find a smart TV and launch an app on it. The catch: the device's description and REST
-endpoints live at its address on the **other segment**, which the client often cannot reach, and some
+endpoints live at its address on the other segment, which the client often cannot reach, and some
 devices refuse off-subnet clients outright (the DIAL spec doesn't require that, but Chromecast and
 some Samsung TVs do it). Either way a client on a different segment discovers the device but cannot
 drive it. Setting `dial = true` on an SSDP entry makes netflector bridge that gap.
