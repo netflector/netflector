@@ -20,8 +20,8 @@ It reflects four link-local protocols and layers an optional DIAL proxy on top o
 - **WS-Discovery (WSD)**: SOAP-over-UDP discovery is relayed both ways, so a client on one segment can
   discover ONVIF cameras or Windows devices (printers, scanners) on the other.
 
-Each named entry bridges one `source_if` → `target_if` interface pair and enables any combination of
-these.
+Each named entry bridges one `source_if` → `target_if` interface pair and enables one or more of the
+four reflected protocols, in any mix; the DIAL proxy then layers onto SSDP.
 
 ## Contents
 
@@ -224,7 +224,7 @@ pkg install os-netflector
 
 `config.toml` contains optional top-level settings plus at least one reflector entry. Entries are tables
 under `reflectors`, keyed by name (`[reflectors.<name>]`, the name being the label used in logs), each
-describing one `source_if` → `target_if` bridge that enables any combination of the protocols. The
+describing one `source_if` → `target_if` bridge that enables one or more of the protocols. The
 top-level settings are `log_level`, `debug_memory_interval_secs`, and `counters_interval_secs`:
 
 ```toml
