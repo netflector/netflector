@@ -145,6 +145,16 @@ jobs:
           mkdir signed
           ci/freebsd-vm.sh pull /repo signed/opnsense
           ci/freebsd-vm.sh pull /tmp/repo.pub signed/netflector-pkg.pub
+          # Clients pin the published key, so a replaced signing secret locks every existing
+          # install out of updates. The gate below verifies the catalogue against the key just
+          # derived from that secret and so passes either way; only comparing against what is
+          # already published catches it. Deliberate rotation means removing the published key in
+          # netflector/pkg first, which is the point: it cannot happen as a side effect.
+          if [ -f pkg-repo/netflector-pkg.pub ] \
+            && ! cmp -s pkg-repo/netflector-pkg.pub signed/netflector-pkg.pub; then
+            echo "::error::signing key does not match the published netflector-pkg.pub"
+            exit 1
+          fi
           # upload-artifact rejects ':' in any file path inside the artifact,
           # and the tree directories are ABI-named (FreeBSD:14:amd64); a tar
           # crosses the boundary intact.

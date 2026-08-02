@@ -45,6 +45,10 @@ jobs:
     needs: verify-ci
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
+    # tag-check has already required the tag to equal v<Cargo.toml version>, but the asset names
+    # below still take it through the environment rather than into the script text.
+    env:
+      ASSET: netflector-${{ github.ref_name }}-${{ matrix.variant }}
     strategy:
       fail-fast: true
       matrix:
@@ -145,12 +149,12 @@ jobs:
       - name: Stage binary
         run: |
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/netflector" "dist/netflector-${{ github.ref_name }}-${{ matrix.variant }}"
+          cp "target/${{ matrix.target }}/release/netflector" "dist/${ASSET}"
 
       - name: Verify static linking (Linux)
         if: runner.os == 'Linux'
         run: |
-          bin="dist/netflector-${{ github.ref_name }}-${{ matrix.variant }}"
+          bin="dist/${ASSET}"
           file "$bin"
           # The static binary has no shared-library deps (the invariant that matters), but PIE-ness
           # varies -- musl x86_64 is static-pie, the ARM targets and FreeBSD are plain static -- so
@@ -161,7 +165,7 @@ jobs:
       - name: Verify system-only linking (macOS)
         if: runner.os == 'macOS'
         run: |
-          bin="dist/netflector-${{ github.ref_name }}-${{ matrix.variant }}"
+          bin="dist/${ASSET}"
           otool -L "$bin"
           # macOS has no static linking; the invariant that matters is the same one the Linux
           # check enforces: no dependencies beyond the OS (nothing from Homebrew or the
@@ -273,8 +277,12 @@ jobs:
       - name: Which shared tags may move
         id: ord
         run: |
-          newest=$(git tag --list 'v*' --sort=-v:refname | head -1)
-          line=$(git tag --list "${GITHUB_REF_NAME%.*}.*" --sort=-v:refname | head -1)
+          # Strict three-part tags only. `v*` also matches a prerelease or a typo like v9.9.9-rc1,
+          # and -v:refname would sort one of those above the real newest, so a correct release
+          # would then decline to move the tags it owns.
+          releases() { git tag --list "$1" --sort=-v:refname | grep -xE 'v[0-9]+\.[0-9]+\.[0-9]+'; }
+          newest=$(releases 'v*' | head -1)
+          line=$(releases "${GITHUB_REF_NAME%.*}.*" | head -1)
           echo "latest=$([ "$GITHUB_REF_NAME" = "$newest" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
           echo "minor=$([ "$GITHUB_REF_NAME" = "$line" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
 
