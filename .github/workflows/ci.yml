@@ -1,7 +1,7 @@
 name: CI
 
-# The code pipeline: everything except the two dist/ subtrees and markdown,
-# which have their own pipelines (ci-port.yml, ci-opnsense.yml, ci-docs.yml).
+# The code pipeline, and the partition's catch-all: everything the sibling ci-*.yml pipelines do
+# not claim. Adding a pipeline means giving it paths and listing those below.
 on:
   pull_request:
     paths-ignore:
@@ -16,6 +16,8 @@ on:
       - '.github/workflows/ci-port.yml'
       - '.github/workflows/ci-opnsense.yml'
       - '.github/workflows/ci-docs.yml'
+      - '.github/workflows/ci-supply-chain.yml'
+      - 'ci/supply-chain-pin.sh'
       - 'ci/freebsd14-opnsense.env'
       - 'ci/freebsd15-opnsense.env'
       - 'ci/freebsd-port-package.sh'

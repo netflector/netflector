@@ -10,6 +10,14 @@
       "matchStrings": [
         "# renovate: datasource=(?<datasource>[a-z-]+) depName=(?<depName>\\S+)\\nRELEASE=(?<currentValue>\\S+)"
       ]
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["ci/supply-chain.env"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>[a-z-]+) depName=(?<depName>\\S+)\\n[A-Z]+_VERSION=(?<currentValue>\\S+)"
+      ],
+      "extractVersionTemplate": "^(?:cargo-audit/v)?(?<version>.+)$"
     }
   ],
   "packageRules": [
