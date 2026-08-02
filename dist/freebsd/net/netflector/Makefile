@@ -42,10 +42,12 @@ CARGO_CRATES=	equivalent-1.0.2 \
 		winnow-1.0.3
 
 PLIST_FILES=	bin/netflector \
+		"@sample etc/netflector.toml.sample" \
 		share/man/man5/netflector.toml.5.gz \
 		share/man/man8/netflector.8.gz
 
 post-install:
+	${INSTALL_DATA} ${FILESDIR}/netflector.toml.sample ${STAGEDIR}${PREFIX}/etc
 	${INSTALL_MAN} ${WRKSRC}/man/netflector.8 ${STAGEDIR}${PREFIX}/share/man/man8
 	${INSTALL_MAN} ${WRKSRC}/man/netflector.toml.5 ${STAGEDIR}${PREFIX}/share/man/man5
 
