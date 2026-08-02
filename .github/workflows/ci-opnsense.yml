@@ -2,9 +2,8 @@
 # real converted OPNsense of each supported series. publish-plugin runs this
 # before packaging.
 #
-# One of four path-filtered pipelines that must partition the tree: every PR
-# that keeps all four fires at least one, and each reports the required check
-# "Success" (duplicate names are all-must-pass, proven in PR #103).
+# One of the path-filtered pipelines partitioning the tree; ci.yml takes the rest.
+# Each reports the required check "Success": duplicate names are all-must-pass.
 name: OPNsense CI
 
 on:

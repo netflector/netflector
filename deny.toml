@@ -1,0 +1,19 @@
+# Supply-chain policy for the dependency tree, enforced by cargo-deny in ci-supply-chain.yml.
+
+[advisories]
+# An advisory can appear against an unchanged tree, which is why the workflow also runs on a
+# schedule rather than only on pull requests.
+yanked = "deny"
+
+[licenses]
+# Every crate in the tree today is MIT/Apache-2.0, plus Unicode-3.0 for unicode-ident's data tables
+# and BSD-2-Clause for netflector itself. Anything else is a deliberate decision, not a silent one.
+allow = ["Apache-2.0", "MIT", "BSD-2-Clause", "Unicode-3.0"]
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

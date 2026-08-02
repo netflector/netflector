@@ -1,0 +1,66 @@
+# Advisory, licence and source policy for the dependency tree (deny.toml).
+#
+# Scheduled as well as triggered: an advisory lands against a version already in Cargo.lock, so the
+# tree turns vulnerable with no commit of ours to fire on.
+#
+# One of the path-filtered pipelines partitioning the tree; ci.yml takes the rest.
+# Each reports the required check "Success": duplicate names are all-must-pass.
+# ci.yml also fires on the manifests: a dependency change needs the full matrix too.
+name: Supply chain CI
+
+on:
+  pull_request:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'deny.toml'
+      # The pipeline, its pins, and their generator: changing any of them runs it.
+      - 'ci/supply-chain.env'
+      - 'ci/supply-chain-pin.sh'
+      - '.github/workflows/ci-supply-chain.yml'
+  schedule:
+    # Weekly. Off the hour, which GitHub asks for to spread scheduler load.
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # On a scheduled run there is no pull request, so the result lands on the default branch.
+  success:
+    name: Success
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # Before anything trusts them: the pins must still describe what upstream serves. Catches a
+      # re-uploaded release and a version bump whose hashes were never refreshed.
+      - name: Pins reproduce
+        run: |
+          ci/supply-chain-pin.sh
+          git diff --exit-code ci/supply-chain.env
+
+      # Fetched and verified rather than taken from the upstream actions, which curl these same
+      # binaries with no checksum: pinning those pins a Dockerfile, not what it runs.
+      - name: Install the pinned tools
+        run: |
+          . ci/supply-chain.env
+          mkdir -p "${RUNNER_TEMP}/bin"
+          fetch() {
+            curl -fsSL -o "${RUNNER_TEMP}/t.tgz" "$1"
+            echo "$2  ${RUNNER_TEMP}/t.tgz" | sha256sum -c -
+            tar -xzf "${RUNNER_TEMP}/t.tgz" -C "${RUNNER_TEMP}/bin" --strip-components=1 --wildcards "*/$3"
+          }
+          fetch "${AUDIT_URL}" "${AUDIT_SHA256}" cargo-audit
+          fetch "${DENY_URL}" "${DENY_SHA256}" cargo-deny
+          echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
+
+      # RustSec's own implementation first: if the two ever disagree on an advisory, trust this one.
+      - name: cargo-audit
+        run: cargo-audit audit --deny warnings
+
+      - name: cargo-deny
+        run: cargo-deny check
