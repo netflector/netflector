@@ -54,8 +54,8 @@ Configuration comes from a TOML file, from environment variables, or from both. 
 the file is read and merged with any `NETFLECTOR_*` environment variables; with **no argument** the
 configuration comes entirely from the environment (see [Environment variables](#environment-variables)).
 The process logs to stderr with UTC timestamps, shuts down cleanly on `SIGINT` / `SIGTERM`, and on
-`SIGUSR1` dumps the per-interface [packet counters](#configuration) to the log on demand (regardless of
-`counters_interval_secs`).
+`SIGUSR1` dumps the per-interface [packet counters](#configuration) and a memory report to the log on
+demand (regardless of `counters_interval_secs`).
 
 | Option | |
 | --- | --- |
@@ -163,7 +163,7 @@ docker run -d --name netflector --restart unless-stopped \
 The `arm64`, `arm/v7`, and `arm/v5` variants let netflector run on the router itself through the
 RouterOS *Container* feature, bridging two of the router's VLANs without a separate host. Since it has
 to see both segments, give the container **two `veth` interfaces, one bridged into each VLAN**, and name
-them as the entry's `source_if` / `target_if`:
+them as the entry's `source_if` / `target_if`. Two veths on one container needs RouterOS 7.20 or newer:
 
 ```toml
 [reflectors.livingroom-tv]
@@ -178,8 +178,10 @@ wsd       = true         # enable WS-Discovery, disabled by default
 ```
 
 On RouterOS, setting the container's environment variables is usually easier than mounting a file: the
-entry above becomes `NETFLECTOR_TV_SOURCE_IF=veth-lan`, `NETFLECTOR_TV_TARGET_IF=veth-iot`,
-`NETFLECTOR_TV_MACS=B0:37:95:C5:60:BE`, `NETFLECTOR_TV_WOL=true`, and so on (see
+entry above becomes `NETFLECTOR_TV_NAME=livingroom-tv`, `NETFLECTOR_TV_SOURCE_IF=veth-lan`,
+`NETFLECTOR_TV_TARGET_IF=veth-iot`, `NETFLECTOR_TV_MACS=B0:37:95:C5:60:BE`,
+`NETFLECTOR_TV_WOL=true`, and so on. The tag names the entry unless `NAME` overrides it, so without
+that first variable the reflector is called `tv` (see
 [Environment variables](#environment-variables)). To use the file instead, mount it to
 `/etc/netflector/config.toml` and set that path as the container's command argument. For the RouterOS
 side (enabling container mode, creating the `veth`s, and attaching each to its VLAN), see MikroTik's
@@ -303,8 +305,9 @@ devices:
   and WSD the same filter scopes the proxied unicast replies: only the allow-set's responses are
   carried back to a searcher.
 
-Omit `macs` for a network-level entry: WoL proxies every valid magic packet, and mDNS/SSDP/WSD reflect all
-traffic in both directions.
+Omit `macs` for a network-level entry: WoL proxies every valid magic packet, and mDNS/SSDP/WSD relay
+every device's traffic rather than a chosen set (only the message kinds the corresponding direction
+allows, per the table below).
 
 ### `address_family`
 
@@ -324,11 +327,11 @@ interface loses its address and brought back up once both can send it again.
 
 netflector watches the kernel for interface address and lifecycle changes (a `NETLINK_ROUTE`
 socket on Linux, a `PF_ROUTE` socket on the BSDs) and adapts at runtime, without a restart. mDNS,
-SSDP, and WSD bring a family up (joining its multicast group(s) and installing its capture
-registrations) once that family becomes
+SSDP, and WSD bring a family up (joining its multicast group(s)) once that family becomes
 reflectable (a source address for it is present on **both** interfaces), and tear it down when either
-interface loses the address; the family resumes automatically when the address returns. WoL keeps its
-captures installed and instead checks reachability per packet, so it has nothing to join or leave.
+interface loses the address; the family resumes automatically when the address returns. Capture
+registrations stay installed throughout; what changes is the group membership and whether the egress
+can source the family. WoL has no group to join and instead checks reachability per packet.
 Either way, a best-effort IPv6 family that had no address at startup begins reflecting as soon as one
 appears. Gaining a family logs at `info`; losing a *required* family logs at `error`, an optional one at
 `info`. The monitor is best-effort: if it cannot start, netflector logs a warning and runs without
@@ -358,8 +361,19 @@ the periodic reconcile (up to ~30 s).
 WoL matching requires the magic-packet sequence (six `0xFF` bytes followed by the target MAC repeated 16
 times) at the start of the UDP payload; trailing bytes such as a SecureOn password are ignored when
 matching and forwarded as-is. mDNS responses include unsolicited announcements (so they flow
-target→source too); mDNS/SSDP/WSD datagrams are re-emitted verbatim to the same group (SSDP at hop limit 2, WSD at 1).
-A site-local SSDP group (`ff05::c`) is sourced from a routable address, not the interface's link-local.
+target→source too); mDNS/SSDP/WSD datagrams are re-emitted verbatim to the same group (mDNS at hop
+limit 255, SSDP at 2, WSD at 1).
+A site-local SSDP group (`ff05::c`) is sourced from a routable address when the interface has one. With
+only a link-local address it is sourced from that, which still reaches the attached segment but will
+not cross a router.
+
+mDNS is relayed as pure multicast. A querier that asks for a unicast answer (the QU bit, or a query
+from an ephemeral source port) is answered off the group, and that answer is not relayed; SSDP and WSD
+instead proxy each searcher's unicast reply.
+
+netflector reads untagged Ethernet frames carrying IPv4 or IPv6 UDP. VLAN-tagged frames and IPv6
+extension headers are not parsed, so configure the VLAN as its own interface (`vlan10`, `em0.10`) and
+name that as the entry's `source_if` / `target_if` rather than the trunk.
 
 For SSDP, multicast reflection delivers **passive** discovery: devices' periodic `NOTIFY ssdp:alive`
 advertisements reach the source segment so clients see them. **Active** discovery works end to end as

@@ -26,8 +26,10 @@ pub(crate) struct TcpSocket {
 }
 
 impl TcpSocket {
-    /// Listen on `addr:0`: an ephemeral port on the source interface's address (not `0.0.0.0`, so only
-    /// that subnet reaches it). Read the assigned port back with [`local_addr`](Self::local_addr).
+    /// Listen on `addr:0`: an ephemeral port on the source interface's address rather than `0.0.0.0`,
+    /// so the listener is not offered on every interface. Whether anything off that segment can still
+    /// route to the address is a routing and firewall question, not one the bind settles.
+    /// Read the assigned port back with [`local_addr`](Self::local_addr).
     ///
     /// # Errors
     /// Propagates the socket / `setsockopt` / `bind` / `listen` syscall failure.

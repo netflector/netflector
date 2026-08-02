@@ -16,8 +16,9 @@ cargo build --release  # optimized binary at target/release/netflector
 ```
 
 The release profile enables LTO, a single codegen unit, and symbol stripping for a small footprint
-(the binary targets embedded ARM). The only dependencies are
-`thiserror`, `serde`, `toml`, `log`, and `libc`; cargo fetches them, no system packages needed.
+(the binary targets embedded ARM). The only crate dependencies are
+`thiserror`, `serde`, `toml`, `log`, and `libc`; cargo fetches them. Beyond a C linker (Xcode command
+line tools, `build-essential`, or the base system on FreeBSD) no system packages are needed.
 
 ### Docker build
 
@@ -94,5 +95,6 @@ CI runs the unit suite on Ubuntu 24.04 (amd64 and arm64, both glibc and the ship
 macOS 15, FreeBSD 14 and 15 (amd64 and arm64, cross-compiled on the runner and executed in QEMU VMs), and
 the cross-compiled `linux/arm/v7` and `linux/arm/v5` builds whose suites run under QEMU, each in both
 debug and release. `clippy` and the rustdoc link gate run per target. The e2e suite runs on the
-Docker backend for both image arches (plus a Valgrind memcheck job) and natively on linux amd64/arm64
-(glibc and musl), armv7/armv5 (daemon under qemu-user), and FreeBSD amd64/arm64.
+Docker backend on amd64 and arm64 (plus a Valgrind memcheck job) and natively on linux amd64/arm64
+(glibc and musl), armv7/armv5 (daemon under qemu-user), and FreeBSD amd64/arm64. The armv7 and armv5
+images are covered by the native lanes rather than the Docker ones.

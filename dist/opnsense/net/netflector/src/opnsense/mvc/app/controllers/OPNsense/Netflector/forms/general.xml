@@ -24,6 +24,6 @@
         <id>netflector.general.counters_interval_secs</id>
         <label>Counter interval</label>
         <type>text</type>
-        <help><![CDATA[Seconds between per-interface packet-counter summaries in the log. 0 disables them.]]></help>
+        <help><![CDATA[Seconds between per-interface packet-counter summaries in the log, up to one day. 0 disables them.]]></help>
     </field>
 </form>
