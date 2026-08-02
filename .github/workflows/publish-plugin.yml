@@ -37,13 +37,18 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Verify the tag and compare daemon versions
         id: decide
+        # Through the environment, not interpolated into the script: a tag name is attacker-chosen
+        # text and git permits quotes and semicolons in one, which would otherwise be shell here.
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
-          tag='${{ github.ref_name }}'
           plugin=$(sed -n 's/^PLUGIN_VERSION=[[:space:]]*//p' dist/opnsense/net/netflector/Makefile)
-          if [ "$tag" != "os-v${plugin}" ]; then
-            echo "tag ${tag} does not match PLUGIN_VERSION ${plugin}" >&2
+          if [ "$TAG" != "os-v${plugin}" ]; then
+            echo "tag ${TAG} does not match PLUGIN_VERSION ${plugin}" >&2
             exit 1
           fi
+          echo "$plugin" | grep -qxE '[0-9]+\.[0-9]+\.[0-9]+' \
+            || { echo "PLUGIN_VERSION ${plugin} is not a three-part version" >&2; exit 1; }
           port=$(sed -n 's/^DISTVERSION=[[:space:]]*//p' dist/freebsd/net/netflector/Makefile)
           revision=$(sed -n 's/^PORTREVISION=[[:space:]]*//p' dist/freebsd/net/netflector/Makefile)
           if [ -n "$revision" ] && [ "$revision" != 0 ]; then
