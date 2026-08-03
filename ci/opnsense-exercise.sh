@@ -27,4 +27,7 @@ case "$verdict" in
 *) echo "the configd check action did not report ok" >&2; exit 1 ;;
 esac
 
-"$HERE"/freebsd-vm.sh run 'service netflector start && sleep 2 && service netflector status'
+# restart, not start: freebsd-vm.sh wait only waits for sshd, so the plugin can be installed while
+# the boot is still running. Whether the boot reaches its service phase before or after the plugin
+# writes rc.conf.d decides whether the daemon is already up by now, and start fails when it is.
+"$HERE"/freebsd-vm.sh run 'service netflector restart && sleep 2 && service netflector status'
