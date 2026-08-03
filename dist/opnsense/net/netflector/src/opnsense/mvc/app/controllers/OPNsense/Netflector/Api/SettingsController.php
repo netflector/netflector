@@ -46,7 +46,10 @@ class SettingsController extends ApiMutableModelControllerBase
     {
         return $this->searchBase(
             'reflectors.reflector',
-            ['enabled', 'name', 'source_if', 'target_if', 'description']
+            [
+                'enabled', 'name', 'source_if', 'target_if', 'description',
+                'wol', 'mdns', 'ssdp', 'dial', 'wsd', 'address_family',
+            ]
         );
     }
 

@@ -138,6 +138,15 @@
                     <th data-column-id="source_if" data-type="string">{{ lang._('Source') }}</th>
                     <th data-column-id="target_if" data-type="string">{{ lang._('Target') }}</th>
                     <th data-column-id="description" data-type="string">{{ lang._('Description') }}</th>
+                    <!-- What an entry reflects, which otherwise means opening every row in turn.
+                         Read-only: the protocols constrain each other (dial needs ssdp and an
+                         IPv4-capable family), so a single cell is the wrong place to change one. -->
+                    <th data-column-id="wol" data-type="string" data-width="5em" data-formatter="boolean">{{ lang._('WoL') }}</th>
+                    <th data-column-id="mdns" data-type="string" data-width="5em" data-formatter="boolean">{{ lang._('mDNS') }}</th>
+                    <th data-column-id="ssdp" data-type="string" data-width="5em" data-formatter="boolean">{{ lang._('SSDP') }}</th>
+                    <th data-column-id="dial" data-type="string" data-width="5em" data-formatter="boolean">{{ lang._('DIAL') }}</th>
+                    <th data-column-id="wsd" data-type="string" data-width="5em" data-formatter="boolean">{{ lang._('WSD') }}</th>
+                    <th data-column-id="address_family" data-type="string" data-width="8em">{{ lang._('IP family') }}</th>
                     <th data-column-id="uuid" data-identifier="true" data-visible="false">{{ lang._('ID') }}</th>
                     <th data-column-id="commands" data-width="7em" data-formatter="commands" data-sortable="false">{{ lang._('Commands') }}</th>
                 </tr>
