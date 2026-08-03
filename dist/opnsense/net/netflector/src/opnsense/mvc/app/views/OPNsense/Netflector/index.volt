@@ -43,27 +43,53 @@
             updateServiceControlUI('netflector');
         });
 
+        // Both ways an Apply is refused end here. The lines are set as text, not markup: they carry
+        // configured values, and the daemon's own wording, back to the page.
+        function refuseApply(dfObj, lines) {
+            const body = $('<div/>');
+            $.each(lines, function(index, line) {
+                body.append($('<p/>').text(line));
+            });
+            BootstrapDialog.show({
+                type: BootstrapDialog.TYPE_DANGER,
+                title: '{{ lang._('Netflector') }}',
+                message: body,
+                buttons: [{
+                    label: '{{ lang._('Close') }}',
+                    action: function(dialog) { dialog.close(); }
+                }]
+            });
+            dfObj.reject();
+        }
+
         $("#reconfigureAct").SimpleActionButton({
             onPreAction: function() {
                 const dfObj = $.Deferred();
-                saveFormToEndpoint("/api/netflector/settings/set", 'frm_GeneralSettings', dfObj.resolve, true,
+                saveFormToEndpoint("/api/netflector/settings/set", 'frm_GeneralSettings',
+                    function() {
+                        // The model's rules mirror the daemon's and can drift from them, and the
+                        // reconfigure that follows stops the running daemon before starting the new
+                        // one. Ask the daemon about the candidate first, so a configuration it
+                        // rejects leaves the old one running instead of nothing at all.
+                        ajaxCall("/api/netflector/service/check", {}, function(data) {
+                            // Only a rejection blocks: "idle" means nothing is enabled, which has to
+                            // apply, or the last reflector could never be removed.
+                            if (data['status'] === 'failed') {
+                                refuseApply(dfObj, (data['message'] || '{{ lang._('The daemon rejected the configuration.') }}').split('\n'));
+                            } else {
+                                dfObj.resolve();
+                            }
+                        });
+                    },
+                    true,
                     function(data) {
                         let messages = [];
                         $.each(data['validations'] || {}, function(field, message) {
                             messages.push(message);
                         });
-                        BootstrapDialog.show({
-                            type: BootstrapDialog.TYPE_DANGER,
-                            title: '{{ lang._('Netflector') }}',
-                            message: messages.length
-                                ? messages.join('<br/><br/>')
-                                : '{{ lang._('The configuration could not be saved.') }}',
-                            buttons: [{
-                                label: '{{ lang._('Close') }}',
-                                action: function(dialog) { dialog.close(); }
-                            }]
-                        });
-                        dfObj.reject();
+                        refuseApply(dfObj, messages.length
+                            ? messages
+                            : ['{{ lang._('The configuration could not be saved.') }}']);
                     }
                 );
                 return dfObj;
