@@ -78,6 +78,16 @@ class Netflector extends BaseModel
             }
         }
 
+        // Checked even when the field was not edited: what invalidates it is deleting the virtual IP
+        // on another page, so it goes stale without anyone touching this form.
+        $depends_on = (string)$this->general->carp_depend_on;
+        if ($depends_on !== '' && !$this->carpVipExists($depends_on)) {
+            $messages->appendMessage(new Message(
+                gettext('The selected CARP virtual IP no longer exists.'),
+                'netflector.general.carp_depend_on'
+            ));
+        }
+
         // Nothing enabled is a legal configuration, not an error: the rc.conf.d template arms the
         // service only when the switch is on AND an entry is on, so Apply stops the daemon and the
         // status widget reads "disabled". Rejecting it here instead would mean the last reflector
@@ -171,6 +181,21 @@ class Netflector extends BaseModel
                 $ref . '.wol_ports'
             ));
         }
+    }
+
+    /**
+     * Whether `$uuid` still names a CARP virtual IP. VirtualIPField offers only the ones that exist
+     * when the form is drawn, but the value it stored outlives the virtual IP itself.
+     */
+    private function carpVipExists($uuid)
+    {
+        foreach ((new \OPNsense\Interfaces\Vip())->vip->iterateItems() as $key => $vip) {
+            if ($key === $uuid && (string)$vip->mode === 'carp') {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
