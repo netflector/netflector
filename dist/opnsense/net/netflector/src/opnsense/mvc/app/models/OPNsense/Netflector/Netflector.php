@@ -184,6 +184,17 @@ class Netflector extends BaseModel
     }
 
     /**
+     * An entry by name, for a message that has to stand on its own. Falls back for the entry being
+     * added, which has no name until it is saved.
+     */
+    private static function describe($entry)
+    {
+        $name = trim((string)$entry->name);
+
+        return $name !== '' ? sprintf(gettext('"%s"'), $name) : gettext('This entry');
+    }
+
+    /**
      * Whether `$uuid` still names a CARP virtual IP. VirtualIPField offers only the ones that exist
      * when the form is drawn, but the value it stored outlives the virtual IP itself.
      */
@@ -217,15 +228,15 @@ class Netflector extends BaseModel
 
         $protocol = self::conflictingProtocol($a, $b);
         if ($protocol !== null) {
-            $other = (string)$a->name !== ''
-                ? sprintf(gettext('"%s"'), (string)$a->name)
-                : gettext('another entry');
+            // Both entries are named rather than one being "this entry": enabling several at once
+            // reports through a dialog that carries the text alone, with no field to point at.
             $messages->appendMessage(new Message(
                 sprintf(
-                    gettext('This entry would reflect %s between the same interfaces as %s, for overlapping ' .
+                    gettext('%s would reflect %s between the same interfaces as %s, for overlapping ' .
                             'devices and address families, so each packet would be reflected twice.'),
+                    self::describe($b),
                     $protocol,
-                    $other
+                    self::describe($a)
                 ),
                 $b->__reference . '.source_if'
             ));
