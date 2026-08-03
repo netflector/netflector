@@ -4,9 +4,9 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 /// RFC 6762.
 pub(crate) const MDNS_PORT: u16 = 5353;
-/// mDNS uses IP TTL 255 so receivers can verify a message originated on the local link; a lower TTL
-/// means it was routed and is rejected (RFC 6762 §11). The reflector re-emits a fresh link-local
-/// message, so it sets 255 rather than preserving the captured TTL.
+/// mDNS is sent at IP TTL 255: a send-side SHOULD in RFC 6762 §11, kept for old queriers that
+/// checked the TTL on receipt (current receivers check the source address instead). The reflector
+/// re-emits a fresh link-local message, so it sets 255 rather than preserving the captured TTL.
 pub(crate) const MDNS_TTL: u8 = 255;
 pub(crate) const MDNS_GROUP_V4: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
 /// Link-local scope (`ff02::`), not site-local.
