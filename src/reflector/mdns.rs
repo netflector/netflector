@@ -21,7 +21,7 @@ use crate::net::mdns::{
 
 use super::{
     BuildError, InterfaceMap, SimpleReflector, Verdict, join_group_logged,
-    require_bidirectional_families,
+    require_bidirectional_families, require_macs_matchable,
 };
 
 /// mDNS's classifier kind *is* its message type: `Query`/`Response` map straight across.
@@ -81,6 +81,12 @@ pub(crate) fn build(
         reflector.address_family,
         source,
         reflector.source_if.as_str(),
+        target,
+        reflector.target_if.as_str(),
+    )?;
+    require_macs_matchable(
+        dispatcher,
+        reflector.macs.as_ref(),
         target,
         reflector.target_if.as_str(),
     )?;

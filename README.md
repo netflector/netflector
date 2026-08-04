@@ -308,7 +308,10 @@ devices:
 - **mDNS / SSDP / WSD** relay, in the target→source direction, only frames whose L2 source MAC is in the
   allow-set (exposing just those devices); the source→target direction is never MAC-filtered. For SSDP
   and WSD the same filter scopes the proxied unicast replies: only the allow-set's responses are
-  carried back to a searcher.
+  carried back to a searcher. Because the filter reads the frame's L2 source, these protocols refuse
+  `macs` at startup when the target link carries no MAC addresses (a BSD `DLT_NULL` link such as a
+  loopback or an L3 tunnel) - it could never match. WoL is unaffected: it matches the MAC inside the
+  magic packet's payload.
 
 Omit `macs` for a network-level entry: WoL proxies every valid magic packet, and mDNS/SSDP/WSD relay
 every device's traffic rather than a chosen set (only the message kinds the corresponding direction
