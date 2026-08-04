@@ -9,7 +9,7 @@ use libc::socklen_t;
 
 use super::super::rtnetlink::read_at;
 use super::InterfaceEvent;
-use crate::libcex::{IfAddrMsg, NETLINK_ROUTE, NlMsgHdr, SockAddrNl, nl_align};
+use crate::libcex::nl_align;
 
 /// Holds one notification. Multicast delivers one message per datagram, never a coalesced
 /// dump. Sized for the largest: an `RTM_NEWLINK` carries the interface's whole attribute set
@@ -37,21 +37,22 @@ pub(super) fn open() -> io::Result<OwnedFd> {
         libc::socket(
             libc::AF_NETLINK,
             libc::SOCK_RAW | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
-            NETLINK_ROUTE,
+            libc::NETLINK_ROUTE,
         )
     })?;
-    let addr = SockAddrNl {
-        family: u16::try_from(libc::AF_NETLINK).expect("AF_NETLINK fits a u16"),
-        groups: SUBSCRIBED_GROUPS,
-        ..SockAddrNl::default()
-    };
+    // SAFETY: a zeroed `sockaddr_nl` is an all-integer POD (libc keeps its padding field
+    // private, so there is no literal to write); the two meaningful fields are set below.
+    let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+    addr.nl_family = u16::try_from(libc::AF_NETLINK).expect("AF_NETLINK fits a u16");
+    addr.nl_groups = SUBSCRIBED_GROUPS;
     // SAFETY: a fully-initialized `sockaddr_nl` of its own size; `bind` reads it and
     // subscribes the multicast groups.
     let rc = unsafe {
         libc::bind(
             sock.as_raw_fd(),
             (&raw const addr).cast::<libc::sockaddr>(),
-            socklen_t::try_from(size_of::<SockAddrNl>()).expect("sockaddr_nl fits socklen_t"),
+            socklen_t::try_from(size_of::<libc::sockaddr_nl>())
+                .expect("sockaddr_nl fits socklen_t"),
         )
     };
     if rc != 0 {
@@ -65,11 +66,12 @@ pub(super) fn open() -> io::Result<OwnedFd> {
 /// `RTM_{NEW,DEL}LINK` ([`InterfaceEvent::Link`], from its `ifinfomsg`).
 pub(super) fn for_each_change(buf: &[u8], on_change: &mut impl FnMut(InterfaceEvent)) {
     let mut offset = 0;
-    while let Some(hdr) = read_at::<NlMsgHdr>(buf, offset) {
-        let len = hdr.len as usize;
+    while let Some(hdr) = read_at::<libc::nlmsghdr>(buf, offset) {
+        let len = hdr.nlmsg_len as usize;
         // checked_add: a crafted len must not wrap `offset + len` past the bound on a 32-bit usize
         // (which would also make `nl_align(len)` wrap to 0 and spin the walk forever).
-        if len < size_of::<NlMsgHdr>() || offset.checked_add(len).is_none_or(|end| end > buf.len())
+        if len < size_of::<libc::nlmsghdr>()
+            || offset.checked_add(len).is_none_or(|end| end > buf.len())
         {
             // Not a normal end (that's the `while` running out): a message claims an
             // impossible length (truncated datagram or corruption), so a change is dropped.
@@ -80,12 +82,12 @@ pub(super) fn for_each_change(buf: &[u8], on_change: &mut impl FnMut(InterfaceEv
             );
             break;
         }
-        let body_at = offset + nl_align(size_of::<NlMsgHdr>());
+        let body_at = offset + nl_align(size_of::<libc::nlmsghdr>());
         let end = offset + len;
-        match hdr.msg_type {
+        match hdr.nlmsg_type {
             libc::RTM_NEWADDR | libc::RTM_DELADDR => {
-                if let Some(body) = read_at::<IfAddrMsg>(&buf[..end], body_at) {
-                    report(body.index, InterfaceEvent::Address, on_change);
+                if let Some(body) = read_at::<libc::ifaddrmsg>(&buf[..end], body_at) {
+                    report(body.ifa_index, InterfaceEvent::Address, on_change);
                 }
             }
             libc::RTM_NEWLINK | libc::RTM_DELLINK => {
@@ -109,12 +111,12 @@ pub(super) fn for_each_change(buf: &[u8], on_change: &mut impl FnMut(InterfaceEv
 /// a user process's carries its port id, so a non-zero pid is a locally-spoofed datagram (netlink
 /// user-to-user unicast needs no privilege) and is dropped.
 pub(super) fn sender_ok(src: &libc::sockaddr_storage, len: socklen_t) -> bool {
-    if usize::try_from(len).unwrap_or(0) < size_of::<SockAddrNl>() {
+    if usize::try_from(len).unwrap_or(0) < size_of::<libc::sockaddr_nl>() {
         return false;
     }
     // SAFETY: the len check guarantees the storage holds a full sockaddr_nl; read its prefix unaligned.
-    let nl = unsafe { std::ptr::read_unaligned((&raw const *src).cast::<SockAddrNl>()) };
-    nl.pid == 0
+    let nl = unsafe { std::ptr::read_unaligned((&raw const *src).cast::<libc::sockaddr_nl>()) };
+    nl.nl_pid == 0
 }
 
 /// Forward an `event(index)` change; `event` is a variant constructor
@@ -141,7 +143,7 @@ mod tests {
 
     /// A netlink message: a `nlmsghdr` (len, type) followed by `body`, length-padded.
     fn message(msg_type: u16, body: &[u8]) -> Vec<u8> {
-        let len = size_of::<NlMsgHdr>() + body.len();
+        let len = size_of::<libc::nlmsghdr>() + body.len();
         let mut m = vec![0u8; nl_align(len)];
         m[0..4].copy_from_slice(
             &u32::try_from(len)
@@ -149,13 +151,14 @@ mod tests {
                 .to_ne_bytes(),
         );
         m[4..6].copy_from_slice(&msg_type.to_ne_bytes());
-        m[size_of::<NlMsgHdr>()..size_of::<NlMsgHdr>() + body.len()].copy_from_slice(body);
+        m[size_of::<libc::nlmsghdr>()..size_of::<libc::nlmsghdr>() + body.len()]
+            .copy_from_slice(body);
         m
     }
 
     /// An `ifaddrmsg` body carrying `ifa_index` (a `u32` at body offset 4).
     fn ifaddrmsg(index: u32) -> Vec<u8> {
-        let mut b = vec![0u8; size_of::<IfAddrMsg>()];
+        let mut b = vec![0u8; size_of::<libc::ifaddrmsg>()];
         b[4..8].copy_from_slice(&index.to_ne_bytes());
         b
     }
@@ -169,22 +172,20 @@ mod tests {
 
     /// A `sockaddr_storage` holding a `sockaddr_nl` with `pid` as its `nl_pid`.
     fn storage_with_pid(pid: u32) -> libc::sockaddr_storage {
-        let nl = SockAddrNl {
-            pid,
-            ..SockAddrNl::default()
-        };
         // SAFETY: an all-zero sockaddr_storage is valid, and it is large enough and aligned to hold a
         // sockaddr_nl written into its prefix.
         unsafe {
+            let mut nl: libc::sockaddr_nl = std::mem::zeroed();
+            nl.nl_pid = pid;
             let mut ss: libc::sockaddr_storage = std::mem::zeroed();
-            std::ptr::write((&raw mut ss).cast::<SockAddrNl>(), nl);
+            std::ptr::write((&raw mut ss).cast::<libc::sockaddr_nl>(), nl);
             ss
         }
     }
 
     #[test]
     fn sender_ok_accepts_only_the_kernel() {
-        let full = socklen_t::try_from(size_of::<SockAddrNl>()).unwrap();
+        let full = socklen_t::try_from(size_of::<libc::sockaddr_nl>()).unwrap();
         assert!(sender_ok(&storage_with_pid(0), full)); // the kernel (nl_pid 0)
         assert!(!sender_ok(&storage_with_pid(1234), full)); // a user process's port id
         assert!(!sender_ok(&storage_with_pid(0), 4)); // a too-short source address

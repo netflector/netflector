@@ -1,7 +1,6 @@
 //! Linux address resolution over rtnetlink (`NETLINK_ROUTE`): one `RTM_GETADDR` dump for the
 //! v4/v6 addresses (each carrying its `IFA_FLAGS`, so tentative/deprecated/dadfailed are
-//! filtered inline) and one `RTM_GETLINK` dump for the MAC. The netlink message framing is
-//! hand-rolled: `libc` exposes it for Android only, not glibc/musl.
+//! filtered inline) and one `RTM_GETLINK` dump for the MAC.
 
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -12,10 +11,7 @@ use std::time::{Duration, Instant};
 use libc::{c_int, socklen_t};
 
 use super::{InterfaceAddresses, V6Pick, v6_rank};
-use crate::libcex::{
-    IfAddrMsg, NETLINK_ROUTE, NLM_F_DUMP, NLM_F_REQUEST, NLMSG_DONE, NLMSG_ERROR, NlMsgHdr, RtAttr,
-    SockAddrNl, nl_align,
-};
+use crate::libcex::nl_align;
 use crate::net::mac::MacAddr;
 use crate::sys::IoStatus;
 
@@ -45,14 +41,14 @@ impl<'a> Iterator for RtAttrs<'a> {
     type Item = (u16, &'a [u8]);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let rta = read_at::<RtAttr>(self.msg, self.at)?;
-        let rta_len = rta.len as usize;
-        if rta_len < size_of::<RtAttr>() || self.at + rta_len > self.msg.len() {
+        let rta = read_at::<libc::rtattr>(self.msg, self.at)?;
+        let rta_len = rta.rta_len as usize;
+        if rta_len < size_of::<libc::rtattr>() || self.at + rta_len > self.msg.len() {
             return None;
         }
-        let data = &self.msg[self.at + size_of::<RtAttr>()..self.at + rta_len];
+        let data = &self.msg[self.at + size_of::<libc::rtattr>()..self.at + rta_len];
         self.at += nl_align(rta_len);
-        Some((rta.attr_type, data))
+        Some((rta.rta_type, data))
     }
 }
 
@@ -84,11 +80,14 @@ pub(super) fn resolve(if_name: &str, ifindex: u32) -> io::Result<InterfaceAddres
     let mut addrs = InterfaceAddresses::default();
 
     let mut v6_pick = V6Pick::default();
+    // SAFETY: a zeroed `ifaddrmsg` (an all-integer POD) is a valid `AF_UNSPEC` address-dump
+    // request body.
+    let addr_req: libc::ifaddrmsg = unsafe { std::mem::zeroed() };
     dump(
         &sock,
         libc::RTM_GETADDR,
         libc::RTM_NEWADDR,
-        IfAddrMsg::default(),
+        addr_req,
         |msg| {
             scan_addr(msg, if_name, ifindex, &mut addrs, &mut v6_pick);
         },
@@ -114,7 +113,7 @@ fn netlink_socket() -> io::Result<OwnedFd> {
         libc::socket(
             libc::AF_NETLINK,
             libc::SOCK_RAW | libc::SOCK_CLOEXEC,
-            NETLINK_ROUTE,
+            libc::NETLINK_ROUTE,
         )
     })?;
     crate::sys::set_recv_timeout(sock.as_raw_fd(), READ_TIMEOUT)?;
@@ -132,16 +131,16 @@ fn dump<B>(
 ) -> io::Result<()> {
     #[repr(C)]
     struct Request<B> {
-        hdr: NlMsgHdr,
+        hdr: libc::nlmsghdr,
         body: B,
     }
     let req = Request {
-        hdr: NlMsgHdr {
-            len: u32::try_from(size_of::<Request<B>>()).expect("request fits a u32"),
-            msg_type: request_type,
-            flags: NLM_F_REQUEST | NLM_F_DUMP,
-            seq: 1,
-            pid: 0,
+        hdr: libc::nlmsghdr {
+            nlmsg_len: u32::try_from(size_of::<Request<B>>()).expect("request fits a u32"),
+            nlmsg_type: request_type,
+            nlmsg_flags: nl_u16(libc::NLM_F_REQUEST | libc::NLM_F_DUMP),
+            nlmsg_seq: 1,
+            nlmsg_pid: 0,
         },
         body,
     };
@@ -186,9 +185,11 @@ fn dump<B>(
         };
         buf.resize(size, 0);
 
-        let mut src = SockAddrNl::default();
-        let mut addrlen =
-            socklen_t::try_from(size_of::<SockAddrNl>()).expect("sockaddr_nl fits socklen_t");
+        // SAFETY: a zeroed `sockaddr_nl` (an all-integer POD; libc keeps its padding field
+        // private, so there is no literal to write) is a valid recvfrom out-param.
+        let mut src: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+        let mut addrlen = socklen_t::try_from(size_of::<libc::sockaddr_nl>())
+            .expect("sockaddr_nl fits socklen_t");
         // SAFETY: `recvfrom` fills up to `buf.len()` bytes of the owned buffer (now the whole
         // datagram) and writes the source address into the `src`/`addrlen` out-params.
         let received = unsafe {
@@ -206,10 +207,10 @@ fn dump<B>(
         };
         // Only the kernel (nl_pid == 0) may answer the dump; a local process could unicast a spoofed
         // reply to inject a bogus address. Discard anything else and read the next datagram.
-        if src.pid != 0 {
+        if src.nl_pid != 0 {
             log::debug!(
                 "netlink dump: ignoring a reply from a non-kernel sender (pid {})",
-                src.pid
+                src.nl_pid
             );
             continue;
         }
@@ -232,20 +233,34 @@ enum DumpStep {
     More,
 }
 
+/// A `c_int`-typed netlink header value as the `u16` the wire header carries. libc types the
+/// `NLMSG_*` kinds and `NLM_F_*` flags `c_int`; `nlmsg_type`/`nlmsg_flags` are `u16`, and a path
+/// const of a different type can't even pattern-match `nlmsg_type`.
+// guarded: the assert rejects any negative or truncating value
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+const fn nl_u16(value: libc::c_int) -> u16 {
+    assert!(0 <= value && value <= 0xffff);
+    value as u16
+}
+
+const NLMSG_DONE: u16 = nl_u16(libc::NLMSG_DONE);
+const NLMSG_ERROR: u16 = nl_u16(libc::NLMSG_ERROR);
+
 /// Walk one dump datagram, feeding each `reply_type` message to `on_msg`, and report whether the dump is
 /// done, failed, or needs another datagram. Split from [`dump`]'s socket loop so the message walk (and
 /// its bounds handling) is unit-testable.
 fn walk_dump(buf: &[u8], reply_type: u16, on_msg: &mut impl FnMut(&[u8])) -> DumpStep {
     let mut offset = 0;
-    while let Some(hdr) = read_at::<NlMsgHdr>(buf, offset) {
-        let len = hdr.len as usize;
+    while let Some(hdr) = read_at::<libc::nlmsghdr>(buf, offset) {
+        let len = hdr.nlmsg_len as usize;
         // checked_add: a crafted len must not wrap `offset + len` past the bound on a 32-bit usize,
         // which would then panic the `&buf[offset..offset + len]` slice (start > end) below.
-        if len < size_of::<NlMsgHdr>() || offset.checked_add(len).is_none_or(|end| end > buf.len())
+        if len < size_of::<libc::nlmsghdr>()
+            || offset.checked_add(len).is_none_or(|end| end > buf.len())
         {
             break;
         }
-        match hdr.msg_type {
+        match hdr.nlmsg_type {
             NLMSG_DONE => return DumpStep::Done,
             NLMSG_ERROR => return DumpStep::Failed(nlmsg_error(buf, offset)),
             t if t == reply_type => on_msg(&buf[offset..offset + len]),
@@ -259,7 +274,7 @@ fn walk_dump(buf: &[u8], reply_type: u16, on_msg: &mut impl FnMut(&[u8])) -> Dum
 /// The error for an `NLMSG_ERROR` reply at `offset`. Its payload is `struct nlmsgerr { int error; ... }`
 /// where `error` is a negative errno, or 0 for an ACK (which our dumps never request).
 fn nlmsg_error(buf: &[u8], offset: usize) -> io::Error {
-    match read_at::<c_int>(buf, offset + nl_align(size_of::<NlMsgHdr>())) {
+    match read_at::<c_int>(buf, offset + nl_align(size_of::<libc::nlmsghdr>())) {
         Some(errno) if errno != 0 => io::Error::from_raw_os_error(errno.saturating_neg()),
         _ => io::Error::other("netlink dump failed (NLMSG_ERROR without an errno)"),
     }
@@ -274,12 +289,12 @@ fn scan_addr(
     addrs: &mut InterfaceAddresses,
     v6_pick: &mut V6Pick,
 ) {
-    let body_at = nl_align(size_of::<NlMsgHdr>());
-    let Some(body) = read_at::<IfAddrMsg>(msg, body_at) else {
+    let body_at = nl_align(size_of::<libc::nlmsghdr>());
+    let Some(body) = read_at::<libc::ifaddrmsg>(msg, body_at) else {
         return;
     };
-    let family = c_int::from(body.family);
-    if body.index != ifindex || (family != libc::AF_INET && family != libc::AF_INET6) {
+    let family = c_int::from(body.ifa_family);
+    if body.ifa_index != ifindex || (family != libc::AF_INET && family != libc::AF_INET6) {
         return;
     }
 
@@ -288,8 +303,8 @@ fn scan_addr(
     // 32-bit set and supersedes the 8-bit `ifa_flags`.
     let mut local: Option<&[u8]> = None;
     let mut address: Option<&[u8]> = None;
-    let mut flags = u32::from(body.flags);
-    for (attr_type, data) in rtattrs(msg, body_at + nl_align(size_of::<IfAddrMsg>())) {
+    let mut flags = u32::from(body.ifa_flags);
+    for (attr_type, data) in rtattrs(msg, body_at + nl_align(size_of::<libc::ifaddrmsg>())) {
         match attr_type {
             libc::IFA_ADDRESS => address = Some(data),
             libc::IFA_LOCAL => local = Some(data),
@@ -334,7 +349,7 @@ fn scan_addr(
 /// Parse one `RTM_NEWLINK` message; if it is `ifindex` and carries a 6-byte `IFLA_ADDRESS`,
 /// record it as the MAC. `msg` spans one netlink message.
 fn scan_link(msg: &[u8], if_name: &str, ifindex: u32, addrs: &mut InterfaceAddresses) {
-    let body_at = nl_align(size_of::<NlMsgHdr>());
+    let body_at = nl_align(size_of::<libc::nlmsghdr>());
     let Some(body) = read_at::<libc::ifinfomsg>(msg, body_at) else {
         return;
     };
@@ -362,7 +377,7 @@ mod tests {
     /// Serialize `[len:u16][type:u16][value]` rtattr TLVs, each padded to 4 bytes, onto `buf`.
     fn push_attrs(buf: &mut Vec<u8>, attrs: &[(u16, &[u8])]) {
         for &(attr_type, value) in attrs {
-            let len = u16::try_from(size_of::<RtAttr>() + value.len()).unwrap();
+            let len = u16::try_from(size_of::<libc::rtattr>() + value.len()).unwrap();
             buf.extend_from_slice(&len.to_ne_bytes());
             buf.extend_from_slice(&attr_type.to_ne_bytes());
             buf.extend_from_slice(value);
@@ -374,7 +389,7 @@ mod tests {
 
     /// An `RTM_NEWADDR` message: a zeroed nlmsghdr, an ifaddrmsg (family/flags/index), then `attrs`.
     fn addr_msg(family: c_int, index: u32, flags: u8, attrs: &[(u16, &[u8])]) -> Vec<u8> {
-        let mut m = vec![0u8; nl_align(size_of::<NlMsgHdr>())];
+        let mut m = vec![0u8; nl_align(size_of::<libc::nlmsghdr>())];
         m.push(u8::try_from(family).unwrap()); // family
         m.extend_from_slice(&[0, flags, 0]); // prefixlen, flags, scope
         m.extend_from_slice(&index.to_ne_bytes()); // index
@@ -384,7 +399,7 @@ mod tests {
 
     /// An `RTM_NEWLINK` message: a zeroed nlmsghdr, an ifinfomsg (index), then `attrs`.
     fn link_msg(index: i32, attrs: &[(u16, &[u8])]) -> Vec<u8> {
-        let mut m = vec![0u8; nl_align(size_of::<NlMsgHdr>())];
+        let mut m = vec![0u8; nl_align(size_of::<libc::nlmsghdr>())];
         m.extend_from_slice(&[0, 0]); // family, pad
         m.extend_from_slice(&0u16.to_ne_bytes()); // dev_type
         m.extend_from_slice(&index.to_ne_bytes()); // index (i32)
@@ -395,11 +410,12 @@ mod tests {
 
     /// A netlink message with its `nlmsghdr` len/type set from `body`, length-padded.
     fn nl_message(msg_type: u16, body: &[u8]) -> Vec<u8> {
-        let len = size_of::<NlMsgHdr>() + body.len();
+        let len = size_of::<libc::nlmsghdr>() + body.len();
         let mut m = vec![0u8; nl_align(len)];
         m[0..4].copy_from_slice(&u32::try_from(len).unwrap().to_ne_bytes());
         m[4..6].copy_from_slice(&msg_type.to_ne_bytes());
-        m[size_of::<NlMsgHdr>()..size_of::<NlMsgHdr>() + body.len()].copy_from_slice(body);
+        m[size_of::<libc::nlmsghdr>()..size_of::<libc::nlmsghdr>() + body.len()]
+            .copy_from_slice(body);
         m
     }
 
@@ -427,11 +443,11 @@ mod tests {
         // A crafted second message with len ~usize::MAX (u32::MAX on the 32-bit targets) must not wrap
         // `offset + len` past the bound and panic the `&buf[offset..offset + len]` slice (start > end);
         // the walk delivers the valid first message, then breaks and asks for the next datagram.
-        let mut buf = nl_message(libc::RTM_NEWADDR, &[0u8; size_of::<IfAddrMsg>()]);
+        let mut buf = nl_message(libc::RTM_NEWADDR, &[0u8; size_of::<libc::ifaddrmsg>()]);
         let second = buf.len();
         buf.extend(nl_message(
             libc::RTM_NEWADDR,
-            &[0u8; size_of::<IfAddrMsg>()],
+            &[0u8; size_of::<libc::ifaddrmsg>()],
         ));
         buf[second..second + 4].copy_from_slice(&u32::MAX.to_ne_bytes());
         let mut count = 0;
