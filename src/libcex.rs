@@ -24,9 +24,6 @@ pub(crate) use self::bpf_device::bpf_wordalign;
 pub(crate) use self::bpf_device::BPF_ALIGN;
 pub(crate) use self::multicast::{GroupReq, MCAST_JOIN_GROUP};
 #[cfg(target_os = "linux")]
-pub(crate) use self::netlink::{
-    IfAddrMsg, NETLINK_ROUTE, NLM_F_DUMP, NLM_F_REQUEST, NLMSG_DONE, NLMSG_ERROR, NlMsgHdr, RtAttr,
-    SockAddrNl, nl_align,
-};
+pub(crate) use self::netlink::nl_align;
 #[cfg(target_os = "freebsd")]
 pub(crate) use self::route::RtMsgHdr;
