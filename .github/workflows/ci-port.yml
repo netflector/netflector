@@ -130,6 +130,9 @@ jobs:
       - name: VM console log
         if: always()
         run: ci/freebsd-vm.sh console
+      - name: Crash summary
+        if: always()
+        run: ci/freebsd-vm.sh crash
 
   # The aggregate the ruleset requires: green only when every job above is.
   # Without !cancelled() a failed job would skip this one, and a skipped

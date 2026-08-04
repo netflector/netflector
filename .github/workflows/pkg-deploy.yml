@@ -168,6 +168,9 @@ jobs:
       - name: VM console log
         if: always()
         run: ci/freebsd-vm.sh console
+      - name: Crash summary
+        if: always()
+        run: ci/freebsd-vm.sh crash
 
   gate:
     name: Gate on OPNsense ${{ matrix.opnsense }}
@@ -244,6 +247,9 @@ jobs:
       - name: VM console log
         if: always()
         run: ci/freebsd-vm.sh console
+      - name: Crash summary
+        if: always()
+        run: ci/freebsd-vm.sh crash
 
   push:
     name: Push the snapshot

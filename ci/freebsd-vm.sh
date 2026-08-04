@@ -13,6 +13,7 @@
 #   ci/freebsd-vm.sh push SRC... DEST   copy files/dirs to DEST in the VM
 #   ci/freebsd-vm.sh pull SRC DEST      copy a file/dir from the VM to DEST
 #   ci/freebsd-vm.sh console   dump the serial console (boot diagnostics)
+#   ci/freebsd-vm.sh crash     print the guest's saved panic summary, if any
 #
 # State (disk, seed, per-run ssh key, console log) lives in $FREEBSD_VM_DIR,
 # default ~/.freebsd-vm. $FREEBSD_VM_ARCH (required, no default: a guessed
@@ -50,8 +51,13 @@ SSH_PORT=${FREEBSD_VM_SSH_PORT:-2222}
 SSH_WAIT_SECS=${FREEBSD_VM_SSH_WAIT_SECS:-$WAIT_DEFAULT}
 
 # No port here: ssh wants -p, scp wants -P; each call site adds its own.
+# Keepalives: a guest kernel panic reboots the VM without resetting slirp's
+# host-side TCP, so a session blocked in read (the e2e suite) would sit silent
+# until the job budget; four missed 15s probes end it in ~1 minute instead.
+# ConnectTimeout bounds new connections against a frozen guest the same way.
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
-    -o LogLevel=ERROR -i "$VM_DIR/id_ed25519")
+    -o LogLevel=ERROR -o ServerAliveInterval=15 -o ServerAliveCountMax=4
+    -o ConnectTimeout=10 -i "$VM_DIR/id_ed25519")
 
 # NoCloud seed for nuageinit(7), the in-base cloud-init shim the
 # BASIC-CLOUDINIT image enables. Whatever the flavor below, the seed does
@@ -244,6 +250,29 @@ pull() {
     scp -qr "${SSH_OPTS[@]}" -P "$SSH_PORT" "root@127.0.0.1:$1" "$2"
 }
 
+# A panicked guest reboots itself, and savecore(8) writes the panic summary
+# (backtrace, faulting process, dmesg tail) to /var/crash during that boot --
+# about a minute after the panic even under TCG. The wait is bounded: a guest
+# that froze without panicking never answers, and burning the first-boot ssh
+# budget (20 minutes on arm64) on a post-mortem would stall the job's real
+# diagnostics.
+crash_summary() {
+    if [ ! -f "$VM_DIR/qemu.pid" ]; then
+        echo "no crash summary: the VM was never launched"
+        return 0
+    fi
+    local deadline=$((SECONDS + 180))
+    until ssh "${SSH_OPTS[@]}" -p "$SSH_PORT" root@127.0.0.1 true 2>/dev/null; do
+        if ((SECONDS >= deadline)); then
+            echo "no crash summary: no ssh answer after 180s"
+            return 0
+        fi
+        sleep 5
+    done
+    run 'cat /var/crash/core.txt.* 2>/dev/null || echo "no crash dump in /var/crash"' ||
+        echo "no crash summary: ssh dropped while reading /var/crash"
+}
+
 case "${1:-}" in
 launch) launch ;;
 wait) wait_ssh ;;
@@ -264,8 +293,9 @@ console)
     # never got as far as launching the VM must not fail the step.
     cat "$VM_DIR/console.log" 2>/dev/null || echo "no console log: the VM was never launched"
     ;;
+crash) crash_summary ;;
 *)
-    echo "usage: $0 launch|wait|run CMD|push SRC... DEST|pull SRC DEST|console" >&2
+    echo "usage: $0 launch|wait|run CMD|push SRC... DEST|pull SRC DEST|console|crash" >&2
     exit 64
     ;;
 esac

@@ -149,6 +149,9 @@ jobs:
       - name: VM console log
         if: always()
         run: ci/freebsd-vm.sh console
+      - name: Crash summary
+        if: always()
+        run: ci/freebsd-vm.sh crash
 
   build-daemon:
     needs: [guard, verify-ci]
