@@ -18,6 +18,7 @@ use libc::{c_uint, c_ulong, c_void};
 
 use super::filter::{BpfInsn, DLT_NULL_UDP_FILTER, ETHERNET_UDP_FILTER};
 use crate::libcex::bpf_wordalign;
+use crate::logging::{WARN_WINDOW, log_rate};
 use crate::net::LinkType;
 use crate::sys::IoStatus;
 
@@ -29,6 +30,9 @@ pub(crate) struct Capture {
     offset: usize,
     link_type: LinkType,
     name: String,
+    /// Frames dropped for exceeding the forwarding limit since the last
+    /// [`take_oversized`](Self::take_oversized) drain.
+    oversized: u64,
 }
 
 impl Capture {
@@ -66,6 +70,7 @@ impl Capture {
             offset: 0,
             link_type,
             name: if_name.into(),
+            oversized: 0,
         })
     }
 
@@ -137,13 +142,19 @@ impl Capture {
             self.offset = start + advance;
             match record {
                 Record::Frame(frame) => break (start + frame.start)..(start + frame.end),
-                // trace, not warn: this runs in the per-frame drain loop, and a remote peer can flood
-                // oversized frames. A per-frame warn would both break data-path-quiet and spam the
-                // operator's log. The frame is still correctly dropped.
-                Record::Oversized { datalen } => log::trace!(
-                    "dropping oversized frame: {datalen} bytes exceeds the {}-byte forwarding limit",
-                    crate::net::MAX_FRAME_LEN
-                ),
+                // Rate-limited: this is the per-frame drain loop, and a remote peer can flood
+                // oversized frames.
+                Record::Oversized { datalen } => {
+                    log_rate!(
+                        log::Level::Warn,
+                        WARN_WINDOW,
+                        "{}: dropping oversized frame: {datalen} bytes exceeds the {}-byte \
+                         forwarding limit",
+                        self.name,
+                        crate::net::MAX_FRAME_LEN
+                    );
+                    self.oversized += 1;
+                }
             }
         };
         Ok(Some(&self.buf[range]))
@@ -153,6 +164,12 @@ impl Capture {
     /// draining, since a level-triggered wait won't re-fire until new kernel data.
     pub(crate) fn has_buffered(&self) -> bool {
         self.offset < self.filled
+    }
+
+    /// The oversized-frame drops since the last call, resetting the tally: the dispatcher folds
+    /// them into the interface's counter row after each drain.
+    pub(crate) fn take_oversized(&mut self) -> u64 {
+        std::mem::take(&mut self.oversized)
     }
 
     /// Inject a fully-built link-layer `frame` on this interface.

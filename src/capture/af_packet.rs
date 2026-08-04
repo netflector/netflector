@@ -15,6 +15,7 @@ use libc::{c_int, c_void};
 
 use super::filter::{BpfInsn, DROP_OUTGOING_PROLOGUE, ETHERNET_UDP_FILTER};
 use crate::interface::if_index;
+use crate::logging::{WARN_WINDOW, log_rate};
 use crate::net::LinkType;
 use crate::sys::{IoStatus, socklen_of};
 
@@ -27,6 +28,9 @@ pub(crate) struct Capture {
     fd: OwnedFd,
     buf: Box<[u8]>,
     name: String,
+    /// Frames dropped for exceeding the receive buffer since the last
+    /// [`take_oversized`](Self::take_oversized) drain.
+    oversized: u64,
 }
 
 impl Capture {
@@ -72,6 +76,7 @@ impl Capture {
             fd,
             buf: vec![0u8; crate::net::MAX_FRAME_LEN].into_boxed_slice(),
             name: if_name.into(),
+            oversized: 0,
         })
     }
 
@@ -151,12 +156,17 @@ impl Capture {
             // MSG_TRUNC reports the frame's real length even past the buffer, so an
             // oversized frame is detectable (and dropped) instead of silently cut.
             if bytes > self.buf.len() {
-                // trace, not warn: per-frame drain loop, and a remote peer can flood oversized
-                // frames. A per-frame warn would break data-path-quiet and spam the log.
-                log::trace!(
-                    "dropping oversized frame: {bytes} bytes exceeds the {}-byte receive buffer",
+                // Rate-limited: this is the per-frame drain loop, and a remote peer can flood
+                // oversized frames.
+                log_rate!(
+                    log::Level::Warn,
+                    WARN_WINDOW,
+                    "{}: dropping oversized frame: {bytes} bytes exceeds the {}-byte receive \
+                     buffer",
+                    self.name,
                     self.buf.len()
                 );
+                self.oversized += 1;
                 continue;
             }
             break bytes;
@@ -169,6 +179,12 @@ impl Capture {
     #[allow(clippy::unused_self)] // uniform Capture API; the BPF backend reads self
     pub(crate) fn has_buffered(&self) -> bool {
         false
+    }
+
+    /// The oversized-frame drops since the last call, resetting the tally: the dispatcher folds
+    /// them into the interface's counter row after each drain.
+    pub(crate) fn take_oversized(&mut self) -> u64 {
+        std::mem::take(&mut self.oversized)
     }
 
     /// Inject a fully-built link-layer `frame` on this interface.
