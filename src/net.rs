@@ -57,6 +57,11 @@ pub(crate) const MAX_FRAME_LEN: usize = 2048;
 pub(crate) const MAX_UDP_PAYLOAD_LEN: usize =
     MAX_FRAME_LEN - (ETHERNET_HEADER_SIZE + IPV6_HEADER_SIZE + UDP_HEADER_SIZE);
 
+/// The largest interface MTU whose full-size packets still fit [`MAX_FRAME_LEN`] once framed (an
+/// MTU counts L3 bytes; the frame adds the link header). Ethernet is the binding case; a
+/// `DLT_NULL` link's 4-byte header leaves a little more room, accepted as slack.
+pub(crate) const MAX_MTU: usize = MAX_FRAME_LEN - ETHERNET_HEADER_SIZE;
+
 /// Whether `ip` is link-local (IPv4 `169.254.0.0/16`, IPv6 `fe80::/10`).
 pub(crate) fn is_link_local(ip: IpAddr) -> bool {
     match ip {

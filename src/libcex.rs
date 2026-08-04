@@ -10,6 +10,8 @@
 
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 mod bpf_device;
+#[cfg(target_os = "macos")]
+mod if_data;
 mod multicast;
 #[cfg(target_os = "linux")]
 mod netlink;
@@ -22,6 +24,8 @@ pub(crate) use self::bpf_device::bpf_wordalign;
 // via `bpf_wordalign`), so re-export it only for tests.
 #[cfg(all(test, any(target_os = "macos", target_os = "freebsd")))]
 pub(crate) use self::bpf_device::BPF_ALIGN;
+#[cfg(target_os = "macos")]
+pub(crate) use self::if_data::IfData;
 pub(crate) use self::multicast::{GroupReq, MCAST_JOIN_GROUP};
 #[cfg(target_os = "linux")]
 pub(crate) use self::netlink::nl_align;

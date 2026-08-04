@@ -66,18 +66,22 @@ pub(super) fn read_at<T>(buf: &[u8], off: usize) -> Option<T> {
 
 /// Resolve interface `ifindex`'s current source addresses with two netlink dumps:
 /// `RTM_GETADDR` for v4/v6 (flag-filtered, link-local > ULA > global) and `RTM_GETLINK` for
-/// the MAC. `if_name` is for tracing only; the dumps are filtered by `ifindex`. A `0`
+/// the MAC and MTU. `if_name` is for tracing only; the dumps are filtered by `ifindex`. A `0`
 /// `ifindex` (the caller's "unknown interface" sentinel) skips the dumps.
 ///
 /// # Errors
 /// Returns an error if a netlink socket, request, or reply fails.
-pub(super) fn resolve(if_name: &str, ifindex: u32) -> io::Result<InterfaceAddresses> {
+pub(super) fn resolve(
+    if_name: &str,
+    ifindex: u32,
+) -> io::Result<(InterfaceAddresses, Option<u32>)> {
     if ifindex == 0 {
-        return Ok(InterfaceAddresses::default());
+        return Ok((InterfaceAddresses::default(), None));
     }
 
     let sock = netlink_socket()?;
     let mut addrs = InterfaceAddresses::default();
+    let mut mtu = None;
 
     let mut v6_pick = V6Pick::default();
     // SAFETY: a zeroed `ifaddrmsg` (an all-integer POD) is a valid `AF_UNSPEC` address-dump
@@ -100,11 +104,11 @@ pub(super) fn resolve(if_name: &str, ifindex: u32) -> io::Result<InterfaceAddres
         libc::RTM_NEWLINK,
         link_req,
         |msg| {
-            scan_link(msg, if_name, ifindex, &mut addrs);
+            scan_link(msg, if_name, ifindex, &mut addrs, &mut mtu);
         },
     )?;
 
-    Ok(addrs)
+    Ok((addrs, mtu))
 }
 
 fn netlink_socket() -> io::Result<OwnedFd> {
@@ -346,9 +350,15 @@ fn scan_addr(
     }
 }
 
-/// Parse one `RTM_NEWLINK` message; if it is `ifindex` and carries a 6-byte `IFLA_ADDRESS`,
-/// record it as the MAC. `msg` spans one netlink message.
-fn scan_link(msg: &[u8], if_name: &str, ifindex: u32, addrs: &mut InterfaceAddresses) {
+/// Parse one `RTM_NEWLINK` message; if it is `ifindex`, record its 6-byte `IFLA_ADDRESS` as the
+/// MAC and its `IFLA_MTU`. `msg` spans one netlink message.
+fn scan_link(
+    msg: &[u8],
+    if_name: &str,
+    ifindex: u32,
+    addrs: &mut InterfaceAddresses,
+    mtu: &mut Option<u32>,
+) {
     let body_at = nl_align(size_of::<libc::nlmsghdr>());
     let Some(body) = read_at::<libc::ifinfomsg>(msg, body_at) else {
         return;
@@ -364,8 +374,12 @@ fn scan_link(msg: &[u8], if_name: &str, ifindex: u32, addrs: &mut InterfaceAddre
             let mac = MacAddr::from(mac);
             log::trace!("{if_name}: mac {mac}");
             addrs.mac = Some(mac);
-            // A link has a single L2 address; the rest of the message is irrelevant.
-            return;
+        } else if attr_type == libc::IFLA_MTU
+            && let Ok(bytes) = <[u8; 4]>::try_from(data)
+        {
+            let value = u32::from_ne_bytes(bytes);
+            log::trace!("{if_name}: mtu {value}");
+            *mtu = Some(value);
         }
     }
 }
@@ -544,11 +558,29 @@ mod tests {
         let mac = [0x02, 0, 0, 0, 0, 0x2a];
         let msg = link_msg(5, &[(libc::IFLA_ADDRESS, &mac)]);
         let mut addrs = InterfaceAddresses::default();
-        scan_link(&msg, "eth0", 5, &mut addrs);
+        let mut mtu = None;
+        scan_link(&msg, "eth0", 5, &mut addrs, &mut mtu);
         assert_eq!(addrs.mac, Some(MacAddr::from(mac)));
 
         let mut other = InterfaceAddresses::default();
-        scan_link(&msg, "eth0", 6, &mut other);
+        scan_link(&msg, "eth0", 6, &mut other, &mut mtu);
         assert_eq!(other.mac, None);
+    }
+
+    #[test]
+    fn scan_link_records_the_mtu_beside_the_mac() {
+        let mac = [0x02, 0, 0, 0, 0, 0x2a];
+        let msg = link_msg(
+            5,
+            &[
+                (libc::IFLA_ADDRESS, &mac),
+                (libc::IFLA_MTU, &1500u32.to_ne_bytes()),
+            ],
+        );
+        let mut addrs = InterfaceAddresses::default();
+        let mut mtu = None;
+        scan_link(&msg, "eth0", 5, &mut addrs, &mut mtu);
+        assert_eq!(addrs.mac, Some(MacAddr::from(mac)));
+        assert_eq!(mtu, Some(1500));
     }
 }

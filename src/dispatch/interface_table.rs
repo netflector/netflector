@@ -159,6 +159,14 @@ impl InterfaceTable {
         self.addrs(self.interface_of(capture)?)
     }
 
+    /// The MTU of the interface behind `capture`, as of its last resolution.
+    pub(super) fn mtu_of(&self, capture: CaptureKey) -> Option<u32> {
+        self.entries
+            .get(self.interface_of(capture)?.0 as usize)?
+            .interface
+            .mtu
+    }
+
     /// A shared borrow of a present capture, for [`send`](super::PacketDispatcher::send).
     pub(super) fn capture(&self, capture: CaptureKey) -> Option<&Capture> {
         self.captures.get(capture.0 as usize)?.capture.as_ref()
