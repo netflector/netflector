@@ -17,12 +17,17 @@ pub(crate) use simple::SimpleReflector;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 
+use std::time::Duration;
+
 use thiserror::Error;
 
 use crate::config::AddressFamily;
 use crate::dispatch::{CaptureKey, MessageType, PacketDispatcher, join_deferrable};
 use crate::interface::InterfaceAddresses;
 use crate::reactor::Reactor;
+
+/// The [`log_rate!`](crate::logging::log_rate) window shared by the reflectors' per-packet warns.
+const WARN_WINDOW: Duration = Duration::from_mins(1);
 
 /// A reflector's verdict on a captured payload, from its protocol's classifier. `Reflect`/`Skip` carry
 /// the message's own [`MessageType`] (the packet's *intrinsic* type) so the handler can tally it. See

@@ -7,10 +7,11 @@
 //! (per-searcher sessions), so they use the shared `SearchReflector` instead.
 
 use crate::dispatch::{CaptureKey, Outcome, PacketDispatcher, PacketHandler};
+use crate::logging::log_rate;
 use crate::net::packet::Packet;
 use crate::reactor::Reactor;
 
-use super::{NoRewrite, ReplyRewrite, Verdict, egress_sources};
+use super::{NoRewrite, ReplyRewrite, Verdict, WARN_WINDOW, egress_sources};
 
 /// One direction of one multicast-discovery protocol: re-emits each accepted message captured on its
 /// ingress onto `egress`, to the message's own destination (the dispatcher's filter pins that to the
@@ -135,7 +136,9 @@ impl PacketHandler for SimpleReflector {
                 Outcome::Reflected(message_type)
             }
             Err(e) => {
-                log::warn!(
+                log_rate!(
+                    log::Level::Warn,
+                    WARN_WINDOW,
                     "{}: cannot reflect {} from {} to {}: {e}",
                     self.name,
                     self.kind,
