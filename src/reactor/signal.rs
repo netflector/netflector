@@ -39,7 +39,7 @@ static DUMP_REQUESTED: AtomicBool = AtomicBool::new(false);
 extern "C" fn on_signal(signum: c_int) {
     // The handler can land between a failed syscall and the `errno` read that reports it, so the
     // write below must leave no errno of its own behind.
-    let location = crate::libcex::errno_location();
+    let location = errno_location();
     // SAFETY: the calling thread's `errno` cell; reading and writing it is async-signal-safe.
     let saved = unsafe { *location };
 
@@ -62,6 +62,19 @@ extern "C" fn on_signal(signum: c_int) {
 
     // SAFETY: as above.
     unsafe { *location = saved };
+}
+
+/// A pointer to the calling thread's `errno` cell (glibc/musl `__errno_location`, BSD `__error`).
+/// Async-signal-safe: the accessor only computes a thread-local address, so the handler above can
+/// save and restore `errno` through it.
+fn errno_location() -> *mut c_int {
+    #[cfg(target_os = "linux")]
+    // SAFETY: the accessor takes no arguments and always returns the thread's errno cell.
+    let location = unsafe { libc::__errno_location() };
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    // SAFETY: as above.
+    let location = unsafe { libc::__error() };
+    location
 }
 
 /// An installed self-pipe with the previous signal dispositions saved. Dropping it
@@ -298,7 +311,7 @@ mod tests {
         let (read, _write) = self_pipe().unwrap();
         let previous = WRITE_FD.swap(read.as_raw_fd(), Ordering::SeqCst);
 
-        let location = crate::libcex::errno_location();
+        let location = errno_location();
         // SAFETY: the calling thread's errno cell.
         let observed = unsafe {
             *location = libc::EEXIST;

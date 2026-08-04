@@ -11,7 +11,6 @@
 mod bpf;
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 mod bpf_device;
-mod errno;
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 mod in6_ifreq;
 mod multicast;
@@ -31,7 +30,6 @@ pub(crate) use self::in6_ifreq::{IN6_IFF_UNUSABLE, In6Ifreq, siocgifaflag_in6};
 // via `bpf_wordalign`), so re-export it only for tests.
 #[cfg(all(test, any(target_os = "macos", target_os = "freebsd")))]
 pub(crate) use self::bpf_device::BPF_ALIGN;
-pub(crate) use self::errno::errno_location;
 pub(crate) use self::multicast::{GroupReq, MCAST_JOIN_GROUP};
 #[cfg(target_os = "linux")]
 pub(crate) use self::netlink::{
