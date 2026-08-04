@@ -16,7 +16,7 @@ use crate::interface::InterfaceAddresses;
 use crate::net::MAX_UDP_PAYLOAD_LEN;
 use crate::net::ssdp::{
     MSEARCH_MX_DEFAULT, SSDP_GROUP_V4, SSDP_GROUP_V6_LINK_LOCAL, SSDP_GROUP_V6_SITE_LOCAL,
-    SSDP_PORT, SSDP_TTL, SsdpKind, classify, parse_msearch_mx,
+    SSDP_PORT, SSDP_TTL, SsdpKind, advertises_only_link_local, classify, parse_msearch_mx,
 };
 use crate::net::uninit_buf::UninitBuf;
 use crate::reactor::Reactor;
@@ -51,15 +51,15 @@ impl DialRewrite {
 
 impl ReplyRewrite for DialRewrite {
     /// Rewrite a target→source SSDP datagram's DIAL `LOCATION` to a source-side description proxy, into
-    /// the reused scratch. Returns the rewritten slice on success, else `payload` (forward verbatim).
+    /// the reused scratch. Returns the rewritten slice, or `None` to forward `payload` verbatim.
     /// `egress` is the source capture the datagram reflects onto.
     fn rewrite<'a>(
         &'a mut self,
-        payload: &'a [u8],
+        payload: &[u8],
         egress: CaptureKey,
         dispatcher: &mut PacketDispatcher,
         reactor: &mut Reactor,
-    ) -> &'a [u8] {
+    ) -> Option<&'a [u8]> {
         let (Some(source), Some(target)) = (
             dispatcher
                 .egress_addrs(egress)
@@ -68,7 +68,7 @@ impl ReplyRewrite for DialRewrite {
                 .egress_addrs(self.target)
                 .and_then(InterfaceAddresses::v4),
         ) else {
-            return payload; // a family the proxy can't bridge yet
+            return None; // a family the proxy can't bridge yet
         };
         let (ctx, target_iface) = dispatcher.dial_context(self.target);
         let placement = ProxyPlacement {
@@ -80,9 +80,9 @@ impl ReplyRewrite for DialRewrite {
         };
         self.scratch.clear();
         if rewrite_location(ctx, reactor, payload, placement, &mut self.scratch) {
-            self.scratch.filled()
+            Some(self.scratch.filled())
         } else {
-            payload
+            None
         }
     }
 }
@@ -177,6 +177,8 @@ pub(crate) fn build(
     let group_ips: IpSet = groups.iter().map(SocketAddr::ip).collect();
     // target -> source: advertisements (a stateless re-emit), optionally filtered to the configured
     // device's MAC. With `dial`, the reflected `LOCATION` is rewritten to a source-side proxy.
+    // A NOTIFY whose LOCATION names a link-local address advertises an endpoint the source side
+    // can never reach.
     let advertisement = SimpleReflector::new(
         source,
         "SSDP",
@@ -184,7 +186,8 @@ pub(crate) fn build(
         SSDP_PORT,
         SSDP_TTL,
         advertisement_verdict,
-    );
+    )
+    .with_suppress(advertises_only_link_local);
     let advertisement = if ssdp.dial {
         advertisement.with_rewrite(Box::new(DialRewrite::new(target)))
     } else {
@@ -225,6 +228,8 @@ pub(crate) fn build(
             search_verdict,
             search_window,
             make_reply,
+            // Each session's 200 OK reply is gated the same way as the NOTIFY leg.
+            advertises_only_link_local,
         )),
     );
     log::info!(

@@ -1,6 +1,8 @@
 //! The wire layer: on-the-wire packet formats. Link-layer framing, IP/UDP
 //! checksums, building and parsing frames.
 
+use std::net::IpAddr;
+
 mod checksum;
 pub(crate) mod frame;
 pub(crate) mod http;
@@ -54,3 +56,27 @@ pub(crate) const MAX_FRAME_LEN: usize = 2048;
 /// IPv4, and fixed at 40 since the builders emit no extension headers) plus UDP.
 pub(crate) const MAX_UDP_PAYLOAD_LEN: usize =
     MAX_FRAME_LEN - (ETHERNET_HEADER_SIZE + IPV6_HEADER_SIZE + UDP_HEADER_SIZE);
+
+/// Whether `ip` is link-local (IPv4 `169.254.0.0/16`, IPv6 `fe80::/10`).
+pub(crate) fn is_link_local(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_link_local(),
+        IpAddr::V6(v6) => v6.is_unicast_link_local(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn link_local_covers_both_families_and_nothing_routable() {
+        assert!(is_link_local("169.254.7.9".parse().unwrap()));
+        assert!(is_link_local("fe80::1".parse().unwrap()));
+        assert!(!is_link_local("192.168.1.1".parse().unwrap()));
+        assert!(!is_link_local("2001:db8::1".parse().unwrap()));
+        // Adjacent special ranges don't leak in: loopback and unique-local are not link-local.
+        assert!(!is_link_local("127.0.0.1".parse().unwrap()));
+        assert!(!is_link_local("fd00::1".parse().unwrap()));
+    }
+}

@@ -4,7 +4,9 @@ pub(crate) mod dial;
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use crate::net::http::strip_prefix_ignore_ascii_case;
+use crate::net::http::{strip_prefix_ignore_ascii_case, url_host_ip};
+
+use super::is_link_local;
 
 /// The SSDP UDP port (`UPnP` Device Architecture).
 pub(crate) const SSDP_PORT: u16 = 1900;
@@ -47,6 +49,14 @@ pub(crate) fn classify(payload: &[u8]) -> Option<SsdpKind> {
     } else {
         None
     }
+}
+
+/// Whether the message's `LOCATION` names a link-local IP literal. An absent `LOCATION` (a
+/// `byebye`), a hostname, or a routable literal reads as `false`.
+pub(crate) fn advertises_only_link_local(payload: &[u8]) -> bool {
+    dial::dial_location_value(payload)
+        .and_then(url_host_ip)
+        .is_some_and(is_link_local)
 }
 
 /// MX is clamped to `[1, 5]` seconds (`UPnP` Device Architecture 2.0).
@@ -187,6 +197,22 @@ mod tests {
 
     /// Real NOTIFY `ssdp:byebye` off a Canon EOS 6D going to sleep (airmtp `ssdp.py`).
     const NOTIFY_BYEBYE_CANON: &str = "NOTIFY * HTTP/1.1\r\nHost: 239.255.255.250:1900\r\nNT: urn:schemas-canon-com:service:ICPO-SmartPhoneEOSSystemService:1\r\nNTS: ssdp:byebye\r\nUSN: uuid:00000000-0000-0000-0001-2C9EFCD137BE::urn:schemas-canon-com:service:ICPO-SmartPhoneEOSSystemService:1\r\n\r\n";
+
+    #[test]
+    fn suppresses_only_a_link_local_location() {
+        assert!(advertises_only_link_local(
+            b"NOTIFY * HTTP/1.1\r\nNTS: ssdp:alive\r\nLOCATION: http://169.254.9.9:1900/d.xml\r\n\r\n"
+        ));
+        assert!(advertises_only_link_local(
+            b"HTTP/1.1 200 OK\r\nLOCATION: http://[fe80::1]:8080/d.xml\r\n\r\n"
+        ));
+        // Routable, hostname, or no LOCATION at all (a byebye): reflect as usual.
+        assert!(!advertises_only_link_local(NOTIFY_ALIVE_SONY.as_bytes()));
+        assert!(!advertises_only_link_local(
+            b"NOTIFY * HTTP/1.1\r\nLOCATION: http://printer.local/d.xml\r\n\r\n"
+        ));
+        assert!(!advertises_only_link_local(NOTIFY_BYEBYE_CANON.as_bytes()));
+    }
 
     #[test]
     fn classifies_real_on_the_wire_messages() {

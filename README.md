@@ -371,6 +371,15 @@ mDNS is relayed as pure multicast. A querier that asks for a unicast answer (the
 from an ephemeral source port) is answered off the group, and that answer is not relayed; SSDP and WSD
 instead proxy each searcher's unicast reply.
 
+Messages that advertise only link-local addresses (`169.254.0.0/16`, `fe80::/10`) are dropped rather
+than relayed: an mDNS response whose A/AAAA records are all link-local, an SSDP advertisement or
+search reply whose `LOCATION` names one, a WSD message whose `XAddrs` all name one. Such an address
+is valid only on the link it came from, so the relayed message would advertise endpoints the other
+segment can never reach. One routable address among them lets the message through. A `LOCATION` the
+DIAL proxy rewrote is exempt: it names netflector's own listener on the egress interface, reachable
+from that link even when the interface's address is itself link-local. Suppressed messages tally as
+`dropped` and log at debug level.
+
 netflector reads untagged Ethernet frames carrying IPv4 or IPv6 UDP. VLAN-tagged frames and IPv6
 extension headers are not parsed, so configure the VLAN as its own interface (`vlan10`, `em0.10`) and
 name that as the entry's `source_if` / `target_if` rather than the trunk.

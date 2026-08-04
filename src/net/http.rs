@@ -4,7 +4,7 @@
 
 pub(crate) mod framing;
 
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4};
 
 /// A parsed HTTP authority plus the byte span (`offset`/`len`) of its `host[:port]` text within the
 /// source value, so a caller splices a replacement over exactly that span. HTTP/DIAL rewrites are
@@ -50,6 +50,32 @@ pub(crate) fn parse_authority(value: &[u8], bare: bool) -> Option<Authority> {
         offset: auth_offset,
         len,
     })
+}
+
+/// The host of an `http://` / `https://` URL as an IP address, or `None` for a hostname or a
+/// non-URL value. Unlike [`parse_authority`] it reads both schemes and both families; a bracketed
+/// IPv6 host may carry a zone suffix (`%` or URL-encoded `%25`), cut before the parse.
+pub(crate) fn url_host_ip(url: &[u8]) -> Option<IpAddr> {
+    let rest = strip_prefix_ignore_ascii_case(url, b"http://")
+        .or_else(|| strip_prefix_ignore_ascii_case(url, b"https://"))?;
+    if let Some(v6) = rest.strip_prefix(b"[") {
+        let host = &v6[..v6.iter().position(|&b| b == b']')?];
+        let host = &host[..host.iter().position(|&b| b == b'%').unwrap_or(host.len())];
+        return std::str::from_utf8(host)
+            .ok()?
+            .parse::<Ipv6Addr>()
+            .ok()
+            .map(IpAddr::V6);
+    }
+    let host = &rest[..rest
+        .iter()
+        .position(|&b| matches!(b, b':' | b'/' | b'?' | b'#' | b' ' | b'\t' | b'\r'))
+        .unwrap_or(rest.len())];
+    std::str::from_utf8(host)
+        .ok()?
+        .parse::<Ipv4Addr>()
+        .ok()
+        .map(IpAddr::V4)
 }
 
 /// `line` with `prefix` removed if it begins with it (ASCII case-insensitive), else `None`.
@@ -100,6 +126,66 @@ mod tests {
         let a = parse_authority(b"http://10.0.0.7#frag", false).unwrap();
         assert_eq!(a.endpoint, "10.0.0.7:80".parse().unwrap());
         assert_eq!(a.len, "10.0.0.7".len());
+    }
+
+    #[test]
+    fn url_host_ip_reads_both_schemes_and_families() {
+        assert_eq!(
+            url_host_ip(b"http://169.254.1.2:8080/desc.xml"),
+            Some("169.254.1.2".parse().unwrap())
+        );
+        assert_eq!(
+            url_host_ip(b"https://192.168.0.2:5357/x"),
+            Some("192.168.0.2".parse().unwrap())
+        );
+        assert_eq!(
+            url_host_ip(b"HTTP://10.0.0.7"),
+            Some("10.0.0.7".parse().unwrap())
+        );
+        assert_eq!(
+            url_host_ip(b"http://[fe80::1]:5357/a"),
+            Some("fe80::1".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn url_host_ip_terminates_at_query_or_fragment() {
+        // A pathless URL with a query or fragment, as in the parse_authority case above.
+        assert_eq!(
+            url_host_ip(b"http://169.254.1.2?token=x"),
+            Some("169.254.1.2".parse().unwrap())
+        );
+        assert_eq!(
+            url_host_ip(b"http://10.0.0.7#frag"),
+            Some("10.0.0.7".parse().unwrap())
+        );
+        // With a port, the port ends at the same delimiters; the host is unaffected.
+        assert_eq!(
+            url_host_ip(b"http://10.0.0.7:8008?token=x"),
+            Some("10.0.0.7".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn url_host_ip_cuts_an_ipv6_zone_before_the_parse() {
+        // WSDAPI advertises zoned link-local XAddrs; both the raw and the URL-encoded percent cut.
+        assert_eq!(
+            url_host_ip(b"http://[fe80::1%25eth0]:5357/a"),
+            Some("fe80::1".parse().unwrap())
+        );
+        assert_eq!(
+            url_host_ip(b"http://[fe80::1%eth0]/a"),
+            Some("fe80::1".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn url_host_ip_rejects_hostnames_and_non_urls() {
+        assert_eq!(url_host_ip(b"http://printer.local:80/x"), None);
+        assert_eq!(url_host_ip(b"urn:uuid:1234"), None);
+        assert_eq!(url_host_ip(b"http://"), None);
+        assert_eq!(url_host_ip(b"http://[fe80::1"), None); // unclosed bracket
+        assert_eq!(url_host_ip(b""), None);
     }
 
     #[test]

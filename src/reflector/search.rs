@@ -59,6 +59,8 @@ struct ResponseReflector {
     message_type: MessageType,
     ttl: u8,
     reply: Box<dyn ReplyRewrite>,
+    /// The link-local suppression check for untouched replies (see [`SearchReflector::suppress`]).
+    suppress: fn(&[u8]) -> bool,
 }
 
 impl PacketHandler for ResponseReflector {
@@ -80,9 +82,21 @@ impl PacketHandler for ResponseReflector {
             );
             return Outcome::Stalled(self.message_type);
         }
-        let payload = self
+        let rewritten = self
             .reply
             .rewrite(packet.payload, self.egress, dispatcher, reactor);
+        // A rewritten reply is exempt; the why lives at `SimpleReflector::on_packet`'s gate.
+        if rewritten.is_none() && (self.suppress)(packet.payload) {
+            log::debug!(
+                "{}: suppressing response from {} to searcher {}: advertises only link-local \
+                 addresses",
+                self.name,
+                packet.source,
+                self.searcher
+            );
+            return Outcome::Dropped(self.message_type);
+        }
+        let payload = rewritten.unwrap_or(packet.payload);
         match dispatcher.send_udp(
             self.egress,
             self.searcher,
@@ -141,6 +155,9 @@ pub(crate) struct SearchReflector {
     window: fn(&[u8]) -> Duration,
     /// Mints a fresh reply transform per session (its own scratch, for a rewriting protocol).
     make_reply: Box<dyn Fn() -> Box<dyn ReplyRewrite>>,
+    /// The protocol's `advertises_only_link_local` check, handed to each session's
+    /// [`ResponseReflector`]: an untouched reply it flags is dropped rather than reflected.
+    suppress: fn(&[u8]) -> bool,
     sessions: Vec<Session>,
 }
 
@@ -156,6 +173,7 @@ impl SearchReflector {
         classify: fn(&[u8]) -> Verdict,
         window: fn(&[u8]) -> Duration,
         make_reply: Box<dyn Fn() -> Box<dyn ReplyRewrite>>,
+        suppress: fn(&[u8]) -> bool,
     ) -> Self {
         Self {
             source,
@@ -167,6 +185,7 @@ impl SearchReflector {
             classify,
             window,
             make_reply,
+            suppress,
             sessions: Vec::new(),
         }
     }
@@ -240,6 +259,7 @@ impl SearchReflector {
                 message_type: self.response_type,
                 ttl: self.ttl,
                 reply: (self.make_reply)(),
+                suppress: self.suppress,
             }),
         );
         Ok(Session {
@@ -425,6 +445,7 @@ impl PacketHandler for SearchReflector {
 #[cfg(test)]
 mod tests {
     use std::net::Ipv4Addr;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
     use crate::capture::Capture;
@@ -454,6 +475,7 @@ mod tests {
             always_reflect,
             fixed_window,
             Box::new(|| Box::new(NoRewrite) as Box<dyn ReplyRewrite>),
+            |_| false,
         )
     }
 
@@ -483,6 +505,7 @@ mod tests {
                 message_type: MessageType::SsdpResponse,
                 ttl: TEST_TTL,
                 reply: Box::new(NoRewrite),
+                suppress: |_| false,
             }),
         );
         reflector.sessions.push(Session {
@@ -809,6 +832,99 @@ mod tests {
         ));
     }
 
+    /// A reply transform that replaces the payload wholesale, standing in for a DIAL rewrite that
+    /// spliced in the proxy's own listener.
+    struct ReplaceRewrite;
+
+    impl ReplyRewrite for ReplaceRewrite {
+        fn rewrite<'a>(
+            &'a mut self,
+            _: &[u8],
+            _: CaptureKey,
+            _: &mut PacketDispatcher,
+            _: &mut Reactor,
+        ) -> Option<&'a [u8]> {
+            Some(b"REWRITTEN")
+        }
+    }
+
+    /// A reply for a `ResponseReflector` with the given transform and suppression check, plus the
+    /// dispatcher/reactor it runs against, over a real loopback egress (`None` = skip, no
+    /// `CAP_NET_RAW`).
+    fn reply_over_loopback(
+        reply: Box<dyn ReplyRewrite>,
+        suppress: fn(&[u8]) -> bool,
+    ) -> Option<(ResponseReflector, PacketDispatcher, Reactor)> {
+        let cap = open_loopback_or_skip()?;
+        let mut dispatcher = PacketDispatcher::new();
+        let egress = dispatcher
+            .add_capture(cap)
+            .expect("add the loopback capture");
+        let reactor = Reactor::new().expect("reactor");
+        let reflector = ResponseReflector {
+            searcher: "127.0.0.1:4000".parse().unwrap(),
+            searcher_mac: MacAddr::from([0x02, 0, 0, 0, 0, 1]),
+            egress,
+            name: "TEST",
+            message_type: MessageType::SsdpResponse,
+            ttl: TEST_TTL,
+            reply,
+            suppress,
+        };
+        Some((reflector, dispatcher, reactor))
+    }
+
+    fn reply_packet() -> Packet<'static> {
+        Packet {
+            source: "127.0.0.1:1900".parse().unwrap(),
+            dest: "127.0.0.1:4000".parse().unwrap(),
+            ttl: TEST_TTL,
+            dst_mac: None,
+            src_mac: None,
+            payload: b"HTTP/1.1 200 OK\r\n\r\n",
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "needs a real capture device")]
+    fn suppression_drops_an_untouched_reply() {
+        // The Dropped outcome proves the early return: a completed loopback send would be Reflected.
+        let Some((mut reflector, mut dispatcher, mut reactor)) =
+            reply_over_loopback(Box::new(NoRewrite), |_| true)
+        else {
+            return;
+        };
+        assert_eq!(
+            reflector.on_packet(&reply_packet(), &mut dispatcher, &mut reactor),
+            Outcome::Dropped(MessageType::SsdpResponse)
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "needs a real capture device")]
+    fn a_rewritten_reply_is_exempt_from_suppression() {
+        // The rewrite spliced in our own egress-side listener, reachable from that link whatever
+        // its address class, so the gate must not even be consulted. The tracking fn (would-be
+        // suppressing) proves it: a fn pointer can't capture, hence the static.
+        static SUPPRESS_CONSULTED: AtomicBool = AtomicBool::new(false);
+        fn tracking_suppress(_: &[u8]) -> bool {
+            SUPPRESS_CONSULTED.store(true, Ordering::Relaxed);
+            true
+        }
+        let Some((mut reflector, mut dispatcher, mut reactor)) =
+            reply_over_loopback(Box::new(ReplaceRewrite), tracking_suppress)
+        else {
+            return;
+        };
+        let outcome = reflector.on_packet(&reply_packet(), &mut dispatcher, &mut reactor);
+        assert!(
+            !SUPPRESS_CONSULTED.load(Ordering::Relaxed),
+            "the gate ran on a rewritten reply"
+        );
+        // And the exempt reply completed the reflect: it was sent, not merely spared the gate.
+        assert_eq!(outcome, Outcome::Reflected(MessageType::SsdpResponse));
+    }
+
     /// Open a loopback capture, or `None` (skip) without `CAP_NET_RAW`. A real capture gives the target
     /// a resolvable address, so `make_session` can succeed.
     fn open_loopback_or_skip() -> Option<Capture> {
@@ -846,6 +962,7 @@ mod tests {
             always_reflect,
             fixed_window,
             Box::new(|| Box::new(NoRewrite) as Box<dyn ReplyRewrite>),
+            |_| false,
         );
         let before = dispatcher.registration_count();
         let packet = Packet {
