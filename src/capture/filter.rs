@@ -1,10 +1,15 @@
 //! Classic-BPF filter programs.
 //!
 //! The instruction encoding is shared between Linux (`SO_ATTACH_FILTER`) and the
-//! BSD BPF device (`BIOCSETF`): [`BpfInsn`] is layout-identical to libc's
-//! `sock_filter` and `bpf_insn`, so the same array installs on either backend.
+//! BSD BPF device (`BIOCSETF`): [`BpfInsn`] aliases libc's per-OS name (`sock_filter` /
+//! `bpf_insn`), so the same array installs on either backend.
 
-use crate::libcex::BpfInsn;
+/// One classic-BPF instruction (`{ u16 code; u8 jt; u8 jf; u32 k }`); the fields are identical
+/// under libc's per-OS names.
+#[cfg(target_os = "linux")]
+pub(crate) type BpfInsn = libc::sock_filter;
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+pub(crate) type BpfInsn = libc::bpf_insn;
 
 const fn insn(code: u16, jt: u8, jf: u8, k: u32) -> BpfInsn {
     BpfInsn { code, jt, jf, k }

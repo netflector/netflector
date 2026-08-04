@@ -16,8 +16,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use libc::{c_uint, c_ulong, c_void};
 
-use super::filter::{DLT_NULL_UDP_FILTER, ETHERNET_UDP_FILTER};
-use crate::libcex::{BpfInsn, BpfProgram, DLT_EN10MB, DLT_NULL, bpf_wordalign};
+use super::filter::{BpfInsn, DLT_NULL_UDP_FILTER, ETHERNET_UDP_FILTER};
+use crate::libcex::bpf_wordalign;
 use crate::net::LinkType;
 use crate::sys::IoStatus;
 
@@ -281,8 +281,8 @@ fn attach(fd: &OwnedFd, if_name: &str) -> io::Result<LinkType> {
     let mut dlt: c_uint = 0;
     ioctl(fd, libc::BIOCGDLT, (&raw mut dlt).cast())?;
     let link_type = match dlt {
-        DLT_EN10MB => LinkType::Ethernet,
-        DLT_NULL => LinkType::DltNull,
+        libc::DLT_EN10MB => LinkType::Ethernet,
+        libc::DLT_NULL => LinkType::DltNull,
         other => {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -305,7 +305,7 @@ fn attach(fd: &OwnedFd, if_name: &str) -> io::Result<LinkType> {
         LinkType::Ethernet => &ETHERNET_UDP_FILTER,
         LinkType::DltNull => &DLT_NULL_UDP_FILTER,
     };
-    let mut program = BpfProgram {
+    let mut program = libc::bpf_program {
         bf_len: c_uint::try_from(filter.len()).expect("filter length fits c_uint"),
         bf_insns: filter.as_ptr().cast_mut(),
     };

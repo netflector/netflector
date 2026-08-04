@@ -13,9 +13,8 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
 use libc::{c_int, c_void};
 
-use super::filter::{DROP_OUTGOING_PROLOGUE, ETHERNET_UDP_FILTER};
+use super::filter::{BpfInsn, DROP_OUTGOING_PROLOGUE, ETHERNET_UDP_FILTER};
 use crate::interface::if_index;
-use crate::libcex::BpfInsn;
 use crate::net::LinkType;
 use crate::sys::{IoStatus, socklen_of};
 
@@ -278,9 +277,8 @@ fn set_ignore_outgoing(fd: &OwnedFd) -> io::Result<()> {
 fn attach_filter(fd: &OwnedFd, filter: &[BpfInsn]) -> io::Result<()> {
     let program = libc::sock_fprog {
         len: u16::try_from(filter.len()).expect("filter length fits u16"),
-        // BpfInsn is layout-identical to sock_filter (anchored in `filter`); the
-        // kernel only reads the program, so the const-to-mut cast is sound.
-        filter: filter.as_ptr().cast::<libc::sock_filter>().cast_mut(),
+        // The kernel only reads the program, so the const-to-mut cast is sound.
+        filter: filter.as_ptr().cast_mut(),
     };
     // SAFETY: a `setsockopt` with a `sock_fprog` pointing at `filter`, valid for the
     // duration of the call.
@@ -327,16 +325,21 @@ mod tests {
     use crate::net::frame;
     use crate::net::mac::MacAddr;
 
+    /// `BpfInsn` is libc's type, which derives no `PartialEq`/`Debug`; compare as field tuples.
+    fn as_tuples(insns: &[BpfInsn]) -> Vec<(u16, u8, u8, u32)> {
+        insns.iter().map(|i| (i.code, i.jt, i.jf, i.k)).collect()
+    }
+
     #[test]
     fn drop_outgoing_filter_prepends_the_prologue() {
         let filter = drop_outgoing_filter();
         assert_eq!(
-            &filter[..DROP_OUTGOING_PROLOGUE.len()],
-            &DROP_OUTGOING_PROLOGUE
+            as_tuples(&filter[..DROP_OUTGOING_PROLOGUE.len()]),
+            as_tuples(&DROP_OUTGOING_PROLOGUE)
         );
         assert_eq!(
-            &filter[DROP_OUTGOING_PROLOGUE.len()..],
-            &ETHERNET_UDP_FILTER
+            as_tuples(&filter[DROP_OUTGOING_PROLOGUE.len()..]),
+            as_tuples(&ETHERNET_UDP_FILTER)
         );
     }
 

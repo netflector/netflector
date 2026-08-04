@@ -8,7 +8,6 @@
 //! libc ships it. Where libc provides a definition on *some* platform, the hand-rolled arm is anchored
 //! to it with a `const _: () = assert!(…)` so it can't silently drift.
 
-mod bpf;
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 mod bpf_device;
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
@@ -19,9 +18,8 @@ mod netlink;
 #[cfg(target_os = "freebsd")]
 mod route;
 
-pub(crate) use self::bpf::BpfInsn;
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-pub(crate) use self::bpf_device::{BpfProgram, DLT_EN10MB, DLT_NULL, bpf_wordalign};
+pub(crate) use self::bpf_device::bpf_wordalign;
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub(crate) use self::in6_ifreq::{IN6_IFF_UNUSABLE, In6Ifreq, siocgifaflag_in6};
 // `BPF_ALIGN` is used outside `bpf_device` only by the BPF capture's test helpers (production rounds
