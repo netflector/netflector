@@ -12,7 +12,9 @@
 use std::cell::RefCell;
 use std::fmt::{self, Write as _};
 use std::io::Write;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use log::{LevelFilter, Log, Metadata, Record};
 
@@ -148,6 +150,65 @@ pub(crate) fn set_level(level: LogLevel) {
     log::set_max_level(LevelFilter::from(level));
 }
 
+/// Like [`log::log!`], but emits at most once per `window` (a `Duration`) per call site; a call
+/// landing inside a closed window is counted instead, and the next emitted line discloses the
+/// count as ` (N suppressed)`. The window is per call site, not per entry or interface.
+macro_rules! log_rate {
+    ($level:expr, $window:expr, $($arg:tt)+) => {{
+        static LAST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        static SUPPRESSED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        match $crate::logging::rate_gate(
+            &LAST,
+            &SUPPRESSED,
+            $crate::logging::monotonic_secs(),
+            $window,
+        ) {
+            Some(0) => log::log!($level, $($arg)+),
+            Some(suppressed) => log::log!(
+                $level,
+                "{} ({} suppressed)",
+                format_args!($($arg)+),
+                suppressed
+            ),
+            None => {}
+        }
+    }};
+}
+pub(crate) use log_rate;
+
+/// The decision behind [`log_rate!`]: emit now, returning how many were suppressed since the
+/// last emission, or count this one (`None`). The caller reads the clock (as [`format_record`]
+/// does), so the window arithmetic is exercisable against fixed times. Whole-second granularity:
+/// a sub-second window truncates to 0 and every call emits. `u32`, not `u64`, because armv5te (a
+/// shipped target) has no 64-bit atomics; atomics at all only because `static`s demand `Sync` -
+/// the process is single-threaded, hence `Relaxed`.
+pub(crate) fn rate_gate(
+    last: &AtomicU32,
+    suppressed: &AtomicU32,
+    now_secs: u32,
+    window: Duration,
+) -> Option<u32> {
+    // Duration is unsigned, so try_from fails only past u32::MAX s (136 years); read that as never.
+    let window_secs = u32::try_from(window.as_secs()).unwrap_or(u32::MAX);
+    let last_emit = last.load(Ordering::Relaxed);
+    if last_emit == 0 || now_secs.saturating_sub(last_emit) >= window_secs {
+        // max(1): the first call lands at elapsed 0 s, which must not read as "never".
+        last.store(now_secs.max(1), Ordering::Relaxed);
+        Some(suppressed.swap(0, Ordering::Relaxed))
+    } else {
+        suppressed.fetch_add(1, Ordering::Relaxed);
+        None
+    }
+}
+
+/// Seconds since the first call, from the monotonic clock; saturates after 136 years.
+pub(crate) fn monotonic_secs() -> u32 {
+    // A static can't hold a bare `Instant` (no const construction), so the anchor initializes
+    // lazily on first use.
+    static START: LazyLock<Instant> = LazyLock::new(Instant::now);
+    u32::try_from(START.elapsed().as_secs()).unwrap_or(u32::MAX)
+}
+
 impl From<LogLevel> for LevelFilter {
     fn from(level: LogLevel) -> Self {
         match level {
@@ -164,6 +225,28 @@ impl From<LogLevel> for LevelFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rate_gate_emits_first_then_suppresses_within_the_window() {
+        let (last, suppressed) = (AtomicU32::new(0), AtomicU32::new(0));
+        let window = Duration::from_mins(1);
+        // First call emits, with nothing suppressed - even at time 0 (the max(1) offset).
+        assert_eq!(rate_gate(&last, &suppressed, 0, window), Some(0));
+        // Inside the window: counted, not emitted.
+        assert_eq!(rate_gate(&last, &suppressed, 1, window), None);
+        assert_eq!(rate_gate(&last, &suppressed, 59, window), None);
+        // The window reopens: emit, disclosing the two suppressed calls, and the count resets.
+        assert_eq!(rate_gate(&last, &suppressed, 61, window), Some(2));
+        assert_eq!(rate_gate(&last, &suppressed, 200, window), Some(0));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "reads the real clock")]
+    fn monotonic_secs_never_decreases() {
+        let a = monotonic_secs();
+        let b = monotonic_secs();
+        assert!(b >= a);
+    }
 
     #[test]
     fn epoch_renders_as_iso() {
