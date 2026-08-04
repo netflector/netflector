@@ -12,6 +12,7 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::{Duration, Instant};
 
+use crate::logging::log_rate;
 use crate::net::tcp::TcpSocket;
 use crate::reactor::{Arena, Handler, HandlerKey, Key, Reactor, ReadyEvent};
 
@@ -81,9 +82,6 @@ pub(super) struct DialDeviceProxy {
     /// The device's REST endpoint, learned (and re-learned) from a description response's `Application-URL`;
     /// `None` until the first description fetch reveals it. REST connections proxy here.
     rest_endpoint: Option<SocketAddrV4>,
-    /// When saturation was last reported, so it repeats at [`CAP_WARN_INTERVAL`] rather than per
-    /// rejected client.
-    last_cap_warn: Option<Instant>,
     conns: Arena<Connection>,
 }
 
@@ -105,7 +103,6 @@ impl DialDeviceProxy {
             desc_endpoint,
             rest,
             rest_endpoint: None,
-            last_cap_warn: None,
             conns: Arena::new(),
         }
     }
@@ -145,17 +142,12 @@ impl DialDeviceProxy {
             }
         };
         if self.conns.iter().count() >= MAX_CONNECTIONS {
-            let now = Instant::now();
-            if self
-                .last_cap_warn
-                .is_none_or(|t| now - t >= CAP_WARN_INTERVAL)
-            {
-                self.last_cap_warn = Some(now);
-                log::warn!(
-                    "dial: connection cap ({MAX_CONNECTIONS}) reached for {}; dropping new clients",
-                    self.desc_endpoint
-                );
-            }
+            log_rate!(
+                log::Level::Warn,
+                CAP_WARN_INTERVAL,
+                "dial: connection cap ({MAX_CONNECTIONS}) reached for {}; dropping new clients",
+                self.desc_endpoint
+            );
             return None; // `client` drops here, closing it
         }
         Some(client)
