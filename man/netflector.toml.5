@@ -68,7 +68,12 @@ Optional list of MAC addresses limiting the entry to specific devices on
 only the listed devices are reflected or woken, across every protocol the
 entry enables.
 Omit it to cover the whole segment.
-An empty list is rejected.
+An empty list is rejected, as is a list on an mDNS/SSDP/WSD entry whose
+.Ic target_if
+link carries no MAC addresses (a
+.Dv DLT_NULL
+link): the frame-source filter could never match there.
+Wake-on-LAN is unaffected; it matches the address inside the magic packet.
 .It Ic address_family
 .Cm default
 (the default) attempts both families, requires IPv4, and treats IPv6 as

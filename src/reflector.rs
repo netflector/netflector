@@ -23,6 +23,8 @@ use crate::config::AddressFamily;
 use crate::dispatch::{CaptureKey, MessageType, PacketDispatcher, join_deferrable};
 use crate::interface::InterfaceAddresses;
 use crate::logging::WARN_WINDOW;
+use crate::net::LinkType;
+use crate::net::mac::MacSet;
 use crate::reactor::Reactor;
 
 /// A reflector's verdict on a captured payload, from its protocol's classifier. `Reflect`/`Skip` carry
@@ -126,6 +128,27 @@ pub(crate) enum BuildError {
     /// bidirectional reflector (mDNS/SSDP/WSD) the named interface may be the source or the target.
     #[error("interface \"{interface}\" cannot send {family}, required by the reflector")]
     RequiredFamilyUnavailable { interface: String, family: IpFamily },
+    /// A `macs` filter on a target whose link framing carries no MAC addresses: it would match
+    /// nothing, silently discarding every device-side packet.
+    #[error("macs can never match on interface \"{0}\": its link carries no MAC addresses")]
+    MacsUnmatchable(String),
+}
+
+/// Refuse a `macs` filter on a target whose link framing carries no MAC addresses:
+/// [`Filter`](crate::dispatch::Filter)'s MAC fields never match a `DLT_NULL` frame. `WoL` never
+/// calls this: it matches the MAC inside the magic packet's payload, not the frame's.
+fn require_macs_matchable(
+    dispatcher: &PacketDispatcher,
+    macs: Option<&MacSet>,
+    target: CaptureKey,
+    target_if: &str,
+) -> Result<(), BuildError> {
+    if macs.is_some()
+        && matches!(dispatcher.link_type(target), Some(link) if link != LinkType::Ethernet)
+    {
+        return Err(BuildError::MacsUnmatchable(target_if.to_owned()));
+    }
+    Ok(())
 }
 
 /// Whether `egress` currently has a source address of `dst`'s family, which `send_udp_group` needs
@@ -219,6 +242,49 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use super::*;
+    use crate::capture::Capture;
+    use crate::interface::LOOPBACK_IFACE;
+    use crate::net::mac::MacAddr;
+
+    /// Open a loopback capture, or `None` (skip) without `CAP_NET_RAW`.
+    fn open_loopback_or_skip() -> Option<Capture> {
+        match Capture::open(LOOPBACK_IFACE) {
+            Ok(cap) => Some(cap),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skip: no CAP_NET_RAW to open a loopback capture ({e})");
+                None
+            }
+            Err(e) => panic!("unexpected loopback capture open failure: {e}"),
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "needs a real capture device")]
+    fn macs_matchability_follows_the_target_link_framing() {
+        let Some(cap) = open_loopback_or_skip() else {
+            return;
+        };
+        let mut dispatcher = PacketDispatcher::new();
+        let target = dispatcher
+            .add_capture(cap)
+            .expect("add the loopback capture");
+        // No filter configured: nothing to refuse, whatever the framing.
+        assert_eq!(
+            require_macs_matchable(&dispatcher, None, target, LOOPBACK_IFACE),
+            Ok(())
+        );
+        let macs = MacSet::from(MacAddr::from([2, 0, 0, 0, 0, 1]));
+        let result = require_macs_matchable(&dispatcher, Some(&macs), target, LOOPBACK_IFACE);
+        // Linux frames loopback as Ethernet, so MACs match there; the BSDs' loopback is
+        // `DLT_NULL`, the framing the check refuses.
+        #[cfg(target_os = "linux")]
+        assert_eq!(result, Ok(()));
+        #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+        assert_eq!(
+            result,
+            Err(BuildError::MacsUnmatchable(LOOPBACK_IFACE.to_owned()))
+        );
+    }
 
     #[test]
     fn missing_required_family_enforces_the_requires_policy() {
