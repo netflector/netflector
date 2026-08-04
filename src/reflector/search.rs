@@ -17,12 +17,13 @@ use crate::dispatch::{
     CaptureKey, Filter, MessageType, Outcome, PacketDispatcher, PacketHandler, RegistrationKey,
 };
 use crate::interface::{InterfaceAddresses, Ipv6Scope};
+use crate::logging::log_rate;
 use crate::net::mac::{MacAddr, MacSet};
 use crate::net::packet::Packet;
 use crate::net::port_reservation::PortReservation;
 use crate::reactor::Reactor;
 
-use super::{ReplyRewrite, Verdict, egress_sources};
+use super::{ReplyRewrite, Verdict, WARN_WINDOW, egress_sources};
 
 /// In-flight session cap, so a burst of searchers can't exhaust ephemeral ports or registrations. At
 /// the cap a new search is dropped (no live session is evicted early).
@@ -115,7 +116,9 @@ impl PacketHandler for ResponseReflector {
                 Outcome::Reflected(self.message_type)
             }
             Err(e) => {
-                log::warn!(
+                log_rate!(
+                    log::Level::Warn,
+                    WARN_WINDOW,
                     "{}: cannot reflect response to searcher {}: {e}",
                     self.name,
                     self.searcher
@@ -204,7 +207,9 @@ impl SearchReflector {
         message_type: MessageType,
     ) -> Result<Session, Outcome> {
         if self.sessions.len() >= MAX_SESSIONS {
-            log::warn!(
+            log_rate!(
+                log::Level::Warn,
+                WARN_WINDOW,
                 "{}: dropping search from {}: {MAX_SESSIONS} sessions in flight (cap)",
                 self.name,
                 packet.source
@@ -212,7 +217,9 @@ impl SearchReflector {
             return Err(Outcome::Dropped(message_type));
         }
         let Some(searcher_mac) = packet.src_mac else {
-            log::warn!(
+            log_rate!(
+                log::Level::Warn,
+                WARN_WINDOW,
                 "{}: cannot reflect search from {}: frame has no source MAC to reply to",
                 self.name,
                 packet.source
@@ -234,7 +241,9 @@ impl SearchReflector {
         let reservation = match PortReservation::create(our_addr, target_ifindex) {
             Ok(reservation) => reservation,
             Err(e) => {
-                log::warn!(
+                log_rate!(
+                    log::Level::Warn,
+                    WARN_WINDOW,
                     "{}: port reservation for searcher {} failed: {e}",
                     self.name,
                     packet.source
@@ -350,7 +359,9 @@ impl PacketHandler for SearchReflector {
                     Outcome::Reflected(message_type)
                 }
                 Err(e) => {
-                    log::warn!(
+                    log_rate!(
+                        log::Level::Warn,
+                        WARN_WINDOW,
                         "{}: cannot reflect search from {} to {}: {e}",
                         self.name,
                         packet.source,
@@ -380,7 +391,9 @@ impl PacketHandler for SearchReflector {
             }
             Err(e) => {
                 // Roll back the response registration just made; the reservation drops with `session`.
-                log::warn!(
+                log_rate!(
+                    log::Level::Warn,
+                    WARN_WINDOW,
                     "{}: cannot reflect search from {} to {}: {e}",
                     self.name,
                     packet.source,

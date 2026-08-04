@@ -12,11 +12,12 @@ use crate::config::{AddressFamily, Reflector};
 use crate::dispatch::{
     CaptureKey, Filter, MessageType, Outcome, PacketDispatcher, PacketHandler, PortSet,
 };
+use crate::logging::log_rate;
 use crate::net::mac::MacSet;
 use crate::net::packet::Packet;
 use crate::reactor::Reactor;
 
-use super::{BuildError, InterfaceMap, egress_sources, missing_required_family};
+use super::{BuildError, InterfaceMap, WARN_WINDOW, egress_sources, missing_required_family};
 
 const PREFIX_LEN: usize = 6;
 const MAC_LEN: usize = 6;
@@ -76,7 +77,9 @@ impl PacketHandler for WolReflector {
                 Outcome::Reflected(MessageType::WakeOnLan)
             }
             Err(e) => {
-                log::warn!(
+                log_rate!(
+                    log::Level::Warn,
+                    WARN_WINDOW,
                     "WoL: cannot reflect packet from {} to {dst}: {e}",
                     packet.source
                 );
