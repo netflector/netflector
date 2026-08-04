@@ -1,7 +1,6 @@
 //! BSD address resolution: a single `getifaddrs` pass yields the v4 address, the MAC, and
 //! the v6 candidates, with `SIOCGIFAFLAG_IN6` per v6 candidate to drop tentative /
-//! duplicated / deprecated addresses. `libc` exposes `in6_ifreq` on macOS only, so the
-//! ioctl's request struct is hand-rolled.
+//! duplicated / deprecated addresses.
 
 use std::ffi::CStr;
 use std::io;
@@ -12,7 +11,6 @@ use std::ptr;
 use libc::c_int;
 
 use super::{InterfaceAddresses, V6Pick, v6_rank};
-use crate::libcex::{IN6_IFF_UNUSABLE, In6Ifreq, siocgifaflag_in6};
 use crate::net::mac::MacAddr;
 
 /// Resolve `if_name`'s current source addresses in one `getifaddrs` pass.
@@ -185,23 +183,30 @@ fn no_ipv6_stack(e: &io::Error) -> bool {
     )
 }
 
+/// `IN6_IFF_*` bits that disqualify a v6 address as a source: DAD in progress, DAD failed
+/// (duplicate), or preferred-lifetime expired.
+const IN6_IFF_UNUSABLE: c_int =
+    libc::IN6_IFF_TENTATIVE | libc::IN6_IFF_DUPLICATED | libc::IN6_IFF_DEPRECATED;
+
 /// The `IN6_IFF_*` flags of `addr` on `if_name`, queried via `SIOCGIFAFLAG_IN6`, or `None`
 /// if the ioctl fails (the address is then treated as unusable).
 fn v6_flags(sock: &OwnedFd, if_name: &str, addr: libc::sockaddr_in6) -> Option<c_int> {
-    // SAFETY: an all-zero `In6Ifreq` is valid (a zeroed name and union).
-    let mut req: In6Ifreq = unsafe { std::mem::zeroed() };
+    // SAFETY: an all-zero `in6_ifreq` is valid (a zeroed name and union).
+    let mut req: libc::in6_ifreq = unsafe { std::mem::zeroed() };
     let n = if_name.len().min(libc::IFNAMSIZ - 1);
     // SAFETY: copy `n` name bytes into the zeroed `c_char` buffer (same layout as `u8`);
     // the trailing zero keeps it NUL-terminated.
-    unsafe { ptr::copy_nonoverlapping(if_name.as_ptr(), req.name.as_mut_ptr().cast::<u8>(), n) };
-    req.ifru.addr = addr;
+    unsafe {
+        ptr::copy_nonoverlapping(if_name.as_ptr(), req.ifr_name.as_mut_ptr().cast::<u8>(), n);
+    }
+    req.ifr_ifru.ifru_addr = addr;
     // SAFETY: the ioctl reads `req` (name + queried address) and writes the address flags
     // back into the union; `sock` is a valid `AF_INET6` socket.
-    if unsafe { libc::ioctl(sock.as_raw_fd(), siocgifaflag_in6(), &raw mut req) } < 0 {
+    if unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCGIFAFLAG_IN6, &raw mut req) } < 0 {
         return None;
     }
     // SAFETY: a successful ioctl wrote `ifru_flags6` into the union.
-    Some(unsafe { req.ifru.flags6 })
+    Some(unsafe { req.ifr_ifru.ifru_flags6 })
 }
 
 #[cfg(test)]
