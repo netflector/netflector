@@ -381,7 +381,9 @@ impl PacketDispatcher {
     /// (taken-out) or out-of-range capture is a logged drop, not an error and never UB.
     pub(crate) fn send(&self, egress: CaptureKey, frame: &[u8]) -> io::Result<()> {
         if let Some(capture) = self.table.capture(egress) {
-            capture.send(frame)
+            capture.send(frame).map_err(|e| {
+                oversize_context(e, capture.if_name(), frame.len(), self.table.mtu_of(egress))
+            })
         } else {
             log::warn!("egress {egress:?} unavailable (drained or unknown); frame dropped");
             Ok(())
@@ -1010,6 +1012,20 @@ impl Handler for PacketDispatcher {
             ControlEvent::Dump => log_counters(self.table.counter_rows()),
         }
     }
+}
+
+/// Re-word an `EMSGSIZE` send failure to name the frame, the interface, and its MTU (as of the
+/// interface's last resolution); the bare "Message too long" names none of them. Any other error
+/// passes through.
+fn oversize_context(e: io::Error, if_name: &str, frame_len: usize, mtu: Option<u32>) -> io::Error {
+    if e.raw_os_error() != Some(libc::EMSGSIZE) {
+        return e;
+    }
+    let mtu = mtu.map_or_else(String::new, |mtu| format!(" (MTU {mtu})"));
+    io::Error::new(
+        e.kind(),
+        format!("a frame of {frame_len} bytes exceeds what {if_name}{mtu} can carry"),
+    )
 }
 
 #[cfg(test)]
@@ -1988,5 +2004,34 @@ mod tests {
         let mut dispatcher = PacketDispatcher::new();
         let group = IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251));
         assert!(dispatcher.join_group(CaptureKey(9999), group).is_ok());
+    }
+
+    #[test]
+    fn oversize_context_rewords_only_emsgsize() {
+        // The reworded message is the feature: it must name the frame length, the interface, and
+        // the MTU when known.
+        let e = oversize_context(
+            io::Error::from_raw_os_error(libc::EMSGSIZE),
+            "vxlan0",
+            1500,
+            Some(1370),
+        );
+        let text = e.to_string();
+        assert!(
+            text.contains("1500") && text.contains("vxlan0") && text.contains("1370"),
+            "{text}"
+        );
+        // The custom message costs the errno representation (std's `io::Error` carries one or the
+        // other, never both). Deliberate: nothing matches on EMSGSIZE downstream, and the message
+        // is the only surface an operator sees.
+        assert_eq!(e.raw_os_error(), None);
+        // Any other error passes through untouched: its message is the plain strerror text, and
+        // it keeps its errno (rewording builds a custom error, whose `raw_os_error` is `None`).
+        let other = oversize_context(io::Error::from_raw_os_error(libc::ENETDOWN), "x0", 9, None);
+        assert_eq!(
+            other.to_string(),
+            io::Error::from_raw_os_error(libc::ENETDOWN).to_string()
+        );
+        assert_eq!(other.raw_os_error(), Some(libc::ENETDOWN));
     }
 }
