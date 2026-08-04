@@ -18,8 +18,6 @@ mod multicast;
 mod netlink;
 #[cfg(target_os = "freebsd")]
 mod route;
-#[cfg(target_os = "freebsd")]
-mod sockopt;
 
 pub(crate) use self::bpf::BpfInsn;
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
@@ -38,5 +36,3 @@ pub(crate) use self::netlink::{
 };
 #[cfg(target_os = "freebsd")]
 pub(crate) use self::route::RtMsgHdr;
-#[cfg(target_os = "freebsd")]
-pub(crate) use self::sockopt::SO_RERROR;
