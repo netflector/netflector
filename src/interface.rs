@@ -139,6 +139,10 @@ pub(crate) struct Interface {
     pub(crate) name: String,
     pub(crate) ifindex: u32,
     pub(crate) addrs: InterfaceAddresses,
+    /// The MTU as of the last [`refresh`](Self::refresh), `None` when unreadable. Deliberately
+    /// outside [`InterfaceAddresses`]: that struct's equality drives the refresh diffing, and a
+    /// bare MTU change must not read as an address change (which clears sessions).
+    pub(crate) mtu: Option<u32>,
 }
 
 impl Interface {
@@ -152,6 +156,7 @@ impl Interface {
             name: name.to_owned(),
             ifindex: if_index(name).unwrap_or(0),
             addrs: InterfaceAddresses::default(),
+            mtu: None,
         };
         iface.refresh()?;
         Ok(iface)
@@ -168,10 +173,14 @@ impl Interface {
     /// Propagates a resolution syscall failure.
     pub(crate) fn refresh(&mut self) -> io::Result<AddressChange> {
         #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-        let addrs = self::getifaddrs::resolve(&self.name)?;
+        let (addrs, mtu) = self::getifaddrs::resolve(&self.name)?;
         #[cfg(target_os = "linux")]
-        let addrs = self::rtnetlink::resolve(&self.name, self.ifindex)?;
-        log::debug!("{}: resolved {addrs}", self.name);
+        let (addrs, mtu) = self::rtnetlink::resolve(&self.name, self.ifindex)?;
+        self.mtu = mtu;
+        match mtu {
+            Some(mtu) => log::debug!("{}: resolved {addrs}, mtu {mtu}", self.name),
+            None => log::debug!("{}: resolved {addrs}, mtu unreadable", self.name),
+        }
         // Both v6 transitions are logged (the `let`s run before the `||`), and either folds into the
         // single `v6` change bit, since no caller distinguishes the two v6 sources.
         let v6 = log_field_change(&self.name, "IPv6", self.addrs.v6, addrs.v6);
@@ -494,5 +503,22 @@ mod tests {
         crate::logging::set_level(crate::config::LogLevel::Trace);
         let addrs = Interface::open(&iface).expect("open failed").addrs;
         eprintln!("resolved {iface}: {addrs}");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "resolves a real interface")]
+    fn resolves_loopback_mtu() {
+        // The loopback MTU is a stable per-OS constant, so pin it exactly: this doubles as the
+        // layout canary for the `if_data` read (a wrong field offset yields a counter or zero,
+        // never this value). No privileges are needed on any OS.
+        #[cfg(target_os = "linux")]
+        const LOOPBACK_MTU: u32 = 65536;
+        #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+        const LOOPBACK_MTU: u32 = 16384;
+        let mtu = Interface::open(LOOPBACK_IFACE)
+            .unwrap()
+            .mtu
+            .expect("loopback has an MTU");
+        assert_eq!(mtu, LOOPBACK_MTU);
     }
 }

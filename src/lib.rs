@@ -110,6 +110,7 @@ fn reflect(path: Option<&Path>) -> Result<()> {
     let mut dispatcher = PacketDispatcher::new();
     let interfaces = open_captures(&config, &mut dispatcher)?;
     for reflector in &config.reflectors {
+        log_mtu_info(reflector, &interfaces, &dispatcher);
         crate::reflector::wol::build(reflector, &interfaces, &mut dispatcher)
             .map_err(|e| Error::reflector(reflector.name.as_str(), e))?;
         crate::reflector::mdns::build(reflector, &interfaces, &mut dispatcher)
@@ -172,6 +173,47 @@ fn open_captures(config: &Config, dispatcher: &mut PacketDispatcher) -> Result<I
         }
     }
     Ok(interfaces)
+}
+
+/// Log an entry's MTU topology: an interface whose MTU exceeds [`net::MAX_MTU`] (netflector
+/// reflects nothing larger regardless of the other side), and an unequal pair whose smaller side
+/// bounds what crosses. Info, never warn: an actual oversize drop warns at the send, with the
+/// frame and MTU in hand; here it is only a possibility.
+fn log_mtu_info(
+    reflector: &config::Reflector,
+    interfaces: &InterfaceMap,
+    dispatcher: &PacketDispatcher,
+) {
+    let (source_if, target_if) = (reflector.source_if.as_str(), reflector.target_if.as_str());
+    let (Ok(source_key), Ok(target_key)) =
+        (interfaces.require(source_if), interfaces.require(target_if))
+    else {
+        return; // the protocol builders surface the unknown-interface error
+    };
+    let (Some(source), Some(target)) = (
+        dispatcher.interface_mtu(source_key),
+        dispatcher.interface_mtu(target_key),
+    ) else {
+        return;
+    };
+    let ceiling = u32::try_from(net::MAX_MTU).expect("the MTU ceiling fits a u32");
+    for (if_name, mtu) in [(source_if, source), (target_if, target)] {
+        if mtu > ceiling {
+            log::info!(
+                "{}: {if_name} MTU {mtu} exceeds the {ceiling}-byte ceiling; larger \
+                 packets are not reflected",
+                reflector.name.as_str(),
+            );
+        }
+    }
+    if source != target && source.min(target) <= ceiling {
+        log::info!(
+            "{}: MTU mismatch: {source_if} has {source}, {target_if} has {target}; packets larger \
+             than {} bytes cannot cross toward the smaller side and are dropped",
+            reflector.name.as_str(),
+            source.min(target),
+        );
+    }
 }
 
 #[cfg(test)]

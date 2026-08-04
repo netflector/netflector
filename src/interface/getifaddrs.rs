@@ -13,13 +13,21 @@ use libc::c_int;
 use super::{InterfaceAddresses, V6Pick, v6_rank};
 use crate::net::mac::MacAddr;
 
-/// Resolve `if_name`'s current source addresses in one `getifaddrs` pass.
+/// What an `AF_LINK` entry's `ifa_data` points at: the interface's `if_data`. libc binds it for
+/// FreeBSD; libcex fills apple's until libc ships it.
+#[cfg(target_os = "freebsd")]
+type LinkData = libc::if_data;
+#[cfg(target_os = "macos")]
+type LinkData = crate::libcex::IfData;
+
+/// Resolve `if_name`'s current source addresses (plus the interface MTU) in one `getifaddrs`
+/// pass.
 ///
 /// # Errors
 /// Returns an error if `getifaddrs` fails or the v6 flag socket can't open; an unknown
 /// interface (or one with no addresses yet) yields an all-absent [`InterfaceAddresses`],
 /// as does a host with no IPv6 stack.
-pub(super) fn resolve(if_name: &str) -> io::Result<InterfaceAddresses> {
+pub(super) fn resolve(if_name: &str) -> io::Result<(InterfaceAddresses, Option<u32>)> {
     // One socket for the per-v6 `SIOCGIFAFLAG_IN6` ioctl.
     let v6_sock = inet6_socket()?;
 
@@ -32,6 +40,7 @@ pub(super) fn resolve(if_name: &str) -> io::Result<InterfaceAddresses> {
 
     let mut addrs = InterfaceAddresses::default();
     let mut v6_pick = V6Pick::default();
+    let mut mtu: Option<u32> = None;
     let mut node = head;
     while !node.is_null() {
         // SAFETY: `node` points at a live list entry owned by `head`, valid until
@@ -72,6 +81,10 @@ pub(super) fn resolve(if_name: &str) -> io::Result<InterfaceAddresses> {
                     None => log::trace!("{if_name}: link layer carries no mac"),
                 }
                 addrs.mac = mac;
+                if !ifa.ifa_data.is_null() {
+                    // SAFETY: an `AF_LINK` entry's non-null `ifa_data` points at the `if_data`.
+                    mtu = Some(unsafe { (*ifa.ifa_data.cast::<LinkData>()).ifi_mtu });
+                }
             }
             libc::AF_INET6 => {
                 // SAFETY: family is `AF_INET6`, so `ifa_addr` points at a `sockaddr_in6`.
@@ -100,7 +113,7 @@ pub(super) fn resolve(if_name: &str) -> io::Result<InterfaceAddresses> {
 
     // SAFETY: `head` came from the matching `getifaddrs` and has not been freed yet.
     unsafe { libc::freeifaddrs(head) };
-    Ok(addrs)
+    Ok((addrs, mtu))
 }
 
 /// The IPv4 address of an `AF_INET` `sockaddr`.

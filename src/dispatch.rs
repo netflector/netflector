@@ -388,6 +388,11 @@ impl PacketDispatcher {
         }
     }
 
+    /// The MTU of the interface behind `capture`, as of its last resolution.
+    pub(crate) fn interface_mtu(&self, capture: CaptureKey) -> Option<u32> {
+        self.table.mtu_of(capture)
+    }
+
     /// The current source addresses of the interface behind `egress`, for a reflector
     /// building a frame. `InterfaceAddresses` is `Copy`, so a caller reads out the fields it
     /// needs.
