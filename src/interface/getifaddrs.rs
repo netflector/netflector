@@ -13,13 +13,6 @@ use libc::c_int;
 use super::{InterfaceAddresses, V6Pick, v6_rank};
 use crate::net::mac::MacAddr;
 
-/// What an `AF_LINK` entry's `ifa_data` points at: the interface's `if_data`. libc binds it for
-/// FreeBSD; libcex fills apple's until libc ships it.
-#[cfg(target_os = "freebsd")]
-type LinkData = libc::if_data;
-#[cfg(target_os = "macos")]
-type LinkData = crate::libcex::IfData;
-
 /// Resolve `if_name`'s current source addresses (plus the interface MTU) in one `getifaddrs`
 /// pass.
 ///
@@ -83,7 +76,7 @@ pub(super) fn resolve(if_name: &str) -> io::Result<(InterfaceAddresses, Option<u
                 addrs.mac = mac;
                 if !ifa.ifa_data.is_null() {
                     // SAFETY: an `AF_LINK` entry's non-null `ifa_data` points at the `if_data`.
-                    mtu = Some(unsafe { (*ifa.ifa_data.cast::<LinkData>()).ifi_mtu });
+                    mtu = Some(unsafe { (*ifa.ifa_data.cast::<libc::if_data>()).ifi_mtu });
                 }
             }
             libc::AF_INET6 => {
