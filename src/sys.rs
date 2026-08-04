@@ -192,7 +192,7 @@ pub(crate) fn set_recv_error_reporting(fd: RawFd) -> io::Result<()> {
         libc::setsockopt(
             fd,
             libc::SOL_SOCKET,
-            crate::libcex::SO_RERROR,
+            libc::SO_RERROR,
             (&raw const on).cast(),
             socklen_of::<c_int>(),
         )
