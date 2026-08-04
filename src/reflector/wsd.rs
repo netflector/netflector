@@ -121,7 +121,9 @@ pub(crate) fn build(
         ),
     );
     // source -> target: Probe/Resolve searches (unfiltered, any source client may search); each
-    // searcher's unicast matches route back through a per-searcher session.
+    // searcher's unicast matches route back through a per-searcher session. As with SSDP, the
+    // filter deliberately pins only the group and port; a src constraint would silently break
+    // chained (router-to-router) deployments.
     dispatcher.register(
         source,
         Filter {
