@@ -382,7 +382,7 @@ search reply whose `LOCATION` names one, a WSD message whose `XAddrs` all name o
 is valid only on the link it came from, so the relayed message would advertise endpoints the other
 segment can never reach. One routable address among them lets the message through. A `LOCATION` the
 DIAL proxy rewrote is exempt: it names netflector's own listener on the egress interface, reachable
-from that link even when the interface's address is itself link-local. Suppressed messages tally as
+from that link even when the interface's address is itself link-local. Suppressed messages count as
 `dropped` and log at debug level.
 
 netflector reads untagged Ethernet frames carrying IPv4 or IPv6 UDP. VLAN-tagged frames and IPv6

@@ -29,10 +29,10 @@ pub(super) struct StaleInterface {
     pub(super) cur: u32,
 }
 
-/// One capture, the interface it runs on, and its observability tallies. The `capture` is `Option`
+/// One capture, the interface it runs on, and its observability counts. The `capture` is `Option`
 /// so the drain can take it OUT and restore it; the `interface` link and `counters` stay resident,
 /// so a capture's addresses resolve and its routed outcomes still record mid-drain. `None` marks
-/// "currently draining". Never removed, so the tallies accrue for the whole run. Bundling the
+/// "currently draining". Never removed, so the counts accrue for the whole run. Bundling the
 /// counters here rather than a parallel `Vec` makes them impossible to desync: one push adds both.
 struct CaptureEntry {
     capture: Option<Capture>,
@@ -197,21 +197,21 @@ impl InterfaceTable {
         }
     }
 
-    /// Tally a routed packet's folded [`Outcome`] on `capture`'s counter row. Indexed directly:
+    /// Count a routed packet's folded [`Outcome`] on `capture`'s counter row. Indexed directly:
     /// recording is reached only from `route`, with the ingress key of a real, in-range capture (the
     /// drain's take-out guard rejects any other), so the row always exists.
     pub(super) fn record(&mut self, capture: CaptureKey, outcome: Outcome) {
         self.captures[capture.0 as usize].counters.record(outcome);
     }
 
-    /// Tally a completed recovery on a capture's row (see [`CaptureCounters::record_recovery`]).
+    /// Count a completed recovery on a capture's row (see [`CaptureCounters::record_recovery`]).
     /// Indexed directly, like [`record`](Self::record): the keys come from
     /// [`captures_of`](Self::captures_of) in the reconcile, so the row always exists.
     pub(super) fn record_recovery(&mut self, capture: CaptureKey) {
         self.captures[capture.0 as usize].counters.record_recovery();
     }
 
-    /// Tally `n` oversized-frame drops on a capture's row (see
+    /// Count `n` oversized-frame drops on a capture's row (see
     /// [`CaptureCounters::record_oversized`]). Indexed directly, like [`record`](Self::record):
     /// the drain that produced the count holds the row's own capture.
     pub(super) fn record_oversized(&mut self, capture: CaptureKey, n: u64) {
@@ -491,7 +491,7 @@ mod tests {
             key
         }
 
-        /// The `(reflected, skipped, dropped, stalled)` tally recorded for `ty` on `capture`'s row.
+        /// The `(reflected, skipped, dropped, stalled)` count recorded for `ty` on `capture`'s row.
         pub(in crate::dispatch) fn typed_counts(
             &self,
             capture: CaptureKey,
@@ -500,7 +500,7 @@ mod tests {
             self.captures[capture.0 as usize].counters.typed(ty)
         }
 
-        /// The recovery tally recorded on `capture`'s row, for the dispatcher's reconcile test.
+        /// The recovery count recorded on `capture`'s row, for the dispatcher's reconcile test.
         pub(in crate::dispatch) fn recoveries_of(&self, capture: CaptureKey) -> u64 {
             self.captures[capture.0 as usize].counters.recoveries()
         }

@@ -225,7 +225,7 @@ struct Registration {
     handler: Option<Box<dyn PacketHandler>>,
 }
 
-/// The periodic counter-summary schedule: log every capture's tallies every `interval`. Held as an
+/// The periodic counter-summary schedule: log every capture's counts every `interval`. Held as an
 /// `Option` on the dispatcher; `None` disables reporting, and the counters accrue regardless.
 struct CounterReport {
     interval: Duration,
@@ -281,7 +281,7 @@ impl PacketDispatcher {
         }
     }
 
-    /// Enable the periodic counter summary: log each capture's tallies every `interval`, first firing
+    /// Enable the periodic counter summary: log each capture's counts every `interval`, first firing
     /// `interval` after `now`. Called from [`run`](crate::run) when the config sets a positive
     /// interval; the counters accrue regardless, so this controls only whether they are reported.
     pub(crate) fn enable_counter_report(&mut self, interval: Duration, now: Instant) {
@@ -629,7 +629,7 @@ impl PacketDispatcher {
                 }
             });
         }
-        // One packet, one tally: record the folded outcome on the ingress capture's row. The row
+        // One packet, one count: record the folded outcome on the ingress capture's row. The row
         // always exists: `route` is reached only via the drain, whose take-out guard admits only a
         // real, in-range ingress key.
         if let Some(outcome) = final_outcome {
@@ -1110,7 +1110,7 @@ mod tests {
         Ok(())
     }
 
-    // A completed recovery bumps the recoveries tally on each of the interface's capture rows.
+    // A completed recovery bumps the recoveries count on each of the interface's capture rows.
     // Unprivileged: the moved identity is faked through the test seam and the capture row is a
     // capture-less test entry (rebind_capture reports it missing, which does not fail the recovery).
     #[test]
@@ -1459,19 +1459,19 @@ mod tests {
     impl PacketDispatcher {
         /// Add a capture-less table entry so a routing test can mint a valid `CaptureKey` and
         /// exercise `route`'s record path without opening a real capture; read the row back with
-        /// [`tally`](Self::tally).
+        /// [`counts`](Self::counts).
         fn add_test_capture(&mut self) -> CaptureKey {
             self.table.add_test_capture()
         }
 
-        /// The `(reflected, skipped, dropped, stalled)` tally recorded for `ty` on `key`'s row.
-        fn tally(&self, key: CaptureKey, ty: MessageType) -> (u64, u64, u64, u64) {
+        /// The `(reflected, skipped, dropped, stalled)` count recorded for `ty` on `key`'s row.
+        fn counts(&self, key: CaptureKey, ty: MessageType) -> (u64, u64, u64, u64) {
             self.table.typed_counts(key, ty)
         }
     }
 
     // route folds every matched handler's outcome into one and records it once on the ingress row:
-    // a reflect and its mirror skip (both matching) tally a single reflect, and a handler whose filter
+    // a reflect and its mirror skip (both matching) count a single reflect, and a handler whose filter
     // misses doesn't contribute at all.
     #[test]
     #[cfg_attr(miri, ignore = "needs a real socket")]
@@ -1491,7 +1491,7 @@ mod tests {
             Filter::default(),
             Box::new(Outcomer(Outcome::Skipped(MessageType::MdnsQuery))),
         );
-        // A third handler whose filter never matches (wrong dst port) must not reach the tally.
+        // A third handler whose filter never matches (wrong dst port) must not reach the count.
         dispatcher.register(
             ingress,
             Filter {
@@ -1503,14 +1503,14 @@ mod tests {
 
         dispatcher.route(ingress, &probe_packet(b"q"), &mut reactor);
 
-        // The reflect wins the fold and is counted once; the skip is shadowed, not a second tally.
+        // The reflect wins the fold and is counted once; the skip is shadowed, not a second count.
         assert_eq!(
-            dispatcher.tally(ingress, MessageType::MdnsQuery),
+            dispatcher.counts(ingress, MessageType::MdnsQuery),
             (1, 0, 0, 0)
         );
         // The unmatched handler contributed nothing.
         assert_eq!(
-            dispatcher.tally(ingress, MessageType::SsdpSearch),
+            dispatcher.counts(ingress, MessageType::SsdpSearch),
             (0, 0, 0, 0)
         );
         Ok(())
@@ -1538,9 +1538,9 @@ mod tests {
 
         dispatcher.route(ingress, &probe_packet(b"q"), &mut reactor);
 
-        // One packet, one tally per ingress: the two reflects fold to a single reflected count.
+        // One packet, one count per ingress: the two reflects fold to a single reflected count.
         assert_eq!(
-            dispatcher.tally(ingress, MessageType::MdnsQuery),
+            dispatcher.counts(ingress, MessageType::MdnsQuery),
             (1, 0, 0, 0)
         );
         Ok(())

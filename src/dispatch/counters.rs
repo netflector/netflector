@@ -9,7 +9,7 @@
 //! config" [`Anomalies`] for the dispatcher to log.
 //!
 //! The interface dimension is the ingress [`CaptureKey`](super::CaptureKey), which the dispatcher
-//! supplies; a [`CaptureCounters`] row per interface holds the tallies.
+//! supplies; a [`CaptureCounters`] row per interface holds the counts.
 
 use std::fmt;
 
@@ -146,7 +146,7 @@ impl Outcome {
     }
 }
 
-/// The four typed tallies for one message type on one interface.
+/// The four typed counts for one message type on one interface.
 #[derive(Clone, Copy, Default)]
 struct TypeCounters {
     reflected: u64,
@@ -156,7 +156,7 @@ struct TypeCounters {
 }
 
 impl TypeCounters {
-    /// The non-zero tallies as `reflected=.. skipped=..`, or `None` when every tally is zero (so the
+    /// The non-zero counts as `reflected=.. skipped=..`, or `None` when every count is zero (so the
     /// report omits a message type nothing has happened to).
     fn format_nonzero(&self) -> Option<String> {
         let parts: Vec<String> = [
@@ -173,7 +173,7 @@ impl TypeCounters {
     }
 }
 
-/// Every tally for one interface (capture): one [`TypeCounters`] per [`MessageType`], a type-less
+/// Every count for one interface (capture): one [`TypeCounters`] per [`MessageType`], a type-less
 /// `filtered` count for junk, a `recoveries` count of completed interface rebuilds (a recreated
 /// or returned interface whose captures re-bound), and a type-less `oversized` count of received
 /// frames too large to forward (dropped before parsing).
@@ -186,7 +186,7 @@ pub(crate) struct CaptureCounters {
 }
 
 impl CaptureCounters {
-    /// Tally one packet's folded [`Outcome`].
+    /// Count one packet's folded [`Outcome`].
     pub(crate) fn record(&mut self, outcome: Outcome) {
         match outcome {
             Outcome::Reflected(t) => self.types[t as usize].reflected += 1,
@@ -197,20 +197,20 @@ impl CaptureCounters {
         }
     }
 
-    /// Tally one completed recovery of the interface behind this row: its kernel identity was
+    /// Count one completed recovery of the interface behind this row: its kernel identity was
     /// recreated (or it returned from absent) and its captures re-bound. A lifecycle event, not a
     /// per-packet outcome, so it leads the report line.
     pub(crate) fn record_recovery(&mut self) {
         self.recoveries += 1;
     }
 
-    /// Tally `n` frames the capture dropped for exceeding the forwarding limit, folded in per
+    /// Count `n` frames the capture dropped for exceeding the forwarding limit, folded in per
     /// drain rather than per frame.
     pub(crate) fn record_oversized(&mut self, n: u64) {
         self.oversized += n;
     }
 
-    /// This row's non-zero tallies as one line, e.g. `recoveries=1; mDNS query reflected=42
+    /// This row's non-zero counts as one line, e.g. `recoveries=1; mDNS query reflected=42
     /// skipped=10; SSDP search reflected=5 dropped=1; filtered=2`. `None` when nothing has been
     /// counted, so an idle interface produces no report line.
     fn format_nonzero(&self) -> Option<String> {
@@ -238,7 +238,7 @@ impl CaptureCounters {
     }
 }
 
-/// Log one `info` line per interface with any non-zero tallies (idle interfaces stay silent). The
+/// Log one `info` line per interface with any non-zero counts (idle interfaces stay silent). The
 /// dispatcher calls this from its periodic report; the `(interface, row)` pairs come from the
 /// interface table, which owns the capture→interface-name mapping.
 pub(crate) fn log_counters<'a>(rows: impl Iterator<Item = (&'a str, &'a CaptureCounters)>) {
@@ -254,7 +254,7 @@ mod tests {
     use super::*;
 
     impl CaptureCounters {
-        /// The four typed tallies (`reflected, skipped, dropped, stalled`) for `ty`. The test reader
+        /// The four typed counts (`reflected, skipped, dropped, stalled`) for `ty`. The test reader
         /// for recorded outcomes, here and in the dispatcher's route-fold test.
         pub(crate) fn typed(&self, ty: MessageType) -> (u64, u64, u64, u64) {
             let c = self.types[ty as usize];
@@ -263,7 +263,7 @@ mod tests {
         fn filtered(&self) -> u64 {
             self.filtered
         }
-        /// This row's recovery tally. Read from the dispatcher's reconcile test through the
+        /// This row's recovery count. Read from the dispatcher's reconcile test through the
         /// interface table, hence `pub(crate)`.
         pub(crate) fn recoveries(&self) -> u64 {
             self.recoveries
@@ -347,7 +347,7 @@ mod tests {
     }
 
     #[test]
-    fn format_nonzero_summarizes_only_touched_tallies() {
+    fn format_nonzero_summarizes_only_touched_counters() {
         let mut c = CaptureCounters::default();
         assert_eq!(c.format_nonzero(), None, "an untouched row logs no line");
         c.record(Outcome::Reflected(MessageType::MdnsQuery));
@@ -355,7 +355,7 @@ mod tests {
         c.record(Outcome::Skipped(MessageType::MdnsQuery));
         c.record(Outcome::Dropped(MessageType::SsdpSearch));
         c.record(Outcome::Filtered);
-        // Only touched types and sub-tallies appear, in declaration order, then the filtered total.
+        // Only touched types and sub-counts appear, in declaration order, then the filtered total.
         assert_eq!(
             c.format_nonzero().as_deref(),
             Some("mDNS query reflected=2 skipped=1; SSDP search dropped=1; filtered=1"),
