@@ -14,7 +14,10 @@ use std::net::SocketAddr;
 
 use crate::config::{AddressFamily, Reflector};
 use crate::dispatch::{Filter, IpSet, MessageType, PacketDispatcher};
-use crate::net::mdns::{MDNS_GROUP_V4, MDNS_GROUP_V6, MDNS_PORT, MDNS_TTL, MdnsKind, classify};
+use crate::net::mdns::{
+    MDNS_GROUP_V4, MDNS_GROUP_V6, MDNS_PORT, MDNS_TTL, MdnsKind, advertises_only_link_local,
+    classify,
+};
 
 use super::{
     BuildError, InterfaceMap, SimpleReflector, Verdict, join_group_logged,
@@ -118,14 +121,19 @@ pub(crate) fn build(
             src_mac: reflector.macs.clone(),
             ..Filter::default()
         },
-        Box::new(SimpleReflector::new(
-            source,
-            "mDNS",
-            "response",
-            MDNS_PORT,
-            MDNS_TTL,
-            response_verdict,
-        )),
+        Box::new(
+            SimpleReflector::new(
+                source,
+                "mDNS",
+                "response",
+                MDNS_PORT,
+                MDNS_TTL,
+                response_verdict,
+            )
+            // A response whose A/AAAA records are all link-local advertises endpoints the source
+            // side can never reach; queries carry no advertisement, so only this leg checks.
+            .with_suppress(advertises_only_link_local),
+        ),
     );
     log::info!(
         "mDNS reflector \"{}\": {} <-> {}",

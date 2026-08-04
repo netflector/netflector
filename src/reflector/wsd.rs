@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use crate::config::{AddressFamily, Reflector};
 use crate::dispatch::{Filter, IpSet, MessageType, PacketDispatcher};
-use crate::net::wsd::{WSD_GROUP_V4, WSD_GROUP_V6, WSD_PORT, WSD_TTL, WsdKind, classify};
+use crate::net::wsd::{
+    WSD_GROUP_V4, WSD_GROUP_V6, WSD_PORT, WSD_TTL, WsdKind, advertises_only_link_local, classify,
+};
 
 use super::{
     BuildError, InterfaceMap, NoRewrite, ReplyRewrite, SearchReflector, SimpleReflector, Verdict,
@@ -104,14 +106,19 @@ pub(crate) fn build(
             src_mac: reflector.macs.clone(),
             ..Filter::default()
         },
-        Box::new(SimpleReflector::new(
-            source,
-            "WSD",
-            "announcement",
-            WSD_PORT,
-            WSD_TTL,
-            announcement_verdict,
-        )),
+        Box::new(
+            SimpleReflector::new(
+                source,
+                "WSD",
+                "announcement",
+                WSD_PORT,
+                WSD_TTL,
+                announcement_verdict,
+            )
+            // A Hello whose XAddrs are all link-local advertises endpoints the source side can
+            // never reach.
+            .with_suppress(advertises_only_link_local),
+        ),
     );
     // source -> target: Probe/Resolve searches (unfiltered, any source client may search); each
     // searcher's unicast matches route back through a per-searcher session.
@@ -132,6 +139,8 @@ pub(crate) fn build(
             search_verdict,
             window,
             Box::new(|| Box::new(NoRewrite) as Box<dyn ReplyRewrite>),
+            // Each session's ProbeMatches / ResolveMatches reply is gated the same way.
+            advertises_only_link_local,
         )),
     );
     log::info!(

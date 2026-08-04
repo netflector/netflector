@@ -6,6 +6,10 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
+use crate::net::http::url_host_ip;
+
+use super::is_link_local;
+
 /// WSD runs SOAP-over-UDP on port 3702, re-emitted at TTL 1. The re-emit is a single hop onto the
 /// egress link, matching the link scope of the groups it serves.
 pub(crate) const WSD_PORT: u16 = 3702;
@@ -38,10 +42,41 @@ pub(crate) fn classify(payload: &[u8]) -> Option<WsdKind> {
 }
 
 /// The final `/`-delimited segment of the first `Action` element's URI (the WS-Addressing message
-/// type), or `None` when there is no such element. Walks the payload element by element so the match is
-/// scoped to the `Action` tag: tolerant of the namespace prefix (`a:` / `wsa:` / none) and of tag
-/// attributes (ONVIF sends `mustUnderstand`), and never fooled by the token appearing in the body.
+/// type), or `None` when there is no such element.
 fn action_segment(payload: &[u8]) -> Option<&[u8]> {
+    let (uri, _) = element_text(payload, b"Action")?;
+    uri.rsplit(|&b| b == b'/').next().filter(|s| !s.is_empty())
+}
+
+/// Whether the message's `XAddrs` (the device's transport addresses) hold at least one IP-literal
+/// URI and every one is link-local. A hostname or unparseable URI, a routable literal, or no
+/// `XAddrs` at all reads as `false`.
+pub(crate) fn advertises_only_link_local(payload: &[u8]) -> bool {
+    // Every XAddrs element counts: a ProbeMatches carries one per ProbeMatch.
+    let mut saw_ip = false;
+    let mut rest = payload;
+    while let Some((text, after)) = element_text(rest, b"XAddrs") {
+        for uri in text.split(|b: &u8| b.is_ascii_whitespace()) {
+            if uri.is_empty() {
+                continue;
+            }
+            match url_host_ip(uri) {
+                Some(ip) if is_link_local(ip) => saw_ip = true,
+                // A routable literal, a hostname, or an unparseable URI: not provably dead.
+                _ => return false,
+            }
+        }
+        rest = after;
+    }
+    saw_ip
+}
+
+/// The trimmed text content of the first element named `local_name` (ASCII-case-insensitive, any
+/// namespace prefix), with the remainder after that content, or `None` when no such element opens.
+/// Walks the payload element by element so a match is scoped to the tag: tolerant of the prefix
+/// (`a:` / `wsa:` / none) and of tag attributes (ONVIF sends `mustUnderstand`), and never fooled by
+/// the token appearing in body text.
+fn element_text<'a>(payload: &'a [u8], local_name: &[u8]) -> Option<(&'a [u8], &'a [u8])> {
     let mut rest = payload;
     while let Some(open) = rest.iter().position(|&b| b == b'<') {
         rest = &rest[open + 1..];
@@ -53,7 +88,7 @@ fn action_segment(payload: &[u8]) -> Option<&[u8]> {
         if matches!(tag.first().copied(), Some(b'/' | b'?' | b'!')) {
             continue;
         }
-        // A self-closed element (`<a:Action/>`) has no text content, so there is no URI to read.
+        // A self-closed element (`<a:Action/>`) has no text content.
         if tag.last() == Some(&b'/') {
             continue;
         }
@@ -63,10 +98,9 @@ fn action_segment(payload: &[u8]) -> Option<&[u8]> {
             .next()
             .unwrap_or(tag);
         let local = name.rsplit(|&b| b == b':').next().unwrap_or(name);
-        if local.eq_ignore_ascii_case(b"Action") {
+        if local.eq_ignore_ascii_case(local_name) {
             let end = rest.iter().position(|&b| b == b'<').unwrap_or(rest.len());
-            let uri = rest[..end].trim_ascii();
-            return uri.rsplit(|&b| b == b'/').next().filter(|s| !s.is_empty());
+            return Some((rest[..end].trim_ascii(), &rest[end..]));
         }
     }
     None
@@ -375,6 +409,71 @@ urn:schemas-xmlsoap-org:ws:2005:04:discovery
     </wsd:ResolveMatches>
 </soap:Body>
 </soap:Envelope>"#;
+
+    /// A Hello body carrying the given `XAddrs` text.
+    fn hello_with_xaddrs(xaddrs: &str) -> Vec<u8> {
+        format!(
+            "<s:Envelope><s:Header><a:Action>http://x/Hello</a:Action></s:Header>\
+             <s:Body><d:Hello><d:XAddrs>{xaddrs}</d:XAddrs></d:Hello></s:Body></s:Envelope>"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn suppresses_only_all_link_local_xaddrs() {
+        assert!(advertises_only_link_local(&hello_with_xaddrs(
+            "http://169.254.1.5:5357/dev"
+        )));
+        assert!(advertises_only_link_local(&hello_with_xaddrs(
+            "http://[fe80::1]:5357/a http://169.254.2.2:5357/a"
+        )));
+        // WSDAPI advertises zoned link-local XAddrs.
+        assert!(advertises_only_link_local(&hello_with_xaddrs(
+            "http://[fe80::1%25eth0]:5357/a"
+        )));
+        // One routable address, a hostname, or an unparseable URI rescues the message.
+        assert!(!advertises_only_link_local(&hello_with_xaddrs(
+            "http://[fe80::1]:5357/a http://192.168.1.5:5357/a"
+        )));
+        assert!(!advertises_only_link_local(&hello_with_xaddrs(
+            "http://169.254.1.5:5357/a http://printer.local:5357/a"
+        )));
+        assert!(!advertises_only_link_local(&hello_with_xaddrs("")));
+    }
+
+    #[test]
+    fn every_xaddrs_element_counts() {
+        // A ProbeMatches carries one XAddrs per ProbeMatch: all must be link-local to suppress.
+        let two = |first: &str, second: &str| {
+            format!(
+                "<s:Body><d:ProbeMatch><d:XAddrs>{first}</d:XAddrs></d:ProbeMatch>\
+                 <d:ProbeMatch><d:XAddrs>{second}</d:XAddrs></d:ProbeMatch></s:Body>"
+            )
+            .into_bytes()
+        };
+        assert!(advertises_only_link_local(&two(
+            "http://169.254.1.5:5357/a",
+            "http://[fe80::2]:5357/b"
+        )));
+        assert!(!advertises_only_link_local(&two(
+            "http://169.254.1.5:5357/a",
+            "http://10.0.0.2:5357/b"
+        )));
+    }
+
+    #[test]
+    fn messages_without_xaddrs_are_not_suppressed() {
+        // Resolution then happens via Resolve; there is no advertised endpoint to judge.
+        assert!(!advertises_only_link_local(HELLO_OASIS_2009.as_bytes()));
+        assert!(!advertises_only_link_local(b""));
+        // Real replies carrying routable XAddrs (http and https).
+        assert!(!advertises_only_link_local(
+            PROBEMATCHES_ONVIF_UNIVIEW.as_bytes()
+        ));
+        assert!(!advertises_only_link_local(
+            RESOLVEMATCHES_MS_WSDAPI.as_bytes()
+        ));
+    }
 
     #[test]
     fn classifies_real_on_the_wire_messages() {

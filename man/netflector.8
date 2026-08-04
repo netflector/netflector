@@ -167,8 +167,9 @@ Re-emitted on the other interface.
 Recognized, but arrived in a direction the entry does not relay.
 This is normal; it is also what keeps reflected packets from looping.
 .It Sy dropped
-Should have been reflected, but the re-emit failed: a send error or a
-resource cap.
+Should have been reflected, but was not: a send error, a resource cap, or a
+message advertising only link-local addresses, which the other segment could
+never reach.
 .It Sy stalled
 Should have been reflected, but the egress interface had no source address
 of the packet's family yet.

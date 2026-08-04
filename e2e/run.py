@@ -59,6 +59,19 @@ MDNS_QUERY_HEX = "00000000000100000000000074657374"
 MDNS_RESPONSE_HEX = "00008400000100010000000074657374"
 # 8 bytes: below the 12-byte DNS-header minimum, so classify() returns None and drops it.
 MDNS_SHORT_QUERY_HEX = "0000000000010000"
+# Well-formed responses for the link-local suppression: QR+AA header, ANCOUNT=2, both answers under
+# the name "x." (each record: 3-byte name, TYPE, IN, TTL 120, RDLENGTH, rdata). A response is
+# suppressed only when every A/AAAA it carries is link-local; one routable address rescues it.
+MDNS_RESPONSE_MIXED_HEX = (
+    "000084000000000200000000"  # header
+    "01780000010001000000780004a9fe0102"  # A x. -> 169.254.1.2 (link-local)
+    "01780000010001000000780004c0a80909"  # A x. -> 192.168.9.9 (routable)
+)
+MDNS_RESPONSE_LINK_LOCAL_HEX = (
+    "000084000000000200000000"  # header
+    "01780000010001000000780004a9fe0102"  # A x. -> 169.254.1.2
+    "017800001c0001000000780010fe800000000000000000000000000001"  # AAAA x. -> fe80::1
+)
 # --- SSDP (UPnP discovery, HTTPU): multicast group 239.255.255.250 / ff02::c on UDP 1900. ---
 SSDP_GROUP_V4 = "239.255.255.250"
 SSDP_GROUP_V6 = "ff02::c"
@@ -91,6 +104,22 @@ SSDP_NOTIFY_HEX = (
     "HOST: 239.255.255.250:1900\r\n"
     "NT: upnp:rootdevice\r\n"
     "NTS: ssdp:alive\r\n\r\n"
+).encode().hex()
+# LOCATION variants for the link-local suppression: an advertisement whose LOCATION names a
+# link-local literal is suppressed; a routable literal reflects.
+SSDP_NOTIFY_ROUTABLE_LOCATION_HEX = (
+    "NOTIFY * HTTP/1.1\r\n"
+    "HOST: 239.255.255.250:1900\r\n"
+    "NT: upnp:rootdevice\r\n"
+    "NTS: ssdp:alive\r\n"
+    "LOCATION: http://192.168.9.9:1900/desc.xml\r\n\r\n"
+).encode().hex()
+SSDP_NOTIFY_LINK_LOCAL_LOCATION_HEX = (
+    "NOTIFY * HTTP/1.1\r\n"
+    "HOST: 239.255.255.250:1900\r\n"
+    "NT: upnp:rootdevice\r\n"
+    "NTS: ssdp:alive\r\n"
+    "LOCATION: http://169.254.9.9:1900/desc.xml\r\n\r\n"
 ).encode().hex()
 # A search response that strayed onto the group: neither M-SEARCH nor NOTIFY, so netflector
 # classifies it as non-SSDP and drops it.
@@ -142,6 +171,35 @@ WSD_HELLO_HEX = (
     "<d:Types>dn:NetworkVideoTransmitter</d:Types><d:MetadataVersion>1</d:MetadataVersion>"
     "</d:Hello></s:Body></s:Envelope>"
 ).encode().hex()
+
+
+# A Hello carrying the given XAddrs, for the link-local suppression: suppressed only when every
+# XAddrs URI names a link-local literal. (WSD_HELLO_HEX above has no XAddrs at all and must keep
+# reflecting; resolution then happens via Resolve.)
+def wsd_hello_with_xaddrs(xaddrs: str) -> str:
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"'
+        ' xmlns:a="http://schemas.xmlsoap.org/ws/2004/08/addressing"'
+        ' xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery">'
+        "<s:Header>"
+        "<a:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/Hello</a:Action>"
+        "<a:MessageID>urn:uuid:hello-0002</a:MessageID>"
+        "<a:To>urn:schemas-xmlsoap-org:ws:2005:04:discovery</a:To>"
+        "</s:Header>"
+        "<s:Body><d:Hello>"
+        "<a:EndpointReference><a:Address>urn:uuid:camera-0001</a:Address></a:EndpointReference>"
+        "<d:Types>dn:NetworkVideoTransmitter</d:Types>"
+        f"<d:XAddrs>{xaddrs}</d:XAddrs>"
+        "<d:MetadataVersion>1</d:MetadataVersion>"
+        "</d:Hello></s:Body></s:Envelope>"
+    ).encode().hex()
+
+
+WSD_HELLO_MIXED_XADDRS_HEX = wsd_hello_with_xaddrs(
+    "http://[fe80::1]:5357/dev http://192.168.9.9:5357/dev"
+)
+WSD_HELLO_LINK_LOCAL_XADDRS_HEX = wsd_hello_with_xaddrs("http://169.254.7.7:5357/dev")
 WSD_BYE_HEX = (
     '<?xml version="1.0" encoding="utf-8"?>'
     '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"'
@@ -419,6 +477,29 @@ MDNS_CASES = [
         family=6,
         direction="reverse",
     ),
+    # A routable address beside the link-local one rescues the response from suppression.
+    TestCase(
+        name="reflects_mdns_response_with_mixed_addresses",
+        send_port=MDNS_PORT,
+        receive_port=MDNS_PORT,
+        expect_mac=None,
+        timeout_seconds=5.0,
+        send_payload_hex=MDNS_RESPONSE_MIXED_HEX,
+        expect_payload_hex=MDNS_RESPONSE_MIXED_HEX,
+        group=MDNS_GROUP_V4,
+        direction="reverse",
+    ),
+    # Every address is link-local, so the response is suppressed rather than relayed.
+    TestCase(
+        name="ignores_mdns_link_local_only_response",
+        send_port=MDNS_PORT,
+        receive_port=MDNS_PORT,
+        expect_mac=None,
+        timeout_seconds=1.5,
+        send_payload_hex=MDNS_RESPONSE_LINK_LOCAL_HEX,
+        group=MDNS_GROUP_V4,
+        direction="reverse",
+    ),
     # A query sent target->source hits the target's response-only handler and is dropped.
     TestCase(
         name="ignores_mdns_query_in_response_direction",
@@ -529,6 +610,28 @@ SSDP_CASES = [
         timeout_seconds=5.0,
         send_payload_hex=SSDP_NOTIFY_HEX,
         expect_payload_hex=SSDP_NOTIFY_HEX,
+        group=SSDP_GROUP_V4,
+        direction="reverse",
+    ),
+    # A routable LOCATION literal reflects; a link-local one is suppressed rather than relayed.
+    TestCase(
+        name="reflects_ssdp_notify_with_routable_location",
+        send_port=SSDP_PORT,
+        receive_port=SSDP_PORT,
+        expect_mac=None,
+        timeout_seconds=5.0,
+        send_payload_hex=SSDP_NOTIFY_ROUTABLE_LOCATION_HEX,
+        expect_payload_hex=SSDP_NOTIFY_ROUTABLE_LOCATION_HEX,
+        group=SSDP_GROUP_V4,
+        direction="reverse",
+    ),
+    TestCase(
+        name="ignores_ssdp_link_local_location_notify",
+        send_port=SSDP_PORT,
+        receive_port=SSDP_PORT,
+        expect_mac=None,
+        timeout_seconds=1.5,
+        send_payload_hex=SSDP_NOTIFY_LINK_LOCAL_LOCATION_HEX,
         group=SSDP_GROUP_V4,
         direction="reverse",
     ),
@@ -674,6 +777,31 @@ WSD_CASES = [
         timeout_seconds=5.0,
         send_payload_hex=WSD_BYE_HEX,
         expect_payload_hex=WSD_BYE_HEX,
+        group=WSD_GROUP_V4,
+        direction="reverse",
+    ),
+    # A routable XAddrs URI beside the link-local one rescues the Hello from suppression.
+    TestCase(
+        name="reflects_wsd_hello_with_mixed_xaddrs",
+        config="config-wsd.toml",
+        send_port=WSD_PORT,
+        receive_port=WSD_PORT,
+        expect_mac=None,
+        timeout_seconds=5.0,
+        send_payload_hex=WSD_HELLO_MIXED_XADDRS_HEX,
+        expect_payload_hex=WSD_HELLO_MIXED_XADDRS_HEX,
+        group=WSD_GROUP_V4,
+        direction="reverse",
+    ),
+    # Every XAddrs URI is link-local, so the Hello is suppressed rather than relayed.
+    TestCase(
+        name="ignores_wsd_link_local_only_xaddrs",
+        config="config-wsd.toml",
+        send_port=WSD_PORT,
+        receive_port=WSD_PORT,
+        expect_mac=None,
+        timeout_seconds=1.5,
+        send_payload_hex=WSD_HELLO_LINK_LOCAL_XADDRS_HEX,
         group=WSD_GROUP_V4,
         direction="reverse",
     ),

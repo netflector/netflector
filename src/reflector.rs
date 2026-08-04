@@ -40,17 +40,19 @@ pub(crate) enum Verdict {
 }
 
 /// Transforms a datagram's payload before it is re-emitted: the SSDP DIAL `LOCATION` rewrite, applied
-/// on both the advertisement direction and each search session's reply. The returned slice is either
-/// `payload` verbatim or a rewrite held in the implementor's own reused scratch. The `Fn` traits can't
-/// express that lending signature, which is why this is a trait rather than a closure.
+/// on both the advertisement direction and each search session's reply. Returns the rewrite, held in
+/// the implementor's own reused scratch, or `None` to forward `payload` verbatim; the caller also
+/// reads `None` as "still advertising the device's own addresses" for the link-local suppression.
+/// The `Fn` traits can't express that lending signature, which is why this is a trait rather than a
+/// closure.
 pub(crate) trait ReplyRewrite {
     fn rewrite<'a>(
         &'a mut self,
-        payload: &'a [u8],
+        payload: &[u8],
         egress: CaptureKey,
         dispatcher: &mut PacketDispatcher,
         reactor: &mut Reactor,
-    ) -> &'a [u8];
+    ) -> Option<&'a [u8]>;
 }
 
 /// The identity transform: forward the payload verbatim. A ZST for the reflectors (mDNS, WSD, and SSDP
@@ -60,12 +62,12 @@ pub(crate) struct NoRewrite;
 impl ReplyRewrite for NoRewrite {
     fn rewrite<'a>(
         &'a mut self,
-        payload: &'a [u8],
+        _payload: &[u8],
         _egress: CaptureKey,
         _dispatcher: &mut PacketDispatcher,
         _reactor: &mut Reactor,
-    ) -> &'a [u8] {
-        payload
+    ) -> Option<&'a [u8]> {
+        None
     }
 }
 
