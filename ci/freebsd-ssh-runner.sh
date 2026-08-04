@@ -9,8 +9,14 @@ set -euo pipefail
 
 VM_DIR=${FREEBSD_VM_DIR:-$HOME/.freebsd-vm}
 SSH_PORT=${FREEBSD_VM_SSH_PORT:-2222}
+# Keepalives: a guest kernel panic reboots the VM without resetting slirp's
+# host-side TCP, so a session blocked in read (a running test binary) would
+# sit silent until the job budget; four missed 15s probes end it in ~1 minute
+# instead. ConnectTimeout bounds new connections against a frozen guest the
+# same way.
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
-    -o LogLevel=ERROR -i "$VM_DIR/id_ed25519")
+    -o LogLevel=ERROR -o ServerAliveInterval=15 -o ServerAliveCountMax=4
+    -o ConnectTimeout=10 -i "$VM_DIR/id_ed25519")
 
 bin=$1
 shift

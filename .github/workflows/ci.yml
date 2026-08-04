@@ -131,6 +131,9 @@ jobs:
       - name: VM console log
         if: always()
         run: ci/freebsd-vm.sh console
+      - name: Crash summary
+        if: always()
+        run: ci/freebsd-vm.sh crash
 
   # The native e2e suite on a real FreeBSD kernel: epair segments, every participant in its own
   # vnet jail -- the BPF capture/inject and PF_ROUTE monitor paths end to end, which no Linux lane
@@ -230,6 +233,9 @@ jobs:
       - name: VM console log
         if: always()
         run: ci/freebsd-vm.sh console
+      - name: Crash summary
+        if: always()
+        run: ci/freebsd-vm.sh crash
 
   # The port built from this commit's source instead of the pinned release
   # tarball: crates regenerated from the working tree's Cargo.lock, the tarball
@@ -311,6 +317,9 @@ jobs:
       - name: VM console log
         if: always()
         run: ci/freebsd-vm.sh console
+      - name: Crash summary
+        if: always()
+        run: ci/freebsd-vm.sh crash
 
   # The e2e suite with netflector under Valgrind memcheck (the runtime-valgrind image: a glibc release
   # binary with debug symbols). run.py --valgrind SIGTERMs the daemon per case so Valgrind runs its leak
