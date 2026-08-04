@@ -181,7 +181,7 @@ impl Capture {
         false
     }
 
-    /// The oversized-frame drops since the last call, resetting the tally: the dispatcher folds
+    /// The oversized-frame drops since the last call, resetting the count: the dispatcher folds
     /// them into the interface's counter row after each drain.
     pub(crate) fn take_oversized(&mut self) -> u64 {
         std::mem::take(&mut self.oversized)

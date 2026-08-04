@@ -26,7 +26,7 @@ use crate::logging::WARN_WINDOW;
 use crate::reactor::Reactor;
 
 /// A reflector's verdict on a captured payload, from its protocol's classifier. `Reflect`/`Skip` carry
-/// the message's own [`MessageType`] (the packet's *intrinsic* type) so the handler can tally it. See
+/// the message's own [`MessageType`] (the packet's *intrinsic* type) so the handler can count it. See
 /// [`From`] impls like `From<MdnsKind>` in each protocol reflector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Verdict {
