@@ -204,7 +204,10 @@ pub(crate) fn build(
         Box::new(advertisement),
     );
     // source -> target: searches (unfiltered, any source client may search); each searcher's unicast
-    // 200-OK replies route back through a per-searcher session. With `dial`, each session's reply
+    // 200-OK replies route back through a per-searcher session. The filter deliberately pins only
+    // the group and port: a search relayed by another netflector arrives from its reserved
+    // ephemeral source port, so a src_port or src_mac pin would silently break chained
+    // (router-to-router) deployments. With `dial`, each session's reply
     // rewrites the device's DIAL `LOCATION` (a fresh DialRewrite per session); else it passes through.
     let make_reply: Box<dyn Fn() -> Box<dyn ReplyRewrite>> = if ssdp.dial {
         Box::new(move || Box::new(DialRewrite::new(target)) as Box<dyn ReplyRewrite>)
