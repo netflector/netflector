@@ -28,6 +28,7 @@ four reflected protocols, in any mix; the DIAL proxy then layers onto SSDP.
 - [Platform support](#platform-support)
 - [Run](#run): [privileges](#runtime-privileges), [Docker](#run-in-docker), [MikroTik](#on-mikrotik-routeros), [FreeBSD/OPNsense packages](#install-on-freebsd-and-opnsense)
 - [Configuration](#configuration): [env vars](#environment-variables), [`macs`](#the-macs-field), [`address_family`](#address_family), [per-protocol behavior](#per-protocol-behavior), [DIAL](#dial), [duplicate detection](#duplicate-detection)
+- [Diagnostics](#diagnostics)
 - [Developing](#developing)
 - [License](#license)
 
@@ -54,8 +55,11 @@ Configuration comes from a TOML file, from environment variables, or from both. 
 the file is read and merged with any `NETFLECTOR_*` environment variables; with **no argument** the
 configuration comes entirely from the environment (see [Environment variables](#environment-variables)).
 The process logs to stderr with UTC timestamps, shuts down cleanly on `SIGINT` / `SIGTERM`, and on
-`SIGUSR1` dumps the per-interface [packet counters](#configuration) and a memory report to the log on
-demand (regardless of `counters_interval_secs`).
+`SIGUSR1` dumps the per-interface [packet counters](#diagnostics) and a memory report to the log on
+demand (regardless of `counters_interval_secs`). Warnings whose cause can recur per packet (a failing
+send, an oversized frame) are logged at most once per minute; occurrences inside the window are
+counted and reported by the next logged warning as `(N suppressed)`; the counters carry the exact
+volumes.
 
 | Option | |
 | --- | --- |
@@ -225,7 +229,8 @@ pkg install os-netflector
 `config.toml` contains optional top-level settings plus at least one reflector entry. Entries are tables
 under `reflectors`, keyed by name (`[reflectors.<name>]`, the name being the label used in logs), each
 describing one `source_if` → `target_if` bridge that enables one or more of the protocols. The
-top-level settings are `log_level`, `debug_memory_interval_secs`, and `counters_interval_secs`:
+top-level settings are `log_level`, `debug_memory_interval_secs`, and `counters_interval_secs` (the
+summaries the latter enables are described under [Diagnostics](#diagnostics)):
 
 ```toml
 log_level = "info"                 # optional; one of off | error | warn | info | debug | trace (default: info)
@@ -436,6 +441,23 @@ share at least one device, or when either omits its MAC filter (any device). Add
 handle the same IP version: an `ipv4`-only and an `ipv6`-only entry never overlap, while `default`/`dual`
 overlap with either. Entries that differ in interface, MAC, address family (or WoL ports), or that
 enable *different* protocols, coexist.
+
+## Diagnostics
+
+With `counters_interval_secs` set (and on `SIGUSR1`), one summary line per interface reports its
+non-zero counters:
+
+```
+counters eth0: recoveries=1; mDNS query reflected=42 skipped=10; SSDP search reflected=5 dropped=1; filtered=2; oversized=3
+```
+
+Per message type: `reflected` (re-emitted on the other interface), `skipped` (right protocol, wrong
+direction for this leg - normal, this is the loop prevention working), `dropped` (should have been
+reflected but was not: a send error, a resource cap, or the link-local suppression) and `stalled`
+(the egress had no source address of the packet's family yet). Interface-wide: `filtered`
+(unrecognized traffic on the group), `oversized` (received frames too large to forward) and
+`recoveries` (the interface was destroyed and recreated, and its capture re-bound). `netflector(8)`
+carries the full definitions.
 
 ## Developing
 

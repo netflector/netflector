@@ -555,6 +555,10 @@ impl PacketDispatcher {
         if drained > 0 {
             log::trace!("fd {fd}: drained {drained} frame(s)");
         }
+        let oversized = capture.take_oversized();
+        if oversized > 0 {
+            self.table.record_oversized(ingress, oversized);
+        }
         if !self.table.restore(ingress, capture) {
             log::warn!("drain_and_route: ingress {ingress:?} vanished mid-drain; capture dropped");
         }

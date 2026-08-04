@@ -156,6 +156,10 @@ service.
 scopes the check to the interface carrying the group, needed only when the
 same vhid runs on more than one interface.
 .Sh DIAGNOSTICS
+A warning whose cause can recur per packet (a failing send, an oversized
+frame) is logged at most once per minute; occurrences inside the window are
+counted, and the next logged one reports them as
+.Ql (N suppressed) .
 The counter summary, logged periodically when enabled and on
 .Dv SIGUSR1 ,
 tallies per interface what happened to each packet, by message type
@@ -178,6 +182,8 @@ Not a message
 .Nm
 handles: unrecognized traffic on the group, or an address family the entry
 does not cover.
+.It Sy oversized
+Received frames too large to forward, dropped before parsing.
 .It Sy recoveries
 Times the interface was destroyed and recreated, and its capture re-bound.
 .El

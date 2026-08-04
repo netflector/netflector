@@ -174,13 +174,15 @@ impl TypeCounters {
 }
 
 /// Every tally for one interface (capture): one [`TypeCounters`] per [`MessageType`], a type-less
-/// `filtered` count for junk, and a `recoveries` count of completed interface rebuilds (a recreated
-/// or returned interface whose captures re-bound).
+/// `filtered` count for junk, a `recoveries` count of completed interface rebuilds (a recreated
+/// or returned interface whose captures re-bound), and a type-less `oversized` count of received
+/// frames too large to forward (dropped before parsing).
 #[derive(Clone, Default)]
 pub(crate) struct CaptureCounters {
     types: [TypeCounters; MESSAGE_TYPE_COUNT],
     filtered: u64,
     recoveries: u64,
+    oversized: u64,
 }
 
 impl CaptureCounters {
@@ -200,6 +202,12 @@ impl CaptureCounters {
     /// per-packet outcome, so it leads the report line.
     pub(crate) fn record_recovery(&mut self) {
         self.recoveries += 1;
+    }
+
+    /// Tally `n` frames the capture dropped for exceeding the forwarding limit, folded in per
+    /// drain rather than per frame.
+    pub(crate) fn record_oversized(&mut self, n: u64) {
+        self.oversized += n;
     }
 
     /// This row's non-zero tallies as one line, e.g. `recoveries=1; mDNS query reflected=42
@@ -222,6 +230,9 @@ impl CaptureCounters {
         );
         if self.filtered > 0 {
             parts.push(format!("filtered={}", self.filtered));
+        }
+        if self.oversized > 0 {
+            parts.push(format!("oversized={}", self.oversized));
         }
         (!parts.is_empty()).then(|| parts.join("; "))
     }
@@ -303,6 +314,20 @@ mod tests {
         assert_eq!(c.typed(MessageType::SsdpSearch), (0, 0, 1, 1));
         assert_eq!(c.typed(MessageType::WakeOnLan), (0, 0, 0, 0));
         assert_eq!(c.filtered(), 1);
+    }
+
+    #[test]
+    fn record_oversized_counts_and_reports() {
+        let mut c = CaptureCounters::default();
+        c.record_oversized(3);
+        c.record_oversized(2);
+        // Reported on its own even with no routed packet, trailing the summary.
+        assert_eq!(c.format_nonzero().as_deref(), Some("oversized=5"));
+        c.record(Outcome::Filtered);
+        assert_eq!(
+            c.format_nonzero().as_deref(),
+            Some("filtered=1; oversized=5")
+        );
     }
 
     #[test]

@@ -176,6 +176,9 @@ macro_rules! log_rate {
 }
 pub(crate) use log_rate;
 
+/// The default window for [`log_rate!`] emissions.
+pub(crate) const WARN_WINDOW: Duration = Duration::from_mins(1);
+
 /// The decision behind [`log_rate!`]: emit now, returning how many were suppressed since the
 /// last emission, or count this one (`None`). The caller reads the clock (as [`format_record`]
 /// does), so the window arithmetic is exercisable against fixed times. Whole-second granularity:
