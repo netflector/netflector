@@ -76,6 +76,7 @@ pub(super) fn resolve(
     ifindex: u32,
 ) -> io::Result<(InterfaceAddresses, Option<u32>)> {
     if ifindex == 0 {
+        log::debug!("{if_name}: no kernel ifindex; skipping the address dump");
         return Ok((InterfaceAddresses::default(), None));
     }
 
@@ -262,6 +263,14 @@ fn walk_dump(buf: &[u8], reply_type: u16, on_msg: &mut impl FnMut(&[u8])) -> Dum
         if len < size_of::<libc::nlmsghdr>()
             || offset.checked_add(len).is_none_or(|end| end > buf.len())
         {
+            // Not a normal end (that's the `while` running out): a message claims an impossible
+            // length, so the datagram's remaining addresses are lost. The monitor twins warn on
+            // this; here the next refresh re-reads everything, so debug suffices.
+            log::debug!(
+                "netlink dump walk stopped at offset {offset}: len {len}, buffer {} B \
+                 (truncated or malformed); remaining messages skipped",
+                buf.len()
+            );
             break;
         }
         match hdr.nlmsg_type {
@@ -326,13 +335,17 @@ fn scan_addr(
         return;
     };
     if family == libc::AF_INET {
+        let Ok(octets) = <[u8; 4]>::try_from(bytes) else {
+            return;
+        };
+        let v4 = Ipv4Addr::from(octets);
         // First usable address wins: skip a tentative/deprecated/DAD-failed v4 (the same
         // IFA_F_UNUSABLE mask the v6 branch applies) so it is never chosen as the reflection source.
-        if addrs.v4.is_none()
-            && flags & IFA_F_UNUSABLE == 0
-            && let Ok(octets) = <[u8; 4]>::try_from(bytes)
-        {
-            let v4 = Ipv4Addr::from(octets);
+        if flags & IFA_F_UNUSABLE != 0 {
+            log::trace!("{if_name}: v4 {v4} flags {flags:#06x} -> filtered");
+        } else if addrs.v4.is_some() {
+            log::trace!("{if_name}: v4 {v4} (ignored; already have one)");
+        } else {
             log::trace!("{if_name}: v4 {v4}");
             addrs.v4 = Some(v4);
         }

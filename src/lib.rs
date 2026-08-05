@@ -86,7 +86,10 @@ fn reflect(path: Option<&Path>) -> Result<()> {
 
     // Resolve the log level first from a minimal read of env + file, so the full parse below
     // logs at the configured verbosity (see resolve_log_level).
-    logging::set_level(config::resolve_log_level(toml_text.as_deref(), &env)?);
+    let level = config::resolve_log_level(toml_text.as_deref(), &env)?;
+    logging::set_level(level);
+    // After set_level, so the line lands under the configured threshold, not the bootstrap one.
+    log::debug!("log level {level:?}");
     log::info!("netflector {} starting", env!("CARGO_PKG_VERSION"));
     if let Some(path) = path {
         log::debug!(

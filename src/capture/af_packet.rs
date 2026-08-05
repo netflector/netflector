@@ -55,13 +55,15 @@ impl Capture {
         // Loop prevention: stop the kernel from handing us our own injected frames.
         // PACKET_IGNORE_OUTGOING (Linux 4.20+) drops them at the socket; if the kernel
         // lacks it (or user-mode QEMU rejects it), prepend an in-filter drop instead.
-        if set_ignore_outgoing(&fd).is_ok() {
-            attach_filter(&fd, &ETHERNET_UDP_FILTER)?;
-        } else {
-            log::info!(
-                "PACKET_IGNORE_OUTGOING unavailable; dropping our own frames in the BPF filter"
-            );
-            attach_filter(&fd, &drop_outgoing_filter())?;
+        match set_ignore_outgoing(&fd) {
+            Ok(()) => attach_filter(&fd, &ETHERNET_UDP_FILTER)?,
+            Err(e) => {
+                log::info!(
+                    "PACKET_IGNORE_OUTGOING unavailable ({e}); dropping our own frames in the \
+                     BPF filter"
+                );
+                attach_filter(&fd, &drop_outgoing_filter())?;
+            }
         }
 
         // Bind with ETH_P_ALL to start capturing. The filter is already installed, so

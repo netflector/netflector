@@ -68,7 +68,9 @@ impl ReplyRewrite for DialRewrite {
                 .egress_addrs(self.target)
                 .and_then(InterfaceAddresses::v4),
         ) else {
-            return None; // a family the proxy can't bridge yet
+            // A family the proxy can't bridge yet; any DIAL LOCATION goes through unrewritten.
+            log::debug!("SSDP: source or target has no IPv4; DIAL rewrite skipped");
+            return None;
         };
         let (ctx, target_iface) = dispatcher.dial_context(self.target);
         let placement = ProxyPlacement {

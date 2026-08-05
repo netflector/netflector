@@ -252,6 +252,12 @@ impl DialDeviceProxy {
         };
         // A description response just revealed (or moved) the device's REST endpoint.
         if let Some(endpoint) = learned {
+            if self.rest_endpoint != Some(endpoint) {
+                log::debug!(
+                    "dial: learned {}'s REST endpoint {endpoint}",
+                    self.desc_endpoint
+                );
+            }
             self.rest_endpoint = Some(endpoint);
         }
         if outcome == Outcome::Close {

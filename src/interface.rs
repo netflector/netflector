@@ -158,6 +158,10 @@ impl Interface {
             addrs: InterfaceAddresses::default(),
             mtu: None,
         };
+        match iface.ifindex {
+            0 => log::debug!("{name}: no kernel ifindex (interface absent)"),
+            i => log::debug!("{name}: ifindex {i}"),
+        }
         iface.refresh()?;
         Ok(iface)
     }

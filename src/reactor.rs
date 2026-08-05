@@ -473,6 +473,7 @@ impl Reactor {
                 log::trace!("dispatch_deadlines: handler for {key:?} gone mid-sweep, skipped");
                 continue;
             };
+            log::trace!("deadline fired for {key:?}");
             handler.on_deadline(now, self);
             if let Some(entry) = self.handlers.get_mut(key) {
                 entry.handler = Some(handler);
@@ -499,6 +500,7 @@ impl Reactor {
                 .get_mut(key)
                 .and_then(|entry| entry.handler.take())
             else {
+                log::trace!("dispatch_control: handler for {key:?} gone mid-broadcast, skipped");
                 continue;
             };
             handler.on_control(event, self);

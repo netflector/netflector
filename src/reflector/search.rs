@@ -251,6 +251,12 @@ impl SearchReflector {
                 return Err(Outcome::Dropped(message_type));
             }
         };
+        log::trace!(
+            "{}: reserved {} (ifindex {target_ifindex}) for searcher {}",
+            self.name,
+            SocketAddr::new(our_addr, reservation.port()),
+            packet.source
+        );
         // Register before the reflect so a fast responder's reply is captured, not ICMP-rejected.
         let response_key = dispatcher.register(
             self.target,
