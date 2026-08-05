@@ -80,12 +80,13 @@ jobs:
         run: ci/freebsd-vm.sh run 'echo IGNORE_OSVERSION=yes >> /usr/local/etc/pkg.conf'
       - name: Build the package from the port
         run: ci/freebsd-port-package.sh
-      # pkg add of the built file, not make install: the artifact being
-      # published is what gets exercised, plist and metadata included.
-      - name: Install the package
-        run: ci/freebsd-vm.sh run 'pkg add /usr/ports/net/netflector/work/pkg/netflector-*.pkg'
-      - name: e2e against the installed package
+      - name: Install and run
+        run: ci/port-install.sh
+      - name: Native e2e against the installed package
         run: ci/port-e2e.sh
+      - name: Deinstall
+        run: |
+          ci/freebsd-vm.sh run 'pkg delete -y netflector'
       - name: Fetch the package
         run: |
           mkdir out
