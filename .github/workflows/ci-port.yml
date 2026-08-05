@@ -117,13 +117,13 @@ jobs:
           ci/freebsd-vm.sh run 'mandoc -T lint -W style /usr/local/share/man/man8/netflector.8.gz /usr/local/share/man/man5/netflector.toml.5.gz'
       # The port's binary is the one configuration no other lane executes end to end: release
       # profile, dynamically linked, built by the ports framework from the release tarball. Run
-      # the full native e2e suite against the INSTALLED binary before deinstalling it.
+      # the full native e2e suite against the INSTALLED binary before deinstalling it. The suite
+      # comes from the extracted tarball (WRKSRC), not the working tree: HEAD cases may assert
+      # behavior the release predates (HEAD code with HEAD suite is ci.yml's from-source build).
       - name: Native e2e against the installed port binary
         run: |
           ci/freebsd-vm.sh run 'pkg install -y python3'
-          ci/freebsd-vm.sh run 'mkdir -p /root/netflector'
-          ci/freebsd-vm.sh push e2e /root/netflector/
-          ci/freebsd-vm.sh run 'cd /root/netflector && python3 e2e/run.py --backend native --binary /usr/local/bin/netflector'
+          ci/freebsd-vm.sh run 'cd $(make -C /usr/ports/net/netflector -V WRKSRC) && python3 e2e/run.py --backend native --binary /usr/local/bin/netflector'
       - name: Deinstall
         run: |
           ci/freebsd-vm.sh run 'cd /usr/ports/net/netflector && make deinstall'
