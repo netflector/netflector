@@ -22,6 +22,7 @@ use thiserror::Error;
 use crate::config::AddressFamily;
 use crate::dispatch::{CaptureKey, MessageType, PacketDispatcher, join_deferrable};
 use crate::interface::InterfaceAddresses;
+use crate::linear_map::LinearMap;
 use crate::logging::WARN_WINDOW;
 use crate::net::LinkType;
 use crate::net::mac::MacSet;
@@ -94,19 +95,19 @@ impl fmt::Display for IpFamily {
 /// Maps each configured interface name to the capture `run()` opened for it, so a reflector's
 /// `source_if` / `target_if` resolve to the ingress / egress [`CaptureKey`]s. `run()` opens one
 /// capture per distinct interface and records it here; the per-protocol `build` functions look
-/// names up. A plain `Vec`: only ever a handful of interfaces.
+/// names up.
 #[derive(Default)]
-pub(crate) struct InterfaceMap(Vec<(String, CaptureKey)>);
+pub(crate) struct InterfaceMap(LinearMap<String, CaptureKey>);
 
 impl InterfaceMap {
     /// Record the capture `run()` opened for `name`.
     pub(crate) fn insert(&mut self, name: String, key: CaptureKey) {
-        self.0.push((name, key));
+        self.0.insert(name, key);
     }
 
     /// The capture key recorded for `name`, or `None` if none was.
     pub(crate) fn key_for(&self, name: &str) -> Option<CaptureKey> {
-        self.0.iter().find(|(n, _)| n == name).map(|&(_, key)| key)
+        self.0.get(name).copied()
     }
 
     /// The capture key for `name`, or [`BuildError::UnknownInterface`]. Build functions call this
