@@ -27,7 +27,7 @@ impl<K: PartialEq, V> LinearMap<K, V> {
             .map(|(_, v)| v)
     }
 
-    fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
+    pub(crate) fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
     where
         K: Borrow<Q>,
         Q: PartialEq + ?Sized,
@@ -45,6 +45,14 @@ impl<K: PartialEq, V> LinearMap<K, V> {
         }
         self.0.push((key, value));
         None
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        self.0.iter().map(|(k, v)| (k, v))
     }
 }
 
@@ -74,5 +82,26 @@ mod tests {
         map.insert(7u32, "old");
         assert_eq!(map.insert(7, "new"), Some("old"));
         assert_eq!(map.get(&7), Some(&"new"));
+    }
+
+    #[test]
+    fn get_mut_edits_in_place() {
+        let mut map = LinearMap::new();
+        map.insert(1u32, false);
+        *map.get_mut(&1).unwrap() |= true;
+        assert_eq!(map.get(&1), Some(&true));
+        assert_eq!(map.get_mut(&2), None);
+    }
+
+    #[test]
+    fn iter_yields_every_pair() {
+        let mut map = LinearMap::new();
+        assert!(map.is_empty());
+        map.insert(1u32, "one");
+        map.insert(2, "two");
+        assert!(!map.is_empty());
+        let mut pairs: Vec<_> = map.iter().map(|(k, v)| (*k, *v)).collect();
+        pairs.sort_unstable();
+        assert_eq!(pairs, [(1, "one"), (2, "two")]);
     }
 }

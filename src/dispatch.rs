@@ -38,6 +38,7 @@ use std::time::{Duration, Instant};
 
 use crate::capture::Capture;
 use crate::interface::{InterfaceAddresses, InterfaceEvent, InterfaceMonitor};
+use crate::linear_map::LinearMap;
 use crate::net::LinkType;
 use crate::net::mac::{MacAddr, MacSet};
 use crate::net::packet::Packet;
@@ -660,16 +661,18 @@ impl PacketDispatcher {
         let Some(monitor) = self.monitor.as_mut() else {
             return;
         };
-        // Coalesce to one (ifindex, saw-a-Link-event) row per interface.
-        let mut changed: Vec<(u32, bool)> = Vec::new();
+        // Coalesce to one ifindex -> saw-a-Link-event entry per interface.
+        let mut changed: LinearMap<u32, bool> = LinearMap::new();
         let mut overflow = false;
         if let Err(e) = monitor.drain(|event| match event {
             InterfaceEvent::Overflow => overflow = true,
             InterfaceEvent::Address(ifindex) | InterfaceEvent::Link(ifindex) => {
                 let is_link = matches!(event, InterfaceEvent::Link(_));
-                match changed.iter_mut().find(|(seen, _)| *seen == ifindex) {
-                    Some((_, link)) => *link |= is_link,
-                    None => changed.push((ifindex, is_link)),
+                match changed.get_mut(&ifindex) {
+                    Some(link) => *link |= is_link,
+                    None => {
+                        changed.insert(ifindex, is_link);
+                    }
                 }
             }
         }) {
@@ -686,7 +689,7 @@ impl PacketDispatcher {
         // The creation gate compares against the ceiling from BEFORE this batch: the creation's
         // own Link event would otherwise raise the ceiling past itself and slip through.
         let prior_ceiling = self.max_seen_ifindex;
-        for (ifindex, _) in &changed {
+        for (ifindex, _) in changed.iter() {
             self.max_seen_ifindex = self.max_seen_ifindex.max(*ifindex);
         }
         let mut want_reconcile = overflow;
@@ -727,7 +730,7 @@ impl PacketDispatcher {
                 }
             }
         } else {
-            for (ifindex, is_link) in &changed {
+            for (ifindex, is_link) in changed.iter() {
                 match self.table.refresh_by_ifindex(*ifindex) {
                     Ok(Some(change)) => {
                         log::debug!("re-resolved interface (ifindex {ifindex}) after a change");
