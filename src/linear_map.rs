@@ -51,8 +51,31 @@ impl<K: PartialEq, V> LinearMap<K, V> {
         self.0.is_empty()
     }
 
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
         self.0.iter().map(|(k, v)| (k, v))
+    }
+
+    /// Remove `key`'s entry, returning its value. `swap_remove` underneath, so iteration order is
+    /// not insertion order once anything was removed.
+    pub(crate) fn remove<Q>(&mut self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+        Q: PartialEq + ?Sized,
+    {
+        let pos = self.0.iter().position(|(k, _)| k.borrow() == key)?;
+        Some(self.0.swap_remove(pos).1)
+    }
+
+    pub(crate) fn retain(&mut self, mut keep: impl FnMut(&K, &mut V) -> bool) {
+        self.0.retain_mut(|(k, v)| keep(k, v));
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.0.clear();
     }
 }
 
@@ -103,5 +126,40 @@ mod tests {
         let mut pairs: Vec<_> = map.iter().map(|(k, v)| (*k, *v)).collect();
         pairs.sort_unstable();
         assert_eq!(pairs, [(1, "one"), (2, "two")]);
+    }
+
+    #[test]
+    fn remove_takes_the_entry_out() {
+        let mut map = LinearMap::new();
+        map.insert(1u32, "one");
+        map.insert(2, "two");
+        assert_eq!(map.remove(&1), Some("one"));
+        assert_eq!(map.remove(&1), None);
+        assert_eq!(map.get(&1), None);
+        assert_eq!(map.get(&2), Some(&"two"));
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn retain_filters_by_key_and_value() {
+        let mut map = LinearMap::new();
+        for i in 0..4u32 {
+            map.insert(i, i * 10);
+        }
+        map.retain(|k, v| *k % 2 == 0 && *v < 30);
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get(&0), Some(&0));
+        assert_eq!(map.get(&1), None);
+        assert_eq!(map.get(&2), Some(&20));
+        assert_eq!(map.get(&3), None);
+    }
+
+    #[test]
+    fn clear_empties_the_map() {
+        let mut map = LinearMap::new();
+        map.insert(1u32, ());
+        map.clear();
+        assert!(map.is_empty());
+        assert_eq!(map.get(&1), None);
     }
 }

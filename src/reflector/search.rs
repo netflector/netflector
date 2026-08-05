@@ -17,6 +17,7 @@ use crate::dispatch::{
     CaptureKey, Filter, MessageType, Outcome, PacketDispatcher, PacketHandler, RegistrationKey,
 };
 use crate::interface::{InterfaceAddresses, Ipv6Scope};
+use crate::linear_map::LinearMap;
 use crate::logging::log_rate;
 use crate::net::mac::{MacAddr, MacSet};
 use crate::net::packet::Packet;
@@ -29,17 +30,22 @@ use super::{ReplyRewrite, Verdict, WARN_WINDOW, egress_sources};
 /// the cap a new search is dropped (no live session is evicted early).
 const MAX_SESSIONS: usize = 64;
 
-/// One in-flight search, keyed by `(searcher, dest)`. The searcher (`ip:port`) plus the group it
-/// searched: each group's replies arrive at a different scope-matched target address (link-local for
-/// `ff02::c`, routable for `ff05::c`), so one searcher's searches to two scopes need separate sessions.
-/// `expiry` is when the session lapses; `reservation` holds the ephemeral target reply port for the
-/// session's life (dropping it frees the port); `response_key` is the per-session response registration. A
-/// `RegistrationKey` is not a RAII guard, so eviction and rollback `unregister` it by hand.
-struct Session {
+/// What identifies an in-flight search session: the searcher (`ip:port`) plus the group it
+/// searched. The group is part of the key because its scope picks the reserved reply address
+/// (link-local for `ff02::c`, routable for `ff05::c`), so one searcher's searches to two scopes
+/// are separate sessions, not retransmits.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct SessionKey {
     searcher: SocketAddr,
-    /// The multicast group searched; part of the dedup key, since its scope picks the reserved reply
-    /// address — a different group is a new session, not a retransmit.
+    /// The multicast group searched.
     dest: SocketAddr,
+}
+
+/// One in-flight search. `expiry` is when the session lapses; `reservation` holds the ephemeral
+/// target reply port for the session's life (dropping it frees the port); `response_key` is the
+/// per-session response registration. A `RegistrationKey` is not a RAII guard, so eviction and
+/// rollback `unregister` it by hand.
+struct Session {
     expiry: Instant,
     reservation: PortReservation,
     response_key: RegistrationKey,
@@ -161,7 +167,7 @@ pub(crate) struct SearchReflector {
     /// The protocol's `advertises_only_link_local` check, handed to each session's
     /// [`ResponseReflector`]: an untouched reply it flags is dropped rather than reflected.
     suppress: fn(&[u8]) -> bool,
-    sessions: Vec<Session>,
+    sessions: LinearMap<SessionKey, Session>,
 }
 
 impl SearchReflector {
@@ -189,7 +195,7 @@ impl SearchReflector {
             window,
             make_reply,
             suppress,
-            sessions: Vec::new(),
+            sessions: LinearMap::new(),
         }
     }
 
@@ -278,8 +284,6 @@ impl SearchReflector {
             }),
         );
         Ok(Session {
-            searcher: packet.source,
-            dest: packet.dest,
             expiry,
             reservation,
             response_key,
@@ -301,16 +305,6 @@ fn reply_source(dispatcher: &PacketDispatcher, target: CaptureKey, dest: IpAddr)
             .and_then(|a| a.v6(Ipv6Scope::of(dst6)))
             .map(IpAddr::V6),
     }
-}
-
-/// The index of the live session a search belongs to: same searcher *and* same group. The group is
-/// part of the key because its scope picks the reserved reply address, so a search to a different
-/// group is a new session, not a retransmit. An index, not a `&mut Session`: the caller decides
-/// between reusing the session and evicting it, and a borrow would lock `self.sessions` for both.
-fn session_for(sessions: &[Session], source: SocketAddr, dest: SocketAddr) -> Option<usize> {
-    sessions
-        .iter()
-        .position(|s| s.searcher == source && s.dest == dest)
 }
 
 impl PacketHandler for SearchReflector {
@@ -342,8 +336,11 @@ impl PacketHandler for SearchReflector {
         // an interface recreation or address change orphans a session's reservation, but the dispatcher
         // drops such sessions eagerly via [`on_iface_change`](SearchReflector::on_iface_change), so a
         // reused session is always bound to the interface's current identity.
-        if let Some(index) = session_for(&self.sessions, packet.source, packet.dest) {
-            let session = &mut self.sessions[index];
+        let key = SessionKey {
+            searcher: packet.source,
+            dest: packet.dest,
+        };
+        if let Some(session) = self.sessions.get_mut(&key) {
             let port = session.reservation.port();
             return match dispatcher.send_udp_group(
                 self.target,
@@ -385,7 +382,7 @@ impl PacketHandler for SearchReflector {
         let port = session.reservation.port();
         match dispatcher.send_udp_group(self.target, packet.dest, port, self.ttl, packet.payload) {
             Ok(()) => {
-                self.sessions.push(session);
+                self.sessions.insert(key, session);
                 log::debug!(
                     "reflected {} search from {} to {} on reserved port {port}; opened a session, {} active",
                     self.name,
@@ -412,7 +409,7 @@ impl PacketHandler for SearchReflector {
     }
 
     fn next_deadline(&self) -> Option<Instant> {
-        self.sessions.iter().map(|s| s.expiry).min()
+        self.sessions.iter().map(|(_, s)| s.expiry).min()
     }
 
     fn on_deadline(
@@ -421,13 +418,13 @@ impl PacketHandler for SearchReflector {
         dispatcher: &mut PacketDispatcher,
         _reactor: &mut Reactor,
     ) {
-        self.sessions.retain(|session| {
+        self.sessions.retain(|key, session| {
             if session.expiry <= now {
                 dispatcher.unregister(session.response_key);
                 log::debug!(
                     "evicted {} session for searcher {} on reserved port {}",
                     self.name,
-                    session.searcher,
+                    key.searcher,
                     session.reservation.port()
                 );
                 false
@@ -451,9 +448,10 @@ impl PacketHandler for SearchReflector {
         if self.sessions.is_empty() || !captures.contains(&self.target) {
             return;
         }
-        for session in self.sessions.drain(..) {
+        for (_, session) in self.sessions.iter() {
             dispatcher.unregister(session.response_key);
         }
+        self.sessions.clear();
         log::debug!(
             "{}: cleared all sessions after the target interface changed",
             self.name
@@ -527,13 +525,14 @@ mod tests {
                 suppress: |_| false,
             }),
         );
-        reflector.sessions.push(Session {
-            searcher,
-            dest,
-            expiry,
-            reservation,
-            response_key,
-        });
+        reflector.sessions.insert(
+            SessionKey { searcher, dest },
+            Session {
+                expiry,
+                reservation,
+                response_key,
+            },
+        );
     }
 
     #[test]
@@ -598,7 +597,7 @@ mod tests {
             "the expired session is dropped"
         );
         assert_eq!(
-            reflector.sessions[0].searcher,
+            reflector.sessions.iter().next().unwrap().0.searcher,
             "10.0.0.2:5".parse::<SocketAddr>().unwrap()
         );
         assert_eq!(
@@ -651,7 +650,7 @@ mod tests {
             "no second response registration is made"
         );
         assert!(
-            reflector.sessions[0].expiry > base,
+            reflector.sessions.iter().next().unwrap().1.expiry > base,
             "the session's window is refreshed"
         );
     }
@@ -683,7 +682,8 @@ mod tests {
         reflector.on_packet(&packet, &mut dispatcher, &mut reactor);
 
         assert_eq!(
-            reflector.sessions[0].expiry, far,
+            reflector.sessions.iter().next().unwrap().1.expiry,
+            far,
             "replies promised by the earlier window are still collected"
         );
     }
@@ -707,8 +707,9 @@ mod tests {
         let searcher: SocketAddr = "[fe80::1]:50000".parse().unwrap();
         let link_local: SocketAddr = "[ff02::c]:1900".parse().unwrap();
         let site_local: SocketAddr = "[ff05::c]:1900".parse().unwrap();
-        assert!(session_for(&reflector.sessions, searcher, link_local).is_some());
-        assert!(session_for(&reflector.sessions, searcher, site_local).is_none());
+        let key = |dest| SessionKey { searcher, dest };
+        assert!(reflector.sessions.get(&key(link_local)).is_some());
+        assert!(reflector.sessions.get(&key(site_local)).is_none());
     }
 
     // on_iface_change drops every session on a capture the reflector uses: a recreation or address
@@ -821,11 +822,11 @@ mod tests {
         // At MAX_SESSIONS in flight a new searcher is dropped; no live session is evicted early.
         let mut dispatcher = PacketDispatcher::new();
         let mut reflector = test_reflector();
-        for _ in 0..MAX_SESSIONS {
+        for i in 0..MAX_SESSIONS {
             push_session(
                 &mut reflector,
                 &mut dispatcher,
-                "10.0.0.1:5",
+                &format!("10.0.0.1:{}", 5000 + i),
                 "239.255.255.250:1900",
                 Instant::now(),
             );
