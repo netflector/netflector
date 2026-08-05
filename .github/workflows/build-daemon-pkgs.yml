@@ -36,9 +36,10 @@ jobs:
   package:
     name: Package (freebsd${{ matrix.os }}-${{ matrix.arch.name }})
     runs-on: ubuntu-24.04
-    # Measured across publish runs: KVM lanes 2-5 minutes, arm64 13-14 (no
-    # GitHub runner offers KVM for aarch64 guests, so rustc runs under TCG).
-    timeout-minutes: ${{ matrix.arch.kvm && 15 || 40 }}
+    # Measured across publish runs: KVM lanes 2-5 minutes plus ~9 of e2e,
+    # arm64 13-14 plus ~12 (no GitHub runner offers KVM for aarch64 guests,
+    # so rustc and the suite run under TCG).
+    timeout-minutes: ${{ matrix.arch.kvm && 25 || 40 }}
     env:
       FREEBSD_VM_ARCH: ${{ matrix.arch.name }}
       FREEBSD_VM_VERSION: ${{ matrix.os }}-opnsense
@@ -79,6 +80,12 @@ jobs:
         run: ci/freebsd-vm.sh run 'echo IGNORE_OSVERSION=yes >> /usr/local/etc/pkg.conf'
       - name: Build the package from the port
         run: ci/freebsd-port-package.sh
+      # pkg add of the built file, not make install: the artifact being
+      # published is what gets exercised, plist and metadata included.
+      - name: Install the package
+        run: ci/freebsd-vm.sh run 'pkg add /usr/ports/net/netflector/work/pkg/netflector-*.pkg'
+      - name: e2e against the installed package
+        run: ci/port-e2e.sh
       - name: Fetch the package
         run: |
           mkdir out

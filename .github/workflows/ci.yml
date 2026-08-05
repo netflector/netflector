@@ -14,6 +14,7 @@ on:
       # only ignored paths fires nothing and stays blocked; workflow_dispatch
       # ci.yml unsticks it.
       - '.github/workflows/ci-port.yml'
+      - 'ci/port-e2e.sh'
       - '.github/workflows/ci-opnsense.yml'
       - '.github/workflows/ci-docs.yml'
       - '.github/workflows/ci-supply-chain.yml'
