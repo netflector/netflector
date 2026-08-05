@@ -250,12 +250,13 @@ pull() {
     scp -qr "${SSH_OPTS[@]}" -P "$SSH_PORT" "root@127.0.0.1:$1" "$2"
 }
 
-# A panicked guest reboots itself, and savecore(8) writes the panic summary
-# (backtrace, faulting process, dmesg tail) to /var/crash during that boot --
-# about a minute after the panic even under TCG. The wait is bounded: a guest
-# that froze without panicking never answers, and burning the first-boot ssh
-# budget (20 minutes on arm64) on a post-mortem would stall the job's real
-# diagnostics.
+# A panicked guest reboots itself; savecore(8) preserves the dump during that
+# boot, about a minute after the panic even under TCG. The wait is bounded: a
+# guest that froze without panicking never answers, and burning the first-boot
+# ssh budget (20 minutes on arm64) on a post-mortem would stall the job's real
+# diagnostics. crashinfo(8)'s boot-time core.txt carries no backtrace without a
+# kernel debugger, and it re-runs fine after the fact, so gdb is fetched and
+# the summary regenerated only on a run that actually panicked.
 crash_summary() {
     if [ ! -f "$VM_DIR/qemu.pid" ]; then
         echo "no crash summary: the VM was never launched"
@@ -269,8 +270,15 @@ crash_summary() {
         fi
         sleep 5
     done
-    run 'cat /var/crash/core.txt.* 2>/dev/null || echo "no crash dump in /var/crash"' ||
-        echo "no crash summary: ssh dropped while reading /var/crash"
+    run 'if ls /var/crash/vmcore.* >/dev/null 2>&1; then
+             if ! command -v gdb >/dev/null; then
+                 pkg install -y gdb >/dev/null
+                 crashinfo >/dev/null
+             fi
+             cat /var/crash/core.txt.*
+         else
+             echo "no crash dump in /var/crash"
+         fi' || echo "no crash summary: fetching it from the guest failed"
 }
 
 case "${1:-}" in
