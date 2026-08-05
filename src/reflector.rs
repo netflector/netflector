@@ -223,7 +223,7 @@ fn join_group_logged(
     side: &str,
 ) {
     match dispatcher.join_group(capture, group) {
-        Ok(()) => {}
+        Ok(()) => log::debug!("{protocol}: joined {group} on {side}"),
         Err(e) if join_deferrable(&e) => {
             log::debug!(
                 "{protocol}: join {group} on {side} deferred (no address of its family yet): {e}"

@@ -125,6 +125,7 @@ fn mint_proxy(
     let desc = listen_or_warn(placement.source, Listener::Description)?;
     let rest = listen_or_warn(placement.source, Listener::Rest)?;
     let desc_addr = desc.local_addr();
+    let rest_addr = rest.local_addr();
     let watches = [(desc.as_raw_fd(), 0), (rest.as_raw_fd(), 0)];
     let proxy = DialDeviceProxy::new(
         placement.target,
@@ -141,7 +142,10 @@ fn mint_proxy(
         }
     };
     ctx.insert(key, handler, desc_addr, desc_grace);
-    log::debug!("dial: minted a proxy for {endpoint} via description listener {desc_addr}");
+    log::debug!(
+        "dial: minted a proxy for {endpoint}: description listener {desc_addr}, \
+         REST listener {rest_addr}"
+    );
     Some(desc_addr)
 }
 

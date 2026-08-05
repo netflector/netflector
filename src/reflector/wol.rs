@@ -13,7 +13,7 @@ use crate::dispatch::{
     CaptureKey, Filter, MessageType, Outcome, PacketDispatcher, PacketHandler, PortSet,
 };
 use crate::logging::log_rate;
-use crate::net::mac::MacSet;
+use crate::net::mac::{MacAddr, MacSet};
 use crate::net::packet::Packet;
 use crate::reactor::Reactor;
 
@@ -45,8 +45,15 @@ impl PacketHandler for WolReflector {
         dispatcher: &mut PacketDispatcher,
         _reactor: &mut Reactor,
     ) -> Outcome {
-        if !is_magic_packet(packet.payload, self.target_macs.as_ref()) {
+        let Some(mac) = magic_packet_mac(packet.payload) else {
             log::debug!("WoL: ignoring non-magic packet from {}", packet.source);
+            return Outcome::Filtered;
+        };
+        if !wake_allowed(mac, self.target_macs.as_ref()) {
+            log::debug!(
+                "WoL: ignoring wake for {mac} from {}: not in the configured device set",
+                packet.source
+            );
             return Outcome::Filtered;
         }
         let Some(dst) = wol_destination(self.family, packet) else {
@@ -89,16 +96,14 @@ impl PacketHandler for WolReflector {
     }
 }
 
-/// Whether `payload` opens with a Wake-on-LAN magic packet for an acceptable target: the `6×0xFF`
-/// prefix followed by one MAC repeated 16 times. Only the leading [`MAGIC_LEN`] bytes are inspected;
-/// trailing bytes (a `SecureOn` password) are ignored here and forwarded as-is by the caller. When
-/// `targets` is set, the repeated MAC must be a member, so only those devices' wakes are reflected.
-fn is_magic_packet(payload: &[u8], targets: Option<&MacSet>) -> bool {
-    let Some(magic) = payload.get(..MAGIC_LEN) else {
-        return false;
-    };
+/// The target MAC of the Wake-on-LAN magic packet opening `payload`: the `6×0xFF` prefix followed
+/// by one MAC repeated 16 times. `None` when the structure doesn't match. Only the leading
+/// [`MAGIC_LEN`] bytes are inspected; trailing bytes (a `SecureOn` password) are ignored here and
+/// forwarded as-is by the caller.
+fn magic_packet_mac(payload: &[u8]) -> Option<MacAddr> {
+    let magic = payload.get(..MAGIC_LEN)?;
     if magic[..PREFIX_LEN] != [0xff; PREFIX_LEN] {
-        return false;
+        return None;
     }
     let mac = &magic[PREFIX_LEN..PREFIX_LEN + MAC_LEN];
     // The other 15 repetitions must all equal the first.
@@ -106,9 +111,14 @@ fn is_magic_packet(payload: &[u8], targets: Option<&MacSet>) -> bool {
         .chunks_exact(MAC_LEN)
         .all(|rep| rep == mac)
     {
-        return false;
+        return None;
     }
-    targets.is_none_or(|targets| targets.iter().any(|target| mac == target.octets()))
+    Some(MacAddr::from(<[u8; MAC_LEN]>::try_from(mac).ok()?))
+}
+
+/// Whether the optional `targets` allow-set admits a wake for `mac`.
+fn wake_allowed(mac: MacAddr, targets: Option<&MacSet>) -> bool {
+    targets.is_none_or(|targets| targets.contains(&mac))
 }
 
 /// Link-wide destination a captured magic `packet` re-emits to under `family`: the IPv4 limited
@@ -196,47 +206,48 @@ mod tests {
 
     #[test]
     fn accepts_any_device_when_unfiltered() {
-        assert!(is_magic_packet(&magic_packet(DEVICE, &[]), None));
+        let mac = magic_packet_mac(&magic_packet(DEVICE, &[])).unwrap();
+        assert!(wake_allowed(mac, None));
     }
 
     #[test]
     fn accepts_a_secureon_trailer() {
         // Bytes past the 102 are a SecureOn password: ignored here, forwarded by the caller.
         let packet = magic_packet(DEVICE, &[0xde, 0xad, 0xbe, 0xef]);
-        assert!(is_magic_packet(&packet, None));
+        assert_eq!(magic_packet_mac(&packet), Some(MacAddr::from(DEVICE)));
     }
 
     #[test]
     fn filters_to_the_configured_device() {
-        let packet = magic_packet(DEVICE, &[]);
+        let mac = magic_packet_mac(&magic_packet(DEVICE, &[])).unwrap();
         let allowed = MacSet::from(MacAddr::from(DEVICE));
-        assert!(is_magic_packet(&packet, Some(&allowed)));
+        assert!(wake_allowed(mac, Some(&allowed)));
         let others = MacSet::from(MacAddr::from([0xaa; 6]));
-        assert!(!is_magic_packet(&packet, Some(&others)));
+        assert!(!wake_allowed(mac, Some(&others)));
     }
 
     #[test]
     fn filters_to_any_of_several_configured_devices() {
-        let packet = magic_packet(DEVICE, &[]);
+        let mac = magic_packet_mac(&magic_packet(DEVICE, &[])).unwrap();
         let set = MacSet::try_from(vec![MacAddr::from([0xaa; 6]), MacAddr::from(DEVICE)]).unwrap();
-        assert!(is_magic_packet(&packet, Some(&set)));
+        assert!(wake_allowed(mac, Some(&set)));
         let disjoint =
             MacSet::try_from(vec![MacAddr::from([0xaa; 6]), MacAddr::from([0xbb; 6])]).unwrap();
-        assert!(!is_magic_packet(&packet, Some(&disjoint)));
+        assert!(!wake_allowed(mac, Some(&disjoint)));
     }
 
     #[test]
     fn rejects_a_short_payload() {
         let packet = magic_packet(DEVICE, &[]);
-        assert!(!is_magic_packet(&packet[..MAGIC_LEN - 1], None));
-        assert!(!is_magic_packet(&[], None));
+        assert!(magic_packet_mac(&packet[..MAGIC_LEN - 1]).is_none());
+        assert!(magic_packet_mac(&[]).is_none());
     }
 
     #[test]
     fn rejects_a_broken_prefix() {
         let mut packet = magic_packet(DEVICE, &[]);
         packet[0] = 0xfe;
-        assert!(!is_magic_packet(&packet, None));
+        assert!(magic_packet_mac(&packet).is_none());
     }
 
     #[test]
@@ -244,7 +255,7 @@ mod tests {
         let mut packet = magic_packet(DEVICE, &[]);
         // Corrupt the 7th repetition so it no longer matches the first.
         packet[PREFIX_LEN + 6 * MAC_LEN] ^= 0xff;
-        assert!(!is_magic_packet(&packet, None));
+        assert!(magic_packet_mac(&packet).is_none());
     }
 
     /// A packet whose `dest` (the captured Wake-on-LAN port) drives the re-emit destination.

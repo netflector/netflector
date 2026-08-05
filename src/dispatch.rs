@@ -634,6 +634,14 @@ impl PacketDispatcher {
         // real, in-range ingress key.
         if let Some(outcome) = final_outcome {
             self.table.record(ingress, outcome);
+        } else {
+            // The one drop no counter covers: past the kernel filter but matching no
+            // registration (e.g. a reply outliving its search session's registration).
+            log::trace!(
+                "no registration matched {} -> {} on {ingress:?}",
+                packet.source,
+                packet.dest
+            );
         }
     }
 

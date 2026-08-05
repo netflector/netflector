@@ -392,6 +392,14 @@ impl Connection {
     /// and tear us down early. Unwatch the vanished fd, whose level-triggered HUP would otherwise re-fire
     /// every wait. The connection closes once the forward flow finishes draining.
     fn peer_gone(&mut self, direction: Direction, reactor: &mut Reactor) -> Outcome {
+        log::debug!(
+            "dial: {} hung up on the connection to {}",
+            match direction {
+                Direction::ClientToDevice => "client",
+                Direction::DeviceToClient => "device",
+            },
+            self.device_endpoint
+        );
         // The abandoned reverse flow's source is the reg to disarm; the hung-up fd is the reg to unwatch.
         // The guard routes here only with a live destination reg, and the source's reg is still set (its
         // fd just hung up, and peer_gone (which takes it) runs once), so both expects hold.
@@ -461,7 +469,10 @@ impl Connection {
     fn on_writable(&mut self, direction: Direction, reactor: &mut Reactor) -> Outcome {
         if direction == Direction::ClientToDevice && self.device.is_connecting() {
             match self.device.finish_connect() {
-                Ok(()) => self.deadline = Instant::now() + IDLE_TIMEOUT,
+                Ok(()) => {
+                    log::debug!("dial: connected to {}", self.device_endpoint);
+                    self.deadline = Instant::now() + IDLE_TIMEOUT;
+                }
                 Err(e) => {
                     log::warn!(
                         "dial: device connect to {} failed: {e}",

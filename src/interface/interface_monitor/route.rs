@@ -96,7 +96,12 @@ pub(super) fn for_each_change(buf: &[u8], on_change: &mut impl FnMut(InterfaceEv
                 ANNOUNCE_INDEX_OFFSET,
                 InterfaceEvent::Link as fn(u32) -> InterfaceEvent,
             )),
-            _ => None,
+            _ => {
+                // PF_ROUTE is unfiltered, so every routing message on the system lands here;
+                // this is the only trail of what a drain actually saw.
+                log::trace!("interface monitor: ignoring routing message type {msg_type}");
+                None
+            }
         };
         if let Some((index_offset, event)) = hit
             && msglen >= index_offset + 2

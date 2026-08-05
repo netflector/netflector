@@ -395,6 +395,7 @@ fn pin_egress(fd: RawFd, iface: Option<&str>) -> io::Result<()> {
             return Err(io::Error::last_os_error());
         }
     }
+    log::trace!("connect egress pinned to {name}");
     Ok(())
 }
 
