@@ -16,3 +16,6 @@ HERE="$(dirname "$0")"
 "$HERE"/freebsd-vm.sh run 'rm -rf /usr/ports/net/netflector'
 "$HERE"/freebsd-vm.sh push dist/freebsd/net/netflector /usr/ports/net/netflector
 "$HERE"/freebsd-vm.sh run 'cd /usr/ports/net/netflector && make ALLOW_UNSUPPORTED_SYSTEM=yes package'
+# Base-sensitive QA the PR lanes cannot cover: they lint on the release images,
+# while this stages on the EOL OPNsense bases the packages are built for.
+"$HERE"/freebsd-vm.sh run 'cd /usr/ports/net/netflector && make ALLOW_UNSUPPORTED_SYSTEM=yes stage-qa check-plist'

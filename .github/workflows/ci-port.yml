@@ -14,7 +14,8 @@ on:
       - '.github/workflows/ci-port.yml'
       # --check runs only here; ci.yml exercises just --local.
       - 'ci/port-sync.py'
-      # Consumed by the port-build e2e step.
+      # Consumed by the port-build install and e2e steps.
+      - 'ci/port-install.sh'
       - 'ci/port-e2e.sh'
   workflow_call:
     inputs:
@@ -99,15 +100,7 @@ jobs:
           ci/freebsd-vm.sh run 'cd /usr/ports/net/netflector && make check-plist'
           ci/freebsd-vm.sh run 'cd /usr/ports/net/netflector && make package'
       - name: Install and run
-        run: |
-          ci/freebsd-vm.sh run 'cd /usr/ports/net/netflector && make install'
-          ci/freebsd-vm.sh run '/usr/local/bin/netflector --version'
-          # The rc script must refuse a configuration the daemon would reject, rather than launching a
-          # service that dies a second later.
-          ci/freebsd-vm.sh run 'sysrc netflector_enable=YES'
-          ci/freebsd-vm.sh run 'printf "[reflectors.bad]\nsource_if = \"em0\"\ntarget_if = \"em0\"\nmdns = true\n" > /usr/local/etc/netflector.toml'
-          ci/freebsd-vm.sh run 'service netflector start 2>&1 | grep -q "refusing to start" && echo "rc refused an invalid configuration"'
-          ci/freebsd-vm.sh run 'rm /usr/local/etc/netflector.toml'
+        run: ci/port-install.sh
       # Lint the pages as installed, cross-reference check included: at the default floor
       # the Xr search is deliberately base-system-only, but -W style (added in mandoc
       # 1.14.6 for exactly this case) searches the full manpath, which has the port tree.
@@ -119,13 +112,13 @@ jobs:
           ci/freebsd-vm.sh run 'mandoc -T lint -W style /usr/local/share/man/man8/netflector.8.gz /usr/local/share/man/man5/netflector.toml.5.gz'
       # The port's binary is the one configuration no other lane executes end to end: release
       # profile, dynamically linked, built by the ports framework from the release tarball. Run
-      # the full native e2e suite against the INSTALLED binary before deinstalling it; the
+      # the full native e2e suite against the INSTALLED package before deinstalling it; the
       # script picks the suite that matches it.
-      - name: Native e2e against the installed port binary
+      - name: Native e2e against the installed package
         run: ci/port-e2e.sh
       - name: Deinstall
         run: |
-          ci/freebsd-vm.sh run 'cd /usr/ports/net/netflector && make deinstall'
+          ci/freebsd-vm.sh run 'pkg delete -y netflector'
       - name: VM console log
         if: always()
         run: ci/freebsd-vm.sh console
