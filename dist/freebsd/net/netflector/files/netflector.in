@@ -28,15 +28,19 @@ load_rc_config $name
 : ${netflector_carp_vhid:=""}
 : ${netflector_carp_interface:=""}
 
+# The pidfile must hold daemon(8) itself (-P), not the child: stop then terminates the supervisor,
+# which forwards the signal and exits. Killing only the child would let a restarting supervisor
+# (netflector_flags="-r") respawn it behind rc's back. The child's pid stays visible beside it.
 pidfile="/var/run/${name}.pid"
-procname="%%PREFIX%%/bin/${name}"
+child_pidfile="/var/run/${name}_child.pid"
+netflector_bin="%%PREFIX%%/bin/${name}"
 
 # The daemon runs in the foreground and logs to stderr, so daemon(8) backgrounds it and -S routes that
 # stderr into syslog under our own tag rather than /dev/null. -f closes the descriptors daemon(8)
 # inherited: without it the supervisor holds the caller's stdout open for the service's lifetime, so
 # `ssh host service netflector start` never returns. It does not affect -S, which redirects the child.
 command="/usr/sbin/daemon"
-command_args="-f -S -T ${name} -p ${pidfile} ${procname} '${netflector_config}'"
+command_args="-f -S -T ${name} -P ${pidfile} -p ${child_pidfile} ${netflector_bin} '${netflector_config}'"
 
 start_precmd="${name}_precmd"
 
@@ -49,8 +53,8 @@ netflector_precmd()
     # Refuse to start on a configuration the daemon would reject, so the failure is one clear message
     # here rather than a service that appears to start and is gone a moment later. --check-config parses
     # and validates only: it opens no interface and needs no privileges.
-    if ! ${procname} --check-config "${netflector_config}" > /dev/null 2>&1; then
-        ${procname} --check-config "${netflector_config}" 2>&1 | while read -r line; do
+    if ! ${netflector_bin} --check-config "${netflector_config}" > /dev/null 2>&1; then
+        ${netflector_bin} --check-config "${netflector_config}" 2>&1 | while read -r line; do
             warn "${line}"
         done
         err 1 "refusing to start: ${netflector_config} is not valid"
