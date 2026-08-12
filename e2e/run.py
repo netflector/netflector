@@ -59,9 +59,10 @@ MDNS_QUERY_HEX = "00000000000100000000000074657374"
 MDNS_RESPONSE_HEX = "00008400000100010000000074657374"
 # 8 bytes: below the 12-byte DNS-header minimum, so classify() returns None and drops it.
 MDNS_SHORT_QUERY_HEX = "0000000000010000"
-# Well-formed responses for the link-local suppression: QR+AA header, ANCOUNT=2, both answers under
-# the name "x." (each record: 3-byte name, TYPE, IN, TTL 120, RDLENGTH, rdata). A response is
-# suppressed only when every A/AAAA it carries is link-local; one routable address rescues it.
+# Well-formed responses for the advertisement suppression: QR+AA header, ANCOUNT=2, both answers
+# under the name "x." (each record: 3-byte name, TYPE, IN, TTL 120, RDLENGTH, rdata). A response is
+# suppressed only when every A/AAAA it carries is unreachable (here link-local); one routable
+# address rescues it.
 MDNS_RESPONSE_MIXED_HEX = (
     "000084000000000200000000"  # header
     "01780000010001000000780004a9fe0102"  # A x. -> 169.254.1.2 (link-local)
@@ -173,9 +174,9 @@ WSD_HELLO_HEX = (
 ).encode().hex()
 
 
-# A Hello carrying the given XAddrs, for the link-local suppression: suppressed only when every
-# XAddrs URI names a link-local literal. (WSD_HELLO_HEX above has no XAddrs at all and must keep
-# reflecting; resolution then happens via Resolve.)
+# A Hello carrying the given XAddrs, for the advertisement suppression: suppressed only when every
+# XAddrs URI names an unreachable literal (here link-local). (WSD_HELLO_HEX above has no XAddrs at
+# all and must keep reflecting; resolution then happens via Resolve.)
 def wsd_hello_with_xaddrs(xaddrs: str) -> str:
     return (
         '<?xml version="1.0" encoding="utf-8"?>'

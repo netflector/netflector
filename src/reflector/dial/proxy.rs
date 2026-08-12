@@ -8,11 +8,12 @@
 //! sweeps its own connections past their connect/idle deadlines.
 
 use std::fmt;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::{Duration, Instant};
 
 use crate::logging::log_rate;
+use crate::net::is_never_a_peer;
 use crate::net::tcp::TcpSocket;
 use crate::reactor::{Arena, Handler, HandlerKey, Key, Reactor, ReadyEvent};
 
@@ -252,17 +253,31 @@ impl DialDeviceProxy {
         };
         // A description response just revealed (or moved) the device's REST endpoint.
         if let Some(endpoint) = learned {
-            if self.rest_endpoint != Some(endpoint) {
-                log::debug!(
-                    "dial: learned {}'s REST endpoint {endpoint}",
-                    self.desc_endpoint
-                );
-            }
-            self.rest_endpoint = Some(endpoint);
+            self.adopt_rest_endpoint(endpoint);
         }
         if outcome == Outcome::Close {
             self.close_conn(conn_key, reactor);
         }
+    }
+
+    /// Adopt a REST endpoint a description response revealed, unless it can never name a device
+    /// ([`is_never_a_peer`]): dialing such an address would reach a local service, not the device.
+    /// A link-local endpoint is fine, deliberately: the dial goes out the target interface, on-link.
+    fn adopt_rest_endpoint(&mut self, endpoint: SocketAddrV4) {
+        if is_never_a_peer(IpAddr::V4(*endpoint.ip())) {
+            log::debug!(
+                "dial: ignoring {}'s REST endpoint {endpoint}: it can never name a device",
+                self.desc_endpoint
+            );
+            return;
+        }
+        if self.rest_endpoint != Some(endpoint) {
+            log::debug!(
+                "dial: learned {}'s REST endpoint {endpoint}",
+                self.desc_endpoint
+            );
+        }
+        self.rest_endpoint = Some(endpoint);
     }
 
     /// A connection socket is writable: complete the connect / drain its send backlog; close on error.
@@ -383,6 +398,24 @@ mod tests {
         );
         proxy.adopt_key(key);
         (proxy, rest_addr)
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "needs a real poll backend")]
+    fn a_never_a_peer_rest_endpoint_is_not_adopted() {
+        let mut reactor = Reactor::new().expect("reactor");
+        let (mut proxy, _rest_addr) = watched_proxy(&mut reactor);
+        let device: SocketAddrV4 = "10.0.0.5:8009".parse().unwrap();
+        proxy.adopt_rest_endpoint(device);
+        assert_eq!(proxy.rest_endpoint, Some(device));
+        // A later description naming loopback or unspecified does not displace it.
+        proxy.adopt_rest_endpoint("127.0.0.1:9".parse().unwrap());
+        proxy.adopt_rest_endpoint("0.0.0.0:8009".parse().unwrap());
+        assert_eq!(proxy.rest_endpoint, Some(device));
+        // A link-local endpoint is adoptable: the proxy dials it on-link from the target side.
+        let link_local: SocketAddrV4 = "169.254.9.9:8009".parse().unwrap();
+        proxy.adopt_rest_endpoint(link_local);
+        assert_eq!(proxy.rest_endpoint, Some(link_local));
     }
 
     #[test]

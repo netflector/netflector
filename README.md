@@ -379,14 +379,17 @@ mDNS is relayed as pure multicast. A querier that asks for a unicast answer (the
 from an ephemeral source port) is answered off the group, and that answer is not relayed; SSDP and WSD
 instead proxy each searcher's unicast reply.
 
-Messages that advertise only link-local addresses (`169.254.0.0/16`, `fe80::/10`) are dropped rather
-than relayed: an mDNS response whose A/AAAA records are all link-local, an SSDP advertisement or
-search reply whose `LOCATION` names one, a WSD message whose `XAddrs` all name one. Such an address
-is valid only on the link it came from, so the relayed message would advertise endpoints the other
-segment can never reach. One routable address among them lets the message through. A `LOCATION` the
-DIAL proxy rewrote is exempt: it names netflector's own listener on the egress interface, reachable
-from that link even when the interface's address is itself link-local. Suppressed messages count as
-`dropped` and log at debug level.
+Messages whose advertised addresses are all unreachable are dropped rather than relayed: an mDNS
+response whose A/AAAA records, an SSDP advertisement or search reply whose `LOCATION`, or a WSD
+message whose `XAddrs` name only such addresses. Unreachable means link-local (`169.254.0.0/16`,
+`fe80::/10`), valid only on the link it came from, or an address that never names a device at all:
+loopback, unspecified (`0.0.0.0`, `::`), multicast, broadcast (`255.255.255.255`). One usable
+address among them lets
+the message through. A `LOCATION` the DIAL proxy rewrote is exempt: it names netflector's own
+listener on the egress interface, reachable from that link even when the interface's address is
+itself link-local. The DIAL proxy itself refuses to proxy a device whose `LOCATION` or
+`Application-URL` names a never-a-device address. Suppressed messages count as `dropped` and log at
+debug level.
 
 netflector reads untagged Ethernet frames carrying IPv4 or IPv6 UDP. VLAN-tagged frames and IPv6
 extension headers are not parsed, so configure the VLAN as its own interface (`vlan10`, `em0.10`) and
@@ -456,7 +459,7 @@ counters eth0: recoveries=1; mDNS query reflected=42 skipped=10; SSDP search ref
 
 Per message type: `reflected` (re-emitted on the other interface), `skipped` (right protocol, wrong
 direction for this leg - normal, this is the loop prevention working), `dropped` (should have been
-reflected but was not: a send error, a resource cap, or the link-local suppression) and `stalled`
+reflected but was not: a send error, a resource cap, or the advertisement suppression) and `stalled`
 (the egress had no source address of the packet's family yet). Interface-wide: `filtered`
 (unrecognized traffic on the group), `oversized` (received frames too large to forward) and
 `recoveries` (the interface was destroyed and recreated, and its capture re-bound). `netflector(8)`

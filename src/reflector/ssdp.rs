@@ -16,7 +16,7 @@ use crate::interface::InterfaceAddresses;
 use crate::net::MAX_UDP_PAYLOAD_LEN;
 use crate::net::ssdp::{
     MSEARCH_MX_DEFAULT, SSDP_GROUP_V4, SSDP_GROUP_V6_LINK_LOCAL, SSDP_GROUP_V6_SITE_LOCAL,
-    SSDP_PORT, SSDP_TTL, SsdpKind, advertises_only_link_local, classify, parse_msearch_mx,
+    SSDP_PORT, SSDP_TTL, SsdpKind, advertises_only_unreachable, classify, parse_msearch_mx,
 };
 use crate::net::uninit_buf::UninitBuf;
 use crate::reactor::Reactor;
@@ -185,8 +185,8 @@ pub(crate) fn build(
     let group_ips: IpSet = groups.iter().map(SocketAddr::ip).collect();
     // target -> source: advertisements (a stateless re-emit), optionally filtered to the configured
     // device's MAC. With `dial`, the reflected `LOCATION` is rewritten to a source-side proxy.
-    // A NOTIFY whose LOCATION names a link-local address advertises an endpoint the source side
-    // can never reach.
+    // A NOTIFY whose LOCATION names a link-local or never-a-peer address advertises an endpoint
+    // the source side can never use.
     let advertisement = SimpleReflector::new(
         source,
         "SSDP",
@@ -195,7 +195,7 @@ pub(crate) fn build(
         SSDP_TTL,
         advertisement_verdict,
     )
-    .with_suppress(advertises_only_link_local);
+    .with_suppress(advertises_only_unreachable);
     let advertisement = if ssdp.dial {
         advertisement.with_rewrite(Box::new(DialRewrite::new(target)))
     } else {
@@ -240,7 +240,7 @@ pub(crate) fn build(
             search_window,
             make_reply,
             // Each session's 200 OK reply is gated the same way as the NOTIFY leg.
-            advertises_only_link_local,
+            advertises_only_unreachable,
         )),
     );
     log::info!(

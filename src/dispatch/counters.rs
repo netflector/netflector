@@ -98,8 +98,8 @@ pub(crate) enum Outcome {
     Reflected(MessageType),
     /// Recognized, but the wrong direction for this leg: the loop-breaker, not ours to forward.
     Skipped(MessageType),
-    /// The right direction, but not re-emitted: a send error, a resource cap, or the link-local
-    /// suppression.
+    /// The right direction, but not re-emitted: a send error, a resource cap, or the
+    /// unreachable-advertisement suppression.
     Dropped(MessageType),
     /// The right direction, but the egress has no source address of the family yet (transient).
     Stalled(MessageType),

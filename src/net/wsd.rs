@@ -8,7 +8,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use crate::net::http::url_host_ip;
 
-use super::is_link_local;
+use super::{is_link_local, is_never_a_peer};
 
 /// WSD runs SOAP-over-UDP on port 3702, re-emitted at TTL 1. The re-emit is a single hop onto the
 /// egress link, matching the link scope of the groups it serves.
@@ -49,9 +49,9 @@ fn action_segment(payload: &[u8]) -> Option<&[u8]> {
 }
 
 /// Whether the message's `XAddrs` (the device's transport addresses) hold at least one IP-literal
-/// URI and every one is link-local. A hostname or unparseable URI, a routable literal, or no
-/// `XAddrs` at all reads as `false`.
-pub(crate) fn advertises_only_link_local(payload: &[u8]) -> bool {
+/// URI and every one is link-local or otherwise never a peer ([`is_never_a_peer`]). A hostname or
+/// unparseable URI, a usable literal, or no `XAddrs` at all reads as `false`.
+pub(crate) fn advertises_only_unreachable(payload: &[u8]) -> bool {
     // Every XAddrs element counts: a ProbeMatches carries one per ProbeMatch.
     let mut saw_ip = false;
     let mut rest = payload;
@@ -61,7 +61,7 @@ pub(crate) fn advertises_only_link_local(payload: &[u8]) -> bool {
                 continue;
             }
             match url_host_ip(uri) {
-                Some(ip) if is_link_local(ip) => saw_ip = true,
+                Some(ip) if is_link_local(ip) || is_never_a_peer(ip) => saw_ip = true,
                 // A routable literal, a hostname, or an unparseable URI: not provably dead.
                 _ => return false,
             }
@@ -420,25 +420,32 @@ urn:schemas-xmlsoap-org:ws:2005:04:discovery
     }
 
     #[test]
-    fn suppresses_only_all_link_local_xaddrs() {
-        assert!(advertises_only_link_local(&hello_with_xaddrs(
+    fn suppresses_only_unreachable_xaddrs() {
+        assert!(advertises_only_unreachable(&hello_with_xaddrs(
             "http://169.254.1.5:5357/dev"
         )));
-        assert!(advertises_only_link_local(&hello_with_xaddrs(
+        assert!(advertises_only_unreachable(&hello_with_xaddrs(
             "http://[fe80::1]:5357/a http://169.254.2.2:5357/a"
         )));
         // WSDAPI advertises zoned link-local XAddrs.
-        assert!(advertises_only_link_local(&hello_with_xaddrs(
+        assert!(advertises_only_unreachable(&hello_with_xaddrs(
             "http://[fe80::1%25eth0]:5357/a"
         )));
+        // The never-a-peer classes suppress like link-local.
+        assert!(advertises_only_unreachable(&hello_with_xaddrs(
+            "http://127.0.0.1:5357/dev"
+        )));
+        assert!(advertises_only_unreachable(&hello_with_xaddrs(
+            "http://0.0.0.0:5357/a http://[fe80::1]:5357/a"
+        )));
         // One routable address, a hostname, or an unparseable URI rescues the message.
-        assert!(!advertises_only_link_local(&hello_with_xaddrs(
+        assert!(!advertises_only_unreachable(&hello_with_xaddrs(
             "http://[fe80::1]:5357/a http://192.168.1.5:5357/a"
         )));
-        assert!(!advertises_only_link_local(&hello_with_xaddrs(
+        assert!(!advertises_only_unreachable(&hello_with_xaddrs(
             "http://169.254.1.5:5357/a http://printer.local:5357/a"
         )));
-        assert!(!advertises_only_link_local(&hello_with_xaddrs("")));
+        assert!(!advertises_only_unreachable(&hello_with_xaddrs("")));
     }
 
     #[test]
@@ -451,11 +458,11 @@ urn:schemas-xmlsoap-org:ws:2005:04:discovery
             )
             .into_bytes()
         };
-        assert!(advertises_only_link_local(&two(
+        assert!(advertises_only_unreachable(&two(
             "http://169.254.1.5:5357/a",
             "http://[fe80::2]:5357/b"
         )));
-        assert!(!advertises_only_link_local(&two(
+        assert!(!advertises_only_unreachable(&two(
             "http://169.254.1.5:5357/a",
             "http://10.0.0.2:5357/b"
         )));
@@ -464,13 +471,13 @@ urn:schemas-xmlsoap-org:ws:2005:04:discovery
     #[test]
     fn messages_without_xaddrs_are_not_suppressed() {
         // Resolution then happens via Resolve; there is no advertised endpoint to judge.
-        assert!(!advertises_only_link_local(HELLO_OASIS_2009.as_bytes()));
-        assert!(!advertises_only_link_local(b""));
+        assert!(!advertises_only_unreachable(HELLO_OASIS_2009.as_bytes()));
+        assert!(!advertises_only_unreachable(b""));
         // Real replies carrying routable XAddrs (http and https).
-        assert!(!advertises_only_link_local(
+        assert!(!advertises_only_unreachable(
             PROBEMATCHES_ONVIF_UNIVIEW.as_bytes()
         ));
-        assert!(!advertises_only_link_local(
+        assert!(!advertises_only_unreachable(
             RESOLVEMATCHES_MS_WSDAPI.as_bytes()
         ));
     }

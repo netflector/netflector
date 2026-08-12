@@ -2,7 +2,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use super::is_link_local;
+use super::{is_link_local, is_never_a_peer};
 
 /// RFC 6762.
 pub(crate) const MDNS_PORT: u16 = 5353;
@@ -52,16 +52,17 @@ pub(crate) fn classify(payload: &[u8]) -> Option<MdnsKind> {
 const TYPE_A: u16 = 1;
 const TYPE_AAAA: u16 = 28;
 
-/// Whether the message carries at least one A/AAAA record and every one is link-local. Callers
-/// apply it to responses only: a query's records are known-answer cache state, not an
-/// advertisement. No address records, a routable address, or malformation all read as `false`.
-pub(crate) fn advertises_only_link_local(payload: &[u8]) -> bool {
-    only_link_local_records(payload).unwrap_or(false)
+/// Whether the message carries at least one A/AAAA record and every one is link-local or otherwise
+/// never a peer ([`is_never_a_peer`]). Callers apply it to responses only: a query's records are
+/// known-answer cache state, not an advertisement. No address records, a usable address, or
+/// malformation all read as `false`.
+pub(crate) fn advertises_only_unreachable(payload: &[u8]) -> bool {
+    only_unreachable_records(payload).unwrap_or(false)
 }
 
-/// The record walk behind [`advertises_only_link_local`]: `None` on truncation or an undefined
+/// The record walk behind [`advertises_only_unreachable`]: `None` on truncation or an undefined
 /// label type.
-fn only_link_local_records(payload: &[u8]) -> Option<bool> {
+fn only_unreachable_records(payload: &[u8]) -> Option<bool> {
     if payload.len() < DNS_HEADER_LEN {
         return None;
     }
@@ -95,7 +96,7 @@ fn only_link_local_records(payload: &[u8]) -> Option<bool> {
             // Any other type, or an A/AAAA whose rdata is not address-sized, holds no address.
             _ => continue,
         };
-        if !is_link_local(ip) {
+        if !(is_link_local(ip) || is_never_a_peer(ip)) {
             return Some(false);
         }
         saw_address = true;
@@ -251,38 +252,51 @@ mod tests {
         TYPE_AAAA,
         &[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
     );
+    const A_LOOPBACK: (u16, &[u8]) = (TYPE_A, &[127, 0, 0, 1]);
+    const A_UNSPECIFIED: (u16, &[u8]) = (TYPE_A, &[0, 0, 0, 0]);
     const TXT: (u16, &[u8]) = (16, b"vers=1");
 
     #[test]
-    fn suppresses_only_when_every_address_is_link_local() {
-        assert!(advertises_only_link_local(&response_with_records(&[
+    fn suppresses_only_when_every_address_is_unreachable() {
+        assert!(advertises_only_unreachable(&response_with_records(&[
             A_LINK_LOCAL
         ])));
-        assert!(advertises_only_link_local(&response_with_records(&[
+        assert!(advertises_only_unreachable(&response_with_records(&[
             AAAA_LINK_LOCAL
         ])));
-        assert!(advertises_only_link_local(&response_with_records(&[
+        assert!(advertises_only_unreachable(&response_with_records(&[
             A_LINK_LOCAL,
             AAAA_LINK_LOCAL
         ])));
         // One routable address of either family rescues the message: the client can use it.
-        assert!(!advertises_only_link_local(&response_with_records(&[
+        assert!(!advertises_only_unreachable(&response_with_records(&[
             A_LINK_LOCAL,
             A_ROUTABLE
         ])));
-        assert!(!advertises_only_link_local(&response_with_records(&[
+        assert!(!advertises_only_unreachable(&response_with_records(&[
             AAAA_LINK_LOCAL,
             AAAA_ROUTABLE
         ])));
+        // The never-a-peer classes suppress like link-local, and a routable address rescues them too.
+        assert!(advertises_only_unreachable(&response_with_records(&[
+            A_LOOPBACK
+        ])));
+        assert!(advertises_only_unreachable(&response_with_records(&[
+            A_UNSPECIFIED,
+            AAAA_LINK_LOCAL
+        ])));
+        assert!(!advertises_only_unreachable(&response_with_records(&[
+            A_LOOPBACK, A_ROUTABLE
+        ])));
         // Other record types don't veto: a bundled advertisement (PTR/SRV/TXT beside the
         // addresses) whose only addresses are link-local is exactly the dead-service case.
-        assert!(advertises_only_link_local(&response_with_records(&[
+        assert!(advertises_only_unreachable(&response_with_records(&[
             TXT,
             A_LINK_LOCAL
         ])));
         // No address records at all is not an advertisement of dead endpoints.
-        assert!(!advertises_only_link_local(&response_with_records(&[TXT])));
-        assert!(!advertises_only_link_local(&response_with_records(&[])));
+        assert!(!advertises_only_unreachable(&response_with_records(&[TXT])));
+        assert!(!advertises_only_unreachable(&response_with_records(&[])));
     }
 
     #[test]
@@ -294,7 +308,7 @@ mod tests {
         m.extend_from_slice(&[0xc0, 0x0c]);
         m.extend_from_slice(&TYPE_A.to_be_bytes());
         m.extend_from_slice(&[0x00, 0x01, 0, 0, 0, 120, 0x00, 0x04, 169, 254, 3, 4]);
-        assert!(advertises_only_link_local(&m));
+        assert!(advertises_only_unreachable(&m));
     }
 
     #[test]
@@ -302,20 +316,20 @@ mod tests {
         // Truncated rdata: the record claims 4 bytes and the payload ends.
         let mut m = response_with_records(&[A_LINK_LOCAL]);
         m.truncate(m.len() - 2);
-        assert!(!advertises_only_link_local(&m));
+        assert!(!advertises_only_unreachable(&m));
         // An undefined label type (0x40) aborts the walk.
         let mut m = response_with_records(&[A_LINK_LOCAL]);
         m[DNS_HEADER_LEN] = 0x40;
-        assert!(!advertises_only_link_local(&m));
-        assert!(!advertises_only_link_local(b""));
+        assert!(!advertises_only_unreachable(&m));
+        assert!(!advertises_only_unreachable(b""));
     }
 
     #[test]
     fn real_responses_with_a_routable_address_are_not_suppressed() {
         // Bonjour: fe80:: AAAA + routable A + global AAAA (mixed); RAOP: one routable A.
-        assert!(!advertises_only_link_local(&MDNS_RESPONSE_BONJOUR));
-        assert!(!advertises_only_link_local(&MDNS_RESPONSE_RAOP));
+        assert!(!advertises_only_unreachable(&MDNS_RESPONSE_BONJOUR));
+        assert!(!advertises_only_unreachable(&MDNS_RESPONSE_RAOP));
         // The reverse-PTR query carries no address records.
-        assert!(!advertises_only_link_local(&MDNS_QUERY_PTR_LINKLOCAL));
+        assert!(!advertises_only_unreachable(&MDNS_QUERY_PTR_LINKLOCAL));
     }
 }

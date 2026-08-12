@@ -11,7 +11,7 @@ use std::time::Duration;
 use crate::config::{AddressFamily, Reflector};
 use crate::dispatch::{Filter, IpSet, MessageType, PacketDispatcher};
 use crate::net::wsd::{
-    WSD_GROUP_V4, WSD_GROUP_V6, WSD_PORT, WSD_TTL, WsdKind, advertises_only_link_local, classify,
+    WSD_GROUP_V4, WSD_GROUP_V6, WSD_PORT, WSD_TTL, WsdKind, advertises_only_unreachable, classify,
 };
 
 use super::{
@@ -121,9 +121,9 @@ pub(crate) fn build(
                 WSD_TTL,
                 announcement_verdict,
             )
-            // A Hello whose XAddrs are all link-local advertises endpoints the source side can
-            // never reach.
-            .with_suppress(advertises_only_link_local),
+            // A Hello whose XAddrs are all link-local or otherwise never a peer advertises
+            // endpoints the source side can never use.
+            .with_suppress(advertises_only_unreachable),
         ),
     );
     // source -> target: Probe/Resolve searches (unfiltered, any source client may search); each
@@ -148,7 +148,7 @@ pub(crate) fn build(
             window,
             Box::new(|| Box::new(NoRewrite) as Box<dyn ReplyRewrite>),
             // Each session's ProbeMatches / ResolveMatches reply is gated the same way.
-            advertises_only_link_local,
+            advertises_only_unreachable,
         )),
     );
     log::info!(
