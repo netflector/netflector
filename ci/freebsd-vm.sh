@@ -154,7 +154,9 @@ launch() {
     }
     xz -dT0 "$VM_DIR/$IMAGE.xz"
     # Headroom over the image's ~1 GB free; the guest growfs's into it at boot.
-    qemu-img resize "$VM_DIR/$IMAGE" +4G
+    # The poudriere lane overrides: a jail's base+lib32 plus binary build deps
+    # need ~10 GB of their own.
+    qemu-img resize "$VM_DIR/$IMAGE" "+${FREEBSD_VM_DISK_EXTRA_GB:-4}G"
     ssh-keygen -q -t ed25519 -N '' -f "$VM_DIR/id_ed25519"
     seed_iso
     # Slirp networking: sshd reachable only through the localhost hostfwd.
