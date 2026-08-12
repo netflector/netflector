@@ -4,15 +4,18 @@
 //! [`MemoryReporter`] is a timer-only reactor handler (watches no fds) that logs resident set size
 //! every configured interval and on a control-event dump. [`run`](crate::run) also emits a baseline at
 //! startup and one at shutdown when the periodic report is on. Peak RSS comes from `getrusage`
-//! (cross-platform); on Linux current RSS is read from `/proc/self/status`. Heap-arena stats (glibc
-//! `mallinfo2`) are omitted: the static musl build has no equivalent.
+//! (cross-platform); current RSS is read from `/proc/self/status` on Linux, the `kern.proc.pid`
+//! sysctl on FreeBSD, and `proc_pidinfo` on macOS. Heap-arena stats (glibc `mallinfo2`) are
+//! omitted: the static musl build has no equivalent.
 
 use std::time::{Duration, Instant};
 
 use crate::reactor::{ControlEvent, Handler, Reactor, ReadyEvent};
 
 /// Peak resident set size in KiB via `getrusage`. No `/proc` needed, so it works on every target.
-/// `ru_maxrss` is in KiB on Linux and FreeBSD, in bytes on macOS.
+/// `ru_maxrss` is in KiB on Linux and FreeBSD, in bytes on macOS. FreeBSD maintains it by
+/// statclock SAMPLING while a thread is on CPU, so a near-idle process the sampler never catches
+/// legitimately reads 0 forever; [`log_report`] folds in the process's own observations there.
 fn peak_rss_kib() -> u64 {
     // SAFETY: a zeroed `rusage` is a valid, fully-initialized buffer for `getrusage` to overwrite.
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
@@ -41,16 +44,96 @@ fn current_rss_kib() -> Option<u64> {
     })
 }
 
+/// The current resident set in KiB from the `kern.proc.pid` sysctl (`ki_rssize`, in pages), or
+/// `None` on a sysctl failure or an unexpected reply size: a `kinfo_proc` ABI mismatch reads as
+/// absent rather than as garbage from a misaligned field.
+#[cfg(target_os = "freebsd")]
+fn current_rss_kib() -> Option<u64> {
+    // SAFETY: a zeroed `kinfo_proc` is a plain-data buffer for the kernel to overwrite.
+    let mut kip: libc::kinfo_proc = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::kinfo_proc>();
+    let pid = i32::try_from(std::process::id()).ok()?;
+    let mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+    // SAFETY: `mib` holds 4 elements, and `kip`/`len` describe a writable buffer of exactly that size.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_ptr(),
+            4,
+            (&raw mut kip).cast(),
+            &raw mut len,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if rc != 0 {
+        log::debug!(
+            "memory: kern.proc.pid sysctl failed: {}",
+            std::io::Error::last_os_error()
+        );
+        return None;
+    }
+    if len != std::mem::size_of::<libc::kinfo_proc>() {
+        log::debug!(
+            "memory: kern.proc.pid returned {len} bytes, expected {}: kinfo_proc ABI mismatch",
+            std::mem::size_of::<libc::kinfo_proc>()
+        );
+        return None;
+    }
+    let pages = u64::try_from(kip.ki_rssize).ok()?;
+    // SAFETY: `sysconf(_SC_PAGESIZE)` is a pure query; libc serves it from the ELF aux vector,
+    // so it is not even a syscall.
+    let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
+    Some(pages * page / 1024)
+}
+
+/// The current resident set in KiB via `proc_pidinfo(PROC_PIDTASKINFO)` (`pti_resident_size`, in
+/// bytes), or `None` when the call fails or fills less than the full struct.
+#[cfg(target_os = "macos")]
+fn current_rss_kib() -> Option<u64> {
+    // SAFETY: a zeroed `proc_taskinfo` is a plain-data buffer for the kernel to overwrite.
+    let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+    let size = i32::try_from(std::mem::size_of::<libc::proc_taskinfo>()).ok()?;
+    let pid = i32::try_from(std::process::id()).ok()?;
+    // SAFETY: `info` is a writable buffer of exactly `size` bytes.
+    let rc =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTASKINFO, 0, (&raw mut info).cast(), size) };
+    if rc <= 0 {
+        log::debug!(
+            "memory: proc_pidinfo failed: {}",
+            std::io::Error::last_os_error()
+        );
+        return None;
+    }
+    if rc != size {
+        log::debug!("memory: proc_pidinfo filled {rc} of {size} bytes");
+        return None;
+    }
+    Some(info.pti_resident_size / 1024)
+}
+
+/// This process's own RSS high-water mark in KiB, fed by [`log_report`]'s `current_rss_kib`
+/// readings: the substitute peak for FreeBSD's sampled-and-possibly-never `ru_maxrss`.
+#[cfg(target_os = "freebsd")]
+static OBSERVED_PEAK_KIB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Record an RSS observation and return the high-water mark including it.
+#[cfg(target_os = "freebsd")]
+fn fold_observed(rss: u64) -> u64 {
+    let prev = OBSERVED_PEAK_KIB.fetch_max(rss, std::sync::atomic::Ordering::Relaxed);
+    prev.max(rss)
+}
+
 /// Log one memory report at `info`.
 pub(crate) fn log_report() {
     let peak = peak_rss_kib();
-    #[cfg(target_os = "linux")]
     match current_rss_kib() {
-        Some(rss) => log::info!("memory: rss={rss} KiB, peak={peak} KiB"),
-        None => log::info!("memory: peak={peak} KiB (VmRSS unavailable)"),
+        Some(rss) => {
+            #[cfg(target_os = "freebsd")]
+            let peak = peak.max(fold_observed(rss));
+            log::info!("memory: rss={rss} KiB, peak={peak} KiB");
+        }
+        None => log::info!("memory: peak={peak} KiB (rss unavailable)"),
     }
-    #[cfg(not(target_os = "linux"))]
-    log::info!("memory: peak={peak} KiB");
 }
 
 /// A reactor handler (watches no fds) that logs [`log_report`] every `interval` and on a control dump.
@@ -97,6 +180,9 @@ impl Handler for MemoryReporter {
 mod tests {
     use super::*;
 
+    // Not on FreeBSD: its sampled maxrss can legitimately be 0 (the tests below cover the
+    // substitute path there).
+    #[cfg(not(target_os = "freebsd"))]
     #[test]
     #[cfg_attr(miri, ignore = "reads the process resource usage from the kernel")]
     fn peak_rss_is_nonzero_for_the_running_process() {
@@ -109,6 +195,29 @@ mod tests {
     #[cfg_attr(miri, ignore = "reads /proc/self/status")]
     fn current_rss_reads_proc_self_status() {
         assert!(current_rss_kib().is_some_and(|rss| rss > 0));
+    }
+
+    #[cfg(target_os = "freebsd")]
+    #[test]
+    #[cfg_attr(miri, ignore = "reads kern.proc from the kernel")]
+    fn current_rss_reads_kern_proc() {
+        assert!(current_rss_kib().is_some_and(|rss| rss > 0));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[cfg_attr(miri, ignore = "reads the task info from the kernel")]
+    fn current_rss_reads_proc_pidinfo() {
+        assert!(current_rss_kib().is_some_and(|rss| rss > 0));
+    }
+
+    #[cfg(target_os = "freebsd")]
+    #[test]
+    fn observed_peak_never_decreases() {
+        // The static is shared across tests, so assert only monotonicity, not absolute values.
+        let first = fold_observed(1);
+        assert!(first >= 1);
+        assert!(fold_observed(0) >= first);
     }
 
     #[test]
