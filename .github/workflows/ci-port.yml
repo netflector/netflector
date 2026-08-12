@@ -158,8 +158,10 @@ jobs:
         run: ci/freebsd-vm.sh launch
       - name: Wait for the VM
         run: ci/freebsd-vm.sh wait
-      - name: Ports tree, pinned to the commit our packages were built from
-        run: ci/freebsd-ports-tree.sh
+      # Current main, not the package pin: -b latest serves packages a pinned
+      # tree's older pkg can't consume.
+      - name: Ports tree, current main
+        run: PORTS_TREE_CURRENT=1 ci/freebsd-ports-tree.sh
       - name: Install the port into the tree
         run: ci/port-into-tree.sh
       - name: Set up poudriere
@@ -170,7 +172,22 @@ jobs:
           # The jail mirrors the guest's own release; base sets come off the mirror.
           ci/freebsd-vm.sh run 'poudriere jail -c -j ci -v "$(freebsd-version -r | sed "s/-p[0-9]*$//")" -a amd64'
           ci/freebsd-vm.sh run 'poudriere ports -c -p main -m null -M /usr/ports'
+      # A rust bump in main the cluster has not built yet would make testport
+      # compile rust from source for hours. Skip loudly instead; the window
+      # closes on its own within days.
+      - name: Check the latest set has the tree's rust
+        id: rust
+        run: |
+          tree=$(ci/freebsd-vm.sh run 'make -C /usr/ports/lang/rust -V PKGVERSION' | tr -d ' \r')
+          ci/freebsd-vm.sh run 'mkdir -p /usr/local/etc/pkg/repos && printf "ci-latest: { url: \"pkg+https://pkg.FreeBSD.org/\${ABI}/latest\", enabled: yes }\n" > /usr/local/etc/pkg/repos/ci-latest.conf'
+          latest=$(ci/freebsd-vm.sh run 'pkg rquery -r ci-latest %v rust' | tail -1 | tr -d ' \r')
+          echo "tree wants rust $tree; latest has $latest"
+          if [ "$tree" != "$latest" ]; then
+            echo "::warning::latest has rust $latest but the tree wants $tree; skipping testport until the cluster catches up"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
       - name: poudriere testport
+        if: steps.rust.outputs.skip != 'true'
         run: ci/freebsd-vm.sh run 'poudriere testport -j ci -p main -b latest net/netflector'
       - name: VM console log
         if: always()
