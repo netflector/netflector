@@ -2,7 +2,7 @@
 #
 # Nothing below is enabled, so the daemon refuses to start until you uncomment an entry and name
 # your own interfaces. Check your work with
-# `netflector --check-config /usr/local/etc/netflector.toml`.
+# `netflector --check-config %%PREFIX%%/etc/netflector.toml`.
 
 # off, error, warn, info, debug, or trace. trace is compiled out and behaves as debug.
 #log_level = "info"

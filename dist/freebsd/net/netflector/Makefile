@@ -1,6 +1,7 @@
 PORTNAME=	netflector
 DISTVERSIONPREFIX=	v
 DISTVERSION=	0.15.1
+PORTREVISION=	1
 CATEGORIES=	net
 
 MAINTAINER=	sergii@bogomolov.io
@@ -11,13 +12,10 @@ LICENSE=	BSD2CLAUSE
 LICENSE_FILE=	${WRKSRC}/LICENSE
 
 ONLY_FOR_ARCHS=	aarch64 amd64
-ONLY_FOR_ARCHS_REASON=	upstream builds and tests FreeBSD on aarch64 and amd64 only
+ONLY_FOR_ARCHS_REASON=	hand-rolled BPF and PF_ROUTE FFI, only ever built and tested on aarch64 and amd64
 
 USES=		cargo
 USE_GITHUB=	yes
-GH_ACCOUNT=	netflector
-GH_PROJECT=	netflector
-GH_TAGNAME=	${DISTVERSIONPREFIX}${DISTVERSION}
 
 USE_RC_SUBR=	netflector
 CARGO_CRATES=	equivalent-1.0.2 \
@@ -41,13 +39,15 @@ CARGO_CRATES=	equivalent-1.0.2 \
 		unicode-ident-1.0.24 \
 		winnow-1.0.3
 
+SUB_FILES=	netflector.toml.sample pkg-message
+
 PLIST_FILES=	bin/netflector \
 		"@sample etc/netflector.toml.sample" \
 		share/man/man5/netflector.toml.5.gz \
 		share/man/man8/netflector.8.gz
 
 post-install:
-	${INSTALL_DATA} ${FILESDIR}/netflector.toml.sample ${STAGEDIR}${PREFIX}/etc
+	${INSTALL_DATA} ${WRKDIR}/netflector.toml.sample ${STAGEDIR}${PREFIX}/etc
 	${INSTALL_MAN} ${WRKSRC}/man/netflector.8 ${STAGEDIR}${PREFIX}/share/man/man8
 	${INSTALL_MAN} ${WRKSRC}/man/netflector.toml.5 ${STAGEDIR}${PREFIX}/share/man/man5
 
