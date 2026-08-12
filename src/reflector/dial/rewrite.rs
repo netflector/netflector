@@ -5,11 +5,12 @@
 //! registry) if none is live for the device, and refreshing its grace either way.
 
 use std::io;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
 use crate::dispatch::{CaptureKey, DialContext, DialProxyKey};
+use crate::net::is_never_a_peer;
 use crate::net::ssdp::dial::{
     dial_location_value, is_dial_service_message, parse_cache_control_max_age,
     parse_dial_location_authority,
@@ -45,8 +46,10 @@ pub(crate) struct ProxyPlacement<'a> {
 /// Rewrite a DIAL discovery message's `LOCATION` to a source-side description proxy, minting and
 /// registering the proxy if one isn't already live for this device and refreshing its grace either way.
 /// On a rewrite the datagram is written to `out` and `true` is returned. `false` means forward `payload`
-/// unchanged: it isn't a DIAL message, its `LOCATION` isn't a rewritable IPv4 `http` URL, the proxy cap
-/// was reached / a mint failed (device stays visible but unproxied), or the rewrite didn't fit `out`.
+/// unchanged: it isn't a DIAL message, its `LOCATION` isn't a rewritable IPv4 `http` URL or names an
+/// address that can never be a device's ([`is_never_a_peer`]; the reflector's suppression then drops
+/// the message), the proxy cap was reached / a mint failed (device stays visible but unproxied), or
+/// the rewrite didn't fit `out`.
 /// `out` is the caller's reused sink; a fixed-capacity one makes an over-long rewrite fail rather
 /// than truncate.
 pub(crate) fn rewrite_location(
@@ -68,6 +71,15 @@ pub(crate) fn rewrite_location(
         );
         return false;
     };
+    // Never-a-peer only, deliberately not link-local: a link-local device stays proxyable, since
+    // the proxy connects on-link from the target side.
+    if is_never_a_peer(IpAddr::V4(*location.endpoint.ip())) {
+        log::debug!(
+            "dial: LOCATION {} can never name a device; not minting a proxy",
+            location.endpoint
+        );
+        return false;
+    }
     // The grace is refreshed on every advertisement / search response, so a re-advertised device's
     // cached LOCATION keeps resolving for another max-age. Clamp it (MAX_DESC_GRACE): the value is
     // attacker-controlled and sets a proxy-slot eviction deadline.
@@ -353,6 +365,39 @@ mod tests {
             LOCATION: https://tv.local/dd.xml\r\n\r\n";
         assert!(rewrite_advert(&mut ctx, &mut reactor, bad).is_none());
         assert_eq!(ctx.proxy_count(), 0, "nothing is minted for either");
+    }
+
+    #[test]
+    #[cfg_attr(all(miri, not(target_os = "linux")), ignore = "needs a real kqueue")]
+    fn rewrite_location_refuses_a_never_a_peer_device() {
+        let mut reactor = Reactor::new().expect("reactor");
+        let mut ctx = DialContext::new();
+        for advert in [
+            &b"NOTIFY * HTTP/1.1\r\nNT: urn:dial-multiscreen-org:service:dial:1\r\n\
+                LOCATION: http://127.0.0.1:8008/dd.xml\r\n\r\n"[..],
+            &b"NOTIFY * HTTP/1.1\r\nNT: urn:dial-multiscreen-org:service:dial:1\r\n\
+                LOCATION: http://0.0.0.0:8008/dd.xml\r\n\r\n"[..],
+            &b"NOTIFY * HTTP/1.1\r\nNT: urn:dial-multiscreen-org:service:dial:1\r\n\
+                LOCATION: http://239.255.255.250:8008/dd.xml\r\n\r\n"[..],
+        ] {
+            assert!(rewrite_advert(&mut ctx, &mut reactor, advert).is_none());
+        }
+        assert_eq!(ctx.proxy_count(), 0, "no proxy is minted for a non-device");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "needs a real poll backend")]
+    fn rewrite_location_proxies_a_link_local_device() {
+        let mut reactor = Reactor::new().expect("reactor");
+        let mut ctx = DialContext::new();
+        let advert = b"NOTIFY * HTTP/1.1\r\nNT: urn:dial-multiscreen-org:service:dial:1\r\n\
+            LOCATION: http://169.254.9.9:8008/dd.xml\r\n\r\n";
+        assert!(rewrite_advert(&mut ctx, &mut reactor, advert).is_some());
+        assert_eq!(
+            ctx.proxy_count(),
+            1,
+            "a link-local device is proxyable on-link"
+        );
     }
 
     #[test]

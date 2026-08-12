@@ -66,7 +66,8 @@ struct ResponseReflector {
     message_type: MessageType,
     ttl: u8,
     reply: Box<dyn ReplyRewrite>,
-    /// The link-local suppression check for untouched replies (see [`SearchReflector::suppress`]).
+    /// The unreachable-advertisement suppression check for untouched replies (see
+    /// [`SearchReflector::suppress`]).
     suppress: fn(&[u8]) -> bool,
 }
 
@@ -95,7 +96,7 @@ impl PacketHandler for ResponseReflector {
         // A rewritten reply is exempt; the why lives at `SimpleReflector::on_packet`'s gate.
         if rewritten.is_none() && (self.suppress)(packet.payload) {
             log::debug!(
-                "{}: suppressing response from {} to searcher {}: advertises only link-local \
+                "{}: suppressing response from {} to searcher {}: advertises only unreachable \
                  addresses",
                 self.name,
                 packet.source,
@@ -164,7 +165,7 @@ pub(crate) struct SearchReflector {
     window: fn(&[u8]) -> Duration,
     /// Mints a fresh reply transform per session (its own scratch, for a rewriting protocol).
     make_reply: Box<dyn Fn() -> Box<dyn ReplyRewrite>>,
-    /// The protocol's `advertises_only_link_local` check, handed to each session's
+    /// The protocol's `advertises_only_unreachable` check, handed to each session's
     /// [`ResponseReflector`]: an untouched reply it flags is dropped rather than reflected.
     suppress: fn(&[u8]) -> bool,
     sessions: LinearMap<SessionKey, Session>,

@@ -30,7 +30,8 @@ pub(crate) struct SimpleReflector {
     classify: fn(&[u8]) -> Verdict,
     /// Transforms the payload before re-emit; [`NoRewrite`] (the default) forwards verbatim.
     rewrite: Box<dyn ReplyRewrite>,
-    /// The link-local suppression check for payloads `rewrite` left untouched (default: none).
+    /// The unreachable-advertisement suppression check for payloads `rewrite` left untouched
+    /// (default: none).
     suppress: fn(&[u8]) -> bool,
 }
 
@@ -63,7 +64,7 @@ impl SimpleReflector {
     }
 
     /// Drop (rather than re-emit) any payload `suppress` flags: the protocol's
-    /// `advertises_only_link_local` check.
+    /// `advertises_only_unreachable` check.
     pub(crate) fn with_suppress(mut self, suppress: fn(&[u8]) -> bool) -> Self {
         self.suppress = suppress;
         self
@@ -114,7 +115,7 @@ impl PacketHandler for SimpleReflector {
         // Only an untouched payload still advertises the far link's addresses.
         if rewritten.is_none() && (self.suppress)(packet.payload) {
             log::debug!(
-                "{}: suppressing {} from {}: advertises only link-local addresses",
+                "{}: suppressing {} from {}: advertises only unreachable addresses",
                 self.name,
                 self.kind,
                 packet.source

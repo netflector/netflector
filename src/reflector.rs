@@ -46,7 +46,8 @@ pub(crate) enum Verdict {
 /// Transforms a datagram's payload before it is re-emitted: the SSDP DIAL `LOCATION` rewrite, applied
 /// on both the advertisement direction and each search session's reply. Returns the rewrite, held in
 /// the implementor's own reused scratch, or `None` to forward `payload` verbatim; the caller also
-/// reads `None` as "still advertising the device's own addresses" for the link-local suppression.
+/// reads `None` as "still advertising the device's own addresses" for the unreachable-advertisement
+/// suppression.
 /// The `Fn` traits can't express that lending signature, which is why this is a trait rather than a
 /// closure.
 pub(crate) trait ReplyRewrite {
