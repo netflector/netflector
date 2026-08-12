@@ -17,6 +17,8 @@ on:
       # Consumed by the port-build install and e2e steps.
       - 'ci/port-install.sh'
       - 'ci/port-e2e.sh'
+      # Shared by port-build and port-testport.
+      - 'ci/port-into-tree.sh'
   workflow_call:
     inputs:
       # For publish-daemon: build-daemon-pkgs builds the port on every ABI
@@ -82,12 +84,7 @@ jobs:
       - name: Ports tree, pinned to the commit our packages were built from
         run: ci/freebsd-ports-tree.sh
       - name: Install the port into the tree
-        run: |
-          # scp -r nests into an existing directory; see ci/freebsd-port-package.sh.
-          ci/freebsd-vm.sh run 'rm -rf /usr/ports/net/netflector'
-          ci/freebsd-vm.sh push dist/freebsd/net/netflector /usr/ports/net/netflector
-          # net/Makefile's SUBDIR list is a deliverable of the submission, and portlint checks it.
-          ci/freebsd-vm.sh run 'cd /usr/ports/net && awk "/^ *SUBDIR \+= / && !ins && \$3 > \"netflector\" { print \"    SUBDIR += netflector\"; ins = 1 } { print } END { if (!ins) print \"    SUBDIR += netflector\" }" Makefile > Makefile.new && mv Makefile.new Makefile && grep -n "SUBDIR += netflector" Makefile'
+        run: ci/port-into-tree.sh
       - name: portlint
         run: |
           ci/freebsd-vm.sh run 'pkg install -y ports-mgmt/portlint'
@@ -126,13 +123,66 @@ jobs:
         if: always()
         run: ci/freebsd-vm.sh crash
 
+  # The same build in a pristine poudriere jail: an undeclared dependency fails
+  # loudly instead of borrowing from the VM's toolchain, and the deinstall is
+  # diffed against the jail's clean state. Hermeticity is a property of the
+  # port's metadata, not the CPU, so the KVM lanes carry it alone.
+  port-testport:
+    name: poudriere testport (freebsd${{ matrix.os }})
+    if: ${{ !inputs.skip_build }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      FREEBSD_VM_ARCH: amd64
+      FREEBSD_VM_VERSION: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [14, 15]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install QEMU
+        run: |
+          sudo apt-get update || true
+          sudo apt-get install -y --no-install-recommends qemu-utils genisoimage qemu-system-x86
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Launch the FreeBSD VM
+        run: ci/freebsd-vm.sh launch
+      - name: Wait for the VM
+        run: ci/freebsd-vm.sh wait
+      - name: Ports tree, pinned to the commit our packages were built from
+        run: ci/freebsd-ports-tree.sh
+      - name: Install the port into the tree
+        run: ci/port-into-tree.sh
+      - name: Set up poudriere
+        run: |
+          ci/freebsd-vm.sh run 'pkg install -y ports-mgmt/poudriere'
+          ci/freebsd-vm.sh run 'printf "NO_ZFS=yes\nBASEFS=/usr/local/poudriere\nDISTFILES_CACHE=/usr/ports/distfiles\nFREEBSD_HOST=https://download.freebsd.org\nRESOLV_CONF=/etc/resolv.conf\n" > /usr/local/etc/poudriere.conf'
+          ci/freebsd-vm.sh run 'mkdir -p /usr/ports/distfiles'
+          # The jail mirrors the guest's own release; base sets come off the mirror.
+          ci/freebsd-vm.sh run 'poudriere jail -c -j ci -v "$(freebsd-version -r | sed "s/-p[0-9]*$//")" -a amd64'
+          ci/freebsd-vm.sh run 'poudriere ports -c -p main -m null -M /usr/ports'
+      - name: poudriere testport
+        run: ci/freebsd-vm.sh run 'poudriere testport -j ci -p main -b latest net/netflector'
+      - name: VM console log
+        if: always()
+        run: ci/freebsd-vm.sh console
+      - name: Crash summary
+        if: always()
+        run: ci/freebsd-vm.sh crash
+
   # The aggregate the ruleset requires: green only when every job above is.
   # Without !cancelled() a failed job would skip this one, and a skipped
   # required check counts as passing.
   success:
     name: Success
     if: ${{ !cancelled() }}
-    needs: [port-check, port-build]
+    needs: [port-check, port-build, port-testport]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

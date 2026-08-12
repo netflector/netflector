@@ -16,6 +16,7 @@ on:
       - '.github/workflows/ci-port.yml'
       - 'ci/port-install.sh'
       - 'ci/port-e2e.sh'
+      - 'ci/port-into-tree.sh'
       - '.github/workflows/ci-opnsense.yml'
       - '.github/workflows/ci-docs.yml'
       - '.github/workflows/ci-supply-chain.yml'
