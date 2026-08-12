@@ -135,6 +135,9 @@ jobs:
     env:
       FREEBSD_VM_ARCH: amd64
       FREEBSD_VM_VERSION: ${{ matrix.os }}
+      # The jail's base+lib32 sets plus the binary build deps outgrow the
+      # default headroom.
+      FREEBSD_VM_DISK_EXTRA_GB: 20
     strategy:
       fail-fast: false
       matrix:
