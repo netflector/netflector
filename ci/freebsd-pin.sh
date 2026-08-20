@@ -4,9 +4,7 @@
 # sysroots), fetched from the official CHECKSUM.SHA512 / MANIFEST files. With no
 # argument it refreshes every pin file at its current release -- the way to
 # complete a Renovate bump PR, which can only edit RELEASE and leaves the hashes
-# stale (the checksum gates keep CI red until this runs). The freebsd-arm64
-# nightly bridge lives separately in ci/freebsd-nightly.env; this script does
-# not touch it.
+# stale (the checksum gates keep CI red until this runs).
 #
 #   ci/freebsd-pin.sh                 # refresh the hashes of every pinned release
 #   ci/freebsd-pin.sh 14.5            # move the 14 pin to 14.5 (the file follows the major)
