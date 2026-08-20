@@ -75,12 +75,12 @@ fn udp_checksum(pseudo: &[u8], udp: &[u8]) -> u16 {
 /// `seed`; a trailing odd byte is treated as the high byte of a final word.
 /// `seed` lets callers chain segments (pseudo-header, then datagram).
 fn sum_words(data: &[u8], seed: u32) -> u32 {
-    let mut words = data.chunks_exact(2);
+    let (words, tail) = data.as_chunks::<2>();
     let mut sum = seed;
-    for word in &mut words {
-        sum += u32::from(u16::from_be_bytes([word[0], word[1]]));
+    for word in words {
+        sum += u32::from(u16::from_be_bytes(*word));
     }
-    if let [tail] = words.remainder() {
+    if let [tail] = tail {
         sum += u32::from(*tail) << 8;
     }
     sum
