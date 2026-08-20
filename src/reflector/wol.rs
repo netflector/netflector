@@ -105,15 +105,14 @@ fn magic_packet_mac(payload: &[u8]) -> Option<MacAddr> {
     if magic[..PREFIX_LEN] != [0xff; PREFIX_LEN] {
         return None;
     }
-    let mac = &magic[PREFIX_LEN..PREFIX_LEN + MAC_LEN];
-    // The other 15 repetitions must all equal the first.
-    if !magic[PREFIX_LEN + MAC_LEN..]
-        .chunks_exact(MAC_LEN)
-        .all(|rep| rep == mac)
-    {
+    // The other 15 repetitions must all equal the first; the prefix length leaves no remainder.
+    let ([mac, repeats @ ..], []) = magic[PREFIX_LEN..].as_chunks::<MAC_LEN>() else {
+        return None;
+    };
+    if repeats.iter().any(|rep| rep != mac) {
         return None;
     }
-    Some(MacAddr::from(<[u8; MAC_LEN]>::try_from(mac).ok()?))
+    Some(MacAddr::from(*mac))
 }
 
 /// Whether the optional `targets` allow-set admits a wake for `mac`.
