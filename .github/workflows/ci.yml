@@ -41,8 +41,7 @@ jobs:
   # ci/freebsd-sysroot.sh), boot the official FreeBSD image under QEMU (ci/freebsd-vm.sh), and run every
   # test binary in it as root through cargo's target runner (ci/freebsd-ssh-runner.sh) -- privileged
   # tests run instead of skipping. amd64 rides KVM; arm64 has no KVM on any GitHub runner, so its guest
-  # runs under TCG -- compilation stays native-speed on the runner, only test execution is emulated --
-  # and builds with the pinned nightly from ci/freebsd-nightly.env until stable 1.98 ships the target's std.
+  # runs under TCG -- compilation stays native-speed on the runner, only test execution is emulated.
   # One VM per lane, the same debug/release split as the native test lanes; the release lanes test the
   # shipped +crt-static configuration (kept off host proc-macros by the target-scoped rustflags).
   # Everything fetched is FreeBSD-project-official and hash-pinned.
@@ -104,23 +103,12 @@ jobs:
       # Launch first so the VM boots while the sysroot downloads and the build runs.
       - name: Launch the FreeBSD VM
         run: ci/freebsd-vm.sh launch
-      # aarch64-unknown-freebsd has no stable dist until 1.98: those lanes install the pinned
-      # dated nightly from ci/freebsd-nightly.env instead of the rust-toolchain.toml stable, and every
-      # later rustc/cargo call picks it up through the FREEBSD_TOOLCHAIN selector set here.
       - name: Add the Rust target
-        run: |
-          . ci/freebsd-nightly.env
-          if [ '${{ matrix.arch.name }}' = arm64 ]; then
-            rustup toolchain install "nightly-${RUST_NIGHTLY}" --profile minimal
-            rustup target add --toolchain "nightly-${RUST_NIGHTLY}" aarch64-unknown-freebsd
-            echo "FREEBSD_TOOLCHAIN=+nightly-${RUST_NIGHTLY}" >> "$GITHUB_ENV"
-          else
-            rustup target add x86_64-unknown-freebsd
-          fi
+        run: rustup target add ${{ matrix.arch.triple }}
       - name: FreeBSD link sysroot
         run: ci/freebsd-sysroot.sh
       - name: Show toolchain
-        run: rustc ${FREEBSD_TOOLCHAIN:-} -V && cargo ${FREEBSD_TOOLCHAIN:-} -V
+        run: rustc -V && cargo -V
       - name: Wait for the VM
         run: ci/freebsd-vm.sh wait
       - name: cargo test
@@ -130,7 +118,7 @@ jobs:
           export "${prefix}_LINKER=$HOME/freebsd-sysroot/bin/freebsd-clang"
           export "${prefix}_RUNNER=$PWD/ci/freebsd-ssh-runner.sh"
           export "${prefix}_RUSTFLAGS=${{ matrix.profile.rustflags }}"
-          cargo ${FREEBSD_TOOLCHAIN:-} test --locked --target "$triple" ${{ matrix.profile.flags }}
+          cargo test --locked --target "$triple" ${{ matrix.profile.flags }}
       - name: VM console log
         if: always()
         run: ci/freebsd-vm.sh console
@@ -200,30 +188,19 @@ jobs:
       # Launch first so the VM boots while the sysroot downloads and the build runs.
       - name: Launch the FreeBSD VM
         run: ci/freebsd-vm.sh launch
-      # aarch64-unknown-freebsd has no stable dist until 1.98: that lane installs the pinned
-      # dated nightly from ci/freebsd-nightly.env instead of the rust-toolchain.toml stable, and every
-      # later cargo call picks it up through the FREEBSD_TOOLCHAIN selector set here.
       - name: Add the Rust target
-        run: |
-          . ci/freebsd-nightly.env
-          if [ '${{ matrix.arch.name }}' = arm64 ]; then
-            rustup toolchain install "nightly-${RUST_NIGHTLY}" --profile minimal
-            rustup target add --toolchain "nightly-${RUST_NIGHTLY}" aarch64-unknown-freebsd
-            echo "FREEBSD_TOOLCHAIN=+nightly-${RUST_NIGHTLY}" >> "$GITHUB_ENV"
-          else
-            rustup target add x86_64-unknown-freebsd
-          fi
+        run: rustup target add ${{ matrix.arch.triple }}
       - name: FreeBSD link sysroot
         run: ci/freebsd-sysroot.sh
       - name: Show toolchain
-        run: rustc ${FREEBSD_TOOLCHAIN:-} -V && cargo ${FREEBSD_TOOLCHAIN:-} -V
+        run: rustc -V && cargo -V
       - name: Build the release binary
         run: |
           triple='${{ matrix.arch.triple }}'
           prefix="CARGO_TARGET_$(echo "$triple" | tr 'a-z-' 'A-Z_')"
           export "${prefix}_LINKER=$HOME/freebsd-sysroot/bin/freebsd-clang"
           export "${prefix}_RUSTFLAGS=${{ matrix.linkage.rustflags }}"
-          cargo ${FREEBSD_TOOLCHAIN:-} build --release --locked --target "$triple"
+          cargo build --release --locked --target "$triple"
       - name: Wait for the VM
         run: ci/freebsd-vm.sh wait
       - name: Install python3 in the VM
