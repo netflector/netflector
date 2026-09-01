@@ -12,7 +12,7 @@ LICENSE=	BSD2CLAUSE
 LICENSE_FILE=	${WRKSRC}/LICENSE
 
 ONLY_FOR_ARCHS=	aarch64 amd64
-ONLY_FOR_ARCHS_REASON=	hand-rolled BPF and PF_ROUTE FFI, only ever built and tested on aarch64 and amd64
+ONLY_FOR_ARCHS_REASON=	packs a 64-bit reactor key into kevent's pointer-sized udata (compile-time assert); untested beyond aarch64 and amd64
 
 USES=		cargo
 USE_GITHUB=	yes
