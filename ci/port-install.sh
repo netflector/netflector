@@ -15,4 +15,12 @@ HERE="$(dirname "$0")"
 "$HERE"/freebsd-vm.sh run 'sysrc netflector_enable=YES'
 "$HERE"/freebsd-vm.sh run 'printf "[reflectors.bad]\nsource_if = \"em0\"\ntarget_if = \"em0\"\nmdns = true\n" > /usr/local/etc/netflector.toml'
 "$HERE"/freebsd-vm.sh run 'service netflector start 2>&1 | grep -q "refusing to start" && echo "rc refused an invalid configuration"'
+# report must signal netflector itself, not the daemon(8) supervisor whose pid
+# the service advertises: SIGUSR1 kills the supervisor and orphans the daemon.
+# The status check would then fail, because the supervisor is what it pgreps.
+"$HERE"/freebsd-vm.sh run 'printf "[reflectors.ci]\nsource_if = \"vtnet0\"\ntarget_if = \"lo0\"\nwol = true\n" > /usr/local/etc/netflector.toml'
+"$HERE"/freebsd-vm.sh run 'service netflector start'
+"$HERE"/freebsd-vm.sh run 'service netflector report && sleep 1 && grep -q "dumping diagnostics" /var/log/messages && echo "report reached the log"'
+"$HERE"/freebsd-vm.sh run 'service netflector status'
+"$HERE"/freebsd-vm.sh run 'service netflector stop'
 "$HERE"/freebsd-vm.sh run 'rm /usr/local/etc/netflector.toml'
