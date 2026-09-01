@@ -214,6 +214,9 @@ sysrc netflector_enable=YES
 service netflector start
 ```
 
+`service netflector report` triggers the `SIGUSR1` diagnostics dump; the pid file the service writes
+holds a supervisor, not the daemon, so don't signal that pid directly.
+
 On a CARP failover pair, `netflector_carp_vhid` confines the service to the MASTER node so the
 backup does not reflect a second copy of everything; netflector(8) has the details.
 

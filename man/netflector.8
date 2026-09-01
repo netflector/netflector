@@ -93,6 +93,15 @@ Dump diagnostics to the log: the per-interface packet counters
 .Pq see Sx DIAGNOSTICS
 and a memory report (peak RSS).
 This works on demand even when the periodic reports are disabled.
+Under the
+.Xr rc 8
+service, send it as
+.Ql service netflector report :
+the pid file the service advertises holds the supervising
+.Xr daemon 8 ,
+which this signal would kill instead, leaving
+.Nm
+running unsupervised.
 .El
 .Sh ENVIRONMENT
 Every setting has an environment-variable form, named
