@@ -43,6 +43,8 @@ command="/usr/sbin/daemon"
 command_args="-f -S -T ${name} -P ${pidfile} -p ${child_pidfile} ${netflector_bin} '${netflector_config}'"
 
 start_precmd="${name}_precmd"
+extra_commands="report"
+report_cmd="${name}_report"
 
 netflector_precmd()
 {
@@ -77,6 +79,17 @@ carp_is_master()
     ifconfig ${2:+"$2"} 2>/dev/null |
         awk -v vhid="$1" '$1 == "carp:" && $4 == vhid { print $2 }' |
         grep -q '^MASTER$'
+}
+
+# SIGUSR1 must reach netflector itself: ${pidfile} holds daemon(8), which has no handler for it and
+# would die, orphaning the daemon it supervises.
+netflector_report()
+{
+    pid=$(check_pidfile "$child_pidfile" "$netflector_bin")
+    if [ -z "$pid" ]; then
+        err 1 "${name} is not running"
+    fi
+    kill -USR1 "$pid"
 }
 
 run_rc_command "$1"
