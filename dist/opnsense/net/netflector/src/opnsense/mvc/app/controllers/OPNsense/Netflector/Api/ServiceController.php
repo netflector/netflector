@@ -50,11 +50,11 @@ class ServiceController extends ApiMutableServiceControllerBase
     {
         $model = new Netflector();
 
-        if ((string)$model->general->enabled !== '1') {
+        if (!$model->general->enabled->isEqual('1')) {
             return false;
         }
         foreach ($model->reflectors->reflector->iterateItems() as $entry) {
-            if ((string)$entry->enabled === '1') {
+            if ($entry->enabled->isEqual('1')) {
                 return true;
             }
         }
