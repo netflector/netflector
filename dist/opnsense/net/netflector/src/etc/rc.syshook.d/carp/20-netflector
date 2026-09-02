@@ -35,7 +35,11 @@
  * node can hold one group and not another, so the vhid is matched too, not the state alone.
  */
 
-require_once('script/load_phalcon.php');
+/* config.inc is load-bearing twice: get_real_interface() silently returns its argument unresolved
+ * without it, and it registers the autoloader the models need, so load_phalcon is not required. */
+require_once('config.inc');
+require_once('interfaces.inc');
+require_once('util.inc');
 
 use OPNsense\Netflector\Netflector;
 use OPNsense\Interfaces\Vip;
@@ -43,27 +47,20 @@ use OPNsense\Interfaces\Vip;
 $subsystem = $argv[1] ?? '';
 $type = $argv[2] ?? '';
 
-/* INIT is not only the transient on the way to MASTER or BACKUP: it is also where a group ends up
- * when its virtual IP is deleted, which is the moment reflection has to stop. It means "not MASTER"
- * either way, so it is paired with BACKUP here. */
+/* A link failure parks the group in INIT with the election timers stopped, so it stays there for
+ * the whole outage and no BACKUP follows: INIT is the only notice that we stopped being MASTER. */
 if (!in_array($type, ['MASTER', 'BACKUP', 'INIT'], true) || strpos($subsystem, '@') === false) {
     exit(0);
 }
 
 $model = new Netflector();
-$depends_on = $model->general->carp_depend_on->getValue();
-if (!$model->general->enabled->isEqual('1') || $depends_on === '') {
+if (!$model->general->enabled->isEqual('1') || !$model->general->carp_depend_on->isSet()) {
     exit(0);
 }
-
-/* Deferred until something is actually configured: every vhid on the box lands here on every
- * transition, and these are the expensive includes. get_real_interface() needs them. */
-require_once('config.inc');
-require_once('util.inc');
-require_once('interfaces.inc');
+$depends_on = $model->general->carp_depend_on->getValue();
 
 /* Stopping a service that is not running reports a failure, which reads as a fault of ours.
- * BACKUP and INIT both arrive routinely while it is already stopped. */
+ * A backup node hits that at boot, and on a link flap. */
 function netflector_running()
 {
     return mwexecf('/usr/local/etc/rc.d/netflector %s', ['status'], true) === 0;
