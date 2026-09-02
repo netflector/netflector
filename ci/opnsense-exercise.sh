@@ -17,14 +17,17 @@ HERE="$(dirname "$0")"
 "$HERE"/freebsd-vm.sh run 'cat /usr/local/etc/netflector.toml'
 "$HERE"/freebsd-vm.sh run 'netflector --check-config /usr/local/etc/netflector.toml'
 
-# The GUI's validate button, end to end: the configd action wiring plus check.py,
+# The GUI's validate button, end to end: the configd action wiring plus check.sh,
 # which nothing else runs. configd reads actions.d at startup and the plugin was
 # pkg-added into a running system, so its actions appear only after a restart.
 "$HERE"/freebsd-vm.sh run 'service configd restart'
+# The controller stages before it checks, and check.sh reads only what staging wrote.
+"$HERE"/freebsd-vm.sh run 'configctl netflector stage OPNsense/Netflector'
 verdict=$("$HERE"/freebsd-vm.sh run 'configctl netflector check')
 echo "$verdict"
+# The verdict is the first line; the daemon's own words follow it.
 case "$verdict" in
-*'"status": "ok"'*) ;;
+ok*) ;;
 *) echo "the configd check action did not report ok" >&2; exit 1 ;;
 esac
 
