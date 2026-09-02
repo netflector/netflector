@@ -110,7 +110,7 @@ class SettingsController extends ApiMutableModelControllerBase
 
             // Three cases, as toggleBase has them: an explicit 0 or 1 sets that value, no value at all
             // flips, and anything else is a malformed request that must not touch the entry.
-            $was = (string)$node->enabled;
+            $was = $node->enabled->getValue();
             if ($enabled === '0' || $enabled === '1') {
                 $node->enabled = (string)$enabled;
             } elseif ($enabled === null) {
@@ -119,8 +119,8 @@ class SettingsController extends ApiMutableModelControllerBase
                 return ['result' => 'failed', 'changed' => false];
             }
 
-            $changed = $changed || (string)$node->enabled !== $was;
-            $result = (string)$node->enabled === '1' ? 'Enabled' : 'Disabled';
+            $changed = $changed || !$node->enabled->isEqual($was);
+            $result = $node->enabled->isEqual('1') ? 'Enabled' : 'Disabled';
         }
 
         // A UserException, not a 'failed' result: the grid has no field to hang a validation message on,
