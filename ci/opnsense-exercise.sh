@@ -10,7 +10,8 @@ set -euo pipefail
 
 HERE="$(dirname "$0")"
 
-"$HERE"/freebsd-vm.sh run 'php /usr/local/opnsense/scripts/netflector/modelcheck.php'
+"$HERE"/freebsd-vm.sh push "$HERE"/modelcheck.php /tmp/modelcheck.php
+"$HERE"/freebsd-vm.sh run 'php /tmp/modelcheck.php'
 "$HERE"/freebsd-vm.sh run 'configctl template reload OPNsense/Netflector'
 "$HERE"/freebsd-vm.sh run 'test -s /usr/local/etc/netflector.toml'
 "$HERE"/freebsd-vm.sh run 'cat /usr/local/etc/netflector.toml'
