@@ -51,8 +51,8 @@ if (!in_array($type, ['MASTER', 'BACKUP', 'INIT'], true) || strpos($subsystem, '
 }
 
 $model = new Netflector();
-$depends_on = (string)$model->general->carp_depend_on;
-if ((string)$model->general->enabled !== '1' || $depends_on === '') {
+$depends_on = $model->general->carp_depend_on->getValue();
+if (!$model->general->enabled->isEqual('1') || $depends_on === '') {
     exit(0);
 }
 
@@ -73,8 +73,8 @@ function netflector_running()
  * other. Both halves are compared: the same vhid can run on several interfaces as unrelated groups. */
 $group = null;
 foreach ((new Vip())->vip->iterateItems() as $uuid => $vip) {
-    if ($uuid === $depends_on && (string)$vip->mode === 'carp') {
-        $group = sprintf('%s@%s', (string)$vip->vhid, get_real_interface((string)$vip->interface));
+    if ($uuid === $depends_on && $vip->mode->isEqual('carp')) {
+        $group = sprintf('%s@%s', $vip->vhid->getValue(), get_real_interface($vip->interface->getValue()));
         break;
     }
 }

@@ -37,7 +37,7 @@ class M0_1_1 extends BaseModelMigration
      * invalid. */
     public function run($model)
     {
-        if ((string)$model->general->log_level === 'trace') {
+        if ($model->general->log_level->isEqual('trace')) {
             $model->general->log_level = 'debug';
         }
     }
