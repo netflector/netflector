@@ -16,6 +16,8 @@ HERE="$(dirname "$0")"
 "$HERE"/freebsd-vm.sh run 'test -s /usr/local/etc/netflector.toml'
 "$HERE"/freebsd-vm.sh run 'cat /usr/local/etc/netflector.toml'
 "$HERE"/freebsd-vm.sh run 'netflector --check-config /usr/local/etc/netflector.toml'
+# The gate config spells its MACs in hyphen and dot form; the template must fold both.
+"$HERE"/freebsd-vm.sh run 'grep -q "^macs = \[\"b0:37:95:c5:60:be\", \"c4:9d:8f:11:22:33\"\]$" /usr/local/etc/netflector.toml'
 
 # The GUI's validate button, end to end: the configd action wiring plus check.sh,
 # which nothing else runs. configd reads actions.d at startup and the plugin was
