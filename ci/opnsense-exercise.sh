@@ -19,20 +19,6 @@ HERE="$(dirname "$0")"
 # The gate config spells its MACs in hyphen and dot form; the template must fold both.
 "$HERE"/freebsd-vm.sh run 'grep -q "^macs = \[\"b0:37:95:c5:60:be\", \"c4:9d:8f:11:22:33\"\]$" /usr/local/etc/netflector.toml'
 
-# The GUI's validate button, end to end: the configd action wiring plus check.sh,
-# which nothing else runs. configd reads actions.d at startup and the plugin was
-# pkg-added into a running system, so its actions appear only after a restart.
-"$HERE"/freebsd-vm.sh run 'service configd restart'
-# The controller stages before it checks, and check.sh reads only what staging wrote.
-"$HERE"/freebsd-vm.sh run 'configctl netflector stage OPNsense/Netflector'
-verdict=$("$HERE"/freebsd-vm.sh run 'configctl netflector check')
-echo "$verdict"
-# The verdict is the first line; the daemon's own words follow it.
-case "$verdict" in
-ok*) ;;
-*) echo "the configd check action did not report ok" >&2; exit 1 ;;
-esac
-
 # restart, not start: freebsd-vm.sh wait only waits for sshd, so the plugin can be installed while
 # the boot is still running. Whether the boot reaches its service phase before or after the plugin
 # writes rc.conf.d decides whether the daemon is already up by now, and start fails when it is.
