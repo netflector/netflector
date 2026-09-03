@@ -26,19 +26,17 @@
 
 <script>
     $(document).ready(function() {
-        var gridParams = {
-            search:  '/api/netflector/settings/search_reflector',
-            get:     '/api/netflector/settings/get_reflector/',
-            set:     '/api/netflector/settings/set_reflector/',
-            add:     '/api/netflector/settings/add_reflector/',
-            del:     '/api/netflector/settings/del_reflector/',
-            toggle:  '/api/netflector/settings/toggle_reflector/'
-        };
-
-        $("#grid-reflectors").UIBootgrid(gridParams);
-
         mapDataToFormUI({'frm_GeneralSettings': "/api/netflector/settings/get"}).done(function() {
             $('.selectpicker').selectpicker('refresh');
+        });
+
+        $("#{{formGridEdit['table_id']}}").UIBootgrid({
+            search: '/api/netflector/settings/search_reflector',
+            get: '/api/netflector/settings/get_reflector/',
+            set: '/api/netflector/settings/set_reflector/',
+            add: '/api/netflector/settings/add_reflector/',
+            del: '/api/netflector/settings/del_reflector/',
+            toggle: '/api/netflector/settings/toggle_reflector/'
         });
 
         $("#reconfigureAct").SimpleActionButton({
@@ -53,69 +51,19 @@
     });
 </script>
 
-<section class="page-content-main">
-    <div class="content-box">
-        <div class="col-md-12">
-            <h2 style="margin-top: 15px;">{{ lang._('General') }}</h2>
-        </div>
-        {{ partial("layout_partials/base_form", ['fields': generalForm, 'id': 'frm_GeneralSettings']) }}
-    </div>
+<ul class="nav nav-tabs" data-tabs="tabs" id="maintabs">
+    <li class="active"><a data-toggle="tab" href="#general">{{ lang._('General') }}</a></li>
+    <li><a data-toggle="tab" href="#reflectors">{{ lang._('Reflectors') }}</a></li>
+</ul>
 
-    <div class="content-box" style="margin-top: 20px;">
-        <div class="col-md-12">
-            <h2 style="margin-top: 15px;">{{ lang._('Reflectors') }}</h2>
-        </div>
-        <table id="grid-reflectors" class="table table-condensed table-hover table-striped table-responsive"
-               data-editDialog="DialogEdit" data-editAlert="netflectorChangeMessage">
-            <thead>
-                <tr>
-                    <th data-column-id="enabled" data-type="string" data-formatter="rowtoggle">{{ lang._('Enabled') }}</th>
-                    <th data-column-id="name" data-type="string">{{ lang._('Name') }}</th>
-                    <th data-column-id="source_if" data-type="string">{{ lang._('Source') }}</th>
-                    <th data-column-id="target_if" data-type="string">{{ lang._('Target') }}</th>
-                    <th data-column-id="description" data-type="string">{{ lang._('Description') }}</th>
-                    <!-- What an entry reflects, which otherwise means opening every row in turn.
-                         Read-only: the protocols constrain each other (dial needs ssdp and an
-                         IPv4-capable family), so a single cell is the wrong place to change one. -->
-                    <th data-column-id="wol" data-type="string" data-width="5em" data-formatter="boolean">{{ lang._('WoL') }}</th>
-                    <th data-column-id="mdns" data-type="string" data-width="5em" data-formatter="boolean">{{ lang._('mDNS') }}</th>
-                    <th data-column-id="ssdp" data-type="string" data-width="5em" data-formatter="boolean">{{ lang._('SSDP') }}</th>
-                    <th data-column-id="dial" data-type="string" data-width="5em" data-formatter="boolean">{{ lang._('DIAL') }}</th>
-                    <th data-column-id="wsd" data-type="string" data-width="5em" data-formatter="boolean">{{ lang._('WSD') }}</th>
-                    <th data-column-id="address_family" data-type="string" data-width="8em">{{ lang._('IP family') }}</th>
-                    <th data-column-id="uuid" data-identifier="true" data-visible="false">{{ lang._('ID') }}</th>
-                    <th data-column-id="commands" data-width="7em" data-formatter="commands" data-sortable="false">{{ lang._('Commands') }}</th>
-                </tr>
-            </thead>
-            <tbody></tbody>
-            <tfoot>
-                <tr>
-                    <td></td>
-                    <td colspan="6"><button data-action="add" type="button" class="btn btn-xs btn-primary"><span class="fa fa-plus"></span></button></td>
-                </tr>
-            </tfoot>
-        </table>
+<div class="tab-content content-box">
+    <div id="general" class="tab-pane fade in active">
+        {{ partial('layout_partials/base_form', ['fields': generalForm, 'id': 'frm_GeneralSettings']) }}
     </div>
-</section>
-
-<section class="page-content-main">
-    <div class="content-box">
-        <div class="col-md-12">
-            <div id="netflectorChangeMessage" class="alert alert-info" style="display: none" role="alert">
-                {{ lang._('After changing settings, please remember to apply them with the button below.') }}
-            </div>
-            <br/>
-            <button class="btn btn-primary" id="reconfigureAct"
-                    data-endpoint="/api/netflector/service/reconfigure"
-                    data-label="{{ lang._('Apply') }}"
-                    data-service-widget="netflector"
-                    data-error-title="{{ lang._('Netflector could not be reconfigured') }}"
-                    type="button">
-                {{ lang._('Apply') }}
-            </button>
-            <br/><br/>
-        </div>
+    <div id="reflectors" class="tab-pane fade in">
+        {{ partial('layout_partials/base_bootgrid_table', formGridEdit) }}
     </div>
-</section>
+</div>
 
-{{ partial("layout_partials/base_dialog", ['fields': formDialogEdit, 'id': 'DialogEdit', 'label': lang._('Edit reflector')]) }}
+{{ partial('layout_partials/base_apply_button', {'data_endpoint': '/api/netflector/service/reconfigure', 'data_service_widget': 'netflector'}) }}
+{{ partial('layout_partials/base_dialog', ['fields': formDialogEdit, 'id': formGridEdit['edit_dialog_id'], 'label': lang._('Edit reflector')]) }}
