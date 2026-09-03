@@ -32,19 +32,14 @@ use OPNsense\Base\BaseModel;
 use Phalcon\Messages\Message;
 
 /**
- * The model's rules, mirroring what the daemon refuses to start with, so the GUI rejects a bad entry
- * against the offending field instead of writing a netflector.toml that fails at startup.
+ * Two rules the model XML cannot express. The daemon refuses everything else itself, at start, with
+ * the reason in the log.
  *
- * This mirroring is a convenience, not the guarantee: it can drift when the daemon's rules change. The
- * authority is the daemon itself, via `configctl netflector check` (netflector --check-config) on the
- * generated file before the service is restarted. Keep both. A rule added here without a matching rule
- * there only annoys the user; a rule there without one here is caught, just later and less precisely.
+ * The pair collision needs every enabled entry at once, and the CARP virtual IP never reaches the
+ * daemon at all: it is gated in rc.conf.d, so nothing downstream would ever report it dangling.
  */
 class Netflector extends BaseModel
 {
-    /** The protocols an entry may enable. One of them must be on, or the entry reflects nothing. */
-    private const PROTOCOLS = ['wol', 'mdns', 'ssdp', 'wsd'];
-
     /** Families that carry IPv4, and those that carry IPv6. Mirrors AddressFamily::uses_ipv4 / uses_ipv6. */
     private const IPV4_FAMILIES = ['default', 'dual', 'ipv4'];
     private const IPV6_FAMILIES = ['default', 'dual', 'ipv6'];
@@ -55,13 +50,6 @@ class Netflector extends BaseModel
     public function performValidation($validateFullModel = false)
     {
         $messages = parent::performValidation($validateFullModel);
-
-        foreach ($this->reflectors->reflector->iterateItems() as $entry) {
-            if (!$validateFullModel && !$entry->isFieldChanged()) {
-                continue;
-            }
-            $this->validateEntry($entry, $messages);
-        }
 
         // Only enabled entries reach the generated file, so only they can collide there. Checked over
         // every pair regardless of which entry was edited: a collision is a property of the pair, and
@@ -93,41 +81,6 @@ class Netflector extends BaseModel
         // status widget reads "disabled". Rejecting it here instead would mean the last reflector
         // could not be removed without switching the whole service off first.
         return $messages;
-    }
-
-    private function validateEntry($entry, $messages)
-    {
-        $ref = $entry->__reference;
-
-        // Reflecting onto the interface a packet arrived on would echo it straight back.
-        if ($entry->source_if->isSet() && $entry->source_if->isEqual($entry->target_if->getValue())) {
-            $messages->appendMessage(new Message(
-                gettext('The source and target interfaces must differ.'),
-                $ref . '.target_if'
-            ));
-        }
-
-        $enabled = false;
-        foreach (self::PROTOCOLS as $protocol) {
-            if ($entry->$protocol->isEqual('1')) {
-                $enabled = true;
-                break;
-            }
-        }
-        if (!$enabled) {
-            $messages->appendMessage(new Message(
-                gettext('Enable at least one protocol.'),
-                $ref . '.mdns'
-            ));
-        }
-
-        // DIAL proxies HTTP over IPv4 literals only, so an IPv6-only entry can never carry it.
-        if ($entry->dial->isEqual('1') && !self::usesIpv4($entry->address_family->getValue())) {
-            $messages->appendMessage(new Message(
-                gettext('The DIAL proxy is IPv4-only and cannot run on an IPv6-only reflector.'),
-                $ref . '.dial'
-            ));
-        }
     }
 
     /**
