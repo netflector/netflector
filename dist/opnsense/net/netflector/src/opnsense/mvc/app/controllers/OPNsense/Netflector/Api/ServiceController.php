@@ -29,7 +29,6 @@
 namespace OPNsense\Netflector\Api;
 
 use OPNsense\Base\ApiMutableServiceControllerBase;
-use OPNsense\Core\Backend;
 use OPNsense\Netflector\Netflector;
 
 class ServiceController extends ApiMutableServiceControllerBase
@@ -60,38 +59,5 @@ class ServiceController extends ApiMutableServiceControllerBase
         }
 
         return false;
-    }
-
-    /**
-     * Ask the daemon itself whether the generated configuration is valid (netflector --check-config).
-     * The model's rules mirror the daemon's, but a mirror can drift; this is the authority, and it runs
-     * against the file that will actually be loaded.
-     */
-    public function checkAction()
-    {
-        if (!$this->request->isPost()) {
-            return ['status' => 'failed', 'message' => gettext('This endpoint expects a POST.')];
-        }
-
-        // Stage the configuration the model would produce into a cache root, then validate that. The
-        // live file stays as it is, so a rejected configuration never leaves the daemon unable to
-        // restart on the one it already had.
-        //
-        // The action answers with the verdict on the first line and the daemon's words after it:
-        // configd returns stdout alone, so the status cannot ride on an exit code.
-        $backend = new Backend();
-        $backend->configdpRun('netflector stage', ['OPNsense/Netflector']);
-        $output = trim($backend->configdRun('netflector check'));
-
-        $parts = explode("\n", $output, 2);
-        $status = trim($parts[0] ?? '');
-        if (!in_array($status, ['ok', 'failed', 'idle'], true)) {
-            return [
-                'status' => 'failed',
-                'message' => $output !== '' ? $output : gettext('The validation returned nothing.'),
-            ];
-        }
-
-        return ['status' => $status, 'message' => trim($parts[1] ?? '')];
     }
 }
