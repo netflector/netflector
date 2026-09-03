@@ -38,9 +38,7 @@
         $("#grid-reflectors").UIBootgrid(gridParams);
 
         mapDataToFormUI({'frm_GeneralSettings': "/api/netflector/settings/get"}).done(function() {
-            formatTokenizersUI();
             $('.selectpicker').selectpicker('refresh');
-            updateServiceControlUI('netflector');
         });
 
         // Both ways an Apply is refused end here. The lines are set as text, not markup: they carry
@@ -93,9 +91,6 @@
                     }
                 );
                 return dfObj;
-            },
-            onAction: function(data, status) {
-                updateServiceControlUI('netflector');
             }
         });
 
