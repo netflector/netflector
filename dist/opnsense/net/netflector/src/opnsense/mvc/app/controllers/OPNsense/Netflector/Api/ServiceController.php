@@ -39,11 +39,8 @@ class ServiceController extends ApiMutableServiceControllerBase
     protected static $internalServiceName = 'netflector';
 
     /**
-     * The base class reads a single model path, but the daemon refuses to start with no reflector to
-     * run. "Enabled" therefore has to mean the same thing here as in netflector_enabled() and in the
-     * rc.conf.d template: the service switch is on AND at least one entry is on. That makes Apply stop
-     * the daemon once the last reflector goes, rather than starting one on a configuration it would
-     * reject, and the status widget reports "disabled" for the same reason.
+     * The daemon refuses to start with no reflector, so enabled means the switch and at least one
+     * entry, as in netflector_enabled() and the rc.conf.d template.
      */
     protected function serviceEnabled()
     {

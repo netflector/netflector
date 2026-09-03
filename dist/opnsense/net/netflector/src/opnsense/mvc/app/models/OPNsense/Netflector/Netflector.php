@@ -32,11 +32,9 @@ use OPNsense\Base\BaseModel;
 use Phalcon\Messages\Message;
 
 /**
- * Two rules the model XML cannot express. The daemon refuses everything else itself, at start, with
- * the reason in the log.
- *
- * The pair collision needs every enabled entry at once, and the CARP virtual IP never reaches the
- * daemon at all: it is gated in rc.conf.d, so nothing downstream would ever report it dangling.
+ * Two rules the model XML cannot express: the pair collision needs every enabled entry at once, and
+ * the CARP virtual IP never reaches the daemon, rc.conf.d gates on it. The daemon refuses everything
+ * else itself, at start, with the reason in the log.
  */
 class Netflector extends BaseModel
 {
@@ -51,9 +49,8 @@ class Netflector extends BaseModel
     {
         $messages = parent::performValidation($validateFullModel);
 
-        // Only enabled entries reach the generated file, so only they can collide there. Checked over
-        // every pair regardless of which entry was edited: a collision is a property of the pair, and
-        // the entry that creates it is often not the one being saved.
+        // Every pair, not only the edited entry: the one that creates a collision is often not the one
+        // being saved.
         $active = [];
         foreach ($this->reflectors->reflector->iterateItems() as $entry) {
             if ($entry->enabled->isEqual('1')) {
@@ -66,8 +63,8 @@ class Netflector extends BaseModel
             }
         }
 
-        // Checked even when the field was not edited: what invalidates it is deleting the virtual IP
-        // on another page, so it goes stale without anyone touching this form.
+        // Checked even when the field was not edited: deleting the virtual IP on another page is what
+        // invalidates it.
         $depends_on = $this->general->carp_depend_on->getValue();
         if ($depends_on !== '' && !$this->carpVipExists($depends_on)) {
             $messages->appendMessage(new Message(
@@ -76,17 +73,12 @@ class Netflector extends BaseModel
             ));
         }
 
-        // Nothing enabled is a legal configuration, not an error: the rc.conf.d template arms the
-        // service only when the switch is on AND an entry is on, so Apply stops the daemon and the
-        // status widget reads "disabled". Rejecting it here instead would mean the last reflector
-        // could not be removed without switching the whole service off first.
+        // No "at least one entry" rule: rc.conf.d arms the service only with an entry on, so the last
+        // reflector can be removed without switching the service off first.
         return $messages;
     }
 
-    /**
-     * An entry by name, for a message that has to stand on its own. Falls back for the entry being
-     * added, which has no name until it is saved.
-     */
+    /** An entry by name; the entry being added has none until it is saved. */
     private static function describe($entry)
     {
         $name = trim($entry->name->getValue());
@@ -95,8 +87,8 @@ class Netflector extends BaseModel
     }
 
     /**
-     * Whether `$uuid` still names a CARP virtual IP. VirtualIPField offers only the ones that exist
-     * when the form is drawn, but the value it stored outlives the virtual IP itself.
+     * VirtualIPField offers only the virtual IPs that exist when the form is drawn; the stored value
+     * outlives them.
      */
     private function carpVipExists($uuid)
     {
@@ -109,16 +101,12 @@ class Netflector extends BaseModel
         return false;
     }
 
-    /**
-     * Two enabled entries must not share a name, nor reflect the same protocol's packets twice.
-     * Mirrors the daemon's check_conflicts / Reflector::conflicts_with.
-     */
+    /** Mirrors the daemon's check_conflicts / Reflector::conflicts_with. */
     private function validatePair($a, $b, $messages)
     {
         $protocol = self::conflictingProtocol($a, $b);
         if ($protocol !== null) {
-            // Both entries are named rather than one being "this entry": enabling several at once
-            // reports through a dialog that carries the text alone, with no field to point at.
+            // Both entries named: toggling several at once reports the text alone, with no field.
             $messages->appendMessage(new Message(
                 sprintf(
                     gettext('%s would reflect %s between the same interfaces as %s, for overlapping ' .
@@ -132,7 +120,6 @@ class Netflector extends BaseModel
         }
     }
 
-    /** The protocol both entries would reflect for the same traffic, or null. */
     private static function conflictingProtocol($a, $b)
     {
         if (
@@ -167,11 +154,7 @@ class Netflector extends BaseModel
         return null;
     }
 
-    /**
-     * An empty port list is not "no ports": the daemon falls back to 7 and 9, so two entries that both
-     * leave it blank do overlap. The opposite of macsOverlap, where empty widens the selection rather
-     * than defaulting it.
-     */
+    /** An empty port list means the daemon's defaults, so two blank lists overlap. */
     private static function portsOverlap($a, $b)
     {
         $set_a = self::toSet($a) ?: self::DEFAULT_WOL_PORTS;
@@ -190,7 +173,6 @@ class Netflector extends BaseModel
         return count(array_intersect($set_a, $set_b)) > 0;
     }
 
-    /** Families overlap when they both carry the same IP version. */
     private static function familiesOverlap($a, $b)
     {
         return (self::usesIpv4($a) && self::usesIpv4($b)) || (self::usesIpv6($a) && self::usesIpv6($b));
@@ -206,7 +188,6 @@ class Netflector extends BaseModel
         return in_array($family, self::IPV6_FAMILIES, true);
     }
 
-    /** A comma-separated field as a set of trimmed, lowercased values, empties dropped. */
     private static function toSet($csv)
     {
         $out = [];

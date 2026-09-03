@@ -6,11 +6,8 @@ counters_interval_secs = {{ OPNsense.Netflector.general.counters_interval_secs|d
 {%   for entry in helpers.toList('OPNsense.Netflector.reflectors.reflector') %}
 {%     if entry.enabled|default('0') == '1' %}
 
-{#     The GUI stores OPNsense's logical names (lan, opt1); the daemon needs the device (vtnet0). #}
-{#     Every switch is written out, false and "default" included: the file states what the GUI
-       showed, so a later change to a daemon default cannot silently flip a plugin user. Only
-       wol_ports and macs may be absent (their absence is itself the setting: the daemon's
-       default ports; all devices). #}
+{#     Every switch is written out, false and "default" included, so a later change to a daemon
+       default cannot silently flip a plugin user. #}
 [reflectors.{{ entry.name }}]
 source_if = "{{ physical_interface(entry.source_if) }}"
 target_if = "{{ physical_interface(entry.target_if) }}"
