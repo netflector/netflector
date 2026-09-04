@@ -417,6 +417,17 @@ TEST_CASES = [
         timeout_seconds=5.0,
         send_mac=WRONG_MAC,
     ),
+    # The same wake sent target->source, which the one-way entry would drop.
+    TestCase(
+        name="bidirectional_reflects_magic_packet_from_target",
+        send_port=ANY_MAC_PORT,
+        receive_port=ANY_MAC_PORT,
+        expect_mac=WRONG_MAC,
+        timeout_seconds=5.0,
+        send_mac=WRONG_MAC,
+        direction="reverse",
+        config="config-bidirectional.toml",
+    ),
     TestCase(
         name="ignores_malformed_packet_without_configured_mac",
         send_port=ANY_MAC_PORT,
@@ -500,6 +511,32 @@ MDNS_CASES = [
         send_payload_hex=MDNS_RESPONSE_LINK_LOCAL_HEX,
         group=MDNS_GROUP_V4,
         direction="reverse",
+    ),
+    # Against the one-way directions: a query from the target and a response from the source
+    # reflect once the entry relays both ways.
+    TestCase(
+        name="bidirectional_reflects_mdns_query_from_target",
+        send_port=MDNS_PORT,
+        receive_port=MDNS_PORT,
+        expect_mac=None,
+        timeout_seconds=5.0,
+        send_payload_hex=MDNS_QUERY_HEX,
+        expect_payload_hex=MDNS_QUERY_HEX,
+        group=MDNS_GROUP_V4,
+        direction="reverse",
+        config="config-bidirectional.toml",
+    ),
+    TestCase(
+        name="bidirectional_reflects_mdns_response_from_source",
+        send_port=MDNS_PORT,
+        receive_port=MDNS_PORT,
+        expect_mac=None,
+        timeout_seconds=5.0,
+        send_payload_hex=MDNS_RESPONSE_HEX,
+        expect_payload_hex=MDNS_RESPONSE_HEX,
+        group=MDNS_GROUP_V4,
+        direction="forward",
+        config="config-bidirectional.toml",
     ),
     # A query sent target->source hits the target's response-only handler and is dropped.
     TestCase(
@@ -613,6 +650,19 @@ SSDP_CASES = [
         expect_payload_hex=SSDP_NOTIFY_HEX,
         group=SSDP_GROUP_V4,
         direction="reverse",
+    ),
+    # A NOTIFY from the source segment, which the one-way entry drops.
+    TestCase(
+        name="bidirectional_reflects_ssdp_notify_from_source",
+        send_port=SSDP_PORT,
+        receive_port=SSDP_PORT,
+        expect_mac=None,
+        timeout_seconds=5.0,
+        send_payload_hex=SSDP_NOTIFY_HEX,
+        expect_payload_hex=SSDP_NOTIFY_HEX,
+        group=SSDP_GROUP_V4,
+        direction="forward",
+        config="config-bidirectional.toml",
     ),
     # A routable LOCATION literal reflects; a link-local one is suppressed rather than relayed.
     TestCase(
@@ -781,6 +831,31 @@ WSD_CASES = [
         group=WSD_GROUP_V4,
         direction="reverse",
     ),
+    # Announcements from the source segment, which the one-way entry drops.
+    TestCase(
+        name="bidirectional_reflects_wsd_hello_from_source",
+        config="config-bidirectional.toml",
+        send_port=WSD_PORT,
+        receive_port=WSD_PORT,
+        expect_mac=None,
+        timeout_seconds=5.0,
+        send_payload_hex=WSD_HELLO_HEX,
+        expect_payload_hex=WSD_HELLO_HEX,
+        group=WSD_GROUP_V4,
+        direction="forward",
+    ),
+    TestCase(
+        name="bidirectional_reflects_wsd_bye_from_source",
+        config="config-bidirectional.toml",
+        send_port=WSD_PORT,
+        receive_port=WSD_PORT,
+        expect_mac=None,
+        timeout_seconds=5.0,
+        send_payload_hex=WSD_BYE_HEX,
+        expect_payload_hex=WSD_BYE_HEX,
+        group=WSD_GROUP_V4,
+        direction="forward",
+    ),
     # A routable XAddrs URI beside the link-local one rescues the Hello from suppression.
     TestCase(
         name="reflects_wsd_hello_with_mixed_xaddrs",
@@ -864,6 +939,9 @@ class RoundTripCase:
     reply_hex: str = SSDP_OK_HEX
     config: str = "config.toml"
     evict_log: str = "evicted SSDP session"
+    # "forward" searches from the source segment with the responder on the target; "reverse" swaps
+    # them, the leg a bidirectional entry adds.
+    direction: str = "forward"
 
 
 ROUNDTRIP_CASES = [
@@ -880,6 +958,13 @@ ROUNDTRIP_CASES = [
     RoundTripCase(name="wsd_probe_roundtrip", family=4, group=WSD_GROUP_V4, port=WSD_PORT,
         probe_hex=WSD_PROBE_HEX, reply_hex=WSD_PROBEMATCHES_HEX, config="config-wsd.toml",
         evict_log="evicted WSD session"),
+    # Searches from the target segment with the device on the source: the sessions a bidirectional
+    # entry's second leg opens, reserving its port on the source side.
+    RoundTripCase(name="bidirectional_ssdp_msearch_roundtrip_from_target", family=4, group=SSDP_GROUP_V4,
+        config="config-bidirectional.toml", direction="reverse"),
+    RoundTripCase(name="bidirectional_wsd_probe_roundtrip_from_target", family=4, group=WSD_GROUP_V4,
+        port=WSD_PORT, probe_hex=WSD_PROBE_HEX, reply_hex=WSD_PROBEMATCHES_HEX,
+        config="config-bidirectional.toml", evict_log="evicted WSD session", direction="reverse"),
     # Resolve -> ResolveMatches: the same search-session path as Probe (both classify as a search).
     RoundTripCase(name="wsd_resolve_roundtrip", family=4, group=WSD_GROUP_V4, port=WSD_PORT,
         probe_hex=WSD_RESOLVE_HEX, reply_hex=WSD_RESOLVEMATCHES_HEX, config="config-wsd.toml",
@@ -907,6 +992,7 @@ class SearchRecreateCase:
     probe_hex: str = SSDP_MSEARCH_MX5_HEX  # wide MX window: the first session must outlive the recreation
     reply_hex: str = SSDP_OK_HEX
     config: str = "config.toml"
+    direction: str = "forward"
     timeout_seconds: float = 8.0
     decoy: bool = False  # plant a decoy on the freed index so the recreation lands on a different one
 
@@ -930,6 +1016,9 @@ class DialCase:
     unreachable: bool = False  # device advertises a dead HTTP port; the proxied fetch must fail, not hang
     config: str = "config-dial.toml"
     expect_echoed: bool = False  # echo-drop verdict, per Backend.ECHOES_OWN_FRAMES
+    # "forward" puts the client on the source segment and the device on the target; "reverse"
+    # swaps them, the leg a bidirectional entry adds.
+    direction: str = "forward"
 
 
 DIAL_CASES = [
@@ -943,6 +1032,12 @@ DIAL_CASES = [
         config="config-dial-mirrored.toml", expect_echoed=True),
     DialCase(name="dial_passive_notify_roundtrip_mirrored", family=4, group=SSDP_GROUP_V4, passive=True,
         config="config-dial-mirrored.toml", expect_echoed=True),
+    # The second leg end to end: client on the target, device on the source, proxies minted on the
+    # target side.
+    DialCase(name="bidirectional_dial_launch_roundtrip_from_target", family=4, group=SSDP_GROUP_V4,
+        config="config-dial-mirrored.toml", expect_echoed=True, direction="reverse"),
+    DialCase(name="bidirectional_dial_passive_notify_roundtrip_from_target", family=4, group=SSDP_GROUP_V4,
+        passive=True, config="config-dial-mirrored.toml", expect_echoed=True, direction="reverse"),
 ]
 
 
@@ -963,6 +1058,7 @@ class DialAddressChangeCase:
     unreachable: bool = False
     config: str = "config-dial.toml"
     expect_echoed: bool = False
+    direction: str = "forward"
 
 
 DIAL_ADDRESS_CHANGE_CASES = [
@@ -989,6 +1085,7 @@ class DialRecreateCase:
     unreachable: bool = False
     config: str = "config-dial.toml"
     expect_echoed: bool = False
+    direction: str = "forward"
 
 
 DIAL_RECREATE_CASES = [
@@ -2293,10 +2390,13 @@ class RoundTripRunner(CaseRunner):
             group=case.group, direction="forward", config=case.config)
         super().__init__(args, shim)
         self.rt = case
+        self.searcher_seg, self.responder_seg = (
+            ("source", "target") if case.direction == "forward" else ("target", "source")
+        )
 
     def start_responder(self) -> None:
         ifname = self.backend.helper_ifname(RECEIVER_IFNAME)
-        self.backend.start_probe("responder", "target", ifname, [
+        self.backend.start_probe("responder", self.responder_seg, ifname, [
             "respond",
             "--port", str(self.rt.port), "--timeout", str(self.rt.timeout_seconds),
             "--family", str(self.rt.family), "--join-group", self.rt.group,
@@ -2306,8 +2406,8 @@ class RoundTripRunner(CaseRunner):
 
     def run_searcher(self) -> None:
         expectation = ["--expect-payload-hex", self.rt.reply_hex] if self.rt.expect_reply else ["--expect-none"]
-        ifname = self.backend.helper_ifname(NETFLECTOR_SOURCE_IFNAME)
-        self.backend.start_probe("searcher", "source", ifname, [
+        ifname = self.backend.helper_ifname(NETFLECTOR_IFNAMES[self.searcher_seg])
+        self.backend.start_probe("searcher", self.searcher_seg, ifname, [
             "search",
             "--source-port", str(SEARCHER_SOURCE_PORT), "--port", str(self.rt.port),
             "--address", self.rt.group, "--interface", ifname,
@@ -2450,16 +2550,19 @@ class DialRunner(CaseRunner):
             group=case.group, direction="forward")
         super().__init__(args, shim)
         self.dial = case
+        self.client_seg, self.device_seg = (
+            ("source", "target") if case.direction == "forward" else ("target", "source")
+        )
         # The DIAL cases load their own configs. The shared config's any-MAC [reflectors.discovery]
         # entry also reflects SSDP, which would double-reflect the device's 200 OK (only one copy
         # rewritten), so the relayed reply stays unambiguous only with a DIAL-only entry set.
         self.config_path = E2E_DIR / case.config
 
     def start_device(self) -> None:
-        # Single-homed on the target segment: the device's HTTP endpoints are reachable only via
-        # netflector's egress-pinned upstream connect, so the peer it records is
-        # netflector's target_if address -- never the source-side client (which cannot route to the
-        # target subnet directly).
+        # Single-homed on its segment: the device's HTTP endpoints are reachable only via
+        # netflector's egress-pinned upstream connect, so the peer it records is netflector's
+        # address on that segment -- never the client (which cannot route to the device's subnet
+        # directly).
         ifname = self.backend.helper_ifname(RECEIVER_IFNAME)
         probe_args = [
             "dial-device",
@@ -2471,14 +2574,14 @@ class DialRunner(CaseRunner):
             probe_args.append("--notify")
         if self.dial.unreachable:
             probe_args.append("--unreachable")
-        self.backend.start_probe("device", "target", ifname, probe_args)
+        self.backend.start_probe("device", self.device_seg, ifname, probe_args)
         self.wait_for_log("device", "dial-device ready", "dial-device")
 
     def _client_args(self, netflector_authority: str, device_authority: str) -> list[str]:
-        # The client is single-homed on the source segment. It is told netflector's source_if
-        # address (what the rewritten authorities must point at) and the device's true target_if
-        # address (which must never leak through a rewrite).
-        ifname = self.backend.helper_ifname(NETFLECTOR_SOURCE_IFNAME)
+        # The client is single-homed on its segment. It is told netflector's address there (what
+        # the rewritten authorities must point at) and the device's true address (which must never
+        # leak through a rewrite).
+        ifname = self.backend.helper_ifname(NETFLECTOR_IFNAMES[self.client_seg])
         probe_args = [
             "dial-client",
             "--port", str(SSDP_PORT), "--address", self.dial.group, "--interface", ifname,
@@ -2494,11 +2597,11 @@ class DialRunner(CaseRunner):
         return probe_args
 
     def run_client(self) -> None:
-        device_target_ip = self.backend.probe_ip("device", "target")
-        refl_source_ip = self.backend.netflector_ip("source")
-        ifname = self.backend.helper_ifname(NETFLECTOR_SOURCE_IFNAME)
+        device_ip = self.backend.probe_ip("device", self.device_seg)
+        refl_client_side_ip = self.backend.netflector_ip(self.client_seg)
+        ifname = self.backend.helper_ifname(NETFLECTOR_IFNAMES[self.client_seg])
         self.backend.start_probe(
-            "client", "source", ifname, self._client_args(refl_source_ip, device_target_ip)
+            "client", self.client_seg, ifname, self._client_args(refl_client_side_ip, device_ip)
         )
 
     def wait_for_client(self) -> None:
@@ -2514,9 +2617,9 @@ class DialRunner(CaseRunner):
     def assert_device_verdicts(self) -> None:
         # Two device-side checks: (1) the device exits non-zero if any request reached it with a
         # Host that was not rewritten to its own authority (netflector must rewrite Host
-        # source->device); (2) netflector's upstream connect is egress-pinned to target_if, so
-        # the only peer the device recorded must be exactly netflector's target_if address.
-        refl_target_ip = self.backend.netflector_ip("target")
+        # client->device); (2) netflector's upstream connect is egress-pinned to the device's
+        # interface, so the only peer the device recorded must be exactly netflector's address there.
+        refl_target_ip = self.backend.netflector_ip(self.device_seg)
         exit_code = self.backend.wait("device")
         out, err = self.backend.logs("device")
         if out:
@@ -2532,23 +2635,24 @@ class DialRunner(CaseRunner):
             raise RuntimeError("dial-device did not report the upstream peers it saw")
         seen = ast.literal_eval(line.split(marker, 1)[1].strip())
         if seen != [refl_target_ip]:
-            raise RuntimeError(f"device saw upstream peers {seen}, expected only netflector's target_if "
-                               f"address [{refl_target_ip!r}] (egress not pinned to target_if)")
+            raise RuntimeError(f"device saw upstream peers {seen}, expected only netflector's "
+                               f"{self.device_seg}-side address [{refl_target_ip!r}] (egress not pinned)")
         print(f"dial: every request's Host was rewritten to the device, and every upstream connection came "
-              f"from netflector's target_if address {refl_target_ip}", flush=True)
+              f"from netflector's {self.device_seg}-side address {refl_target_ip}", flush=True)
 
     def _force_upstream_egress_ambiguity(self) -> None:
         # Make the upstream egress pin load-bearing. The device is single-homed on the target
         # segment, so netflector's connect reaches it via target_if by routing alone, and
         # SO_BINDTODEVICE (TcpSocket PinEgress) would be untestable -- assert_device_verdicts'
         # "peer == netflector target_if address" passes even if the pin were dropped. Plant a
-        # more-specific host route to the device via the WRONG interface (source_if): an unpinned
-        # connect now follows it, ARPs the device on the source segment (where it does not live)
-        # and fails, so the whole DIAL flow breaks. Only the egress pin -- which constrains the
-        # route lookup to target_if -- still reaches the device, so PASS now requires it.
-        # (FreeBSD declines: no pin primitive there, see Backend.add_decoy_route.)
-        device_ip = self.backend.probe_ip("device", "target")
-        if not self.backend.add_decoy_route(device_ip, NETFLECTOR_SOURCE_IFNAME):
+        # more-specific host route to the device via the WRONG interface (the client's side): an
+        # unpinned connect now follows it, ARPs the device on the client's segment (where it does
+        # not live) and fails, so the whole DIAL flow breaks. Only the egress pin -- which
+        # constrains the route lookup to the device's interface -- still reaches the device, so
+        # PASS now requires it. (FreeBSD declines: no pin primitive there, see
+        # Backend.add_decoy_route.)
+        device_ip = self.backend.probe_ip("device", self.device_seg)
+        if not self.backend.add_decoy_route(device_ip, NETFLECTOR_IFNAMES[self.client_seg]):
             print(f"{self.dial.name}: no egress-pin primitive on this backend; decoy route skipped",
                   flush=True)
 

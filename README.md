@@ -253,6 +253,7 @@ dial      = true                 # optional; enable the DIAL app proxy (requires
 wsd       = true                 # optional; enable WS-Discovery reflection (default false)
 wol_ports = [7, 9]               # optional; WoL UDP ports (default [7, 9]); only valid when wol = true
 address_family = "default"       # optional; default | dual | ipv4 | ipv6 (default "default")
+bidirectional = false            # optional; also relay every enabled protocol target -> source (default false)
 ```
 
 An entry must enable at least one protocol and expands into one reflector per enabled protocol, all
@@ -260,6 +261,13 @@ sharing the entry's interfaces, MAC selection, and `address_family`. The same sh
 specific devices (set `macs`) or a whole network (omit it). No IP addresses ever appear in the config.
 `dial` is not a separate reflector; it augments the entry's SSDP reflector with the DIAL application
 proxy (so it requires `ssdp`; see [DIAL](#dial)).
+
+Each protocol relays in a fixed direction (the table under [Per-protocol behavior](#per-protocol-behavior)):
+queries and searches source → target, responses and advertisements target → source. When both segments
+host clients and devices, `bidirectional = true` builds the entry a second time with its interfaces
+swapped, so every enabled protocol relays both ways, and a `macs` allow-set scopes the device side of
+both legs. Run one active netflector per pair of network segments: two would relay each other's re-emits
+without end. On an HA pair, gate on CARP as the OPNsense plugin does.
 
 ### Environment variables
 
@@ -270,7 +278,7 @@ then optional; with none, the environment is the whole configuration. Variables 
 - `<TAG>` ties one entry's parameters together: any alphanumeric string (`1`, `2`, `TV`, …). It also
   becomes the entry's name (and thus its log label) unless a `NAME` parameter overrides it.
 - `<PARAM>` is `NAME` or any field from the entry table above (`SOURCE_IF`, `TARGET_IF`, `MACS`,
-  `WOL`, `MDNS`, `SSDP`, `WSD`, `DIAL`, `WOL_PORTS`, `ADDRESS_FAMILY`), case-insensitive.
+  `WOL`, `MDNS`, `SSDP`, `WSD`, `DIAL`, `WOL_PORTS`, `ADDRESS_FAMILY`, `BIDIRECTIONAL`), case-insensitive.
 
 The globals are `NETFLECTOR_LOG_LEVEL`, `NETFLECTOR_DEBUG_MEMORY_INTERVAL_SECS`, and
 `NETFLECTOR_COUNTERS_INTERVAL_SECS`, so `LOG`, `DEBUG`, and `COUNTERS` are reserved tags. Booleans are
@@ -444,8 +452,10 @@ failure) is forwarded unchanged and logged, leaving on-subnet discovery unaffect
 Entry names must be unique across the file and the environment: a name that appears twice (including the
 same name from both sources) is rejected at startup. Beyond that, two entries that enable the same
 protocol are rejected as a duplicate of that protocol only when they could reflect the same packet
-twice: same `source_if`, same `target_if`, overlapping MAC selection, overlapping address-family
-handling, and, for WoL, at least one shared port. MAC selection overlaps when the entries' allow-sets
+twice: a shared direction, overlapping MAC selection, overlapping address-family handling, and, for
+WoL, at least one shared port. An entry's directions are its `source_if` → `target_if`, plus the reverse
+when it is `bidirectional`, so a bidirectional `lan`/`iot` entry and a plain `iot` → `lan` one duplicate
+each other. MAC selection overlaps when the entries' allow-sets
 share at least one device, or when either omits its MAC filter (any device). Address-family handling overlaps when both can
 handle the same IP version: an `ipv4`-only and an `ipv6`-only entry never overlap, while `default`/`dual`
 overlap with either. Entries that differ in interface, MAC, address family (or WoL ports), or that

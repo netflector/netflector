@@ -68,14 +68,39 @@ pub(crate) struct Reflector {
     pub(crate) ssdp: Option<Ssdp>,
     /// Whether WS-Discovery (WSD) is enabled.
     pub(crate) wsd: bool,
+    /// Also relay every enabled protocol target → source: the entry is built a second time with
+    /// its interfaces swapped.
+    pub(crate) bidirectional: bool,
 }
 
 impl Reflector {
+    /// This entry with its interfaces swapped: the second leg of a bidirectional entry, built
+    /// exactly like the first.
+    pub(crate) fn reversed(&self) -> Reflector {
+        Reflector {
+            source_if: self.target_if.clone(),
+            target_if: self.source_if.clone(),
+            ..self.clone()
+        }
+    }
+
+    /// The `(source, target)` pairs this entry relays over: its own, plus the reverse when
+    /// bidirectional.
+    fn directions(&self) -> impl Iterator<Item = (&InterfaceName, &InterfaceName)> {
+        std::iter::once((&self.source_if, &self.target_if)).chain(
+            self.bidirectional
+                .then_some((&self.target_if, &self.source_if)),
+        )
+    }
+
     /// The protocol on which `self` and `other` would reflect the same packet
-    /// twice, if any: same direction, overlapping MAC selection and address
+    /// twice, if any: a shared direction, overlapping MAC selection and address
     /// family, and a shared enabled protocol (for `WoL`, also a shared port).
     fn conflicts_with(&self, other: &Reflector) -> Option<Protocol> {
-        if self.source_if != other.source_if || self.target_if != other.target_if {
+        if !self
+            .directions()
+            .any(|mine| other.directions().any(|theirs| theirs == mine))
+        {
             return None;
         }
         if !macs_overlap(self.macs.as_ref(), other.macs.as_ref())
@@ -157,6 +182,7 @@ impl TryFrom<(String, RawReflector)> for Reflector {
             mdns: raw.mdns,
             ssdp,
             wsd: raw.wsd,
+            bidirectional: raw.bidirectional,
         })
     }
 }
@@ -205,9 +231,10 @@ impl TryFrom<RawConfig> for Config {
         for (key, raw_reflector) in raw.reflectors {
             let reflector = Reflector::try_from((key, raw_reflector))?;
             log::debug!(
-                "reflector {}: {} -> {} [{}] family={:?}",
+                "reflector {}: {} {} {} [{}] family={:?}",
                 reflector.name,
                 reflector.source_if,
+                if reflector.bidirectional { "<->" } else { "->" },
                 reflector.target_if,
                 protocol_list(&reflector),
                 reflector.address_family,
@@ -416,6 +443,28 @@ mod tests {
         assert!(!r.mdns);
         assert!(r.wol.is_none());
         assert!(r.ssdp.is_none());
+        assert!(!r.bidirectional);
+    }
+
+    #[test]
+    fn bidirectional_reflector_parses_and_reverses() {
+        let cfg = from_toml(
+            r#"
+            [reflectors.lan]
+            source_if = "lan"
+            target_if = "iot"
+            mdns = true
+            bidirectional = true
+            "#,
+        )
+        .unwrap();
+        let r = &cfg.reflectors[0];
+        assert!(r.bidirectional);
+        let reversed = r.reversed();
+        assert_eq!(reversed.source_if, r.target_if);
+        assert_eq!(reversed.target_if, r.source_if);
+        assert_eq!(reversed.name, r.name);
+        assert!(reversed.mdns);
     }
 
     #[test]
@@ -951,6 +1000,51 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn bidirectional_conflicts_with_the_reverse_entry() {
+        // a relays both ways, so b's iot->lan leg duplicates a's second leg.
+        let text = r#"
+            [reflectors.a]
+            source_if = "lan"
+            target_if = "iot"
+            mdns = true
+            bidirectional = true
+
+            [reflectors.b]
+            source_if = "iot"
+            target_if = "lan"
+            mdns = true
+        "#;
+        assert!(matches!(
+            err(text),
+            ConfigError::ConflictingReflectors {
+                protocol: Protocol::Mdns,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn bidirectional_entries_on_different_pairs_do_not_conflict() {
+        let cfg = from_toml(
+            r#"
+            [reflectors.a]
+            source_if = "lan"
+            target_if = "iot"
+            mdns = true
+            bidirectional = true
+
+            [reflectors.b]
+            source_if = "lan"
+            target_if = "guest"
+            mdns = true
+            bidirectional = true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.reflectors.len(), 2);
     }
 
     #[test]
