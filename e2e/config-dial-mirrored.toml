@@ -1,0 +1,18 @@
+log_level = "debug"
+counters_interval_secs = 1
+
+# Both directions of one DIAL pair, the entry pair a `bidirectional = true` entry will expand to.
+# Each interface then carries a same-direction advertisement handler, so netflector's own re-emits,
+# handed back by the Docker harness's hairpin bridges, would relay again without the dispatcher's
+# echo drop.
+[reflectors.dial-tv]
+source_if = "nf_source"
+target_if = "nf_target"
+ssdp = true
+dial = true
+
+[reflectors.dial-tv-reverse]
+source_if = "nf_target"
+target_if = "nf_source"
+ssdp = true
+dial = true

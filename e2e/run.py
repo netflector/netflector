@@ -928,12 +928,21 @@ class DialCase:
     serve_seconds: float = 6.0
     passive: bool = False      # passive discovery (device advertises NOTIFY; client listens) vs active M-SEARCH
     unreachable: bool = False  # device advertises a dead HTTP port; the proxied fetch must fail, not hang
+    config: str = "config-dial.toml"
+    expect_echoed: bool = False  # echo-drop verdict, per Backend.ECHOES_OWN_FRAMES
 
 
 DIAL_CASES = [
     DialCase(name="dial_launch_roundtrip", family=4, group=SSDP_GROUP_V4),
     DialCase(name="dial_passive_notify_roundtrip", family=4, group=SSDP_GROUP_V4, passive=True),
     DialCase(name="dial_upstream_unreachable", family=4, group=SSDP_GROUP_V4, unreachable=True),
+    # The mirrored pair storms without the dispatcher's echo drop: each side proxies the other's
+    # re-emit. The counter assertion keeps the case from passing vacuously on a bridge that
+    # stopped echoing, and pins the native fabrics as non-echoing.
+    DialCase(name="dial_launch_roundtrip_mirrored", family=4, group=SSDP_GROUP_V4,
+        config="config-dial-mirrored.toml", expect_echoed=True),
+    DialCase(name="dial_passive_notify_roundtrip_mirrored", family=4, group=SSDP_GROUP_V4, passive=True,
+        config="config-dial-mirrored.toml", expect_echoed=True),
 ]
 
 
@@ -952,6 +961,8 @@ class DialAddressChangeCase:
     serve_seconds: float = 60.0  # device keeps advertising + serving across all three passes
     passive: bool = True
     unreachable: bool = False
+    config: str = "config-dial.toml"
+    expect_echoed: bool = False
 
 
 DIAL_ADDRESS_CHANGE_CASES = [
@@ -976,6 +987,8 @@ class DialRecreateCase:
     serve_seconds: float = 120.0  # device serves across passes and the recreation waits
     passive: bool = True
     unreachable: bool = False
+    config: str = "config-dial.toml"
+    expect_echoed: bool = False
 
 
 DIAL_RECREATE_CASES = [
@@ -1171,6 +1184,12 @@ class Backend:
     # recreate case skips its silence probe there (there is no wire left to probe on).
     PROBES_SURVIVE_DELETE = False
 
+    # Whether the fabric hands netflector's own re-emits back as received frames. Docker's
+    # bridges do when their ports run in hairpin mode (Docker Desktop's default; Docker Engine
+    # only with the userland proxy off); a veth/epair pair has no third port to reflect off, so
+    # the mirrored DIAL cases assert the `echoed` count stays absent there.
+    ECHOES_OWN_FRAMES = False
+
     def __init__(self, args: argparse.Namespace, prefix: str) -> None:
         self.args = args
         self.prefix = prefix
@@ -1300,6 +1319,7 @@ class Backend:
 
 class DockerBackend(Backend):
     PROBES_SURVIVE_DELETE = True
+    ECHOES_OWN_FRAMES = True
 
     def __init__(self, args: argparse.Namespace, prefix: str) -> None:
         super().__init__(args, prefix)
@@ -1386,6 +1406,40 @@ class DockerBackend(Backend):
             ]
         )
         docker(["start", container])
+        self.enable_hairpin()
+
+    def enable_hairpin(self) -> None:
+        # ECHOES_OWN_FRAMES is the harness's doing, not a daemon default: a bridge port hands a
+        # frame back to its own sender only in hairpin mode, which Docker Desktop sets by default
+        # but Docker Engine sets only with the userland proxy off. Turn it on so the mirrored DIAL
+        # cases meet the echo they exist to exercise on any daemon. Each in-container interface
+        # names its host-side veth by ifindex (iflink); a host-namespace helper resolves that
+        # through sysfs to the bridge port and takes the flag. Where the ports aren't reachable
+        # (nothing resolves), the daemon's own default stands.
+        links = self.admin(
+            "".join(
+                f"cat /sys/class/net/{name}/iflink 2>/dev/null || :; "
+                for name in NETFLECTOR_IFNAMES.values()
+            ),
+            capture=True,
+        ).split()
+        script = (
+            f"for link in {' '.join(links)}; do "
+            "for d in /sys/class/net/*; do "
+            '[ "$(cat "$d/ifindex" 2>/dev/null)" = "$link" ] || continue; '
+            '[ -e "$d/brport/hairpin_mode" ] || continue; '
+            'echo 1 > "$d/brport/hairpin_mode"; basename "$d"; '
+            "done; done"
+        )
+        ports = docker(
+            ["run", "--rm", "--privileged", "--network", "host",
+             self.args.helper_image, "sh", "-ec", script],
+            echo=False,
+        ).stdout.split()
+        if ports:
+            print(f"hairpin enabled on {' '.join(ports)}", flush=True)
+        else:
+            print("no bridge port reachable for hairpin; the daemon's default stands", flush=True)
 
     def start_probe(
         self, role: str, segment: str, ifname: str, probe_args: list[str], *, detach: bool = True
@@ -1493,6 +1547,7 @@ class DockerBackend(Backend):
         if v6:
             command += ["--ip6", v6]
         docker([*command, self.networks[segment], self.roles["netflector"]])
+        self.enable_hairpin()  # the fresh veth comes up with the daemon's default
 
     def add_decoy_interface(self) -> None:
         # The privileged admin sidecar shares netflector's network namespace, so the veth
@@ -2395,11 +2450,10 @@ class DialRunner(CaseRunner):
             group=case.group, direction="forward")
         super().__init__(args, shim)
         self.dial = case
-        # The DIAL case's netflector loads a config with a single DIAL entry. The shared config's any-MAC
-        # [reflectors.discovery] entry also reflects SSDP, which would double-reflect the device's
-        # 200 OK (only one copy rewritten) -- so the DIAL case gets its own config to keep the
-        # relayed reply unambiguous.
-        self.config_path = E2E_DIR / "config-dial.toml"
+        # The DIAL cases load their own configs. The shared config's any-MAC [reflectors.discovery]
+        # entry also reflects SSDP, which would double-reflect the device's 200 OK (only one copy
+        # rewritten), so the relayed reply stays unambiguous only with a DIAL-only entry set.
+        self.config_path = E2E_DIR / case.config
 
     def start_device(self) -> None:
         # Single-homed on the target segment: the device's HTTP endpoints are reachable only via
@@ -2517,6 +2571,13 @@ class DialRunner(CaseRunner):
                 print(out, end="", flush=True)
         else:
             self.assert_device_verdicts()  # device-side verdict: Host rewrite + egress-pinned upstream
+        if self.dial.expect_echoed:
+            if self.backend.ECHOES_OWN_FRAMES:
+                self.wait_for_log("netflector", "echoed=", "netflector echo counter")
+            else:
+                out, err = self.backend.logs("netflector")
+                if "echoed=" in out + err:
+                    raise RuntimeError(f"{self.dial.name}: echoes on a fabric that hands no frame back")
         print(f"PASS {self.dial.name}", flush=True)
         if self.args.show_netflector_logs:
             time.sleep(0.5)
