@@ -2,22 +2,22 @@
 //! target interface, so a wake sent on one link reaches a sleeping device on another.
 //!
 //! A magic packet is 6 bytes of `0xFF` followed by the target device's MAC repeated 16 times
-//! (102 bytes). A trailing `SecureOn` password, if present, is forwarded verbatim. The reflector
-//! validates the payload, then re-emits it on the target interface as a v4 limited broadcast or
-//! v6 link-local all-nodes multicast, sourced from that interface's own address.
+//! (102 bytes). A trailing `SecureOn` password, if present, is forwarded verbatim. The
+//! [`WakeClassifier`] validates the payload and applies the optional device allow-set and the
+//! family policy; the shared [`SimpleReflector`] re-emits on the target interface link-wide (a v4
+//! limited broadcast or v6 all-nodes multicast), sourced from that interface's own address at the
+//! captured source port and TTL ([`Emit::captured`]).
 
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 
 use crate::config::{AddressFamily, Reflector};
-use crate::dispatch::{
-    CaptureKey, Filter, MessageType, Outcome, PacketDispatcher, PacketHandler, PortSet,
-};
-use crate::logging::log_rate;
+use crate::dispatch::{Filter, MessageType, PacketDispatcher, PortSet};
 use crate::net::mac::{MacAddr, MacSet};
 use crate::net::packet::Packet;
-use crate::reactor::Reactor;
 
-use super::{BuildError, InterfaceMap, WARN_WINDOW, egress_sources, missing_required_family};
+use super::{
+    BuildError, Classify, Emit, InterfaceMap, SimpleReflector, Verdict, missing_required_family,
+};
 
 const PREFIX_LEN: usize = 6;
 const MAC_LEN: usize = 6;
@@ -25,74 +25,39 @@ const MAC_REPS: usize = 16;
 /// Smallest valid magic packet: prefix plus the 16 MAC repetitions.
 const MAGIC_LEN: usize = PREFIX_LEN + MAC_REPS * MAC_LEN;
 
-/// IPv6 link-local all-nodes group (`ff02::1`), the v6 equivalent of the IPv4 limited broadcast.
-const V6_ALL_NODES: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
-
-/// Built Wake-on-LAN reflector: re-emits each validated magic packet on its `egress` interface.
-/// One handler covers all configured ports.
-struct WolReflector {
-    egress: CaptureKey,
-    /// Optional device allow-set; `None` reflects a wake for any device.
+/// The Wake-on-LAN gate: a magic packet whose target MAC the optional allow-set admits, in a
+/// family the policy handles. The family is gated here because the filter pins only the port, so
+/// both families arrive.
+struct WakeClassifier {
+    /// Optional device allow-set; `None` admits a wake for any device.
     target_macs: Option<MacSet>,
-    /// IP-version policy: which families this reflector re-emits.
     family: AddressFamily,
 }
 
-impl PacketHandler for WolReflector {
-    fn on_packet(
-        &mut self,
-        packet: &Packet,
-        dispatcher: &mut PacketDispatcher,
-        _reactor: &mut Reactor,
-    ) -> Outcome {
+impl Classify for WakeClassifier {
+    fn classify(&self, packet: &Packet) -> Verdict {
         let Some(mac) = magic_packet_mac(packet.payload) else {
-            log::debug!("WoL: ignoring non-magic packet from {}", packet.source);
-            return Outcome::Filtered;
+            return Verdict::Junk;
         };
         if !wake_allowed(mac, self.target_macs.as_ref()) {
             log::debug!(
                 "WoL: ignoring wake for {mac} from {}: not in the configured device set",
                 packet.source
             );
-            return Outcome::Filtered;
+            return Verdict::Excluded;
         }
-        let Some(dst) = wol_destination(self.family, packet) else {
+        let handled = match packet.dest {
+            SocketAddr::V4(_) => self.family.uses_ipv4(),
+            SocketAddr::V6(_) => self.family.uses_ipv6(),
+        };
+        if !handled {
             log::debug!(
                 "WoL: {} is not a handled address family; ignoring",
                 packet.source
             );
-            return Outcome::Filtered;
-        };
-        // A family the egress can't currently source is a transient drop (address loss): Stalled,
-        // not a genuine send failure.
-        if !egress_sources(dispatcher, self.egress, dst) {
-            log::debug!(
-                "WoL: egress has no source for {dst} yet; dropping wake from {}",
-                packet.source
-            );
-            return Outcome::Stalled(MessageType::WakeOnLan);
+            return Verdict::Excluded;
         }
-        match dispatcher.send_udp_group(
-            self.egress,
-            dst,
-            packet.source.port(),
-            packet.ttl,
-            packet.payload,
-        ) {
-            Ok(()) => {
-                log::debug!("reflected WoL packet from {} to {dst}", packet.source);
-                Outcome::Reflected(MessageType::WakeOnLan)
-            }
-            Err(e) => {
-                log_rate!(
-                    log::Level::Warn,
-                    WARN_WINDOW,
-                    "WoL: cannot reflect packet from {} to {dst}: {e}",
-                    packet.source
-                );
-                Outcome::Dropped(MessageType::WakeOnLan)
-            }
-        }
+        Verdict::Reflect(MessageType::WakeOnLan)
     }
 }
 
@@ -118,21 +83,6 @@ fn magic_packet_mac(payload: &[u8]) -> Option<MacAddr> {
 /// Whether the optional `targets` allow-set admits a wake for `mac`.
 fn wake_allowed(mac: MacAddr, targets: Option<&MacSet>) -> bool {
     targets.is_none_or(|targets| targets.contains(&mac))
-}
-
-/// Link-wide destination a captured magic `packet` re-emits to under `family`: the IPv4 limited
-/// broadcast or the IPv6 link-local all-nodes group, at the captured destination port. `None` when
-/// `family` doesn't handle the packet's IP version.
-fn wol_destination(family: AddressFamily, packet: &Packet) -> Option<SocketAddr> {
-    match packet.dest {
-        SocketAddr::V4(dest) if family.uses_ipv4() => {
-            Some(SocketAddr::from((Ipv4Addr::BROADCAST, dest.port())))
-        }
-        SocketAddr::V6(dest) if family.uses_ipv6() => {
-            Some(SocketAddr::from((V6_ALL_NODES, dest.port())))
-        }
-        _ => None,
-    }
 }
 
 /// Build the Wake-on-LAN reflector for `reflector` and register it on `dispatcher`. No-op when
@@ -170,11 +120,16 @@ pub(crate) fn build(
             dst_port: Some(ports),
             ..Filter::default()
         },
-        Box::new(WolReflector {
+        Box::new(SimpleReflector::new(
             egress,
-            target_macs: reflector.macs.clone(),
-            family: reflector.address_family,
-        }),
+            "WoL",
+            "wake",
+            WakeClassifier {
+                target_macs: reflector.macs.clone(),
+                family: reflector.address_family,
+            },
+            Emit::captured(),
+        )),
     );
     log::info!(
         "WoL reflector \"{}\": {} -> {} on {} port(s)",
@@ -201,6 +156,17 @@ mod tests {
         }
         p.extend_from_slice(trailer);
         p
+    }
+
+    fn packet_with(payload: &[u8]) -> Packet<'_> {
+        Packet {
+            source: "10.0.0.1:5".parse().unwrap(),
+            dest: "10.0.0.2:9".parse().unwrap(),
+            ttl: 64,
+            dst_mac: None,
+            src_mac: None,
+            payload,
+        }
     }
 
     #[test]
@@ -257,33 +223,31 @@ mod tests {
         assert!(magic_packet_mac(&packet).is_none());
     }
 
-    /// A packet whose `dest` (the captured Wake-on-LAN port) drives the re-emit destination.
-    fn packet_to(dest: &str) -> Packet<'static> {
-        Packet {
-            source: "10.0.0.1:5".parse().unwrap(),
-            dest: dest.parse().unwrap(),
-            ttl: 64,
-            dst_mac: None,
-            src_mac: None,
-            payload: b"",
-        }
-    }
-
     #[test]
-    fn wol_destination_targets_the_link_for_used_families() {
-        let v4 = packet_to("10.0.0.2:9");
-        let v6 = packet_to("[fe80::2]:9");
-        // Dual handles both: v4 -> limited broadcast, v6 -> ff02::1, at the captured dst port.
+    fn classifier_reflects_admitted_wakes_and_excludes_the_rest() {
+        let magic = magic_packet(DEVICE, &[]);
+        let any = WakeClassifier {
+            target_macs: None,
+            family: AddressFamily::Dual,
+        };
         assert_eq!(
-            wol_destination(AddressFamily::Dual, &v4),
-            Some("255.255.255.255:9".parse().unwrap())
+            any.classify(&packet_with(&magic)),
+            Verdict::Reflect(MessageType::WakeOnLan)
         );
-        assert_eq!(
-            wol_destination(AddressFamily::Dual, &v6),
-            Some("[ff02::1]:9".parse().unwrap())
-        );
-        // A single-family policy ignores the other family.
-        assert_eq!(wol_destination(AddressFamily::Ipv4, &v6), None);
-        assert_eq!(wol_destination(AddressFamily::Ipv6, &v4), None);
+        // A device outside the allow-set is excluded (recognized, configured out), not junk.
+        let others = WakeClassifier {
+            target_macs: Some(MacSet::from(MacAddr::from([0xaa; 6]))),
+            family: AddressFamily::Dual,
+        };
+        assert_eq!(others.classify(&packet_with(&magic)), Verdict::Excluded);
+        // So is a family the policy doesn't handle: the port-only filter lets both families in.
+        let v4_only = WakeClassifier {
+            target_macs: None,
+            family: AddressFamily::Ipv4,
+        };
+        let mut v6 = packet_with(&magic);
+        v6.dest = "[fe80::2]:9".parse().unwrap();
+        assert_eq!(v4_only.classify(&v6), Verdict::Excluded);
+        assert_eq!(any.classify(&packet_with(b"not magic")), Verdict::Junk);
     }
 }

@@ -20,7 +20,7 @@ use crate::net::mdns::{
 };
 
 use super::{
-    BuildError, InterfaceMap, SimpleReflector, Verdict, join_group_logged,
+    BuildError, Emit, InterfaceMap, SimpleReflector, Verdict, join_group_logged,
     require_bidirectional_families, require_macs_matchable,
 };
 
@@ -113,9 +113,8 @@ pub(crate) fn build(
             target,
             "mDNS",
             "query",
-            MDNS_PORT,
-            MDNS_TTL,
             query_verdict,
+            Emit::fixed(MDNS_PORT, MDNS_TTL),
         )),
     );
     // target → source: reflect responses, optionally only from the configured device's MAC.
@@ -132,9 +131,8 @@ pub(crate) fn build(
                 source,
                 "mDNS",
                 "response",
-                MDNS_PORT,
-                MDNS_TTL,
                 response_verdict,
+                Emit::fixed(MDNS_PORT, MDNS_TTL),
             )
             // A response whose A/AAAA records are all link-local or otherwise never a peer
             // advertises endpoints the source side can never use; queries carry no advertisement,

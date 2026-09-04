@@ -23,8 +23,8 @@ use crate::reactor::Reactor;
 
 use super::dial::{ProxyPlacement, rewrite_location};
 use super::{
-    BuildError, InterfaceMap, NoRewrite, ReplyRewrite, SearchReflector, SimpleReflector, Verdict,
-    join_group_logged, require_bidirectional_families, require_macs_matchable,
+    BuildError, Emit, InterfaceMap, NoRewrite, ReplyRewrite, SearchReflector, SimpleReflector,
+    Verdict, join_group_logged, require_bidirectional_families, require_macs_matchable,
 };
 
 /// What a DIAL-enabled SSDP reflector needs to rewrite a device's `LOCATION` to a source-side proxy: the
@@ -191,9 +191,8 @@ pub(crate) fn build(
         source,
         "SSDP",
         "advertisement",
-        SSDP_PORT,
-        SSDP_TTL,
         advertisement_verdict,
+        Emit::fixed(SSDP_PORT, SSDP_TTL),
     )
     .with_suppress(advertises_only_unreachable);
     let advertisement = if ssdp.dial {
