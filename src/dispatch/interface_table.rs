@@ -220,6 +220,13 @@ impl InterfaceTable {
             .record_oversized(n);
     }
 
+    /// Count one of our own re-emits handed back on a capture's row (see
+    /// [`CaptureCounters::record_echo`]). Indexed directly, like [`record`](Self::record): reached
+    /// only from `route` with a real ingress key.
+    pub(super) fn record_echo(&mut self, capture: CaptureKey) {
+        self.captures[capture.0 as usize].counters.record_echo();
+    }
+
     /// Each capture's `(interface name, counter row)` for the periodic report. The table owns the
     /// capture→interface-name mapping and stays log-free (the dispatcher does the logging).
     pub(super) fn counter_rows(&self) -> impl Iterator<Item = (&str, &CaptureCounters)> {
@@ -503,6 +510,21 @@ mod tests {
         /// The recovery count recorded on `capture`'s row, for the dispatcher's reconcile test.
         pub(in crate::dispatch) fn recoveries_of(&self, capture: CaptureKey) -> u64 {
             self.captures[capture.0 as usize].counters.recoveries()
+        }
+
+        /// The echo count recorded on `capture`'s row, for the dispatcher's echo-drop test.
+        pub(in crate::dispatch) fn echoed_of(&self, capture: CaptureKey) -> u64 {
+            self.captures[capture.0 as usize].counters.echoed()
+        }
+
+        /// Overwrite an interface's cached addresses, giving a routing test's ingress a known MAC
+        /// without a real link. For the dispatcher's echo-drop test.
+        pub(in crate::dispatch) fn set_test_addrs(
+            &mut self,
+            interface: InterfaceKey,
+            addrs: InterfaceAddresses,
+        ) {
+            self.entries[interface.0 as usize].interface.addrs = addrs;
         }
     }
 

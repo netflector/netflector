@@ -464,9 +464,11 @@ Per message type: `reflected` (re-emitted on the other interface), `skipped` (ri
 direction for this leg - normal, this is the loop prevention working), `dropped` (should have been
 reflected but was not: a send error, a resource cap, or the advertisement suppression) and `stalled`
 (the egress had no source address of the packet's family yet). Interface-wide: `filtered`
-(unrecognized traffic on the group), `oversized` (received frames too large to forward) and
-`recoveries` (the interface was destroyed and recreated, and its capture re-bound). `netflector(8)`
-carries the full definitions.
+(unrecognized traffic on the group), `echoed` (netflector's own re-emits handed back by the link,
+as a hairpin bridge port or an access point re-broadcasting a station's multicast does; dropped
+before routing), `oversized` (received frames too large to forward) and `recoveries` (the interface
+was destroyed and recreated, and its capture re-bound). `netflector(8)` carries the full
+definitions.
 
 ## Developing
 

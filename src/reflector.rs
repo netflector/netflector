@@ -36,8 +36,9 @@ pub(crate) enum Verdict {
     /// A message for this direction. Re-emit it.
     Reflect(MessageType),
     /// A message for the *other* direction; drop it silently. Dropping the opposite direction is
-    /// the loop-breaker (atop the capture's own-egress drop): a reflected query re-emitted on the
-    /// egress is still a query, which the egress side's response-only reflector skips.
+    /// the loop-breaker (atop the capture's own-egress drop and the dispatcher's echo drop): a
+    /// reflected query re-emitted on the egress is still a query, which the egress side's
+    /// response-only reflector skips.
     Skip(MessageType),
     /// Not a recognizable protocol message on this dedicated group. Drop it with a debug log.
     Junk,

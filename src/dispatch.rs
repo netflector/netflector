@@ -577,6 +577,24 @@ impl PacketDispatcher {
                 .all(|(_, reg)| reg.handler.is_some()),
             "route re-entered from inside a handler call"
         );
+        // Our own re-emit handed back by the link (a hairpin bridge port, an access point that
+        // re-broadcasts a station's multicast) arrives as an ordinary received frame, past the
+        // capture's outgoing drop, and a same-direction handler on this ingress (the mirrored leg
+        // of a bidirectional pair) would relay it again. Only its source MAC gives it away.
+        if is_own_echo(
+            packet.src_mac,
+            self.table
+                .egress_addrs(ingress)
+                .and_then(InterfaceAddresses::mac),
+        ) {
+            self.table.record_echo(ingress);
+            log::trace!(
+                "dropping our own echoed frame {} -> {} on {ingress:?}",
+                packet.source,
+                packet.dest
+            );
+            return;
+        }
         // Snapshot the live registration keys into the reused buffer. Taking them once means a
         // reflector registering mid-route isn't fed the in-flight frame (its key isn't in the
         // snapshot whether it appended or reused a freed slot), and a generational key keeps the
@@ -1026,6 +1044,16 @@ impl Handler for PacketDispatcher {
         match event {
             ControlEvent::Dump => log_counters(self.table.counter_rows()),
         }
+    }
+}
+
+/// Whether a captured frame is one of our own re-emits handed back by the link: its source MAC is
+/// the ingress interface's own. The all-zero address is exempt: Linux reports it as a loopback's
+/// hardware address and every loopback frame carries it, so it identifies nothing.
+fn is_own_echo(src_mac: Option<MacAddr>, own_mac: Option<MacAddr>) -> bool {
+    match (src_mac, own_mac) {
+        (Some(src), Some(own)) => src == own && !own.is_unspecified(),
+        _ => false,
     }
 }
 
@@ -1524,6 +1552,63 @@ mod tests {
             dispatcher.counts(ingress, MessageType::SsdpSearch),
             (0, 0, 0, 0)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn is_own_echo_matches_the_ingress_mac_except_all_zeros() {
+        let own = MacAddr::from([0x02, 0, 0, 0, 0, 1]);
+        let other = MacAddr::from([0x02, 0, 0, 0, 0, 2]);
+        assert!(is_own_echo(Some(own), Some(own)));
+        assert!(!is_own_echo(Some(other), Some(own)));
+        // A DLT_NULL frame carries no MAC; an interface without one owns nothing.
+        assert!(!is_own_echo(None, Some(own)));
+        assert!(!is_own_echo(Some(own), None));
+        // Linux loopback: zeros on both sides identify nothing.
+        let zero = MacAddr::from([0; 6]);
+        assert!(!is_own_echo(Some(zero), Some(zero)));
+    }
+
+    // A frame whose source MAC is the ingress's own is our own re-emit handed back by the link: it
+    // reaches no handler and counts as echoed, while a peer's frame routes as usual.
+    #[test]
+    #[cfg_attr(miri, ignore = "needs a real socket and interface")]
+    fn route_drops_our_own_echoed_frames_before_any_handler() -> io::Result<()> {
+        let mut dispatcher = PacketDispatcher::new();
+        let mut reactor = Reactor::new()?;
+        // The capture-less entry links to interface 0: give that interface a known MAC.
+        let interface = dispatcher.table.find_or_add_interface(LOOPBACK_IFACE)?;
+        let own = MacAddr::from([0x02, 0, 0, 0, 0, 1]);
+        dispatcher.table.set_test_addrs(
+            interface,
+            InterfaceAddresses::new(Some(own), Some(Ipv4Addr::LOCALHOST), None, None),
+        );
+        let ingress = dispatcher.add_test_capture();
+        assert_eq!(dispatcher.table.interface_of(ingress), Some(interface));
+        dispatcher.register(
+            ingress,
+            Filter::default(),
+            Box::new(Outcomer(Outcome::Reflected(MessageType::MdnsQuery))),
+        );
+
+        let mut echo = probe_packet(b"ours");
+        echo.src_mac = Some(own);
+        dispatcher.route(ingress, &echo, &mut reactor);
+        assert_eq!(dispatcher.table.echoed_of(ingress), 1);
+        assert_eq!(
+            dispatcher.counts(ingress, MessageType::MdnsQuery),
+            (0, 0, 0, 0),
+            "the handler never ran"
+        );
+
+        let mut peer = probe_packet(b"theirs");
+        peer.src_mac = Some(MacAddr::from([0x02, 0, 0, 0, 0, 2]));
+        dispatcher.route(ingress, &peer, &mut reactor);
+        assert_eq!(
+            dispatcher.counts(ingress, MessageType::MdnsQuery),
+            (1, 0, 0, 0)
+        );
+        assert_eq!(dispatcher.table.echoed_of(ingress), 1);
         Ok(())
     }
 
