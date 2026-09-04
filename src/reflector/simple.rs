@@ -1,10 +1,15 @@
-//! A shared stateless reflector for the multicast-discovery protocols.
+//! The shared stateless reflector.
 //!
-//! mDNS (both directions), the WSD Hello/Bye announcements, and SSDP's `NOTIFY` advertisements are the
-//! same operation: classify the payload and, if it's a message for this direction, re-emit it to its
-//! own group on the egress interface, verbatim or through an optional [`ReplyRewrite`] (SSDP's
-//! advertisement direction rewrites the DIAL `LOCATION`). The search directions are stateful
-//! (per-searcher sessions), so they use the shared `SearchReflector` instead.
+//! mDNS (both directions), the WSD Hello/Bye announcements, SSDP's `NOTIFY` advertisements and
+//! Wake-on-LAN are the same operation: classify the payload and, if it's a message for this leg,
+//! re-emit it on the egress interface, verbatim or through an optional [`ReplyRewrite`] (SSDP's
+//! advertisement direction rewrites the DIAL `LOCATION`). What differs per protocol enters as
+//! parameters: the [`Classify`] gate and the [`Emit`] policy (which source port and TTL the re-emit
+//! carries). Where it goes follows from the captured destination alone ([`link_destination`]). The
+//! search directions are stateful (per-searcher sessions), so they use the shared `SearchReflector`
+//! instead.
+
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use crate::dispatch::{CaptureKey, Outcome, PacketDispatcher, PacketHandler};
 use crate::logging::log_rate;
@@ -13,21 +18,90 @@ use crate::reactor::Reactor;
 
 use super::{NoRewrite, ReplyRewrite, Verdict, WARN_WINDOW, egress_sources};
 
-/// One direction of one multicast-discovery protocol: re-emits each accepted message captured on its
-/// ingress onto `egress`, to the message's own destination (the dispatcher's filter pins that to the
-/// group). The `classify` fn is the directional gate; an optional [`ReplyRewrite`] transforms the
-/// payload before re-emit (default: forward verbatim).
-pub(crate) struct SimpleReflector {
+/// A leg's ingress gate: is this packet a message for it? See [`Verdict`].
+pub(crate) trait Classify {
+    fn classify(&self, packet: &Packet) -> Verdict;
+}
+
+/// A plain function over the payload: the multicast-discovery protocols gate on the message alone.
+impl<F: Fn(&[u8]) -> Verdict> Classify for F {
+    fn classify(&self, packet: &Packet) -> Verdict {
+        self(packet.payload)
+    }
+}
+
+/// The UDP source port a re-emit carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourcePort {
+    /// A protocol's well-known port.
+    Fixed(u16),
+    /// The captured packet's own.
+    Captured,
+}
+
+impl SourcePort {
+    fn resolve(self, packet: &Packet) -> u16 {
+        match self {
+            Self::Fixed(port) => port,
+            Self::Captured => packet.source.port(),
+        }
+    }
+}
+
+/// The TTL / hop limit a re-emit carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Ttl {
+    Fixed(u8),
+    /// The captured packet's own.
+    Captured,
+}
+
+impl Ttl {
+    fn resolve(self, packet: &Packet) -> u8 {
+        match self {
+            Self::Fixed(ttl) => ttl,
+            Self::Captured => packet.ttl,
+        }
+    }
+}
+
+/// How a re-emit is stamped: the source port and TTL it carries. The address is always the
+/// egress's own; the destination follows from the captured one ([`link_destination`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Emit {
+    pub(crate) source_port: SourcePort,
+    pub(crate) ttl: Ttl,
+}
+
+impl Emit {
+    /// From `port` at `ttl`: the multicast-discovery protocols.
+    pub(crate) const fn fixed(port: u16, ttl: u8) -> Self {
+        Self {
+            source_port: SourcePort::Fixed(port),
+            ttl: Ttl::Fixed(ttl),
+        }
+    }
+
+    /// From the captured source port at the captured TTL: Wake-on-LAN.
+    pub(crate) const fn captured() -> Self {
+        Self {
+            source_port: SourcePort::Captured,
+            ttl: Ttl::Captured,
+        }
+    }
+}
+
+/// One stateless leg of one protocol: re-emits each accepted packet captured on its ingress onto
+/// `egress`, stamped per its [`Emit`] policy. `classify` is the directional gate; an optional
+/// [`ReplyRewrite`] transforms the payload before re-emit (default: forward verbatim).
+pub(crate) struct SimpleReflector<C> {
     egress: CaptureKey,
     /// Protocol tag for logs, e.g. `"mDNS"`.
     name: &'static str,
     /// The message kind/direction this reflector handles, for logs, e.g. `"query"`.
     kind: &'static str,
-    /// The UDP source port to emit from: a protocol's well-known port. The destination comes from
-    /// `packet.dest`.
-    src_port: u16,
-    ttl: u8,
-    classify: fn(&[u8]) -> Verdict,
+    classify: C,
+    emit: Emit,
     /// Transforms the payload before re-emit; [`NoRewrite`] (the default) forwards verbatim.
     rewrite: Box<dyn ReplyRewrite>,
     /// The unreachable-advertisement suppression check for payloads `rewrite` left untouched
@@ -35,22 +109,20 @@ pub(crate) struct SimpleReflector {
     suppress: fn(&[u8]) -> bool,
 }
 
-impl SimpleReflector {
+impl<C: Classify> SimpleReflector<C> {
     pub(crate) fn new(
         egress: CaptureKey,
         name: &'static str,
         kind: &'static str,
-        src_port: u16,
-        ttl: u8,
-        classify: fn(&[u8]) -> Verdict,
+        classify: C,
+        emit: Emit,
     ) -> Self {
         Self {
             egress,
             name,
             kind,
-            src_port,
-            ttl,
             classify,
+            emit,
             rewrite: Box::new(NoRewrite),
             suppress: |_| false,
         }
@@ -71,16 +143,17 @@ impl SimpleReflector {
     }
 }
 
-impl PacketHandler for SimpleReflector {
+impl<C: Classify> PacketHandler for SimpleReflector<C> {
     fn on_packet(
         &mut self,
         packet: &Packet,
         dispatcher: &mut PacketDispatcher,
         reactor: &mut Reactor,
     ) -> Outcome {
-        let message_type = match (self.classify)(packet.payload) {
+        let message_type = match self.classify.classify(packet) {
             Verdict::Reflect(message_type) => message_type,
             Verdict::Skip(message_type) => return Outcome::Skipped(message_type),
+            Verdict::Excluded => return Outcome::Filtered,
             Verdict::Junk => {
                 log::debug!(
                     "{}: dropping unrecognized payload ({} B) to {} from {}",
@@ -93,13 +166,14 @@ impl PacketHandler for SimpleReflector {
             }
         };
 
+        let dest = link_destination(packet.dest);
+
         // A family the egress can't currently source is a quiet, transient drop (address
         // loss): a Stalled, not a genuine send failure.
-        if !egress_sources(dispatcher, self.egress, packet.dest) {
+        if !egress_sources(dispatcher, self.egress, dest) {
             log::debug!(
-                "{}: egress has no source for {} yet; dropping {} from {}",
+                "{}: egress has no source for {dest} yet; dropping {} from {}",
                 self.name,
-                packet.dest,
                 self.kind,
                 packet.source
             );
@@ -124,15 +198,19 @@ impl PacketHandler for SimpleReflector {
         }
         let payload = rewritten.unwrap_or(packet.payload);
 
-        match dispatcher.send_udp_group(self.egress, packet.dest, self.src_port, self.ttl, payload)
-        {
+        match dispatcher.send_udp_group(
+            self.egress,
+            dest,
+            self.emit.source_port.resolve(packet),
+            self.emit.ttl.resolve(packet),
+            payload,
+        ) {
             Ok(()) => {
                 log::debug!(
-                    "reflected {} {} from {} to {}",
+                    "reflected {} {} from {} to {dest}",
                     self.name,
                     self.kind,
-                    packet.source,
-                    packet.dest
+                    packet.source
                 );
                 Outcome::Reflected(message_type)
             }
@@ -140,15 +218,33 @@ impl PacketHandler for SimpleReflector {
                 log_rate!(
                     log::Level::Warn,
                     WARN_WINDOW,
-                    "{}: cannot reflect {} from {} to {}: {e}",
+                    "{}: cannot reflect {} from {} to {dest}: {e}",
                     self.name,
                     self.kind,
-                    packet.source,
-                    packet.dest
+                    packet.source
                 );
                 Outcome::Dropped(message_type)
             }
         }
+    }
+}
+
+/// IPv6 link-local all-nodes group (`ff02::1`), the v6 equivalent of the IPv4 limited broadcast.
+const V6_ALL_NODES: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
+
+/// Where a re-emit of a packet captured to `dest` goes: a multicast group re-emits to itself (the
+/// dispatcher's filter pinned it); anything else, a limited or directed broadcast or a unicast wake
+/// aimed at this host, goes link-wide on the egress at the captured port, the IPv4 limited
+/// broadcast or the IPv6 all-nodes group.
+fn link_destination(dest: SocketAddr) -> SocketAddr {
+    match dest {
+        SocketAddr::V4(v4) if !v4.ip().is_multicast() => {
+            SocketAddr::from((Ipv4Addr::BROADCAST, v4.port()))
+        }
+        SocketAddr::V6(v6) if !v6.ip().is_multicast() => {
+            SocketAddr::from((V6_ALL_NODES, v6.port()))
+        }
+        group => group,
     }
 }
 
@@ -177,21 +273,33 @@ mod tests {
         Verdict::Reflect(MessageType::MdnsResponse)
     }
 
+    type LoopbackRig = (
+        SimpleReflector<fn(&[u8]) -> Verdict>,
+        PacketDispatcher,
+        Reactor,
+    );
+
     /// A reflector with the given transform and suppression check, plus the dispatcher/reactor it
     /// runs against, over a real loopback egress (`None` = skip, no `CAP_NET_RAW`).
     fn reflector_over_loopback(
         rewrite: Box<dyn ReplyRewrite>,
         suppress: fn(&[u8]) -> bool,
-    ) -> Option<(SimpleReflector, PacketDispatcher, Reactor)> {
+    ) -> Option<LoopbackRig> {
         let cap = open_loopback_or_skip()?;
         let mut dispatcher = PacketDispatcher::new();
         let egress = dispatcher
             .add_capture(cap)
             .expect("add the loopback capture");
         let reactor = Reactor::new().expect("reactor");
-        let reflector = SimpleReflector::new(egress, "TEST", "response", 5353, 255, reflect_all)
-            .with_rewrite(rewrite)
-            .with_suppress(suppress);
+        let reflector = SimpleReflector::new(
+            egress,
+            "TEST",
+            "response",
+            reflect_all as fn(&[u8]) -> Verdict,
+            Emit::fixed(5353, 255),
+        )
+        .with_rewrite(rewrite)
+        .with_suppress(suppress);
         Some((reflector, dispatcher, reactor))
     }
 
@@ -204,6 +312,63 @@ mod tests {
             src_mac: None,
             payload: b"response",
         }
+    }
+
+    /// A packet from an ephemeral port at a non-default TTL, so a captured policy reads apart from a
+    /// fixed one.
+    fn packet_to(dest: &str) -> Packet<'static> {
+        Packet {
+            source: "10.0.0.1:40000".parse().unwrap(),
+            dest: dest.parse().unwrap(),
+            ttl: 7,
+            dst_mac: None,
+            src_mac: None,
+            payload: b"",
+        }
+    }
+
+    #[test]
+    fn link_destination_keeps_groups_and_broadcasts_the_rest() {
+        let dest = |s: &str| s.parse::<SocketAddr>().unwrap();
+        assert_eq!(
+            dest("224.0.0.251:5353"),
+            link_destination(dest("224.0.0.251:5353"))
+        );
+        assert_eq!(
+            dest("[ff02::fb]:5353"),
+            link_destination(dest("[ff02::fb]:5353"))
+        );
+        // Limited and directed broadcasts, and a unicast wake aimed at this host, go link-wide at
+        // the captured port.
+        for captured in ["255.255.255.255:9", "10.0.0.255:9", "10.0.0.2:9"] {
+            assert_eq!(dest("255.255.255.255:9"), link_destination(dest(captured)));
+        }
+        assert_eq!(dest("[ff02::1]:9"), link_destination(dest("[fe80::2]:9")));
+    }
+
+    #[test]
+    fn source_port_and_ttl_policies_resolve_fixed_or_captured() {
+        let packet = packet_to("10.0.0.2:9");
+        assert_eq!(SourcePort::Fixed(1900).resolve(&packet), 1900);
+        assert_eq!(SourcePort::Captured.resolve(&packet), 40000);
+        assert_eq!(Ttl::Fixed(2).resolve(&packet), 2);
+        assert_eq!(Ttl::Captured.resolve(&packet), 7);
+    }
+
+    #[test]
+    fn a_function_classifies_by_payload_alone() {
+        fn by_length(payload: &[u8]) -> Verdict {
+            if payload.is_empty() {
+                Verdict::Junk
+            } else {
+                Verdict::Reflect(MessageType::MdnsQuery)
+            }
+        }
+        assert_eq!(by_length.classify(&packet_to("10.0.0.2:9")), Verdict::Junk);
+        assert_eq!(
+            by_length.classify(&group_packet()),
+            Verdict::Reflect(MessageType::MdnsQuery)
+        );
     }
 
     #[test]

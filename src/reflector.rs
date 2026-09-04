@@ -12,7 +12,7 @@ mod search;
 mod simple;
 
 pub(crate) use search::SearchReflector;
-pub(crate) use simple::SimpleReflector;
+pub(crate) use simple::{Classify, Emit, SimpleReflector};
 
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
@@ -40,6 +40,9 @@ pub(crate) enum Verdict {
     /// reflected query re-emitted on the egress is still a query, which the egress side's
     /// response-only reflector skips.
     Skip(MessageType),
+    /// A message this leg recognizes but is configured not to relay (a wake for a device outside
+    /// the allow-set). The classifier logged why; drop it silently.
+    Excluded,
     /// Not a recognizable protocol message on this dedicated group. Drop it with a debug log.
     Junk,
 }

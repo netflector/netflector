@@ -319,6 +319,7 @@ impl PacketHandler for SearchReflector {
             Verdict::Reflect(message_type) => message_type,
             // A message for the other direction (an announcement) flows through that reflector.
             Verdict::Skip(message_type) => return Outcome::Skipped(message_type),
+            Verdict::Excluded => return Outcome::Filtered,
             Verdict::Junk => {
                 log::debug!(
                     "{}: dropping unrecognized payload ({} B) on the search path from {}",

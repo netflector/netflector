@@ -15,8 +15,8 @@ use crate::net::wsd::{
 };
 
 use super::{
-    BuildError, InterfaceMap, NoRewrite, ReplyRewrite, SearchReflector, SimpleReflector, Verdict,
-    join_group_logged, require_bidirectional_families, require_macs_matchable,
+    BuildError, Emit, InterfaceMap, NoRewrite, ReplyRewrite, SearchReflector, SimpleReflector,
+    Verdict, join_group_logged, require_bidirectional_families, require_macs_matchable,
 };
 
 /// WSD's classifier kind maps to its group message types. The `ProbeMatches`/`ResolveMatches` unicast
@@ -117,9 +117,8 @@ pub(crate) fn build(
                 source,
                 "WSD",
                 "announcement",
-                WSD_PORT,
-                WSD_TTL,
                 announcement_verdict,
+                Emit::fixed(WSD_PORT, WSD_TTL),
             )
             // A Hello whose XAddrs are all link-local or otherwise never a peer advertises
             // endpoints the source side can never use.
