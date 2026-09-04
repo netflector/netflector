@@ -51,6 +51,8 @@ pub(super) struct RawReflector {
     pub(super) dial: bool,
     #[serde(default)]
     pub(super) wsd: bool,
+    #[serde(default)]
+    pub(super) bidirectional: bool,
 }
 
 impl RawConfig {

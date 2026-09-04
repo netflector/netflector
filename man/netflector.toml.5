@@ -133,6 +133,17 @@ is rejected at startup.
 Enable WS-Discovery reflection.
 Boolean, default
 .Cm false .
+.It Ic bidirectional
+Also relay every enabled protocol from
+.Ic target_if
+to
+.Ic source_if ,
+for segments that each host clients and devices.
+Run one active
+.Nm netflector
+per pair of network segments: two would relay each other's re-emits without end.
+Boolean, default
+.Cm false .
 .El
 .Pp
 An entry must enable at least one protocol.
@@ -150,7 +161,7 @@ parameter overrides it.
 .Ic NAME ,
 or any entry field:
 .Ic SOURCE_IF , TARGET_IF , MACS , WOL , MDNS , SSDP , WSD , DIAL ,
-.Ic WOL_PORTS , ADDRESS_FAMILY .
+.Ic WOL_PORTS , ADDRESS_FAMILY , BIDIRECTIONAL .
 Case-insensitive.
 .El
 .Pp
@@ -187,12 +198,15 @@ appears twice, including the same name from both sources, is rejected at
 startup.
 .Pp
 Beyond names, two entries that enable the same protocol are rejected only when
-they could reflect the same packet twice: same
-.Ic source_if ,
-same
+they could reflect the same packet twice: a shared direction, overlapping MAC
+selection, overlapping address-family handling, and, for Wake-on-LAN, at least
+one shared port.
+An entry's directions are its
+.Ic source_if
+to
 .Ic target_if ,
-overlapping MAC selection, overlapping address-family handling, and, for
-Wake-on-LAN, at least one shared port.
+plus the reverse when it is
+.Ic bidirectional .
 MAC selection overlaps when the allow-sets share a device or either entry omits
 its filter.
 Address families overlap when both handle the same IP version:

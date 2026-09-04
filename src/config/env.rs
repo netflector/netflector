@@ -25,6 +25,7 @@ struct PartialReflector {
     ssdp: Option<bool>,
     dial: Option<bool>,
     wsd: Option<bool>,
+    bidirectional: Option<bool>,
     wol_ports: Option<WolPorts>,
     address_family: Option<AddressFamily>,
 }
@@ -61,6 +62,7 @@ impl PartialReflector {
             "ssdp" => put(&mut self.ssdp, env_bool(value, var)?, param, var),
             "dial" => put(&mut self.dial, env_bool(value, var)?, param, var),
             "wsd" => put(&mut self.wsd, env_bool(value, var)?, param, var),
+            "bidirectional" => put(&mut self.bidirectional, env_bool(value, var)?, param, var),
             _ => Err(ConfigError::EnvUnknownParam {
                 var: var.to_owned(),
                 param: param.to_owned(),
@@ -86,6 +88,7 @@ impl PartialReflector {
             ssdp: self.ssdp.unwrap_or(false),
             dial: self.dial.unwrap_or(false),
             wsd: self.wsd.unwrap_or(false),
+            bidirectional: self.bidirectional.unwrap_or(false),
             wol_ports: self.wol_ports,
             address_family: self.address_family.unwrap_or_default(),
         })
@@ -273,6 +276,18 @@ mod tests {
         let r = &cfg.reflectors[0];
         assert!(r.wol.is_some());
         assert!(!r.mdns);
+    }
+
+    #[test]
+    fn env_bidirectional_flag() {
+        let cfg = from_env(&[
+            ("NETFLECTOR_LAN_SOURCE_IF", "lan"),
+            ("NETFLECTOR_LAN_TARGET_IF", "iot"),
+            ("NETFLECTOR_LAN_MDNS", "1"),
+            ("NETFLECTOR_LAN_BIDIRECTIONAL", "true"),
+        ])
+        .unwrap();
+        assert!(cfg.reflectors[0].bidirectional);
     }
 
     #[test]

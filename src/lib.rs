@@ -115,14 +115,10 @@ fn reflect(path: Option<&Path>) -> Result<()> {
     let interfaces = open_captures(&config, &mut dispatcher)?;
     for reflector in &config.reflectors {
         log_mtu_info(reflector, &interfaces, &dispatcher);
-        crate::reflector::wol::build(reflector, &interfaces, &mut dispatcher)
-            .map_err(|e| Error::reflector(reflector.name.as_str(), e))?;
-        crate::reflector::mdns::build(reflector, &interfaces, &mut dispatcher)
-            .map_err(|e| Error::reflector(reflector.name.as_str(), e))?;
-        crate::reflector::ssdp::build(reflector, &interfaces, &mut dispatcher)
-            .map_err(|e| Error::reflector(reflector.name.as_str(), e))?;
-        crate::reflector::wsd::build(reflector, &interfaces, &mut dispatcher)
-            .map_err(|e| Error::reflector(reflector.name.as_str(), e))?;
+        build_reflector(reflector, &interfaces, &mut dispatcher)?;
+        if reflector.bidirectional {
+            build_reflector(&reflector.reversed(), &interfaces, &mut dispatcher)?;
+        }
     }
 
     if let Some(interval) = config.counter_interval {
@@ -155,6 +151,20 @@ fn reflect(path: Option<&Path>) -> Result<()> {
         memory_report::log_report(); // a final report at shutdown
     }
     log::info!("stopped");
+    Ok(())
+}
+
+/// Register every protocol `reflector` enables, source → target.
+fn build_reflector(
+    reflector: &config::Reflector,
+    interfaces: &InterfaceMap,
+    dispatcher: &mut PacketDispatcher,
+) -> Result<()> {
+    use crate::reflector::{mdns, ssdp, wol, wsd};
+    for build in [wol::build, mdns::build, ssdp::build, wsd::build] {
+        build(reflector, interfaces, dispatcher)
+            .map_err(|e| Error::reflector(reflector.name.as_str(), e))?;
+    }
     Ok(())
 }
 

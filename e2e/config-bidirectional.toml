@@ -1,0 +1,18 @@
+log_level = "debug"
+
+# config.toml's entries with every protocol relayed both ways, so the reverse-direction cases reflect
+# where the one-way entries drop.
+[reflectors.wol-any]
+source_if = "nf_source"
+target_if = "nf_target"
+wol = true
+wol_ports = [9011]
+bidirectional = true
+
+[reflectors.discovery]
+source_if = "nf_source"
+target_if = "nf_target"
+mdns = true
+ssdp = true
+wsd = true
+bidirectional = true
