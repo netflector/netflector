@@ -191,6 +191,14 @@ Not a message
 .Nm
 handles: unrecognized traffic on the group, or an address family the entry
 does not cover.
+.It Sy echoed
+Frames
+.Nm
+itself re-emitted, handed back by the link as received frames (a hairpin
+bridge port, an access point re-broadcasting a station's multicast), dropped
+before routing.
+The host's own multicast is never reflected: the capture ignores outgoing
+frames, and this drop catches the echo a link may hand back.
 .It Sy oversized
 Received frames too large to forward, dropped before parsing.
 .It Sy recoveries

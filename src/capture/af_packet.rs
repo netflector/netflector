@@ -52,9 +52,10 @@ impl Capture {
             )
         })?;
 
-        // Loop prevention: stop the kernel from handing us our own injected frames.
-        // PACKET_IGNORE_OUTGOING (Linux 4.20+) drops them at the socket; if the kernel
-        // lacks it (or user-mode QEMU rejects it), prepend an in-filter drop instead.
+        // Loop prevention: stop the kernel from handing us our own injected frames. A link that
+        // returns them as received frames (a hairpin bridge port) gets past this; the dispatcher's
+        // echo drop catches those. PACKET_IGNORE_OUTGOING (Linux 4.20+) drops them at the socket;
+        // if the kernel lacks it (or user-mode QEMU rejects it), prepend an in-filter drop instead.
         match set_ignore_outgoing(&fd) {
             Ok(()) => attach_filter(&fd, &ETHERNET_UDP_FILTER)?,
             Err(e) => {

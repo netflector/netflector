@@ -308,12 +308,12 @@ fn attach(fd: &OwnedFd, if_name: &str) -> io::Result<LinkType> {
         }
     };
 
-    // Loop prevention on Ethernet: don't hand us our own egress, so two mirrored
-    // reflector entries don't ping-pong each other's frames. On DLT_NULL links see-sent
-    // stays on: the BSD lo driver taps each frame once (and tags it outbound), so
-    // default BPF already delivers it; receive-only would instead silence the interface
-    // entirely. Set explicitly both ways so a rebind onto different framing restores the
-    // right mode.
+    // Loop prevention on Ethernet: don't hand us our own egress. A link that returns it
+    // as received frames gets past this; the dispatcher's echo drop catches those. On
+    // DLT_NULL links see-sent stays on: the BSD lo driver taps each frame once (and tags
+    // it outbound), so default BPF already delivers it; receive-only would instead silence
+    // the interface entirely. Set explicitly both ways so a rebind onto different framing
+    // restores the right mode.
     let mut see_sent: c_uint = c_uint::from(link_type == LinkType::DltNull);
     ioctl(fd, libc::BIOCSSEESENT, (&raw mut see_sent).cast())?;
 

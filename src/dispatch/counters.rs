@@ -174,13 +174,15 @@ impl TypeCounters {
 }
 
 /// Every count for one interface (capture): one [`TypeCounters`] per [`MessageType`], a type-less
-/// `filtered` count for junk, a `recoveries` count of completed interface rebuilds (a recreated
-/// or returned interface whose captures re-bound), and a type-less `oversized` count of received
-/// frames too large to forward (dropped before parsing).
+/// `filtered` count for junk, an `echoed` count of our own re-emits the link handed back (dropped
+/// before routing), a `recoveries` count of completed interface rebuilds (a recreated or returned
+/// interface whose captures re-bound), and a type-less `oversized` count of received frames too
+/// large to forward (dropped before parsing).
 #[derive(Clone, Default)]
 pub(crate) struct CaptureCounters {
     types: [TypeCounters; MESSAGE_TYPE_COUNT],
     filtered: u64,
+    echoed: u64,
     recoveries: u64,
     oversized: u64,
 }
@@ -210,6 +212,11 @@ impl CaptureCounters {
         self.oversized += n;
     }
 
+    /// Count one of our own re-emits that the link handed back, dropped before routing.
+    pub(crate) fn record_echo(&mut self) {
+        self.echoed += 1;
+    }
+
     /// This row's non-zero counts as one line, e.g. `recoveries=1; mDNS query reflected=42
     /// skipped=10; SSDP search reflected=5 dropped=1; filtered=2`. `None` when nothing has been
     /// counted, so an idle interface produces no report line.
@@ -230,6 +237,9 @@ impl CaptureCounters {
         );
         if self.filtered > 0 {
             parts.push(format!("filtered={}", self.filtered));
+        }
+        if self.echoed > 0 {
+            parts.push(format!("echoed={}", self.echoed));
         }
         if self.oversized > 0 {
             parts.push(format!("oversized={}", self.oversized));
@@ -260,9 +270,16 @@ mod tests {
             let c = self.types[ty as usize];
             (c.reflected, c.skipped, c.dropped, c.stalled)
         }
+
         fn filtered(&self) -> u64 {
             self.filtered
         }
+
+        /// The echo count, for the dispatcher's echo-drop test.
+        pub(crate) fn echoed(&self) -> u64 {
+            self.echoed
+        }
+
         /// This row's recovery count. Read from the dispatcher's reconcile test through the
         /// interface table, hence `pub(crate)`.
         pub(crate) fn recoveries(&self) -> u64 {
@@ -327,6 +344,21 @@ mod tests {
         assert_eq!(
             c.format_nonzero().as_deref(),
             Some("filtered=1; oversized=5")
+        );
+    }
+
+    #[test]
+    fn record_echo_counts_and_reports() {
+        let mut c = CaptureCounters::default();
+        c.record_echo();
+        c.record_echo();
+        assert_eq!(c.echoed(), 2);
+        // Interface-wide counts trail the typed ones: filtered, echoed, oversized.
+        c.record(Outcome::Filtered);
+        c.record_oversized(1);
+        assert_eq!(
+            c.format_nonzero().as_deref(),
+            Some("filtered=1; echoed=2; oversized=1")
         );
     }
 

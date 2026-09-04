@@ -26,6 +26,13 @@ impl MacAddr {
         MacAddr([0xff; 6])
     }
 
+    /// Whether this is the all-zero address, which names no station: Linux reports it as a
+    /// loopback's hardware address, and loopback frames carry it.
+    #[must_use]
+    pub(crate) fn is_unspecified(self) -> bool {
+        self.0 == [0; 6]
+    }
+
     /// The L2 destination MAC for a multicast IP `addr`: IPv4 maps to `01:00:5e`
     /// plus the low 23 address bits (RFC 1112), IPv6 to `33:33` plus the low 32
     /// bits (RFC 2464).
@@ -207,6 +214,12 @@ mod tests {
     #[test]
     fn broadcast_is_all_ones() {
         assert_eq!(MacAddr::broadcast().octets(), [0xff; 6]);
+    }
+
+    #[test]
+    fn unspecified_is_all_zeros() {
+        assert!(MacAddr::from([0; 6]).is_unspecified());
+        assert!(!MacAddr::from([0, 0, 0, 0, 0, 1]).is_unspecified());
     }
 
     #[test]
