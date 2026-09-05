@@ -359,9 +359,16 @@ class TestCase:
     # netflector config file (relative to e2e/) mounted into the netflector container. Most cases share
     # config.toml; a case needing a distinct reflector set (e.g. single-family) names its own.
     config: str = "config.toml"
+    # An explicit destination for the send, overriding the group / link-wide default.
+    send_to: str | None = None
+    # A line netflector must have logged by the time the receiver's verdict is in, e.g. the
+    # destination it re-emitted to.
+    expect_netflector_log: str | None = None
 
     @property
     def send_address(self) -> str:
+        if self.send_to is not None:
+            return self.send_to
         if self.group is not None:
             return self.group
         return IPV6_ALL_NODES if self.family == 6 else "255.255.255.255"
@@ -416,6 +423,27 @@ TEST_CASES = [
         expect_mac=WRONG_MAC,
         timeout_seconds=5.0,
         send_mac=WRONG_MAC,
+    ),
+    # A wake to the source segment's directed broadcast re-emits to the target's own, not the
+    # limited broadcast; one to the limited broadcast stays limited.
+    TestCase(
+        name="reflects_magic_packet_to_directed_broadcast",
+        send_port=ANY_MAC_PORT,
+        receive_port=ANY_MAC_PORT,
+        expect_mac=WRONG_MAC,
+        timeout_seconds=5.0,
+        send_mac=WRONG_MAC,
+        send_to="192.0.2.255",
+        expect_netflector_log=f"to 198.51.100.255:{ANY_MAC_PORT}",
+    ),
+    TestCase(
+        name="reflects_magic_packet_to_limited_broadcast_as_sent",
+        send_port=ANY_MAC_PORT,
+        receive_port=ANY_MAC_PORT,
+        expect_mac=WRONG_MAC,
+        timeout_seconds=5.0,
+        send_mac=WRONG_MAC,
+        expect_netflector_log=f"to 255.255.255.255:{ANY_MAC_PORT}",
     ),
     # The same wake sent target->source, which the one-way entry would drop.
     TestCase(
@@ -2370,6 +2398,8 @@ class CaseRunner:
         if self.case.expect_payload_hex is None and self.case.expect_mac is None:
             self.close_expect_none_window()
         self.wait_for_result()
+        if self.case.expect_netflector_log is not None:
+            self.wait_for_log("netflector", self.case.expect_netflector_log, "netflector log line")
         print(f"PASS {self.case.name}", flush=True)
         if self.args.show_netflector_logs:
             time.sleep(0.5)

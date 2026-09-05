@@ -31,6 +31,7 @@ pub(crate) use self::interface_monitor::{InterfaceEvent, InterfaceMonitor};
 pub(crate) struct InterfaceAddresses {
     mac: Option<MacAddr>,
     v4: Option<Ipv4Addr>,
+    v4_prefix: Option<u8>,
     v6: Option<Ipv6Addr>,
     v6_routable: Option<Ipv6Addr>,
 }
@@ -45,6 +46,16 @@ impl InterfaceAddresses {
     /// [`v6`](Self::v6) it needs no destination argument.
     pub(crate) fn v4(&self) -> Option<Ipv4Addr> {
         self.v4
+    }
+
+    /// The directed broadcast of the v4 address's subnet, when the prefix is known and the subnet
+    /// has one (a /31 or /32 do not).
+    pub(crate) fn v4_directed_broadcast(&self) -> Option<Ipv4Addr> {
+        let (addr, prefix) = (self.v4?, self.v4_prefix?);
+        if prefix > 30 {
+            return None;
+        }
+        Some(Ipv4Addr::from(u32::from(addr) | (u32::MAX >> prefix)))
     }
 
     /// The best v6 source for a destination of `dest_scope`: a link-local source for a link-local
@@ -77,9 +88,10 @@ impl fmt::Display for InterfaceAddresses {
             None => f.write_str("none")?,
         }
         f.write_str(", v4 ")?;
-        match self.v4 {
-            Some(v4) => write!(f, "{v4}")?,
-            None => f.write_str("none")?,
+        match (self.v4, self.v4_prefix) {
+            (Some(v4), Some(prefix)) => write!(f, "{v4}/{prefix}")?,
+            (Some(v4), None) => write!(f, "{v4}")?,
+            (None, _) => f.write_str("none")?,
         }
         f.write_str(", v6 ")?;
         match self.v6 {
@@ -358,10 +370,42 @@ mod tests {
             Self {
                 mac,
                 v4,
+                v4_prefix: None,
                 v6,
                 v6_routable,
             }
         }
+
+        /// The record with its v4 prefix length set.
+        pub(crate) fn with_v4_prefix(mut self, prefix: u8) -> Self {
+            self.v4_prefix = Some(prefix);
+            self
+        }
+    }
+
+    #[test]
+    fn v4_broadcast_needs_a_prefix_short_enough_for_one() {
+        let base = InterfaceAddresses::new(None, Some(Ipv4Addr::new(192, 0, 2, 2)), None, None);
+        assert_eq!(
+            base.v4_directed_broadcast(),
+            None,
+            "no prefix, no broadcast"
+        );
+        assert_eq!(
+            base.with_v4_prefix(24).v4_directed_broadcast(),
+            Some(Ipv4Addr::new(192, 0, 2, 255))
+        );
+        assert_eq!(
+            base.with_v4_prefix(30).v4_directed_broadcast(),
+            Some(Ipv4Addr::new(192, 0, 2, 3))
+        );
+        assert_eq!(
+            base.with_v4_prefix(0).v4_directed_broadcast(),
+            Some(Ipv4Addr::BROADCAST)
+        );
+        // Point-to-point prefixes have no directed broadcast.
+        assert_eq!(base.with_v4_prefix(31).v4_directed_broadcast(), None);
+        assert_eq!(base.with_v4_prefix(32).v4_directed_broadcast(), None);
     }
 
     #[test]

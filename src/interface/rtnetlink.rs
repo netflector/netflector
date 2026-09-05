@@ -346,8 +346,9 @@ fn scan_addr(
         } else if addrs.v4.is_some() {
             log::trace!("{if_name}: v4 {v4} (ignored; already have one)");
         } else {
-            log::trace!("{if_name}: v4 {v4}");
+            log::trace!("{if_name}: v4 {v4}/{}", body.ifa_prefixlen);
             addrs.v4 = Some(v4);
+            addrs.v4_prefix = Some(body.ifa_prefixlen);
         }
     } else if let Ok(octets) = <[u8; 16]>::try_from(bytes) {
         let addr = Ipv6Addr::from(octets);
@@ -416,9 +417,20 @@ mod tests {
 
     /// An `RTM_NEWADDR` message: a zeroed nlmsghdr, an ifaddrmsg (family/flags/index), then `attrs`.
     fn addr_msg(family: c_int, index: u32, flags: u8, attrs: &[(u16, &[u8])]) -> Vec<u8> {
+        addr_msg_prefixed(family, index, 0, flags, attrs)
+    }
+
+    /// [`addr_msg`] with the ifaddrmsg's prefix length set.
+    fn addr_msg_prefixed(
+        family: c_int,
+        index: u32,
+        prefixlen: u8,
+        flags: u8,
+        attrs: &[(u16, &[u8])],
+    ) -> Vec<u8> {
         let mut m = vec![0u8; nl_align(size_of::<libc::nlmsghdr>())];
         m.push(u8::try_from(family).unwrap()); // family
-        m.extend_from_slice(&[0, flags, 0]); // prefixlen, flags, scope
+        m.extend_from_slice(&[prefixlen, flags, 0]); // prefixlen, flags, scope
         m.extend_from_slice(&index.to_ne_bytes()); // index
         push_attrs(&mut m, attrs);
         m
@@ -513,6 +525,23 @@ mod tests {
         let mut addrs = InterfaceAddresses::default();
         scan_addr(&msg, "eth0", 5, &mut addrs, &mut V6Pick::default());
         assert_eq!(addrs.v4, Some(Ipv4Addr::new(10, 0, 0, 1)));
+    }
+
+    #[test]
+    fn scan_addr_records_the_v4_prefix() {
+        let msg = addr_msg_prefixed(
+            libc::AF_INET,
+            5,
+            24,
+            0,
+            &[(libc::IFA_ADDRESS, &[192, 0, 2, 2])],
+        );
+        let mut addrs = InterfaceAddresses::default();
+        scan_addr(&msg, "eth0", 5, &mut addrs, &mut V6Pick::default());
+        assert_eq!(
+            addrs.v4_directed_broadcast(),
+            Some(Ipv4Addr::new(192, 0, 2, 255))
+        );
     }
 
     #[test]

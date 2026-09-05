@@ -61,8 +61,16 @@ pub(super) fn resolve(if_name: &str) -> io::Result<(InterfaceAddresses, Option<u
                 // secondary alias and the kernel's enumeration order flip the chosen v4 on unrelated
                 // alias churn, producing a spurious v4 delta that needlessly evicts DIAL proxies.
                 if addrs.v4.is_none() {
-                    log::trace!("{if_name}: v4 {v4}");
+                    // An `AF_INET` entry's netmask, when present, is a `sockaddr_in` like the address.
+                    let prefix = (!ifa.ifa_netmask.is_null())
+                        .then(|| prefix_len(read_v4(ifa.ifa_netmask)))
+                        .flatten();
+                    match prefix {
+                        Some(prefix) => log::trace!("{if_name}: v4 {v4}/{prefix}"),
+                        None => log::trace!("{if_name}: v4 {v4} (no netmask)"),
+                    }
                     addrs.v4 = Some(v4);
+                    addrs.v4_prefix = prefix;
                 } else {
                     log::trace!("{if_name}: v4 {v4} (ignored; already have one)");
                 }
@@ -116,6 +124,13 @@ fn read_v4(addr: *const libc::sockaddr) -> Ipv4Addr {
     let sin = unsafe { ptr::read_unaligned(addr.cast::<libc::sockaddr_in>()) };
     // `s_addr` is in network byte order, i.e. its in-memory bytes *are* the octets.
     Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes())
+}
+
+/// The prefix length a contiguous IPv4 netmask encodes, or `None` for a non-contiguous one.
+fn prefix_len(mask: Ipv4Addr) -> Option<u8> {
+    let bits = u32::from(mask);
+    let ones = bits.leading_ones();
+    (bits.count_ones() == ones).then(|| u8::try_from(ones).expect("at most 32"))
 }
 
 /// The MAC of an `AF_LINK` `sockaddr_dl`, or `None` if the link has none (e.g. loopback).
@@ -272,6 +287,15 @@ mod tests {
             read_mac(buf.as_ptr().cast::<libc::sockaddr>()),
             Some(MacAddr::from(mac))
         );
+    }
+
+    #[test]
+    fn prefix_len_reads_a_contiguous_mask_only() {
+        assert_eq!(prefix_len(Ipv4Addr::new(255, 255, 255, 0)), Some(24));
+        assert_eq!(prefix_len(Ipv4Addr::new(255, 255, 255, 252)), Some(30));
+        assert_eq!(prefix_len(Ipv4Addr::BROADCAST), Some(32));
+        assert_eq!(prefix_len(Ipv4Addr::UNSPECIFIED), Some(0));
+        assert_eq!(prefix_len(Ipv4Addr::new(255, 0, 255, 0)), None);
     }
 
     #[test]

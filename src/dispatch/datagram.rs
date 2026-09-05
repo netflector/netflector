@@ -2,7 +2,7 @@
 //! egress's link type, sourcing from the egress's own address. The dispatcher send path's adapter over
 //! [`net::frame`](crate::net::frame).
 
-use std::net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 use thiserror::Error;
 
@@ -29,12 +29,18 @@ pub(super) enum DatagramError {
 }
 
 /// The Ethernet destination MAC for an injected datagram to `dst`: the all-ones broadcast
-/// for the IPv4 limited broadcast, the RFC-derived group MAC for any multicast destination.
-/// Only broadcast/multicast destinations are injected here, so a unicast `dst` (whose MAC
-/// we would have to resolve) is a [`DatagramError::UnicastDestination`].
-pub(super) fn ethernet_dst(dst: IpAddr) -> Result<MacAddr, DatagramError> {
+/// for the IPv4 limited broadcast and for the egress's own directed broadcast
+/// (`v4_directed_broadcast`, when its prefix is known), the RFC-derived group MAC for any multicast
+/// destination. Only broadcast/multicast destinations are injected here, so a unicast `dst`
+/// (whose MAC we would have to resolve) is a [`DatagramError::UnicastDestination`].
+pub(super) fn ethernet_dst(
+    dst: IpAddr,
+    v4_directed_broadcast: Option<Ipv4Addr>,
+) -> Result<MacAddr, DatagramError> {
     match dst {
-        IpAddr::V4(v4) if v4.is_broadcast() => Ok(MacAddr::broadcast()),
+        IpAddr::V4(v4) if v4.is_broadcast() || Some(v4) == v4_directed_broadcast => {
+            Ok(MacAddr::broadcast())
+        }
         _ if dst.is_multicast() => Ok(MacAddr::multicast_for(dst)),
         _ => Err(DatagramError::UnicastDestination),
     }
@@ -150,20 +156,37 @@ mod tests {
     #[test]
     fn ethernet_dst_maps_address_classes() {
         assert_eq!(
-            ethernet_dst(IpAddr::V4(Ipv4Addr::BROADCAST)),
+            ethernet_dst(IpAddr::V4(Ipv4Addr::BROADCAST), None),
             Ok(MacAddr::broadcast())
         );
         let v4_group: IpAddr = "224.0.0.251".parse().unwrap();
-        assert_eq!(ethernet_dst(v4_group), Ok(MacAddr::multicast_for(v4_group)));
+        assert_eq!(
+            ethernet_dst(v4_group, None),
+            Ok(MacAddr::multicast_for(v4_group))
+        );
         let v6_group: IpAddr = "ff02::1".parse().unwrap();
-        assert_eq!(ethernet_dst(v6_group), Ok(MacAddr::multicast_for(v6_group)));
+        assert_eq!(
+            ethernet_dst(v6_group, None),
+            Ok(MacAddr::multicast_for(v6_group))
+        );
         // A unicast destination (either family) has no injectable L2 address.
         assert_eq!(
-            ethernet_dst("192.168.0.1".parse().unwrap()),
+            ethernet_dst("192.168.0.1".parse().unwrap(), None),
             Err(DatagramError::UnicastDestination)
         );
         assert_eq!(
-            ethernet_dst("fe80::1".parse().unwrap()),
+            ethernet_dst("fe80::1".parse().unwrap(), None),
+            Err(DatagramError::UnicastDestination)
+        );
+        // The egress's own directed broadcast is a broadcast; any other subnet's is not ours to
+        // resolve.
+        let directed = Ipv4Addr::new(192, 0, 2, 255);
+        assert_eq!(
+            ethernet_dst(IpAddr::V4(directed), Some(directed)),
+            Ok(MacAddr::broadcast())
+        );
+        assert_eq!(
+            ethernet_dst(IpAddr::V4(directed), Some(Ipv4Addr::new(10, 0, 0, 255))),
             Err(DatagramError::UnicastDestination)
         );
     }

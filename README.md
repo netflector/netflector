@@ -371,7 +371,7 @@ the periodic reconcile (up to ~30 s).
 
 | Protocol | Port(s) | Group / destination | Relay direction |
 |---|---|---|---|
-| WoL | `wol_ports` (default 7, 9) | `255.255.255.255` (v4) / `ff02::1` (v6) | magic packets source → target |
+| WoL | `wol_ports` (default 7, 9) | the target's directed broadcast or `255.255.255.255` (v4) / `ff02::1` (v6) | magic packets source → target |
 | mDNS | 5353 | `224.0.0.251` / `ff02::fb` | queries source→target, responses target→source |
 | SSDP | 1900 | `239.255.255.250` / `ff02::c` + `ff05::c` | M-SEARCH source→target, NOTIFY target→source |
 | DIAL | 1900 + ephemeral TCP | (uses SSDP discovery) | terminating HTTP reverse proxy (IPv4 only) |
@@ -379,7 +379,10 @@ the periodic reconcile (up to ~30 s).
 
 WoL matching requires the magic-packet sequence (six `0xFF` bytes followed by the target MAC repeated 16
 times) at the start of the UDP payload; trailing bytes such as a SecureOn password are ignored when
-matching and forwarded as-is. mDNS responses include unsolicited announcements (so they flow
+matching and forwarded as-is. A wake sent to the source segment's directed broadcast, or to
+netflector's own address, is re-emitted to the target segment's directed broadcast (to
+`255.255.255.255` while the target's prefix is unknown); one sent to `255.255.255.255` stays a
+limited broadcast. mDNS responses include unsolicited announcements (so they flow
 target→source too); mDNS/SSDP/WSD datagrams are re-emitted verbatim to the same group (mDNS at hop
 limit 255, SSDP at 2, WSD at 1).
 A site-local SSDP group (`ff05::c`) is sourced from a routable address when the interface has one. With
