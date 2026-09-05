@@ -16,7 +16,7 @@ use crate::net::wsd::{
 
 use super::{
     BuildError, Emit, InterfaceMap, NoRewrite, ReplyRewrite, SearchReflector, SimpleReflector,
-    Verdict, join_group_logged, require_bidirectional_families, require_macs_matchable,
+    Verdict, require_bidirectional_families, require_group_join, require_macs_matchable,
 };
 
 /// WSD's classifier kind maps to its group message types. The `ProbeMatches`/`ResolveMatches` unicast
@@ -98,8 +98,20 @@ pub(crate) fn build(
     // no address yet is recorded and re-attempted on the next address change.
     let groups = used_groups(reflector.address_family);
     for group in &groups {
-        join_group_logged(dispatcher, target, group.ip(), "WSD", "target");
-        join_group_logged(dispatcher, source, group.ip(), "WSD", "source");
+        require_group_join(
+            dispatcher,
+            target,
+            group.ip(),
+            "WSD",
+            reflector.target_if.as_str(),
+        )?;
+        require_group_join(
+            dispatcher,
+            source,
+            group.ip(),
+            "WSD",
+            reflector.source_if.as_str(),
+        )?;
     }
     // One handler per direction spans every group; its filter matches the group set at the WSD port.
     let group_ips: IpSet = groups.iter().map(SocketAddr::ip).collect();

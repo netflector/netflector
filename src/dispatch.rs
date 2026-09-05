@@ -29,7 +29,7 @@ mod pair_tests;
 pub(crate) use self::counters::{MessageType, Outcome};
 pub(crate) use self::datagram::DatagramSource;
 pub(crate) use self::dial_context::{DialContext, DialProxyKey};
-pub(crate) use self::multicast::join_deferrable;
+pub(crate) use self::multicast::{join_capped, join_deferrable};
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};

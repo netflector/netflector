@@ -20,8 +20,8 @@ use crate::net::mdns::{
 };
 
 use super::{
-    BuildError, Emit, InterfaceMap, SimpleReflector, Verdict, join_group_logged,
-    require_bidirectional_families, require_macs_matchable,
+    BuildError, Emit, InterfaceMap, SimpleReflector, Verdict, require_bidirectional_families,
+    require_group_join, require_macs_matchable,
 };
 
 /// mDNS's classifier kind *is* its message type: `Query`/`Response` map straight across.
@@ -95,8 +95,11 @@ pub(crate) fn build(
     // on the next address change, so a deferred join logs rather than fails the build.
     let groups = used_groups(reflector.address_family);
     for group in &groups {
-        for (capture, side) in [(source, "source"), (target, "target")] {
-            join_group_logged(dispatcher, capture, group.ip(), "mDNS", side);
+        for (capture, interface) in [
+            (source, &reflector.source_if),
+            (target, &reflector.target_if),
+        ] {
+            require_group_join(dispatcher, capture, group.ip(), "mDNS", interface.as_str())?;
         }
     }
     // One handler per direction spans every group; its filter matches the group set at the mDNS port.
