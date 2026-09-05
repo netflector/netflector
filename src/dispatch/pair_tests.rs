@@ -490,7 +490,7 @@ fn inject(
         addrs,
         injector.link_type(),
         dst,
-        ethernet_dst(dst.ip()).expect("broadcast/multicast destination"),
+        ethernet_dst(dst.ip(), None).expect("broadcast/multicast destination"),
         INJECT_SRC_PORT,
         64,
         payload,

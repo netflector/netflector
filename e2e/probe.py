@@ -132,6 +132,13 @@ def send(args: argparse.Namespace) -> int:
                     sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, mreqn)
             else:
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                if sys.platform.startswith("freebsd14") and args.address == "255.255.255.255":
+                    # FreeBSD 14 puts the interface's directed broadcast on the wire for a send to
+                    # the all-ones address; IP_ONESBCAST keeps 255.255.255.255, as Linux does.
+                    # FreeBSD 15 sends all-ones as such and, with the option set, refuses the send
+                    # with ENETUNREACH. Python exposes no constant for it.
+                    IP_ONESBCAST = 23
+                    sock.setsockopt(socket.IPPROTO_IP, IP_ONESBCAST, 1)
             sock.sendto(payload, (args.address, args.port))
 
     print(f"sent {len(payload)} bytes to {args.address}:{args.port}: {packet_hex(payload)}", flush=True)

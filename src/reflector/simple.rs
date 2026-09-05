@@ -12,6 +12,7 @@
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use crate::dispatch::{CaptureKey, Outcome, PacketDispatcher, PacketHandler};
+use crate::interface::InterfaceAddresses;
 use crate::logging::log_rate;
 use crate::net::packet::Packet;
 use crate::reactor::Reactor;
@@ -166,7 +167,12 @@ impl<C: Classify> PacketHandler for SimpleReflector<C> {
             }
         };
 
-        let dest = link_destination(packet.dest);
+        let dest = link_destination(
+            packet.dest,
+            dispatcher
+                .egress_addrs(self.egress)
+                .and_then(InterfaceAddresses::v4_directed_broadcast),
+        );
 
         // A family the egress can't currently source is a quiet, transient drop (address
         // loss): a Stalled, not a genuine send failure.
@@ -232,19 +238,19 @@ impl<C: Classify> PacketHandler for SimpleReflector<C> {
 /// IPv6 link-local all-nodes group (`ff02::1`), the v6 equivalent of the IPv4 limited broadcast.
 const V6_ALL_NODES: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
 
-/// Where a re-emit of a packet captured to `dest` goes: a multicast group re-emits to itself (the
-/// dispatcher's filter pinned it); anything else, a limited or directed broadcast or a unicast wake
-/// aimed at this host, goes link-wide on the egress at the captured port, the IPv4 limited
-/// broadcast or the IPv6 all-nodes group.
-fn link_destination(dest: SocketAddr) -> SocketAddr {
+/// Where a re-emit of a packet captured to `dest` goes, at the captured port: a multicast group
+/// (the dispatcher's filter pinned it) and the IPv4 limited broadcast re-emit to themselves; any
+/// other IPv4 destination, a directed broadcast or a unicast wake aimed at this host, goes to the
+/// egress's own directed broadcast, or the limited broadcast while its prefix is unknown; any other
+/// IPv6 destination goes to the all-nodes group.
+fn link_destination(dest: SocketAddr, directed_broadcast: Option<Ipv4Addr>) -> SocketAddr {
     match dest {
-        SocketAddr::V4(v4) if !v4.ip().is_multicast() => {
-            SocketAddr::from((Ipv4Addr::BROADCAST, v4.port()))
+        SocketAddr::V4(v4) if v4.ip().is_multicast() || v4.ip().is_broadcast() => dest,
+        SocketAddr::V4(v4) => {
+            SocketAddr::from((directed_broadcast.unwrap_or(Ipv4Addr::BROADCAST), v4.port()))
         }
-        SocketAddr::V6(v6) if !v6.ip().is_multicast() => {
-            SocketAddr::from((V6_ALL_NODES, v6.port()))
-        }
-        group => group,
+        SocketAddr::V6(v6) if v6.ip().is_multicast() => dest,
+        SocketAddr::V6(v6) => SocketAddr::from((V6_ALL_NODES, v6.port())),
     }
 }
 
@@ -330,20 +336,31 @@ mod tests {
     #[test]
     fn link_destination_keeps_groups_and_broadcasts_the_rest() {
         let dest = |s: &str| s.parse::<SocketAddr>().unwrap();
-        assert_eq!(
-            dest("224.0.0.251:5353"),
-            link_destination(dest("224.0.0.251:5353"))
-        );
-        assert_eq!(
-            dest("[ff02::fb]:5353"),
-            link_destination(dest("[ff02::fb]:5353"))
-        );
-        // Limited and directed broadcasts, and a unicast wake aimed at this host, go link-wide at
-        // the captured port.
-        for captured in ["255.255.255.255:9", "10.0.0.255:9", "10.0.0.2:9"] {
-            assert_eq!(dest("255.255.255.255:9"), link_destination(dest(captured)));
+        let egress = Some(Ipv4Addr::new(192, 0, 2, 255));
+        for group in ["224.0.0.251:5353", "[ff02::fb]:5353"] {
+            assert_eq!(dest(group), link_destination(dest(group), egress));
         }
-        assert_eq!(dest("[ff02::1]:9"), link_destination(dest("[fe80::2]:9")));
+        // The limited broadcast stays limited; a directed broadcast or a unicast wake aimed at
+        // this host goes to the egress's own directed broadcast, at the captured port.
+        assert_eq!(
+            dest("255.255.255.255:9"),
+            link_destination(dest("255.255.255.255:9"), egress)
+        );
+        for captured in ["10.0.0.255:9", "10.0.0.2:9"] {
+            assert_eq!(
+                dest("192.0.2.255:9"),
+                link_destination(dest(captured), egress)
+            );
+            // Without the egress prefix, link-wide still means the limited broadcast.
+            assert_eq!(
+                dest("255.255.255.255:9"),
+                link_destination(dest(captured), None)
+            );
+        }
+        assert_eq!(
+            dest("[ff02::1]:9"),
+            link_destination(dest("[fe80::2]:9"), egress)
+        );
     }
 
     #[test]

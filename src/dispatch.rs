@@ -489,7 +489,12 @@ impl PacketDispatcher {
         ttl: u8,
         payload: &[u8],
     ) -> io::Result<()> {
-        let dst_mac = ethernet_dst(dst.ip()).map_err(io::Error::other)?;
+        let dst_mac = ethernet_dst(
+            dst.ip(),
+            self.egress_addrs(egress)
+                .and_then(InterfaceAddresses::v4_directed_broadcast),
+        )
+        .map_err(io::Error::other)?;
         self.send_udp(egress, dst, dst_mac, src_port, ttl, payload)
     }
 
