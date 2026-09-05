@@ -57,6 +57,7 @@ message_types! {
     WsdSearch => ("WSD", "search"),
     WsdResponse => ("WSD", "response"),
     WakeOnLan => ("WoL", ""),
+    UdpDatagram => ("UDP relay", ""),
 }
 
 impl fmt::Display for MessageType {

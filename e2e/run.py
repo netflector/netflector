@@ -281,6 +281,28 @@ WSD_RESOLVEMATCHES_HEX = (
     "<d:MetadataVersion>1</d:MetadataVersion>"
     "</d:ResolveMatch></d:ResolveMatches></s:Body></s:Envelope>"
 ).encode().hex()
+RELAY_PORT = 9003
+RELAY_ONE_WAY_PORT = 9004
+RELAY_UNLISTED_PORT = 9005
+RELAY_GROUP_V4 = "239.255.90.90"
+RELAY_GROUP_V6 = "ff02::5a5a"
+RELAY_UNLISTED_GROUP_V4 = "239.255.91.91"
+RELAY_SOURCE_PORT = 9014  # below the ephemeral range, like the ports above
+
+
+def sood_query_hex(properties: dict[str, str]) -> str:
+    # A Roon SOOD query: `SOOD` 0x02 'Q', then per property a 1-byte key length, the key, a
+    # 2-byte big-endian value length and the value.
+    frame = b"SOOD\x02Q"
+    for key, value in properties.items():
+        frame += bytes([len(key)]) + key.encode() + len(value).to_bytes(2, "big") + value.encode()
+    return frame.hex()
+
+
+SOOD_QUERY_HEX = sood_query_hex({
+    "query_service_id": "00720724-5143-4a9b-abac-0e50cba674bb",
+    "_tid": "5a1c2e3d-4f60-4b7a-9c8d-0e1f2a3b4c5d",
+})
 # --- Address-change cases: knock out one (interface, family) source on netflector, prove
 # reflection of that family stops, then restore it and prove it resumes. netflector reacts on
 # its own event loop after the netlink notification, so each check polls across that async window.
@@ -364,6 +386,9 @@ class TestCase:
     # A line netflector must have logged by the time the receiver's verdict is in, e.g. the
     # destination it re-emitted to.
     expect_netflector_log: str | None = None
+    # Send from a fixed port and require the reflected packet to come from that port and from
+    # the sender's own segment: the UDP relay keeps the source as sent.
+    expect_source_preserved: bool = False
 
     @property
     def send_address(self) -> str:
@@ -950,6 +975,118 @@ WSD_CASES = [
     ),
 ]
 
+# The UDP relay carries a datagram on a listed port to a listed group or a broadcast across as
+# sent: payload, source ip:port and all. config-relay.toml relays port 9003 both ways and port
+# 9004 source->target only.
+RELAY_CASES = [
+    TestCase(
+        name="relays_udp_to_group",
+        send_port=RELAY_PORT,
+        receive_port=RELAY_PORT,
+        expect_mac=None,
+        timeout_seconds=5.0,
+        send_payload_hex=SOOD_QUERY_HEX,
+        expect_payload_hex=SOOD_QUERY_HEX,
+        group=RELAY_GROUP_V4,
+        config="config-relay.toml",
+        expect_source_preserved=True,
+        expect_netflector_log=f"to {RELAY_GROUP_V4}:{RELAY_PORT}",
+    ),
+    TestCase(
+        name="relays_udp_to_group_ipv6",
+        send_port=RELAY_PORT,
+        receive_port=RELAY_PORT,
+        expect_mac=None,
+        timeout_seconds=5.0,
+        send_payload_hex=SOOD_QUERY_HEX,
+        expect_payload_hex=SOOD_QUERY_HEX,
+        family=6,
+        group=RELAY_GROUP_V6,
+        config="config-relay.toml",
+        expect_netflector_log=f"to [{RELAY_GROUP_V6}]:{RELAY_PORT}",
+    ),
+    # The broadcast cases check the destination only: the docker host masquerades a bridged
+    # broadcast (bridge-nf-call-iptables), so the receiver sees its gateway as the source there.
+    TestCase(
+        name="relays_udp_to_directed_broadcast",
+        send_port=RELAY_PORT,
+        receive_port=RELAY_PORT,
+        expect_mac=None,
+        timeout_seconds=5.0,
+        send_payload_hex=SOOD_QUERY_HEX,
+        expect_payload_hex=SOOD_QUERY_HEX,
+        config="config-relay.toml",
+        send_to="192.0.2.255",
+        expect_netflector_log=f"to 198.51.100.255:{RELAY_PORT}",
+    ),
+    TestCase(
+        name="relays_udp_to_limited_broadcast_as_sent",
+        send_port=RELAY_PORT,
+        receive_port=RELAY_PORT,
+        expect_mac=None,
+        timeout_seconds=5.0,
+        send_payload_hex=SOOD_QUERY_HEX,
+        expect_payload_hex=SOOD_QUERY_HEX,
+        config="config-relay.toml",
+        expect_netflector_log=f"to 255.255.255.255:{RELAY_PORT}",
+    ),
+    TestCase(
+        name="relays_udp_from_target",
+        send_port=RELAY_PORT,
+        receive_port=RELAY_PORT,
+        expect_mac=None,
+        timeout_seconds=5.0,
+        send_payload_hex=SOOD_QUERY_HEX,
+        expect_payload_hex=SOOD_QUERY_HEX,
+        group=RELAY_GROUP_V4,
+        direction="reverse",
+        config="config-relay.toml",
+        expect_source_preserved=True,
+    ),
+    TestCase(
+        name="relays_udp_one_way",
+        send_port=RELAY_ONE_WAY_PORT,
+        receive_port=RELAY_ONE_WAY_PORT,
+        expect_mac=None,
+        timeout_seconds=5.0,
+        send_payload_hex=SOOD_QUERY_HEX,
+        expect_payload_hex=SOOD_QUERY_HEX,
+        group=RELAY_GROUP_V4,
+        config="config-relay.toml",
+    ),
+    TestCase(
+        name="ignores_udp_one_way_from_target",
+        send_port=RELAY_ONE_WAY_PORT,
+        receive_port=RELAY_ONE_WAY_PORT,
+        expect_mac=None,
+        timeout_seconds=1.5,
+        send_payload_hex=SOOD_QUERY_HEX,
+        group=RELAY_GROUP_V4,
+        direction="reverse",
+        config="config-relay.toml",
+    ),
+    TestCase(
+        name="ignores_udp_on_unlisted_port",
+        send_port=RELAY_UNLISTED_PORT,
+        receive_port=RELAY_UNLISTED_PORT,
+        expect_mac=None,
+        timeout_seconds=1.5,
+        send_payload_hex=SOOD_QUERY_HEX,
+        group=RELAY_GROUP_V4,
+        config="config-relay.toml",
+    ),
+    TestCase(
+        name="ignores_udp_to_unlisted_group",
+        send_port=RELAY_PORT,
+        receive_port=RELAY_PORT,
+        expect_mac=None,
+        timeout_seconds=1.5,
+        send_payload_hex=SOOD_QUERY_HEX,
+        group=RELAY_UNLISTED_GROUP_V4,
+        config="config-relay.toml",
+    ),
+]
+
 
 @dataclasses.dataclass(frozen=True)
 class RoundTripCase:
@@ -1202,7 +1339,8 @@ ALL_CASES: list[
     TestCase | RoundTripCase | SearchRecreateCase | DialCase | DialAddressChangeCase
     | AddressChangeCase | RecreateCase | DialRecreateCase
 ] = [
-    *TEST_CASES, *MDNS_CASES, *SSDP_CASES, *WSD_CASES, *ROUNDTRIP_CASES, *SEARCH_RECREATE_CASES,
+    *TEST_CASES, *MDNS_CASES, *SSDP_CASES, *WSD_CASES, *RELAY_CASES, *ROUNDTRIP_CASES,
+    *SEARCH_RECREATE_CASES,
     *DIAL_CASES, *DIAL_ADDRESS_CHANGE_CASES, *ADDRESS_CHANGE_CASES, *RECREATE_CASES,
     *DIAL_RECREATE_CASES]
 
@@ -2308,6 +2446,10 @@ class CaseRunner:
             probe_args.extend(["--join-group", case.group, "--interface", ifname])
         if case.expect_routable_source:
             probe_args.append("--expect-source-not-link-local")
+        if case.expect_source_preserved:
+            # v4 only: a send to a link-local v6 group is sourced from the sender's fe80::.
+            subnet = f"{SEGMENT_V4_SUBNET[self.sender_segment]}.0/24"
+            probe_args.extend(["--expect-source-net", subnet, "--expect-source-port", str(RELAY_SOURCE_PORT)])
 
         self.backend.start_probe("receiver", self.receiver_segment, ifname, probe_args)
         self.wait_for_receiver()
@@ -2325,6 +2467,7 @@ class CaseRunner:
             raise RuntimeError(f"case {case.name} has no send payload")
 
         ifname = self.backend.helper_ifname(self.sender_ifname)
+        source_args = ["--source-port", str(RELAY_SOURCE_PORT)] if case.expect_source_preserved else []
         self.backend.start_probe(
             "sender",
             self.sender_segment,
@@ -2332,6 +2475,7 @@ class CaseRunner:
             [
                 "send",
                 *payload_args,
+                *source_args,
                 "--port",
                 str(case.send_port),
                 "--address",

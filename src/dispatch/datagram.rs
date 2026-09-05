@@ -23,9 +23,20 @@ pub(super) enum DatagramError {
     NoSourceMac,
     #[error("destination is unicast; only broadcast/multicast is injected")]
     UnicastDestination,
+    #[error("source and destination are of different address families")]
+    SourceFamilyMismatch,
     /// The frame builder rejected the datagram (buffer too small, or payload too large).
     #[error(transparent)]
     Frame(#[from] FrameError),
+}
+
+/// The IP source of an injected datagram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DatagramSource {
+    /// The egress's own address of the destination's family, at `port`.
+    Egress { port: u16 },
+    /// A captured sender's own address and port, kept on the re-emit.
+    Captured(SocketAddr),
 }
 
 /// The Ethernet destination MAC for an injected datagram to `dst`: the all-ones broadcast
@@ -47,11 +58,11 @@ pub(super) fn ethernet_dst(
 }
 
 /// Assemble a UDP datagram for an egress with addresses `addrs` and link framing `link` into
-/// `scratch`, returning its byte length. The L2 source is the egress's own IP and MAC; the L2
-/// destination is the caller-supplied `dst_mac` (so this serves unicast, multicast, and broadcast
-/// alike). BSD `DLT_NULL` (loopback/tunnel) carries no L2 addresses, so it ignores `dst_mac` and
-/// needs no source MAC.
-// A frame builder takes the full wire spec (egress addrs + link, dst addr + MAC, port, ttl,
+/// `scratch`, returning its byte length. The IP source is `source`, the L2 source the egress's own
+/// MAC; the L2 destination is the caller-supplied `dst_mac` (so this serves unicast, multicast, and
+/// broadcast alike). BSD `DLT_NULL` (loopback/tunnel) carries no L2 addresses, so it ignores
+/// `dst_mac` and needs no source MAC.
+// A frame builder takes the full wire spec (egress addrs + link, dst addr + MAC, source, ttl,
 // payload, buffer); bundling any of these would obscure more than the arg count costs.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_udp(
@@ -59,15 +70,22 @@ pub(super) fn build_udp(
     link: LinkType,
     dst: SocketAddr,
     dst_mac: MacAddr,
-    src_port: u16,
+    source: DatagramSource,
     ttl: u8,
     payload: &[u8],
     scratch: &mut [u8],
 ) -> Result<usize, DatagramError> {
     match dst {
         SocketAddr::V4(dst) => {
-            let src =
-                SocketAddrV4::new(addrs.v4().ok_or(DatagramError::NoSourceAddress)?, src_port);
+            let src = match source {
+                DatagramSource::Egress { port } => {
+                    SocketAddrV4::new(addrs.v4().ok_or(DatagramError::NoSourceAddress)?, port)
+                }
+                DatagramSource::Captured(SocketAddr::V4(src)) => src,
+                DatagramSource::Captured(SocketAddr::V6(_)) => {
+                    return Err(DatagramError::SourceFamilyMismatch);
+                }
+            };
             match link {
                 LinkType::Ethernet => Ok(frame::ethernet_ipv4_udp(
                     dst_mac,
@@ -83,12 +101,20 @@ pub(super) fn build_udp(
             }
         }
         SocketAddr::V6(dst) => {
-            // Source the datagram from an address matching the destination's scope, so a site-local
-            // group (`ff05::c`) isn't sourced from a link-local address.
-            let src_ip = addrs
-                .v6(Ipv6Scope::of(*dst.ip()))
-                .ok_or(DatagramError::NoSourceAddress)?;
-            let src = SocketAddrV6::new(src_ip, src_port, 0, 0);
+            let src = match source {
+                // Source the datagram from an address matching the destination's scope, so a
+                // site-local group (`ff05::c`) isn't sourced from a link-local address.
+                DatagramSource::Egress { port } => {
+                    let src_ip = addrs
+                        .v6(Ipv6Scope::of(*dst.ip()))
+                        .ok_or(DatagramError::NoSourceAddress)?;
+                    SocketAddrV6::new(src_ip, port, 0, 0)
+                }
+                DatagramSource::Captured(SocketAddr::V6(src)) => src,
+                DatagramSource::Captured(SocketAddr::V4(_)) => {
+                    return Err(DatagramError::SourceFamilyMismatch);
+                }
+            };
             match link {
                 LinkType::Ethernet => Ok(frame::ethernet_ipv6_udp(
                     dst_mac,
@@ -133,7 +159,7 @@ mod tests {
             LinkType::Ethernet,
             dst,
             MacAddr::multicast_for(dst.ip()),
-            4000,
+            DatagramSource::Egress { port: 4000 },
             2,
             b"ssdp",
             &mut scratch,
@@ -151,6 +177,44 @@ mod tests {
             "ff05::c sourced from the routable address"
         );
         assert!(n > 38);
+    }
+
+    #[test]
+    fn build_udp_keeps_a_captured_source_verbatim() {
+        // A relay re-emit carries the sender's own ip:port, not the egress's; the frame's source
+        // sits at bytes [26..30] (14 Ethernet + offset 12) and its port at [34..36].
+        let addrs = full_addrs();
+        let dst = SocketAddr::from((Ipv4Addr::BROADCAST, 9003));
+        let captured: SocketAddr = "192.0.2.7:40001".parse().unwrap();
+        let mut scratch = [0u8; 2048];
+        let n = build_udp(
+            &addrs,
+            LinkType::Ethernet,
+            dst,
+            MacAddr::broadcast(),
+            DatagramSource::Captured(captured),
+            32,
+            b"sood",
+            &mut scratch,
+        )
+        .unwrap();
+        assert_eq!(&scratch[26..30], &[192, 0, 2, 7]);
+        assert_eq!(&scratch[34..36], &40001u16.to_be_bytes());
+        assert!(n > 36);
+        // A source of the other family cannot be framed.
+        assert_eq!(
+            build_udp(
+                &addrs,
+                LinkType::Ethernet,
+                dst,
+                MacAddr::broadcast(),
+                DatagramSource::Captured("[fe80::7]:40001".parse().unwrap()),
+                32,
+                b"sood",
+                &mut scratch,
+            ),
+            Err(DatagramError::SourceFamilyMismatch)
+        );
     }
 
     #[test]
@@ -201,7 +265,7 @@ mod tests {
             LinkType::Ethernet,
             dst,
             MacAddr::broadcast(),
-            4000,
+            DatagramSource::Egress { port: 4000 },
             64,
             b"wol",
             &mut scratch,
@@ -224,7 +288,7 @@ mod tests {
             LinkType::Ethernet,
             dst,
             MacAddr::multicast_for(IpAddr::V6(group)),
-            4000,
+            DatagramSource::Egress { port: 4000 },
             64,
             b"wol",
             &mut scratch,
@@ -248,7 +312,7 @@ mod tests {
             LinkType::Ethernet,
             dst,
             searcher_mac,
-            4000,
+            DatagramSource::Egress { port: 4000 },
             64,
             b"ok",
             &mut scratch,
@@ -277,7 +341,7 @@ mod tests {
                 LinkType::Ethernet,
                 dst,
                 MacAddr::broadcast(),
-                4000,
+                DatagramSource::Egress { port: 4000 },
                 64,
                 b"x",
                 &mut scratch
@@ -302,7 +366,7 @@ mod tests {
                 LinkType::Ethernet,
                 dst,
                 MacAddr::broadcast(),
-                4000,
+                DatagramSource::Egress { port: 4000 },
                 64,
                 b"x",
                 &mut scratch
@@ -323,7 +387,7 @@ mod tests {
                 LinkType::Ethernet,
                 dst,
                 MacAddr::broadcast(),
-                4000,
+                DatagramSource::Egress { port: 4000 },
                 64,
                 b"x",
                 &mut tiny
@@ -351,7 +415,7 @@ mod tests {
             LinkType::DltNull,
             dst,
             MacAddr::broadcast(),
-            4000,
+            DatagramSource::Egress { port: 4000 },
             64,
             b"wol",
             &mut scratch,

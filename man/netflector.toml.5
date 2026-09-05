@@ -291,5 +291,17 @@ NETFLECTOR_TV_MDNS=true
 NETFLECTOR_TV_SSDP=true
 NETFLECTOR_TV_DIAL=true
 .Ed
+.Pp
+Roon discovery (SOOD) relayed between two segments, each hosting servers or
+endpoints:
+.Bd -literal -offset indent
+[reflectors.roon]
+source_if     = "lan"
+target_if     = "iot"
+udp_ports     = [9003]
+udp_groups    = ["239.255.90.90"]
+udp_broadcast = true
+bidirectional = true
+.Ed
 .Sh SEE ALSO
 .Xr netflector 8
