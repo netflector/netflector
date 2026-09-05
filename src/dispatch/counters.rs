@@ -39,6 +39,12 @@ macro_rules! message_types {
                     $(Self::$variant => ($protocol, $direction)),+
                 }
             }
+
+            /// Whether the type names a protocol. The UDP relay's does not: it types a packet as
+            /// whatever it is, and yields to a protocol handler's verdict on the same packet.
+            fn is_specific(self) -> bool {
+                self != Self::UdpDatagram
+            }
         }
 
         /// The number of [`MessageType`] variants: the width of a per-interface counter row. Derived
@@ -87,7 +93,8 @@ enum Disposition {
 /// dispatcher logs them rather than silently miscounting.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Anomalies {
-    /// Two handlers classified one packet to different message types: a classifier or config bug.
+    /// Two handlers classified one packet to different protocols: a classifier or config bug. The
+    /// relay's datagram type does not count; it yields to a protocol's.
     pub(crate) type_mismatch: bool,
 }
 
@@ -128,20 +135,39 @@ impl Outcome {
         }
     }
 
+    /// This outcome carrying `message_type` instead of its own.
+    fn with_type(self, message_type: MessageType) -> Outcome {
+        match self {
+            Self::Reflected(_) => Self::Reflected(message_type),
+            Self::Skipped(_) => Self::Skipped(message_type),
+            Self::Dropped(_) => Self::Dropped(message_type),
+            Self::Stalled(_) => Self::Stalled(message_type),
+            Self::Filtered => Self::Filtered,
+        }
+    }
+
     /// Fold another handler's outcome for the *same* packet into this running one: keep the
-    /// higher-precedence disposition, and report any invariant [`Anomalies`]. Order-independent (a max
-    /// over [`disposition`](Self::disposition)), so handler visitation order doesn't change the result.
+    /// higher-precedence disposition under the protocol's type when one handler is the relay, and
+    /// report any invariant [`Anomalies`]. Order-independent (a max over
+    /// [`disposition`](Self::disposition)), so handler visitation order doesn't change the result.
     pub(crate) fn combine(self, other: Outcome) -> (Outcome, Anomalies) {
+        let types = (self.message_type(), other.message_type());
         let anomalies = Anomalies {
             type_mismatch: matches!(
-                (self.message_type(), other.message_type()),
-                (Some(a), Some(b)) if a != b
+                types,
+                (Some(a), Some(b)) if a != b && a.is_specific() && b.is_specific()
             ),
         };
         let merged = if other.disposition() > self.disposition() {
             other
         } else {
             self
+        };
+        let merged = match types {
+            (Some(a), Some(b)) if a.is_specific() != b.is_specific() => {
+                merged.with_type(if a.is_specific() { a } else { b })
+            }
+            _ => merged,
         };
         (merged, anomalies)
     }
@@ -435,6 +461,29 @@ mod tests {
         let (merged, anomalies) = Outcome::Reflected(Q).combine(Outcome::Reflected(Q));
         assert_eq!(merged, Outcome::Reflected(Q));
         assert_eq!(anomalies, Anomalies::default());
+    }
+
+    #[test]
+    fn combine_counts_a_packet_the_relay_shares_under_the_protocol() {
+        use MessageType::{MdnsQuery as Q, MdnsResponse as R, UdpDatagram as U};
+        // A relay and a protocol handler on one ingress see the same packet: the protocol's type
+        // wins in either order and at either disposition, and it is no mismatch.
+        for (mine, theirs) in [
+            (Outcome::Reflected(Q), Outcome::Reflected(U)),
+            (Outcome::Reflected(U), Outcome::Reflected(Q)),
+        ] {
+            let (merged, anomalies) = mine.combine(theirs);
+            assert_eq!(merged, Outcome::Reflected(Q));
+            assert!(!anomalies.type_mismatch);
+        }
+        // The relay forwards a response the protocol's leg skips: reflected, as a response.
+        let (merged, anomalies) = Outcome::Skipped(R).combine(Outcome::Reflected(U));
+        assert_eq!(merged, Outcome::Reflected(R));
+        assert!(!anomalies.type_mismatch);
+        // Two relays agree with each other.
+        let (merged, anomalies) = Outcome::Reflected(U).combine(Outcome::Reflected(U));
+        assert_eq!(merged, Outcome::Reflected(U));
+        assert!(!anomalies.type_mismatch);
     }
 
     #[test]
