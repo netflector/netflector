@@ -254,10 +254,13 @@ wsd       = true                 # optional; enable WS-Discovery reflection (def
 wol_ports = [7, 9]               # optional; WoL UDP ports (default [7, 9]); only valid when wol = true
 address_family = "default"       # optional; default | dual | ipv4 | ipv6 (default "default")
 bidirectional = false            # optional; also relay every enabled protocol target -> source (default false)
+udp_ports = [9003]               # optional; UDP ports to relay as sent (see UDP relay); needs udp_groups or udp_broadcast
+udp_groups = ["239.255.90.90"]   # optional; multicast groups to join and relay on those ports
+udp_broadcast = true             # optional; also relay broadcasts on those ports (default false); needs IPv4
 ```
 
-An entry must enable at least one protocol and expands into one reflector per enabled protocol, all
-sharing the entry's interfaces, MAC selection, and `address_family`. The same shape serves one or a few
+An entry must enable at least one protocol or set `udp_ports`, and expands into one reflector per
+enabled protocol, all sharing the entry's interfaces, MAC selection, and `address_family`. The same shape serves one or a few
 specific devices (set `macs`) or a whole network (omit it). No IP addresses ever appear in the config.
 `dial` is not a separate reflector; it augments the entry's SSDP reflector with the DIAL application
 proxy (so it requires `ssdp`; see [DIAL](#dial)).
@@ -278,11 +281,12 @@ then optional; with none, the environment is the whole configuration. Variables 
 - `<TAG>` ties one entry's parameters together: any alphanumeric string (`1`, `2`, `TV`, …). It also
   becomes the entry's name (and thus its log label) unless a `NAME` parameter overrides it.
 - `<PARAM>` is `NAME` or any field from the entry table above (`SOURCE_IF`, `TARGET_IF`, `MACS`,
-  `WOL`, `MDNS`, `SSDP`, `WSD`, `DIAL`, `WOL_PORTS`, `ADDRESS_FAMILY`, `BIDIRECTIONAL`), case-insensitive.
+  `WOL`, `MDNS`, `SSDP`, `WSD`, `DIAL`, `WOL_PORTS`, `ADDRESS_FAMILY`, `BIDIRECTIONAL`, `UDP_PORTS`,
+  `UDP_GROUPS`, `UDP_BROADCAST`), case-insensitive.
 
 The globals are `NETFLECTOR_LOG_LEVEL`, `NETFLECTOR_DEBUG_MEMORY_INTERVAL_SECS`, and
 `NETFLECTOR_COUNTERS_INTERVAL_SECS`, so `LOG`, `DEBUG`, and `COUNTERS` are reserved tags. Booleans are
-`true`/`false` or `1`/`0`; `WOL_PORTS`
+`true`/`false` or `1`/`0`; `WOL_PORTS`, `UDP_PORTS`, `UDP_GROUPS`
 and `MACS` are comma-separated (`7,9` / `B0:...,C4:...`). The `[reflectors.tv]` entry above looks like
 this in the environment:
 
@@ -323,6 +327,8 @@ devices:
   `macs` at startup when the target link carries no MAC addresses (a BSD `DLT_NULL` link such as a
   loopback or an L3 tunnel) - it could never match. WoL is unaffected: it matches the MAC inside the
   magic packet's payload.
+- **The UDP relay** ignores the allow-set and carries every device's datagrams, so an entry enabling
+  only the relay may not set `macs`.
 
 Omit `macs` for a network-level entry: WoL proxies every valid magic packet, and mDNS/SSDP/WSD relay
 every device's traffic rather than a chosen set (only the message kinds the corresponding direction
@@ -456,9 +462,18 @@ Entry names must be unique across the file and the environment: a name that appe
 same name from both sources) is rejected at startup. Beyond that, two entries that enable the same
 protocol are rejected as a duplicate of that protocol only when they could reflect the same packet
 twice: a shared direction, overlapping MAC selection, overlapping address-family handling, and, for
-WoL, at least one shared port. An entry's directions are its `source_if` → `target_if`, plus the reverse
-when it is `bidirectional`, so a bidirectional `lan`/`iot` entry and a plain `iot` → `lan` one duplicate
-each other. MAC selection overlaps when the entries' allow-sets
+WoL, at least one shared port. The UDP relay admits every datagram it captures, so it duplicates a
+protocol (of another entry or its own) when both capture the same datagrams on the same leg: a shared
+port with a shared group or with broadcasts on both sides, or any shared port against WoL, which
+captures every destination on its ports. mDNS, SSDP and WSD capture on both interfaces whatever the
+entry's direction (queries on `source_if`, responses on `target_if`), so a relay on their group
+conflicts with them either way round, and since the relay ignores `macs` and queries admit every
+sender, a MAC selection never separates the two. A relay on 5353 listing `224.0.0.251` beside an
+mDNS entry is rejected as mDNS, a
+broadcast-only relay on 5353 is not, and neither is WoL on 1900 beside SSDP, since each of those
+admits only its own messages. An entry's directions are its
+`source_if` → `target_if`, plus the reverse when it is `bidirectional`, so a bidirectional `lan`/`iot`
+entry and a plain `iot` → `lan` one duplicate each other. MAC selection overlaps when the entries' allow-sets
 share at least one device, or when either omits its MAC filter (any device). Address-family handling overlaps when both can
 handle the same IP version: an `ipv4`-only and an `ipv6`-only entry never overlap, while `default`/`dual`
 overlap with either. Entries that differ in interface, MAC, address family (or WoL ports), or that

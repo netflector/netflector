@@ -9,7 +9,7 @@ use std::str::FromStr;
 
 use super::error::{ConfigError, ParseBoolError, ParseValueError, RequiredField};
 use super::raw::{RawConfig, RawReflector};
-use super::value::{AddressFamily, InterfaceName, LogLevel, ReflectorName, WolPorts};
+use super::value::{AddressFamily, GroupList, InterfaceName, LogLevel, PortList, ReflectorName};
 use crate::net::mac::MacSet;
 
 /// Accumulates a reflector's fields across its `NETFLECTOR_<tag>_<param>` variables,
@@ -26,7 +26,10 @@ struct PartialReflector {
     dial: Option<bool>,
     wsd: Option<bool>,
     bidirectional: Option<bool>,
-    wol_ports: Option<WolPorts>,
+    wol_ports: Option<PortList>,
+    udp_ports: Option<PortList>,
+    udp_groups: Option<GroupList>,
+    udp_broadcast: Option<bool>,
     address_family: Option<AddressFamily>,
 }
 
@@ -63,6 +66,9 @@ impl PartialReflector {
             "dial" => put(&mut self.dial, env_bool(value, var)?, param, var),
             "wsd" => put(&mut self.wsd, env_bool(value, var)?, param, var),
             "bidirectional" => put(&mut self.bidirectional, env_bool(value, var)?, param, var),
+            "udp_ports" => put(&mut self.udp_ports, env_value(value, var)?, param, var),
+            "udp_groups" => put(&mut self.udp_groups, env_value(value, var)?, param, var),
+            "udp_broadcast" => put(&mut self.udp_broadcast, env_bool(value, var)?, param, var),
             _ => Err(ConfigError::EnvUnknownParam {
                 var: var.to_owned(),
                 param: param.to_owned(),
@@ -90,6 +96,9 @@ impl PartialReflector {
             wsd: self.wsd.unwrap_or(false),
             bidirectional: self.bidirectional.unwrap_or(false),
             wol_ports: self.wol_ports,
+            udp_ports: self.udp_ports,
+            udp_groups: self.udp_groups,
+            udp_broadcast: self.udp_broadcast.unwrap_or(false),
             address_family: self.address_family.unwrap_or_default(),
         })
     }
@@ -276,6 +285,25 @@ mod tests {
         let r = &cfg.reflectors[0];
         assert!(r.wol.is_some());
         assert!(!r.mdns);
+    }
+
+    #[test]
+    fn env_udp_relay_fields() {
+        let cfg = from_env(&[
+            ("NETFLECTOR_ROON_SOURCE_IF", "lan"),
+            ("NETFLECTOR_ROON_TARGET_IF", "iot"),
+            ("NETFLECTOR_ROON_UDP_PORTS", "9003,9004"),
+            ("NETFLECTOR_ROON_UDP_GROUPS", "239.255.90.90"),
+            ("NETFLECTOR_ROON_UDP_BROADCAST", "1"),
+        ])
+        .unwrap();
+        let udp = cfg.reflectors[0].udp.as_ref().unwrap();
+        assert_eq!(
+            udp.ports.iter().map(|p| p.get()).collect::<Vec<_>>(),
+            [9003, 9004]
+        );
+        assert_eq!(udp.groups.as_ref().unwrap().len(), 1);
+        assert!(udp.broadcast);
     }
 
     #[test]

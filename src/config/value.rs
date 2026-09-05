@@ -6,6 +6,7 @@
 //! The newtypes make illegal values unrepresentable.
 
 use std::fmt;
+use std::net::IpAddr;
 use std::num::NonZeroU16;
 use std::ops::Deref;
 use std::str::FromStr;
@@ -194,18 +195,11 @@ impl FromStr for ReflectorName {
     }
 }
 
-/// A non-empty, duplicate-free list of Wake-on-LAN destination ports.
+/// A non-empty, duplicate-free list of UDP ports.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct WolPorts(Vec<NonZeroU16>);
+pub(crate) struct PortList(Vec<NonZeroU16>);
 
-impl Default for WolPorts {
-    fn default() -> Self {
-        const PORTS: [NonZeroU16; 2] = [NonZeroU16::new(7).unwrap(), NonZeroU16::new(9).unwrap()];
-        Self(PORTS.to_vec())
-    }
-}
-
-impl Deref for WolPorts {
+impl Deref for PortList {
     type Target = [NonZeroU16];
 
     fn deref(&self) -> &Self::Target {
@@ -214,34 +208,34 @@ impl Deref for WolPorts {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub(crate) enum WolPortsError {
-    #[error("wol_ports must not be empty")]
+pub(crate) enum PortListError {
+    #[error("port list must not be empty")]
     Empty,
-    #[error("wol_ports contains duplicate port {0}")]
+    #[error("duplicate port {0}")]
     Duplicate(u16),
     /// A comma-separated token was not a port in 1..=65535.
-    #[error("wol_ports has an invalid port \"{0}\"")]
+    #[error("invalid port \"{0}\"")]
     BadPort(String),
 }
 
-impl TryFrom<Vec<NonZeroU16>> for WolPorts {
-    type Error = WolPortsError;
+impl TryFrom<Vec<NonZeroU16>> for PortList {
+    type Error = PortListError;
 
     fn try_from(ports: Vec<NonZeroU16>) -> Result<Self, Self::Error> {
         if ports.is_empty() {
-            return Err(WolPortsError::Empty);
+            return Err(PortListError::Empty);
         }
         for (i, port) in ports.iter().enumerate() {
             if ports[..i].contains(port) {
-                return Err(WolPortsError::Duplicate(port.get()));
+                return Err(PortListError::Duplicate(port.get()));
             }
         }
         Ok(Self(ports))
     }
 }
 
-impl FromStr for WolPorts {
-    type Err = WolPortsError;
+impl FromStr for PortList {
+    type Err = PortListError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let ports = s
@@ -250,16 +244,85 @@ impl FromStr for WolPorts {
                 let token = token.trim();
                 token
                     .parse::<NonZeroU16>()
-                    .map_err(|_| WolPortsError::BadPort(token.to_owned()))
+                    .map_err(|_| PortListError::BadPort(token.to_owned()))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        WolPorts::try_from(ports)
+        PortList::try_from(ports)
     }
 }
 
-impl<'de> Deserialize<'de> for WolPorts {
+impl<'de> Deserialize<'de> for PortList {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         Vec::<NonZeroU16>::deserialize(deserializer)?
+            .try_into()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// A non-empty, duplicate-free list of multicast groups, of either family.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GroupList(Vec<IpAddr>);
+
+impl Deref for GroupList {
+    type Target = [IpAddr];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub(crate) enum GroupListError {
+    #[error("group list must not be empty")]
+    Empty,
+    #[error("duplicate group {0}")]
+    Duplicate(IpAddr),
+    #[error("{0} is not a multicast address")]
+    NotMulticast(IpAddr),
+    /// A comma-separated token was not an IP address.
+    #[error("invalid group \"{0}\"")]
+    BadAddress(String),
+}
+
+impl TryFrom<Vec<IpAddr>> for GroupList {
+    type Error = GroupListError;
+
+    fn try_from(groups: Vec<IpAddr>) -> Result<Self, Self::Error> {
+        if groups.is_empty() {
+            return Err(GroupListError::Empty);
+        }
+        for (i, group) in groups.iter().enumerate() {
+            if !group.is_multicast() {
+                return Err(GroupListError::NotMulticast(*group));
+            }
+            if groups[..i].contains(group) {
+                return Err(GroupListError::Duplicate(*group));
+            }
+        }
+        Ok(Self(groups))
+    }
+}
+
+impl FromStr for GroupList {
+    type Err = GroupListError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let groups = s
+            .split(',')
+            .map(|token| {
+                let token = token.trim();
+                token
+                    .parse::<IpAddr>()
+                    .map_err(|_| GroupListError::BadAddress(token.to_owned()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        GroupList::try_from(groups)
+    }
+}
+
+impl<'de> Deserialize<'de> for GroupList {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Vec::<IpAddr>::deserialize(deserializer)?
             .try_into()
             .map_err(serde::de::Error::custom)
     }
@@ -335,30 +398,50 @@ mod tests {
     }
 
     #[test]
-    fn wol_ports_parse_via_fromstr() {
-        let ports = "7, 9, 4000".parse::<WolPorts>().unwrap();
+    fn port_list_parses_via_fromstr() {
+        let ports = "7, 9, 4000".parse::<PortList>().unwrap();
         assert_eq!(
             ports.iter().map(|p| p.get()).collect::<Vec<_>>(),
             [7, 9, 4000]
         );
         assert!(matches!(
-            "7,7".parse::<WolPorts>(),
-            Err(WolPortsError::Duplicate(7))
+            "7,7".parse::<PortList>(),
+            Err(PortListError::Duplicate(7))
         ));
         assert!(matches!(
-            "0".parse::<WolPorts>(),
-            Err(WolPortsError::BadPort(_))
+            "0".parse::<PortList>(),
+            Err(PortListError::BadPort(_))
         ));
         assert!(matches!(
-            "abc".parse::<WolPorts>(),
-            Err(WolPortsError::BadPort(_))
+            "abc".parse::<PortList>(),
+            Err(PortListError::BadPort(_))
+        ));
+    }
+
+    #[test]
+    fn group_list_parses_multicast_groups_only() {
+        let groups = "239.255.90.90, ff12::8384".parse::<GroupList>().unwrap();
+        assert_eq!(
+            groups.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            ["239.255.90.90", "ff12::8384"]
+        );
+        let unicast: IpAddr = "192.0.2.1".parse().unwrap();
+        assert_eq!(
+            "192.0.2.1".parse::<GroupList>(),
+            Err(GroupListError::NotMulticast(unicast))
+        );
+        let group: IpAddr = "239.255.90.90".parse().unwrap();
+        assert_eq!(
+            "239.255.90.90,239.255.90.90".parse::<GroupList>(),
+            Err(GroupListError::Duplicate(group))
+        );
+        assert!(matches!(
+            "roon".parse::<GroupList>(),
+            Err(GroupListError::BadAddress(_))
         ));
         assert_eq!(
-            WolPorts::default()
-                .iter()
-                .map(|p| p.get())
-                .collect::<Vec<_>>(),
-            [7, 9]
+            GroupList::try_from(Vec::<IpAddr>::new()),
+            Err(GroupListError::Empty)
         );
     }
 
@@ -373,11 +456,11 @@ mod tests {
     }
 
     #[test]
-    fn wol_ports_reject_an_empty_list() {
+    fn port_list_rejects_an_empty_list() {
         // FromStr can't yield an empty list, so Empty is reachable only via the TryFrom path.
         assert!(matches!(
-            WolPorts::try_from(Vec::<NonZeroU16>::new()),
-            Err(WolPortsError::Empty)
+            PortList::try_from(Vec::<NonZeroU16>::new()),
+            Err(PortListError::Empty)
         ));
     }
 }

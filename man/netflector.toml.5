@@ -74,6 +74,8 @@ link carries no MAC addresses (a
 .Dv DLT_NULL
 link): the frame-source filter could never match there.
 Wake-on-LAN is unaffected; it matches the address inside the magic packet.
+The UDP relay ignores the list and carries every device's datagrams, so an
+entry enabling only the relay may not set one.
 .It Ic address_family
 .Cm default
 (the default) attempts both families, requires IPv4, and treats IPv6 as
@@ -144,9 +146,35 @@ Run one active
 per pair of network segments: two would relay each other's re-emits without end.
 Boolean, default
 .Cm false .
+.It Ic udp_ports
+Destination UDP ports whose datagrams are relayed as sent, source address and
+port included: to the same multicast group, to the target segment's directed
+broadcast for a directed one, and to the limited broadcast unchanged.
+A list of unique ports in the range 1 to 65535.
+Requires
+.Ic udp_groups
+or
+.Ic udp_broadcast ,
+and may not capture what an enabled protocol of the entry already relays
+.Pq see Sx DUPLICATE DETECTION .
+.It Ic udp_groups
+Multicast groups to join and relay on
+.Ic udp_ports ,
+of either family the entry's
+.Ic address_family
+uses.
+.It Ic udp_broadcast
+Also relay broadcasts on
+.Ic udp_ports :
+the limited broadcast and the segment's own directed one.
+Boolean, default
+.Cm false ;
+requires an IPv4-capable
+.Ic address_family .
 .El
 .Pp
-An entry must enable at least one protocol.
+An entry must enable at least one protocol or set
+.Ic udp_ports .
 .Sh ENVIRONMENT
 Every setting can come from the environment, which suits containers.
 Variables are named
@@ -161,7 +189,8 @@ parameter overrides it.
 .Ic NAME ,
 or any entry field:
 .Ic SOURCE_IF , TARGET_IF , MACS , WOL , MDNS , SSDP , WSD , DIAL ,
-.Ic WOL_PORTS , ADDRESS_FAMILY , BIDIRECTIONAL .
+.Ic WOL_PORTS , ADDRESS_FAMILY , BIDIRECTIONAL , UDP_PORTS , UDP_GROUPS ,
+.Ic UDP_BROADCAST .
 Case-insensitive.
 .El
 .Pp
@@ -179,9 +208,9 @@ Booleans are
 .Cm true Ns / Ns Cm false
 or
 .Cm 1 Ns / Ns Cm 0 ;
-.Ic MACS
+.Ic MACS , WOL_PORTS , UDP_PORTS ,
 and
-.Ic WOL_PORTS
+.Ic UDP_GROUPS
 are comma-separated.
 An unknown parameter, a non-alphanumeric or reserved tag, and a tag with no
 parameter are all rejected at startup.
@@ -201,6 +230,22 @@ Beyond names, two entries that enable the same protocol are rejected only when
 they could reflect the same packet twice: a shared direction, overlapping MAC
 selection, overlapping address-family handling, and, for Wake-on-LAN, at least
 one shared port.
+The UDP relay admits every datagram it captures, so it duplicates a protocol,
+of another entry or of its own, when both capture the same datagrams on the
+same leg: a shared port with a shared group or with broadcasts on both sides,
+or any shared port against Wake-on-LAN, which captures every destination on
+its ports.
+mDNS, SSDP and WSD capture on both interfaces whatever the entry's direction,
+queries on
+.Ic source_if
+and responses on
+.Ic target_if ,
+so a relay on their group conflicts with them either way round; the relay
+ignores
+.Ic macs
+and queries admit every sender, so a MAC selection never separates the two.
+Two discovery protocols on one port do not conflict, each admitting only its
+own messages.
 An entry's directions are its
 .Ic source_if
 to

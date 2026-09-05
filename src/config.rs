@@ -3,7 +3,7 @@
 //! TOML is deserialized into a raw form (`RawConfig`/`RawReflector`) and then
 //! validated into the strongly-typed [`Config`]. Typed values make illegal states
 //! unrepresentable ([`Wol::ports`] exists only when `WoL` is enabled;
-//! [`InterfaceName`]/[`WolPorts`] can't be empty).
+//! [`InterfaceName`]/[`PortList`] can't be empty).
 //!
 //! Submodules: value types in `value`, errors in `error`, the serde layer in
 //! `raw`, the environment parser in `env`. Each value type pairs `FromStr` with a
@@ -22,8 +22,12 @@ mod raw;
 mod value;
 
 pub(crate) use self::error::{ConfigError, Protocol};
-pub(crate) use self::value::{AddressFamily, InterfaceName, LogLevel, ReflectorName, WolPorts};
+pub(crate) use self::value::{
+    AddressFamily, GroupList, InterfaceName, LogLevel, PortList, ReflectorName,
+};
 
+use std::net::IpAddr;
+use std::num::NonZeroU16;
 use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
@@ -32,12 +36,101 @@ use serde::Deserialize;
 
 use self::raw::{RawConfig, RawReflector};
 use crate::net::mac::MacSet;
+use crate::net::mdns::{MDNS_GROUP_V4, MDNS_GROUP_V6, MDNS_PORT};
+use crate::net::ssdp::{
+    SSDP_GROUP_V4, SSDP_GROUP_V6_LINK_LOCAL, SSDP_GROUP_V6_SITE_LOCAL, SSDP_PORT,
+};
+use crate::net::wsd::{WSD_GROUP_V4, WSD_GROUP_V6, WSD_PORT};
 
 /// Wake-on-LAN settings (present only when `WoL` is enabled for the reflector).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Wol {
     /// UDP destination ports whose magic packets are reflected.
-    pub(crate) ports: WolPorts,
+    pub(crate) ports: PortList,
+}
+
+/// The ports a `wol = true` entry relays when `wol_ports` is absent.
+const WOL_DEFAULT_PORTS: [NonZeroU16; 2] =
+    [NonZeroU16::new(7).unwrap(), NonZeroU16::new(9).unwrap()];
+
+impl Wol {
+    fn default_ports() -> PortList {
+        PortList::try_from(WOL_DEFAULT_PORTS.to_vec()).expect("two distinct ports")
+    }
+}
+
+/// The destinations a protocol's filter admits on one port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// Any address the family uses: the Wake-on-LAN filter pins the port alone.
+    Any(AddressFamily),
+    Group(IpAddr),
+    /// The limited broadcast and the segment's directed one.
+    Broadcast,
+}
+
+impl Reach {
+    /// Whether a datagram exists that both admit.
+    fn overlaps(self, other: Reach) -> bool {
+        match (self, other) {
+            (Self::Any(a), Self::Any(b)) => families_overlap(a, b),
+            (Self::Any(family), Self::Group(group)) | (Self::Group(group), Self::Any(family)) => {
+                family_uses(family, group)
+            }
+            (Self::Any(family), Self::Broadcast) | (Self::Broadcast, Self::Any(family)) => {
+                family.uses_ipv4()
+            }
+            (Self::Group(a), Self::Group(b)) => a == b,
+            (Self::Broadcast, Self::Broadcast) => true,
+            (Self::Group(_), Self::Broadcast) | (Self::Broadcast, Self::Group(_)) => false,
+        }
+    }
+}
+
+/// A class of datagrams an entry relays: those to `port` and `reach` arriving on `ingress`,
+/// re-emitted on `egress`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Flow<'a> {
+    protocol: Protocol,
+    ingress: &'a InterfaceName,
+    egress: &'a InterfaceName,
+    port: u16,
+    reach: Reach,
+}
+
+impl Flow<'_> {
+    /// Whether a datagram exists in both flows.
+    fn overlaps(&self, other: &Flow<'_>) -> bool {
+        self.ingress == other.ingress
+            && self.egress == other.egress
+            && self.port == other.port
+            && self.reach.overlaps(other.reach)
+    }
+}
+
+/// The transparent UDP relay's settings (present only when `udp_ports` is set).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UdpRelay {
+    /// Destination ports whose datagrams are relayed as sent.
+    pub(crate) ports: PortList,
+    /// Multicast groups to join and relay on those ports.
+    pub(crate) groups: Option<GroupList>,
+    /// Whether broadcasts on those ports are relayed too.
+    pub(crate) broadcast: bool,
+}
+
+impl UdpRelay {
+    fn destinations(&self) -> Vec<(u16, Reach)> {
+        let groups = self.groups.as_deref().unwrap_or(&[]);
+        self.ports
+            .iter()
+            .map(|port| port.get())
+            .flat_map(|port| {
+                let groups = groups.iter().map(move |group| (port, Reach::Group(*group)));
+                groups.chain(self.broadcast.then_some((port, Reach::Broadcast)))
+            })
+            .collect()
+    }
 }
 
 /// SSDP settings (present only when SSDP is enabled for the reflector).
@@ -71,6 +164,8 @@ pub(crate) struct Reflector {
     /// Also relay every enabled protocol target → source: the entry is built a second time with
     /// its interfaces swapped.
     pub(crate) bidirectional: bool,
+    /// The transparent UDP relay, or `None` when `udp_ports` is unset.
+    pub(crate) udp: Option<UdpRelay>,
 }
 
 impl Reflector {
@@ -93,10 +188,83 @@ impl Reflector {
         )
     }
 
-    /// The protocol on which `self` and `other` would reflect the same packet
-    /// twice, if any: a shared direction, overlapping MAC selection and address
-    /// family, and a shared enabled protocol (for `WoL`, also a shared port).
+    /// Every flow the entry's protocols relay. mDNS, SSDP and WSD capture on both interfaces
+    /// whatever the entry's direction, queries on the source and responses on the target, for
+    /// the groups of the families the entry uses; Wake-on-LAN admits anything on its ports and
+    /// the relay its groups and broadcast, each on the entry's directions.
+    fn flows(&self) -> Vec<Flow<'_>> {
+        let family = self.address_family;
+        let mut flows = Vec::new();
+        let mut discovery = |protocol, port, groups: &[IpAddr]| {
+            for group in groups.iter().filter(|group| family_uses(family, **group)) {
+                let legs = [
+                    (&self.source_if, &self.target_if),
+                    (&self.target_if, &self.source_if),
+                ];
+                flows.extend(legs.map(|(ingress, egress)| Flow {
+                    protocol,
+                    ingress,
+                    egress,
+                    port,
+                    reach: Reach::Group(*group),
+                }));
+            }
+        };
+        if self.mdns {
+            let v4 = IpAddr::V4(MDNS_GROUP_V4);
+            let v6 = IpAddr::V6(MDNS_GROUP_V6);
+            discovery(Protocol::Mdns, MDNS_PORT, &[v4, v6]);
+        }
+        if self.ssdp.is_some() {
+            let v4 = IpAddr::V4(SSDP_GROUP_V4);
+            let link_local = IpAddr::V6(SSDP_GROUP_V6_LINK_LOCAL);
+            let site_local = IpAddr::V6(SSDP_GROUP_V6_SITE_LOCAL);
+            discovery(Protocol::Ssdp, SSDP_PORT, &[v4, link_local, site_local]);
+        }
+        if self.wsd {
+            let v4 = IpAddr::V4(WSD_GROUP_V4);
+            let v6 = IpAddr::V6(WSD_GROUP_V6);
+            discovery(Protocol::Wsd, WSD_PORT, &[v4, v6]);
+        }
+        for (ingress, egress) in self.directions() {
+            if let Some(wol) = &self.wol {
+                flows.extend(wol.ports.iter().map(|port| Flow {
+                    protocol: Protocol::Wol,
+                    ingress,
+                    egress,
+                    port: port.get(),
+                    reach: Reach::Any(family),
+                }));
+            }
+            if let Some(udp) = &self.udp {
+                flows.extend(udp.destinations().into_iter().map(|(port, reach)| Flow {
+                    protocol: Protocol::Udp,
+                    ingress,
+                    egress,
+                    port,
+                    reach,
+                }));
+            }
+        }
+        flows
+    }
+
+    /// The protocol on which `self` and `other` would reflect the same packet twice, if any: a
+    /// protocol both enable, or a flow of one the UDP relay of the other overlaps. Two
+    /// discovery protocols on one port don't duplicate: each classifier admits only its own
+    /// messages. The relay admits every datagram it captures, so it duplicates any protocol
+    /// capturing the same on the same leg, and the conflict is named after that protocol.
     fn conflicts_with(&self, other: &Reflector) -> Option<Protocol> {
+        self.shared_protocol(other).or_else(|| {
+            self.relay_overlap(other.flows())
+                .or_else(|| other.relay_overlap(self.flows()))
+                .map(|(protocol, _)| protocol)
+        })
+    }
+
+    /// A protocol both enable on a shared direction with overlapping MAC selection and address
+    /// family (for `WoL`, also a shared port).
+    fn shared_protocol(&self, other: &Reflector) -> Option<Protocol> {
         if !self
             .directions()
             .any(|mine| other.directions().any(|theirs| theirs == mine))
@@ -124,6 +292,28 @@ impl Reflector {
         }
         None
     }
+
+    /// The first of `others` whose datagrams the entry's UDP relay would carry a second time,
+    /// as its protocol and port.
+    fn relay_overlap<'a>(
+        &self,
+        others: impl IntoIterator<Item = Flow<'a>>,
+    ) -> Option<(Protocol, u16)> {
+        let mine = self.flows();
+        let relay = || mine.iter().filter(|flow| flow.protocol == Protocol::Udp);
+        others
+            .into_iter()
+            .find(|other| relay().any(|mine| mine.overlaps(other)))
+            .map(|other| (other.protocol, other.port))
+    }
+}
+
+/// Whether `family` handles `ip`'s IP version.
+fn family_uses(family: AddressFamily, ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(_) => family.uses_ipv4(),
+        IpAddr::V6(_) => family.uses_ipv6(),
+    }
 }
 
 impl TryFrom<(String, RawReflector)> for Reflector {
@@ -146,18 +336,49 @@ impl TryFrom<(String, RawReflector)> for Reflector {
             });
         }
 
-        if !raw.wol && !raw.mdns && !raw.ssdp && !raw.wsd {
+        // The relay's own checks come first: an entry that sets only udp_groups is a relay
+        // missing its ports, not an entry with no protocol.
+        let udp = match (raw.udp_ports, raw.udp_groups, raw.udp_broadcast) {
+            (None, None, false) => None,
+            (None, _, _) => return Err(ConfigError::UdpRelayWithoutPorts { name }),
+            (Some(_), None, false) => return Err(ConfigError::UdpRelayNoDestination { name }),
+            (Some(ports), groups, broadcast) => {
+                if broadcast && !raw.address_family.uses_ipv4() {
+                    return Err(ConfigError::UdpBroadcastFamily { name });
+                }
+                let foreign = groups
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .find(|group| !family_uses(raw.address_family, **group));
+                if let Some(group) = foreign {
+                    return Err(ConfigError::UdpGroupFamily {
+                        name,
+                        group: *group,
+                    });
+                }
+                Some(UdpRelay {
+                    ports,
+                    groups,
+                    broadcast,
+                })
+            }
+        };
+        if !raw.wol && !raw.mdns && !raw.ssdp && !raw.wsd && udp.is_none() {
             return Err(ConfigError::NoProtocol { name });
         }
         if raw.wol_ports.is_some() && !raw.wol {
             return Err(ConfigError::WolPortsWithoutWol { name });
+        }
+        if raw.macs.is_some() && !raw.wol && !raw.mdns && !raw.ssdp && !raw.wsd {
+            return Err(ConfigError::MacsUnused { name });
         }
         if raw.dial && !raw.ssdp {
             return Err(ConfigError::DialWithoutSsdp { name });
         }
 
         let wol = if raw.wol {
-            let ports = raw.wol_ports.unwrap_or_default();
+            let ports = raw.wol_ports.unwrap_or_else(Wol::default_ports);
             Some(Wol { ports })
         } else {
             None
@@ -172,7 +393,7 @@ impl TryFrom<(String, RawReflector)> for Reflector {
             None
         };
 
-        Ok(Reflector {
+        let reflector = Reflector {
             name,
             source_if,
             target_if,
@@ -183,7 +404,24 @@ impl TryFrom<(String, RawReflector)> for Reflector {
             ssdp,
             wsd: raw.wsd,
             bidirectional: raw.bidirectional,
-        })
+            udp,
+        };
+        let duplicated = {
+            let flows = reflector.flows();
+            let others = flows
+                .iter()
+                .copied()
+                .filter(|flow| flow.protocol != Protocol::Udp);
+            reflector.relay_overlap(others)
+        };
+        if let Some((protocol, port)) = duplicated {
+            return Err(ConfigError::UdpRelayDuplicates {
+                name: reflector.name,
+                port,
+                protocol,
+            });
+        }
+        Ok(reflector)
     }
 }
 
@@ -326,7 +564,7 @@ pub(crate) fn resolve_log_level(
 }
 
 /// The enabled protocols of `reflector` as a comma-separated summary for logging,
-/// with `WoL` ports and the SSDP DIAL flag.
+/// with `WoL` ports, the SSDP DIAL flag, and the relay's ports and destinations.
 fn protocol_list(reflector: &Reflector) -> String {
     let mut protocols: Vec<String> = Vec::new();
     if let Some(wol) = &reflector.wol {
@@ -345,6 +583,19 @@ fn protocol_list(reflector: &Reflector) -> String {
     }
     if reflector.wsd {
         protocols.push("wsd".to_owned());
+    }
+    if let Some(udp) = &reflector.udp {
+        let ports: Vec<String> = udp.ports.iter().map(ToString::to_string).collect();
+        let groups = udp.groups.as_deref().unwrap_or(&[]);
+        let mut destinations: Vec<String> = groups.iter().map(ToString::to_string).collect();
+        if udp.broadcast {
+            destinations.push("broadcast".to_owned());
+        }
+        protocols.push(format!(
+            "udp({} on {})",
+            ports.join(","),
+            destinations.join(",")
+        ));
     }
     protocols.join(", ")
 }
@@ -444,6 +695,180 @@ mod tests {
         assert!(r.wol.is_none());
         assert!(r.ssdp.is_none());
         assert!(!r.bidirectional);
+    }
+
+    #[test]
+    fn wol_relays_ports_7_and_9_by_default() {
+        let cfg = from_toml(
+            r#"
+            [reflectors.pc]
+            source_if = "lan"
+            target_if = "iot"
+            wol = true
+            "#,
+        )
+        .unwrap();
+        let ports = &cfg.reflectors[0].wol.as_ref().unwrap().ports;
+        assert_eq!(ports.iter().map(|p| p.get()).collect::<Vec<_>>(), [7, 9]);
+    }
+
+    #[test]
+    fn udp_relay_parses() {
+        let cfg = from_toml(
+            r#"
+            [reflectors.roon]
+            source_if = "lan"
+            target_if = "iot"
+            udp_ports = [9003]
+            udp_groups = ["239.255.90.90"]
+            udp_broadcast = true
+            "#,
+        )
+        .unwrap();
+        let udp = cfg.reflectors[0].udp.as_ref().unwrap();
+        assert_eq!(
+            udp.ports.iter().map(|p| p.get()).collect::<Vec<_>>(),
+            [9003]
+        );
+        assert_eq!(
+            udp.groups.as_ref().unwrap().to_vec(),
+            ["239.255.90.90".parse::<IpAddr>().unwrap()]
+        );
+        assert!(udp.broadcast);
+        assert!(cfg.reflectors[0].wol.is_none());
+    }
+
+    #[test]
+    fn macs_need_a_protocol_that_applies_them() {
+        let text = r#"
+            [reflectors.roon]
+            source_if = "lan"
+            target_if = "iot"
+            macs = ["00:00:00:00:00:01"]
+            udp_ports = [9003]
+            udp_broadcast = true
+        "#;
+        assert!(matches!(err(text), ConfigError::MacsUnused { .. }));
+        let cfg = from_toml(
+            r#"
+            [reflectors.roon]
+            source_if = "lan"
+            target_if = "iot"
+            macs = ["00:00:00:00:00:01"]
+            wol = true
+            udp_ports = [9003]
+            udp_broadcast = true
+            "#,
+        )
+        .unwrap();
+        assert!(cfg.reflectors[0].macs.is_some());
+    }
+
+    #[test]
+    fn udp_relay_needs_ports_and_a_destination() {
+        // Groups or broadcast without ports: nothing says which datagrams to relay.
+        let text = r#"
+            [reflectors.roon]
+            source_if = "lan"
+            target_if = "iot"
+            udp_groups = ["239.255.90.90"]
+        "#;
+        assert!(matches!(
+            err(text),
+            ConfigError::UdpRelayWithoutPorts { .. }
+        ));
+        // Ports without groups or broadcast: nothing to capture.
+        let text = r#"
+            [reflectors.roon]
+            source_if = "lan"
+            target_if = "iot"
+            udp_ports = [9003]
+        "#;
+        assert!(matches!(
+            err(text),
+            ConfigError::UdpRelayNoDestination { .. }
+        ));
+    }
+
+    #[test]
+    fn udp_group_must_be_of_a_used_family() {
+        let text = r#"
+            [reflectors.sync]
+            source_if = "lan"
+            target_if = "iot"
+            address_family = "ipv4"
+            udp_ports = [21027]
+            udp_groups = ["ff12::8384"]
+        "#;
+        assert!(matches!(err(text), ConfigError::UdpGroupFamily { .. }));
+    }
+
+    #[test]
+    fn udp_broadcast_needs_ipv4() {
+        let text = r#"
+            [reflectors.sync]
+            source_if = "lan"
+            target_if = "iot"
+            address_family = "ipv6"
+            udp_ports = [21027]
+            udp_groups = ["ff12::8384"]
+            udp_broadcast = true
+        "#;
+        assert!(matches!(err(text), ConfigError::UdpBroadcastFamily { .. }));
+    }
+
+    #[test]
+    fn udp_relay_on_a_group_of_the_entrys_own_protocol_rejected() {
+        let text = r#"
+            [reflectors.lan]
+            source_if = "lan"
+            target_if = "iot"
+            mdns = true
+            udp_ports = [5353]
+            udp_groups = ["224.0.0.251"]
+        "#;
+        assert!(matches!(
+            err(text),
+            ConfigError::UdpRelayDuplicates {
+                port: 5353,
+                protocol: Protocol::Mdns,
+                ..
+            }
+        ));
+        // Wake-on-LAN captures every destination on its ports.
+        let text = r#"
+            [reflectors.lan]
+            source_if = "lan"
+            target_if = "iot"
+            wol = true
+            udp_ports = [9]
+            udp_groups = ["239.255.90.90"]
+        "#;
+        assert!(matches!(
+            err(text),
+            ConfigError::UdpRelayDuplicates {
+                port: 9,
+                protocol: Protocol::Wol,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn udp_relay_off_the_entrys_own_groups_parses() {
+        // mDNS never captures a broadcast, so the relay on its port duplicates nothing.
+        let cfg = from_toml(
+            r#"
+            [reflectors.lan]
+            source_if = "lan"
+            target_if = "iot"
+            mdns = true
+            udp_ports = [5353]
+            udp_broadcast = true
+            "#,
+        )
+        .unwrap();
+        assert!(cfg.reflectors[0].udp.is_some());
     }
 
     #[test]
@@ -1000,6 +1425,250 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn udp_relays_conflict_on_a_shared_port_and_destination() {
+        let text = r#"
+            [reflectors.a]
+            source_if = "lan"
+            target_if = "iot"
+            udp_ports = [9003, 9004]
+            udp_groups = ["239.255.90.90"]
+            udp_broadcast = true
+
+            [reflectors.b]
+            source_if = "lan"
+            target_if = "iot"
+            udp_ports = [9004]
+            udp_groups = ["239.255.90.90"]
+        "#;
+        assert!(matches!(
+            err(text),
+            ConfigError::ConflictingReflectors {
+                protocol: Protocol::Udp,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn udp_relays_on_one_port_with_disjoint_destinations_coexist() {
+        let cfg = from_toml(
+            r#"
+            [reflectors.a]
+            source_if = "lan"
+            target_if = "iot"
+            udp_ports = [9003]
+            udp_broadcast = true
+
+            [reflectors.b]
+            source_if = "lan"
+            target_if = "iot"
+            udp_ports = [9003]
+            udp_groups = ["239.255.90.90"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.reflectors.len(), 2);
+    }
+
+    #[test]
+    fn udp_relay_on_a_protocols_group_conflicts_with_it() {
+        // The relay on 5353 would carry mDNS a second time; the conflict names mDNS.
+        let text = r#"
+            [reflectors.a]
+            source_if = "lan"
+            target_if = "iot"
+            mdns = true
+
+            [reflectors.b]
+            source_if = "lan"
+            target_if = "iot"
+            udp_ports = [5353]
+            udp_groups = ["224.0.0.251"]
+        "#;
+        assert!(matches!(
+            err(text),
+            ConfigError::ConflictingReflectors {
+                protocol: Protocol::Mdns,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn udp_relay_on_a_protocols_group_conflicts_either_way_round() {
+        // mDNS relays responses iot -> lan whatever the entry's direction.
+        let text = r#"
+            [reflectors.a]
+            source_if = "lan"
+            target_if = "iot"
+            mdns = true
+
+            [reflectors.b]
+            source_if = "iot"
+            target_if = "lan"
+            udp_ports = [5353]
+            udp_groups = ["224.0.0.251"]
+        "#;
+        assert!(matches!(
+            err(text),
+            ConfigError::ConflictingReflectors {
+                protocol: Protocol::Mdns,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn macs_never_separate_a_discovery_protocol_from_a_udp_relay() {
+        // Queries from any client are relayed regardless of `macs`.
+        let text = r#"
+            [reflectors.a]
+            source_if = "lan"
+            target_if = "iot"
+            mdns = true
+            macs = ["00:00:00:00:00:01"]
+
+            [reflectors.b]
+            source_if = "lan"
+            target_if = "iot"
+            udp_ports = [5353]
+            udp_groups = ["224.0.0.251"]
+        "#;
+        assert!(matches!(
+            err(text),
+            ConfigError::ConflictingReflectors {
+                protocol: Protocol::Mdns,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn udp_relay_on_a_wol_port_in_the_other_direction_coexists() {
+        // Wake-on-LAN relays source -> target only.
+        let cfg = from_toml(
+            r#"
+            [reflectors.wake]
+            source_if = "lan"
+            target_if = "iot"
+            wol = true
+
+            [reflectors.relay]
+            source_if = "iot"
+            target_if = "lan"
+            udp_ports = [9]
+            udp_broadcast = true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.reflectors.len(), 2);
+    }
+
+    #[test]
+    fn udp_relay_off_a_protocols_groups_coexists_with_it() {
+        let cfg = from_toml(
+            r#"
+            [reflectors.a]
+            source_if = "lan"
+            target_if = "iot"
+            mdns = true
+
+            [reflectors.b]
+            source_if = "lan"
+            target_if = "iot"
+            udp_ports = [5353]
+            udp_broadcast = true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.reflectors.len(), 2);
+    }
+
+    #[test]
+    fn udp_relay_on_a_wol_port_conflicts_in_a_family_wol_uses() {
+        let text = r#"
+            [reflectors.wake]
+            source_if = "lan"
+            target_if = "iot"
+            wol = true
+
+            [reflectors.relay]
+            source_if = "lan"
+            target_if = "iot"
+            udp_ports = [9]
+            udp_broadcast = true
+        "#;
+        assert!(matches!(
+            err(text),
+            ConfigError::ConflictingReflectors {
+                protocol: Protocol::Wol,
+                ..
+            }
+        ));
+        // An IPv4-only WoL entry never relays a v6 magic packet.
+        let cfg = from_toml(
+            r#"
+            [reflectors.wake]
+            source_if = "lan"
+            target_if = "iot"
+            address_family = "ipv4"
+            wol = true
+
+            [reflectors.relay]
+            source_if = "lan"
+            target_if = "iot"
+            udp_ports = [9]
+            udp_groups = ["ff02::1"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.reflectors.len(), 2);
+    }
+
+    #[test]
+    fn different_protocols_on_one_port_coexist() {
+        // WoL admits only magic packets and SSDP only its own messages, so port 1900 shared
+        // between them relays nothing twice.
+        let cfg = from_toml(
+            r#"
+            [reflectors.wake]
+            source_if = "lan"
+            target_if = "iot"
+            wol = true
+            wol_ports = [1900]
+
+            [reflectors.discovery]
+            source_if = "lan"
+            target_if = "iot"
+            ssdp = true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.reflectors.len(), 2);
+    }
+
+    #[test]
+    fn udp_relays_on_disjoint_ports_coexist() {
+        let cfg = from_toml(
+            r#"
+            [reflectors.roon]
+            source_if = "lan"
+            target_if = "iot"
+            udp_ports = [9003]
+            udp_broadcast = true
+
+            [reflectors.squeezebox]
+            source_if = "lan"
+            target_if = "iot"
+            udp_ports = [3483]
+            udp_broadcast = true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.reflectors.len(), 2);
     }
 
     #[test]
