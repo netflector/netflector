@@ -467,10 +467,11 @@ failure) is forwarded unchanged and logged, leaving on-subnet discovery unaffect
 `udp_ports` turns an entry into a transparent relay for any other UDP discovery a device or app does
 by multicast or broadcast. A datagram captured on `source_if` to one of the ports, sent to a group in
 `udp_groups` or, with `udp_broadcast = true`, to a broadcast, is re-emitted on `target_if` exactly as
-sent: same payload, same source address and port, same TTL. A group goes to the same group
-(netflector joins it on `source_if`), the source segment's directed broadcast to the target segment's
-own, and `255.255.255.255` stays `255.255.255.255`. Nothing is parsed, so nothing is proxied: replies
-are the receiver's business.
+sent: same payload, same source address and port, same TTL. A group goes to the same group, which
+netflector joins on `source_if`. A directed broadcast of any subnet on the source segment (on a link
+without MAC addresses, of its first subnet) goes to the target segment's directed broadcast of its
+first subnet. `255.255.255.255` stays `255.255.255.255`. Nothing is parsed, so nothing is proxied:
+replies are the receiver's business.
 
 That is the point of keeping the source. A device on the target segment answers a relayed query by
 unicast to the address it came from, on the other segment, and the firewall routes that reply like

@@ -166,7 +166,8 @@ uses.
 .It Ic udp_broadcast
 Also relay broadcasts on
 .Ic udp_ports :
-the limited broadcast and the segment's own directed one.
+the limited broadcast and the directed broadcast of any subnet on the segment
+(on a link without MAC addresses, of its first subnet).
 Boolean, default
 .Cm false ;
 requires an IPv4-capable

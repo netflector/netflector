@@ -32,6 +32,20 @@ pub(crate) struct Packet<'a> {
     pub(crate) payload: &'a [u8],
 }
 
+impl Packet<'_> {
+    /// Whether the datagram is an IPv4 broadcast. On a link with MACs the frame says: it went to
+    /// the all-ones MAC, which carries a directed broadcast of any subnet on the link as well as the
+    /// limited one. A link without MACs (`DLT_NULL`, a tunnel or a loopback) leaves the address:
+    /// the limited broadcast, or `directed_broadcast`, the link's own subnet's.
+    pub(crate) fn is_broadcast(&self, directed_broadcast: Option<Ipv4Addr>) -> bool {
+        match (self.dest.ip(), self.dst_mac) {
+            (IpAddr::V4(v4), Some(mac)) => !v4.is_multicast() && mac == MacAddr::broadcast(),
+            (IpAddr::V4(v4), None) => v4.is_broadcast() || Some(v4) == directed_broadcast,
+            (IpAddr::V6(_), _) => false,
+        }
+    }
+}
+
 /// Why a captured frame could not be parsed into a [`Packet`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub(crate) enum ParseError {

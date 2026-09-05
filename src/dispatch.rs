@@ -152,19 +152,15 @@ pub(crate) struct Filter {
     /// Allow-set on the source MAC: the packet's source must be a member.
     pub(crate) src_mac: Option<MacSet>,
     pub(crate) dst_mac: Option<MacAddr>,
-    /// Require an IPv4 broadcast destination: the ingress's own directed broadcast or the limited
-    /// one. Resolved against the ingress's addresses at match time, so it follows a prefix change
-    /// without re-registering.
+    /// Require an IPv4 broadcast destination, see [`Packet::is_broadcast`].
     pub(crate) broadcast: bool,
 }
 
 impl Filter {
     /// Whether `p` satisfies every set field (an unset field matches anything), given the ingress's
-    /// current directed broadcast for the `broadcast` field.
+    /// directed broadcast for the `broadcast` field on a link without MACs.
     fn matches(&self, p: &Packet, ingress_directed_broadcast: Option<Ipv4Addr>) -> bool {
-        (!self.broadcast
-            || matches!(p.dest.ip(), IpAddr::V4(v4)
-                if v4.is_broadcast() || Some(v4) == ingress_directed_broadcast))
+        (!self.broadcast || p.is_broadcast(ingress_directed_broadcast))
             && self.src_ip.is_none_or(|ip| p.source.ip() == ip)
             && self
                 .dst_ip
@@ -1263,24 +1259,35 @@ mod tests {
     }
 
     #[test]
-    fn filter_broadcast_takes_the_ingress_directed_or_limited_broadcast() {
+    fn filter_broadcast_takes_the_all_ones_mac_or_the_limited_broadcast() {
         let f = Filter {
             broadcast: true,
             ..Filter::default()
         };
-        let directed = Some(Ipv4Addr::new(10, 0, 0, 255));
+        let all_ones = Some(MacAddr::broadcast());
+        let unicast = Some(MacAddr::from([0x02, 0, 0, 0, 0, 1]));
+        let own = Some(Ipv4Addr::new(10, 0, 0, 255));
+        // On the all-ones MAC every subnet's directed broadcast qualifies, the limited one too.
+        assert!(f.matches(&packet("10.0.0.1:1", "10.0.0.255:9", all_ones, None), own));
+        assert!(f.matches(&packet("10.0.1.1:1", "10.0.1.255:9", all_ones, None), own));
         assert!(f.matches(
-            &packet("10.0.0.1:1", "255.255.255.255:9", None, None),
-            directed
+            &packet("10.0.0.1:1", "255.255.255.255:9", all_ones, None),
+            own
         ));
-        assert!(f.matches(&packet("10.0.0.1:1", "10.0.0.255:9", None, None), directed));
-        // Another subnet's broadcast, a unicast, and a group are not broadcasts here; without a
-        // known prefix only the limited broadcast qualifies.
-        assert!(!f.matches(&packet("10.0.0.1:1", "10.0.1.255:9", None, None), directed));
-        assert!(!f.matches(&packet("10.0.0.1:1", "10.0.0.2:9", None, None), directed));
-        assert!(!f.matches(&packet("10.0.0.1:1", "224.0.0.251:9", None, None), directed));
+        // Without MACs (DLT_NULL) the address decides: the limited broadcast, or the link's own.
+        assert!(f.matches(&packet("10.0.0.1:1", "255.255.255.255:9", None, None), own));
+        assert!(f.matches(&packet("10.0.0.1:1", "10.0.0.255:9", None, None), own));
+        assert!(!f.matches(&packet("10.0.1.1:1", "10.0.1.255:9", None, None), own));
         assert!(!f.matches(&packet("10.0.0.1:1", "10.0.0.255:9", None, None), None));
-        assert!(f.matches(&packet("10.0.0.1:1", "255.255.255.255:9", None, None), None));
+        // The frame decides, not the address's shape: a broadcast-looking address on a unicast
+        // frame is unicast, a unicast-looking one on the all-ones MAC is a broadcast of a subnet
+        // the sender knows.
+        assert!(!f.matches(&packet("10.0.0.1:1", "10.0.0.255:9", unicast, None), own));
+        assert!(f.matches(&packet("10.0.0.1:1", "10.0.0.2:9", all_ones, None), own));
+        assert!(!f.matches(&packet("10.0.0.1:1", "224.0.0.251:9", None, None), own));
+        // A group on the all-ones MAC is still a group: the group handler's, not this one's.
+        assert!(!f.matches(&packet("10.0.0.1:1", "224.0.0.251:9", all_ones, None), own));
+        assert!(!f.matches(&packet("[fe80::1]:1", "[ff02::1]:9", all_ones, None), own));
     }
 
     #[test]
