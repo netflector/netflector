@@ -5,12 +5,13 @@
 //! matchable while naming the variable that carried it.
 
 use std::fmt;
+use std::net::IpAddr;
 
 use thiserror::Error;
 
 use super::value::{
-    InterfaceName, ParseAddressFamilyError, ParseInterfaceNameError, ParseLogLevelError,
-    ParseReflectorNameError, ReflectorName, WolPortsError,
+    GroupListError, InterfaceName, ParseAddressFamilyError, ParseInterfaceNameError,
+    ParseLogLevelError, ParseReflectorNameError, PortListError, ReflectorName,
 };
 use crate::net::mac::MacSetError;
 
@@ -44,11 +45,39 @@ pub(crate) enum ConfigError {
         value: InterfaceName,
     },
 
-    #[error("reflector \"{name}\" enables no protocol (set wol, mdns, ssdp, or wsd)")]
+    #[error("reflector \"{name}\" enables no protocol (set wol, mdns, ssdp, wsd, or udp_ports)")]
     NoProtocol { name: ReflectorName },
+
+    #[error("reflector \"{name}\" sets udp_groups or udp_broadcast but not udp_ports")]
+    UdpRelayWithoutPorts { name: ReflectorName },
+
+    #[error("reflector \"{name}\" sets udp_ports but neither udp_groups nor udp_broadcast")]
+    UdpRelayNoDestination { name: ReflectorName },
+
+    #[error(
+        "reflector \"{name}\" lists UDP group {group}, whose family its address_family does not use"
+    )]
+    UdpGroupFamily { name: ReflectorName, group: IpAddr },
+
+    #[error("reflector \"{name}\" sets udp_broadcast but its address_family has no IPv4")]
+    UdpBroadcastFamily { name: ReflectorName },
+
+    #[error(
+        "reflector \"{name}\" would relay {protocol} on port {port} twice, through udp_ports as well"
+    )]
+    UdpRelayDuplicates {
+        name: ReflectorName,
+        port: u16,
+        protocol: Protocol,
+    },
 
     #[error("reflector \"{name}\" sets wol_ports but does not enable wol")]
     WolPortsWithoutWol { name: ReflectorName },
+
+    #[error(
+        "reflector \"{name}\" lists macs but enables only the UDP relay, which does not apply them"
+    )]
+    MacsUnused { name: ReflectorName },
 
     #[error("reflector \"{name}\" sets dial but does not enable ssdp")]
     DialWithoutSsdp { name: ReflectorName },
@@ -143,6 +172,7 @@ pub(crate) enum Protocol {
     Mdns,
     Ssdp,
     Wsd,
+    Udp,
 }
 
 impl fmt::Display for Protocol {
@@ -152,6 +182,7 @@ impl fmt::Display for Protocol {
             Self::Mdns => "mDNS",
             Self::Ssdp => "SSDP",
             Self::Wsd => "WSD",
+            Self::Udp => "UDP relay",
         })
     }
 }
@@ -174,9 +205,12 @@ pub(crate) enum ParseValueError {
     /// `SOURCE_IF`/`TARGET_IF`.
     #[error(transparent)]
     Interface(#[from] ParseInterfaceNameError),
-    /// `WOL_PORTS`.
+    /// `WOL_PORTS` / `UDP_PORTS`.
     #[error(transparent)]
-    WolPorts(#[from] WolPortsError),
+    PortList(#[from] PortListError),
+    /// `UDP_GROUPS`.
+    #[error(transparent)]
+    GroupList(#[from] GroupListError),
     /// `NAME`.
     #[error(transparent)]
     ReflectorName(#[from] ParseReflectorNameError),

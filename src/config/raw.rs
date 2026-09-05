@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 
 use super::error::ConfigError;
-use super::value::{AddressFamily, InterfaceName, LogLevel, ReflectorName, WolPorts};
+use super::value::{AddressFamily, GroupList, InterfaceName, LogLevel, PortList, ReflectorName};
 use crate::net::mac::MacSet;
 
 #[derive(Debug, Default, Deserialize)]
@@ -42,7 +42,7 @@ pub(super) struct RawReflector {
     pub(super) address_family: AddressFamily,
     #[serde(default)]
     pub(super) wol: bool,
-    pub(super) wol_ports: Option<WolPorts>,
+    pub(super) wol_ports: Option<PortList>,
     #[serde(default)]
     pub(super) mdns: bool,
     #[serde(default)]
@@ -53,6 +53,10 @@ pub(super) struct RawReflector {
     pub(super) wsd: bool,
     #[serde(default)]
     pub(super) bidirectional: bool,
+    pub(super) udp_ports: Option<PortList>,
+    pub(super) udp_groups: Option<GroupList>,
+    #[serde(default)]
+    pub(super) udp_broadcast: bool,
 }
 
 impl RawConfig {

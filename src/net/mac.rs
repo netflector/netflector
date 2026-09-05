@@ -111,7 +111,7 @@ impl<'de> Deserialize<'de> for MacAddr {
 
 /// A non-empty, duplicate-free set of MAC addresses: a device allow-filter.
 ///
-/// The set is always non-empty (mirroring [`WolPorts`](crate::config::WolPorts));
+/// The set is always non-empty (mirroring [`PortList`](crate::config::PortList));
 /// "match any device" is expressed by an absent (`None`) filter at the use site,
 /// not by an empty set.
 #[derive(Debug, Clone, PartialEq, Eq)]
