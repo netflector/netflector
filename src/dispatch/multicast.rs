@@ -205,6 +205,12 @@ pub(crate) fn join_unsupported(err: &io::Error) -> bool {
     )
 }
 
+/// Whether a group-join failure means the socket holds as many memberships as the system allows:
+/// `ENOBUFS` on Linux (`net.ipv4.igmp_max_memberships`), `ETOOMANYREFS` on the BSDs.
+pub(crate) fn join_capped(e: &io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(libc::ENOBUFS | libc::ETOOMANYREFS))
+}
+
 /// Whether a group-join failure is deferrable: `EADDRNOTAVAIL` means the interface has no address of
 /// the group's family yet, so the group joins on the address event that supplies one. Every other
 /// error is replayed just the same, but has no trigger anyone can name, so it reports as a failure
@@ -218,6 +224,15 @@ mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     use super::*;
+
+    #[test]
+    fn the_membership_cap_errnos_are_capped_joins() {
+        let of = io::Error::from_raw_os_error;
+        assert!(join_capped(&of(libc::ENOBUFS)));
+        assert!(join_capped(&of(libc::ETOOMANYREFS)));
+        assert!(!join_capped(&of(libc::EINVAL)));
+        assert!(!join_capped(&of(libc::EADDRNOTAVAIL)));
+    }
 
     #[test]
     fn only_eaddrnotavail_is_a_deferrable_join() {

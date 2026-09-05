@@ -7,8 +7,8 @@ use crate::config::Reflector;
 use crate::dispatch::{Filter, MessageType, PacketDispatcher, PortSet};
 
 use super::{
-    BuildError, Emit, InterfaceMap, SimpleReflector, Verdict, join_group_logged,
-    missing_required_family,
+    BuildError, Emit, InterfaceMap, SimpleReflector, Verdict, missing_required_family,
+    require_group_join,
 };
 
 /// Every captured datagram is a message for the leg.
@@ -21,8 +21,9 @@ fn relay(_payload: &[u8]) -> Verdict {
 /// groups and one for the broadcasts, each spanning every port.
 ///
 /// # Errors
-/// [`BuildError::UnknownInterface`] if no capture was opened for the source/target, or
-/// [`BuildError::RequiredFamilyUnavailable`] if the target can't currently send a required family.
+/// [`BuildError::UnknownInterface`] if no capture was opened for the source/target,
+/// [`BuildError::RequiredFamilyUnavailable`] if the target can't currently send a required family,
+/// or [`BuildError::GroupJoin`] if a group can't be joined on the source.
 pub(crate) fn build(
     reflector: &Reflector,
     interfaces: &InterfaceMap,
@@ -44,13 +45,13 @@ pub(crate) fn build(
 
     let groups = udp.groups.as_deref().unwrap_or(&[]);
     for group in groups {
-        join_group_logged(
+        require_group_join(
             dispatcher,
             ingress,
             *group,
             "UDP relay",
             reflector.source_if.as_str(),
-        );
+        )?;
     }
 
     // A filter matches every field it sets, so the groups and the broadcasts need one each.

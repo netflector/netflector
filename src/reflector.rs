@@ -21,7 +21,7 @@ use std::net::{IpAddr, SocketAddr};
 use thiserror::Error;
 
 use crate::config::AddressFamily;
-use crate::dispatch::{CaptureKey, MessageType, PacketDispatcher, join_deferrable};
+use crate::dispatch::{CaptureKey, MessageType, PacketDispatcher, join_capped, join_deferrable};
 use crate::interface::InterfaceAddresses;
 use crate::linear_map::LinearMap;
 use crate::logging::WARN_WINDOW;
@@ -139,6 +139,15 @@ pub(crate) enum BuildError {
     /// nothing, silently discarding every device-side packet.
     #[error("macs can never match on interface \"{0}\": its link carries no MAC addresses")]
     MacsUnmatchable(String),
+    /// A group the reflector captures could not be joined, for a reason no later event clears,
+    /// so its traffic would never arrive. A startup failure rather than a running daemon that
+    /// reflects nothing for it.
+    #[error("cannot join {group} on interface \"{interface}\": {reason}")]
+    GroupJoin {
+        group: IpAddr,
+        interface: String,
+        reason: String,
+    },
 }
 
 /// Refuse a `macs` filter on a target whose link framing carries no MAC addresses:
@@ -218,30 +227,43 @@ fn require_bidirectional_families(
     Ok(())
 }
 
-/// Join `group` on `capture` for `protocol`'s `side` leg (`"source"`/`"target"`), logging the outcome.
-/// A [deferrable](join_deferrable) failure logs at debug (it retries on the next address change); any
-/// other failure is a warning, matching its re-join sibling — a dead reflector must not hide behind
-/// a debug line.
-fn join_group_logged(
+/// Join `group` on `capture`, the capture of `interface`, for `protocol`. A
+/// [deferrable](join_deferrable) failure logs at debug (it retries on the next address change);
+/// any other fails the build.
+///
+/// # Errors
+/// [`BuildError::GroupJoin`], naming the system's membership cap when that is the cause.
+fn require_group_join(
     dispatcher: &mut PacketDispatcher,
     capture: CaptureKey,
     group: IpAddr,
     protocol: &str,
-    side: &str,
-) {
+    interface: &str,
+) -> Result<(), BuildError> {
     match dispatcher.join_group(capture, group) {
-        Ok(()) => log::debug!("{protocol}: joined {group} on {side}"),
+        Ok(()) => log::debug!("{protocol}: joined {group} on {interface}"),
         Err(e) if join_deferrable(&e) => {
             log::debug!(
-                "{protocol}: join {group} on {side} deferred (no address of its family yet): {e}"
+                "{protocol}: join {group} on {interface} deferred (no address of its family yet): {e}"
             );
         }
         Err(e) => {
-            log::warn!(
-                "{protocol}: join {group} on {side} failed; its traffic is not reflected: {e}"
-            );
+            let reason = if join_capped(&e) {
+                format!(
+                    "{e}; the interface holds as many memberships as the system allows \
+                     (net.ipv4.igmp_max_memberships on Linux)"
+                )
+            } else {
+                e.to_string()
+            };
+            return Err(BuildError::GroupJoin {
+                group,
+                interface: interface.to_owned(),
+                reason,
+            });
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -291,6 +313,32 @@ mod tests {
             result,
             Err(BuildError::MacsUnmatchable(LOOPBACK_IFACE.to_owned()))
         );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "needs a real capture device")]
+    fn a_join_failure_no_event_clears_fails_the_build() {
+        let Some(cap) = open_loopback_or_skip() else {
+            return;
+        };
+        let mut dispatcher = PacketDispatcher::new();
+        let capture = dispatcher
+            .add_capture(cap)
+            .expect("add the loopback capture");
+        // A unicast address is no group: the join is refused outright, whatever the platform.
+        let not_a_group = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let result = require_group_join(
+            &mut dispatcher,
+            capture,
+            not_a_group,
+            "test",
+            LOOPBACK_IFACE,
+        );
+        assert!(matches!(
+            result,
+            Err(BuildError::GroupJoin { group, ref interface, .. })
+                if group == not_a_group && interface == LOOPBACK_IFACE
+        ));
     }
 
     #[test]

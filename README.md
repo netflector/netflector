@@ -5,8 +5,8 @@ talk to each other sit on different L2 segments that don't forward each other's 
 multicasts. The classic case: a router with a wired LAN on one side and a Wi-Fi or IoT VLAN on the
 other, where a phone on Wi-Fi can't discover or cast to a TV on the LAN.
 
-It reflects four link-local protocols, layers an optional DIAL proxy on top of SSDP, and relays any
-other UDP discovery protocol as sent:
+It reflects four link-local protocols, adds an optional DIAL proxy on top of SSDP, and can relay any
+other UDP discovery protocol unchanged:
 
 - **Wake-on-LAN**: magic packets sent on one interface are re-emitted on another, so a sender can
   wake a host on a different segment.
@@ -20,13 +20,13 @@ other UDP discovery protocol as sent:
   `dial = true` on an SSDP entry; see [DIAL](#dial).
 - **WS-Discovery (WSD)**: SOAP-over-UDP discovery is relayed both ways, so a client on one segment can
   discover ONVIF cameras or Windows devices (printers, scanners) on the other.
-- **UDP relay**: datagrams to configured ports, sent to configured multicast groups or, optionally,
-  broadcast, cross unchanged, source address and port included, so a protocol netflector does not
-  know (Roon's SOOD, Syncthing's local discovery) works across segments too; see
+- **UDP relay**: datagrams to the configured ports and multicast groups (and broadcasts, if enabled)
+  are copied to the other segment unchanged, source address and port included. This covers
+  protocols netflector knows nothing about, such as Roon's SOOD or Syncthing's local discovery. See
   [UDP relay](#udp-relay).
 
-Each named entry bridges one `source_if` → `target_if` interface pair and enables one or more of the
-four reflected protocols and the relay, in any mix; the DIAL proxy then layers onto SSDP.
+Each named entry bridges one `source_if` → `target_if` interface pair and enables any mix of the four
+reflected protocols and the relay; the DIAL proxy layers onto SSDP.
 
 ## Contents
 
@@ -259,7 +259,7 @@ wsd       = true                 # optional; enable WS-Discovery reflection (def
 wol_ports = [7, 9]               # optional; WoL UDP ports (default [7, 9]); only valid when wol = true
 address_family = "default"       # optional; default | dual | ipv4 | ipv6 (default "default")
 bidirectional = false            # optional; also relay every enabled protocol target -> source (default false)
-udp_ports = [9003]               # optional; UDP ports to relay as sent (see UDP relay); needs udp_groups or udp_broadcast
+udp_ports = [9003]               # optional; UDP ports to relay unchanged (see UDP relay); needs udp_groups or udp_broadcast
 udp_groups = ["239.255.90.90"]   # optional; multicast groups to join and relay on those ports
 udp_broadcast = true             # optional; also relay broadcasts on those ports (default false); needs IPv4
 ```
@@ -332,8 +332,7 @@ devices:
   `macs` at startup when the target link carries no MAC addresses (a BSD `DLT_NULL` link such as a
   loopback or an L3 tunnel) - it could never match. WoL is unaffected: it matches the MAC inside the
   magic packet's payload.
-- **The UDP relay** ignores the allow-set and carries every device's datagrams, so an entry enabling
-  only the relay may not set `macs`.
+- **The UDP relay** ignores the allow-set. An entry with only the relay enabled may not set `macs`.
 
 Omit `macs` for a network-level entry: WoL proxies every valid magic packet, and mDNS/SSDP/WSD relay
 every device's traffic rather than a chosen set (only the message kinds the corresponding direction
@@ -387,7 +386,7 @@ the periodic reconcile (up to ~30 s).
 | SSDP | 1900 | `239.255.255.250` / `ff02::c` + `ff05::c` | M-SEARCH source→target, NOTIFY target→source |
 | DIAL | 1900 + ephemeral TCP | (uses SSDP discovery) | terminating HTTP reverse proxy (IPv4 only) |
 | WSD | 3702 | `239.255.255.250` / `ff02::c` | Probe/Resolve source→target, Hello/Bye target→source |
-| UDP relay | `udp_ports` | `udp_groups`, broadcasts with `udp_broadcast` | everything source→target, as sent |
+| UDP relay | `udp_ports` | `udp_groups`, plus broadcasts if `udp_broadcast` | everything source→target, unchanged |
 
 WoL matching requires the magic-packet sequence (six `0xFF` bytes followed by the target MAC repeated 16
 times) at the start of the UDP payload; trailing bytes such as a SecureOn password are ignored when
@@ -464,25 +463,25 @@ failure) is forwarded unchanged and logged, leaving on-subnet discovery unaffect
 
 ### UDP relay
 
-`udp_ports` turns an entry into a transparent relay for any other UDP discovery a device or app does
-by multicast or broadcast. A datagram captured on `source_if` to one of the ports, sent to a group in
-`udp_groups` or, with `udp_broadcast = true`, to a broadcast, is re-emitted on `target_if` exactly as
-sent: same payload, same source address and port, same TTL. A group goes to the same group, which
-netflector joins on `source_if`. A directed broadcast of any subnet on the source segment (on a link
-without MAC addresses, of its first subnet) goes to the target segment's directed broadcast of its
-first subnet. `255.255.255.255` stays `255.255.255.255`. Nothing is parsed, so nothing is proxied:
-replies are the receiver's business.
+`udp_ports` turns an entry into a transparent relay for UDP discovery protocols netflector does not
+implement. A datagram that arrives on `source_if` for one of these ports is copied to `target_if`
+unchanged, with the original payload, source address, source port and TTL, if it was sent to a
+group listed in `udp_groups` or, with `udp_broadcast = true`, to a broadcast. Group datagrams go to
+the same group; netflector joins it on `source_if`. A directed broadcast goes to the target
+segment's directed broadcast (that of its first subnet). `255.255.255.255` stays
+`255.255.255.255`. On a link without MAC addresses only the interface's first subnet broadcast is
+recognized as one. Nothing is parsed and nothing is proxied.
 
-That is the point of keeping the source. A device on the target segment answers a relayed query by
-unicast to the address it came from, on the other segment, and the firewall routes that reply like
-any other packet. Allow it there: the reply is a new flow from the target segment to the source one,
-which no state from the multicast query covers. Two things follow from the source being off-subnet
-on the receiving segment: a host with strict reverse-path filtering (`rp_filter = 1` on Linux) drops
-the datagram, and a link-local IPv6 source is meaningless on the other link, so relay IPv6 only for
-protocols that use routable addresses.
+Keeping the source address is what makes replies work. A device on the target segment answers a
+query by unicast to the sender's address on the source segment, and that reply is routed like any
+other packet. The firewall has to allow it: it is a new flow from the target segment to the source
+segment, not a reply to a state the multicast query created. Two caveats follow from the source
+address being foreign to the receiving segment. A host with strict reverse path filtering
+(`rp_filter = 1` on Linux) drops the datagram. A link-local IPv6 source means nothing on the other
+link, so relay IPv6 only for protocols that use routable addresses.
 
-Roon, whose SOOD discovery queries `239.255.90.90` and the subnet broadcast on UDP 9003 from
-servers and endpoints alike, is the canonical recipe:
+The typical use is Roon. Its SOOD discovery sends to `239.255.90.90` and to the subnet broadcast on
+UDP 9003, from servers and endpoints alike:
 
 ```toml
 [reflectors.roon]
@@ -494,9 +493,11 @@ udp_broadcast = true
 bidirectional = true
 ```
 
-The relay ignores `macs` (a datagram to a group or a broadcast has no device to select) and admits
-every datagram it captures, so it may not overlap a protocol relaying the same ones; see
-[duplicate detection](#duplicate-detection). Its counters report as `UDP relay`.
+The relay ignores `macs`: a datagram to a group or a broadcast has no single target device. It admits
+every datagram it captures, so it must not overlap a protocol that relays the same datagrams; see
+[duplicate detection](#duplicate-detection). Its counters are reported as `UDP relay`. A group that
+cannot be joined on `source_if` is a startup error, as it is for the discovery protocols. The system
+limits memberships per interface: `net.ipv4.igmp_max_memberships` on Linux, 20 by default.
 
 ### Duplicate detection
 
@@ -504,16 +505,16 @@ Entry names must be unique across the file and the environment: a name that appe
 same name from both sources) is rejected at startup. Beyond that, two entries that enable the same
 protocol are rejected as a duplicate of that protocol only when they could reflect the same packet
 twice: a shared direction, overlapping MAC selection, overlapping address-family handling, and, for
-WoL, at least one shared port. The UDP relay admits every datagram it captures, so it duplicates a
-protocol (of another entry or its own) when both capture the same datagrams on the same leg: a shared
-port with a shared group or with broadcasts on both sides, or any shared port against WoL, which
-captures every destination on its ports. mDNS, SSDP and WSD capture on both interfaces whatever the
-entry's direction (queries on `source_if`, responses on `target_if`), so a relay on their group
-conflicts with them either way round, and since the relay ignores `macs` and queries admit every
-sender, a MAC selection never separates the two. A relay on 5353 listing `224.0.0.251` beside an
-mDNS entry is rejected as mDNS, a
-broadcast-only relay on 5353 is not, and neither is WoL on 1900 beside SSDP, since each of those
-admits only its own messages. An entry's directions are its
+WoL, at least one shared port. The UDP relay is different. It admits every datagram it captures, so it
+conflicts with any protocol, in another entry or in its own, that captures the same datagrams on the
+same leg: a shared port together with a shared group or with broadcasts on both sides, or any shared
+port with WoL, which captures every destination on its ports. mDNS, SSDP and WSD capture on both
+interfaces regardless of the entry's direction, queries on `source_if` and responses on `target_if`,
+so a relay on one of their groups conflicts with them in either direction. `macs` does not help
+here: queries are accepted from any sender and the relay ignores the list. Examples: a relay on 5353
+with group `224.0.0.251` next to an mDNS entry is rejected as a duplicate of mDNS; a broadcast-only
+relay on 5353 is fine; WoL on port 1900 next to SSDP is fine too, because each of them accepts only
+its own messages. An entry's directions are its
 `source_if` → `target_if`, plus the reverse when it is `bidirectional`, so a bidirectional `lan`/`iot`
 entry and a plain `iot` → `lan` one duplicate each other. MAC selection overlaps when the entries' allow-sets
 share at least one device, or when either omits its MAC filter (any device). Address-family handling overlaps when both can

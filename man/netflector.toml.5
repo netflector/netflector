@@ -74,8 +74,8 @@ link carries no MAC addresses (a
 .Dv DLT_NULL
 link): the frame-source filter could never match there.
 Wake-on-LAN is unaffected; it matches the address inside the magic packet.
-The UDP relay ignores the list and carries every device's datagrams, so an
-entry enabling only the relay may not set one.
+The UDP relay ignores the list; an entry with only the relay enabled may not
+set one.
 .It Ic address_family
 .Cm default
 (the default) attempts both families, requires IPv4, and treats IPv6 as
@@ -147,15 +147,18 @@ per pair of network segments: two would relay each other's re-emits without end.
 Boolean, default
 .Cm false .
 .It Ic udp_ports
-Destination UDP ports whose datagrams are relayed as sent, source address and
-port included: to the same multicast group, to the target segment's directed
-broadcast for a directed one, and to the limited broadcast unchanged.
+Destination UDP ports to relay.
+A datagram to one of them is copied to the other segment unchanged, source
+address and port included: to the same multicast group, to the target
+segment's directed broadcast, or to the limited broadcast, whichever it was
+sent to.
 A list of unique ports in the range 1 to 65535.
 Requires
 .Ic udp_groups
 or
 .Ic udp_broadcast ,
-and may not capture what an enabled protocol of the entry already relays
+and must not cover datagrams a protocol enabled on the same entry already
+relays
 .Pq see Sx DUPLICATE DETECTION .
 .It Ic udp_groups
 Multicast groups to join and relay on
@@ -163,11 +166,14 @@ Multicast groups to join and relay on
 of either family the entry's
 .Ic address_family
 uses.
+Startup fails when a group cannot be joined on
+.Ic source_if .
 .It Ic udp_broadcast
-Also relay broadcasts on
+Also relay broadcasts to
 .Ic udp_ports :
-the limited broadcast and the directed broadcast of any subnet on the segment
-(on a link without MAC addresses, of its first subnet).
+the limited broadcast and the directed broadcast of any subnet on the segment.
+On a link without MAC addresses only the first subnet's directed broadcast is
+recognized as one.
 Boolean, default
 .Cm false ;
 requires an IPv4-capable
@@ -231,22 +237,22 @@ Beyond names, two entries that enable the same protocol are rejected only when
 they could reflect the same packet twice: a shared direction, overlapping MAC
 selection, overlapping address-family handling, and, for Wake-on-LAN, at least
 one shared port.
-The UDP relay admits every datagram it captures, so it duplicates a protocol,
-of another entry or of its own, when both capture the same datagrams on the
-same leg: a shared port with a shared group or with broadcasts on both sides,
-or any shared port against Wake-on-LAN, which captures every destination on
-its ports.
-mDNS, SSDP and WSD capture on both interfaces whatever the entry's direction,
-queries on
+The UDP relay admits every datagram it captures, so it conflicts with any
+protocol, in another entry or in its own, that captures the same datagrams on
+the same leg: a shared port together with a shared group or with broadcasts
+on both sides, or any shared port with Wake-on-LAN, which captures every
+destination on its ports.
+mDNS, SSDP and WSD capture on both interfaces regardless of the entry's
+direction, queries on
 .Ic source_if
 and responses on
 .Ic target_if ,
-so a relay on their group conflicts with them either way round; the relay
-ignores
+so a relay on one of their groups conflicts with them in either direction.
 .Ic macs
-and queries admit every sender, so a MAC selection never separates the two.
-Two discovery protocols on one port do not conflict, each admitting only its
-own messages.
+does not separate them: queries are accepted from any sender and the relay
+ignores the list.
+Two discovery protocols on one port do not conflict; each accepts only its own
+messages.
 An entry's directions are its
 .Ic source_if
 to
@@ -293,7 +299,7 @@ NETFLECTOR_TV_SSDP=true
 NETFLECTOR_TV_DIAL=true
 .Ed
 .Pp
-Roon discovery (SOOD) relayed between two segments, each hosting servers or
+Roon discovery (SOOD) relayed between two segments that both have servers or
 endpoints:
 .Bd -literal -offset indent
 [reflectors.roon]
