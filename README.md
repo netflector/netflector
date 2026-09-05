@@ -495,7 +495,8 @@ bidirectional = true
 
 The relay ignores `macs`: a datagram to a group or a broadcast has no single target device. It admits
 every datagram it captures, so it must not overlap a protocol that relays the same datagrams; see
-[duplicate detection](#duplicate-detection). Its counters are reported as `UDP relay`. A group that
+[duplicate detection](#duplicate-detection). Its counters are reported as `UDP relay`, except that a
+datagram a discovery protocol on the same interface also handles counts under that protocol. A group that
 cannot be joined on `source_if` is a startup error, as it is for the discovery protocols. The system
 limits memberships per interface: `net.ipv4.igmp_max_memberships` on Linux, 20 by default.
 
