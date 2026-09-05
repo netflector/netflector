@@ -274,8 +274,17 @@ impl PacketDispatcher {
     /// first [`add_capture`](Self::add_capture) resolve, so a change during startup is
     /// already queued rather than missed.
     pub(crate) fn new() -> Self {
+        Self::with_table(InterfaceTable::new())
+    }
+
+    /// A dispatcher that joins no multicast group: `--no-join`.
+    pub(crate) fn without_group_joins() -> Self {
+        Self::with_table(InterfaceTable::without_group_joins())
+    }
+
+    fn with_table(table: InterfaceTable) -> Self {
         Self {
-            table: InterfaceTable::new(),
+            table,
             registrations: Arena::new(),
             route_keys: Vec::new(),
             monitor: Self::open_monitor(),

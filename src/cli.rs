@@ -1,7 +1,7 @@
 //! Command-line parsing.
 //!
 //! Hand-rolled rather than pulled from a crate: the whole surface is one optional
-//! positional and three flags, and the binary ships to embedded ARM.
+//! positional and four flags, and the binary ships to embedded ARM.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -12,7 +12,11 @@ use crate::error::UsageError;
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Invocation<'a> {
     /// Run netflector, configured from the given file (if any) plus `NETFLECTOR_*`.
-    Run(Option<&'a Path>),
+    Run {
+        path: Option<&'a Path>,
+        /// Whether to join the multicast groups the reflectors capture; `--no-join` clears it.
+        join_groups: bool,
+    },
     /// Load and validate that same configuration, then exit.
     CheckConfig(Option<&'a Path>),
     Help,
@@ -34,6 +38,7 @@ pub(crate) enum Invocation<'a> {
 /// [`UsageError`] for an unknown option or a second positional argument.
 pub(crate) fn parse(args: &[OsString]) -> Result<Invocation<'_>, UsageError> {
     let mut check = false;
+    let mut join_groups = true;
     let mut path: Option<&Path> = None;
     let mut options_done = false;
 
@@ -53,6 +58,10 @@ pub(crate) fn parse(args: &[OsString]) -> Result<Invocation<'_>, UsageError> {
                 check = true;
                 continue;
             }
+            if arg == "--no-join" {
+                join_groups = false;
+                continue;
+            }
         }
         // A lone "-" stays a path (some callers mean stdin by it); anything else that leads with a
         // dash is an option we do not know, and guessing at it would be worse than saying so.
@@ -69,7 +78,7 @@ pub(crate) fn parse(args: &[OsString]) -> Result<Invocation<'_>, UsageError> {
     Ok(if check {
         Invocation::CheckConfig(path)
     } else {
-        Invocation::Run(path)
+        Invocation::Run { path, join_groups }
     })
 }
 
@@ -82,7 +91,7 @@ pub(crate) const HELP: &str = concat!(
 Reflects link-local service traffic (Wake-on-LAN, mDNS, SSDP, WS-Discovery, DIAL) between
 two network interfaces.
 
-usage: netflector [--check-config] [--] [CONFIG]
+usage: netflector [--check-config] [--no-join] [--] [CONFIG]
 
   CONFIG           TOML config file. NETFLECTOR_* environment variables are merged on top of
                    it. Omit it to configure from the environment alone. Put `--` first if the
@@ -91,6 +100,9 @@ usage: netflector [--check-config] [--] [CONFIG]
   --check-config   Load and validate the configuration, then exit. It parses only: no
                    interface is opened, so it needs no privileges and it cannot tell you that
                    an interface is missing or unreachable.
+  --no-join        Do not join multicast groups. Group traffic then reaches netflector only
+                   where the link delivers it without a membership, as an emulated or
+                   promiscuous fabric does.
   -V, --version    Print the version and exit.
   -h, --help       Print this help and exit.
 "
@@ -104,18 +116,34 @@ mod tests {
         list.iter().map(OsString::from).collect()
     }
 
+    fn run(path: Option<&str>) -> Invocation<'_> {
+        Invocation::Run {
+            path: path.map(Path::new),
+            join_groups: true,
+        }
+    }
+
     #[test]
     fn no_args_runs_from_the_environment() {
-        assert_eq!(parse(&[]).unwrap(), Invocation::Run(None));
+        assert_eq!(parse(&[]).unwrap(), run(None));
+    }
+
+    #[test]
+    fn no_join_clears_the_group_joins() {
+        let a = args(&["--no-join", "netflector.toml"]);
+        assert_eq!(
+            parse(&a).unwrap(),
+            Invocation::Run {
+                path: Some(Path::new("netflector.toml")),
+                join_groups: false,
+            }
+        );
     }
 
     #[test]
     fn a_lone_positional_is_the_config_path() {
         let a = args(&["netflector.toml"]);
-        assert_eq!(
-            parse(&a).unwrap(),
-            Invocation::Run(Some(Path::new("netflector.toml")))
-        );
+        assert_eq!(parse(&a).unwrap(), run(Some("netflector.toml")));
     }
 
     #[test]
@@ -162,7 +190,7 @@ mod tests {
     #[test]
     fn a_lone_dash_is_a_path_not_an_option() {
         let a = args(&["-"]);
-        assert_eq!(parse(&a).unwrap(), Invocation::Run(Some(Path::new("-"))));
+        assert_eq!(parse(&a).unwrap(), run(Some("-")));
     }
 
     #[test]
@@ -170,15 +198,9 @@ mod tests {
         // Without the separator these paths are unreachable: every leading-dash argument would be
         // read as an option, a known one or an error.
         let a = args(&["--", "--check-config"]);
-        assert_eq!(
-            parse(&a).unwrap(),
-            Invocation::Run(Some(Path::new("--check-config")))
-        );
+        assert_eq!(parse(&a).unwrap(), run(Some("--check-config")));
         let b = args(&["--", "--nonsense"]);
-        assert_eq!(
-            parse(&b).unwrap(),
-            Invocation::Run(Some(Path::new("--nonsense")))
-        );
+        assert_eq!(parse(&b).unwrap(), run(Some("--nonsense")));
     }
 
     #[test]
@@ -198,7 +220,14 @@ mod tests {
     fn help_names_every_flag_it_accepts() {
         // The help is the only place the flags are documented, so a flag the parser takes but the
         // help omits is a bug the user pays for.
-        for flag in ["--check-config", "--version", "-V", "--help", "-h"] {
+        for flag in [
+            "--check-config",
+            "--no-join",
+            "--version",
+            "-V",
+            "--help",
+            "-h",
+        ] {
             assert!(HELP.contains(flag), "help does not mention {flag}");
         }
         // The separator needs its own check: a bare "--" is a substring of every long flag, so

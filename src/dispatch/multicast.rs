@@ -46,6 +46,8 @@ pub(crate) struct MulticastJoiner {
     v4: Option<OwnedFd>,
     v6: Option<OwnedFd>,
     desired: Vec<Desired>,
+    /// Cleared for an inert joiner, whose joins succeed without a membership.
+    joins: bool,
 }
 
 impl MulticastJoiner {
@@ -54,6 +56,16 @@ impl MulticastJoiner {
             v4: None,
             v6: None,
             desired: Vec::new(),
+            joins: true,
+        }
+    }
+
+    /// A joiner that joins nothing: `--no-join`. Its joins are successful no-ops and its
+    /// rejoins have nothing to replay.
+    pub(crate) fn inert() -> Self {
+        Self {
+            joins: false,
+            ..Self::new()
         }
     }
 
@@ -82,6 +94,9 @@ impl MulticastJoiner {
     /// retries it on the next address-up event. Any other error is marked reported before it
     /// returns -- the caller's log is the report, and the replay repeats it at debug only.
     pub(crate) fn join(&mut self, group: IpAddr, ifindex: NonZeroU32) -> io::Result<()> {
+        if !self.joins {
+            return Ok(());
+        }
         let index = self.record(group);
         let result = self.apply(group, ifindex);
         if let Err(e) = &result
@@ -224,6 +239,17 @@ mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     use super::*;
+
+    #[test]
+    fn an_inert_joiner_joins_nothing_and_opens_no_socket() {
+        let mut joiner = MulticastJoiner::inert();
+        let ifindex = NonZeroU32::new(1).unwrap();
+        joiner
+            .join(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)), ifindex)
+            .unwrap();
+        assert!(joiner.test_socketless());
+        assert_eq!(joiner.rejoin(ifindex), RejoinCounts::default());
+    }
 
     #[test]
     fn the_membership_cap_errnos_are_capped_joins() {

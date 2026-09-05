@@ -7,6 +7,7 @@
 .Sh SYNOPSIS
 .Nm
 .Op Fl -check-config
+.Op Fl -no-join
 .Op Fl -
 .Op Ar config
 .Nm
@@ -52,6 +53,13 @@ report that an interface is missing or unreachable.
 On success it prints
 .Ql config ok: N reflector(s)
 and exits 0; on a rejected configuration it prints the reason and exits 1.
+.It Fl -no-join
+Do not join multicast groups.
+Group traffic then reaches
+.Nm
+only where the link delivers it without a membership, as an emulated or
+promiscuous fabric does.
+A warning is logged at startup.
 .It Fl V , Fl -version
 Print the version and exit.
 .It Fl h , Fl -help

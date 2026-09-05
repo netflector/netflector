@@ -52,7 +52,7 @@ pub fn run(args: &[OsString]) -> Result<()> {
             Ok(())
         }
         Invocation::CheckConfig(path) => check_config(path),
-        Invocation::Run(path) => reflect(path),
+        Invocation::Run { path, join_groups } => reflect(path, join_groups),
     }
 }
 
@@ -74,12 +74,12 @@ fn check_config(path: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-/// Run netflector to completion.
+/// Run netflector to completion. With `join_groups` off, no multicast group is joined.
 ///
 /// # Errors
 /// Returns [`Error`] if configuration loading or validation fails, or if the
 /// reactor cannot be created or its event loop fails.
-fn reflect(path: Option<&Path>) -> Result<()> {
+fn reflect(path: Option<&Path>, join_groups: bool) -> Result<()> {
     let toml_text = path.map(config::read_config_file).transpose()?;
     // sys::process_env, not std::env::vars: vars() segfaults in statically
     // linked FreeBSD binaries (see process_env).
@@ -111,7 +111,15 @@ fn reflect(path: Option<&Path>) -> Result<()> {
     );
 
     // Build the data path: one capture per interface, then the reflectors that bridge them.
-    let mut dispatcher = PacketDispatcher::new();
+    let mut dispatcher = if join_groups {
+        PacketDispatcher::new()
+    } else {
+        log::warn!(
+            "--no-join: multicast groups are not joined; group traffic reaches the captures \
+             only where the link delivers it without a membership"
+        );
+        PacketDispatcher::without_group_joins()
+    };
     let interfaces = open_captures(&config, &mut dispatcher)?;
     for reflector in &config.reflectors {
         log_mtu_info(reflector, &interfaces, &dispatcher);

@@ -55,6 +55,8 @@ pub(super) struct InterfaceTable {
     /// One entry per interface, indexed by [`InterfaceKey`].
     entries: Vec<InterfaceEntry>,
     captures: Vec<CaptureEntry>,
+    /// Whether an added interface gets a joiner that joins.
+    join_groups: bool,
 }
 
 impl InterfaceTable {
@@ -62,6 +64,15 @@ impl InterfaceTable {
         Self {
             entries: Vec::new(),
             captures: Vec::new(),
+            join_groups: true,
+        }
+    }
+
+    /// A table whose interfaces join no multicast group: `--no-join`.
+    pub(super) fn without_group_joins() -> Self {
+        Self {
+            join_groups: false,
+            ..Self::new()
         }
     }
 
@@ -69,7 +80,11 @@ impl InterfaceTable {
     fn add_interface(&mut self, interface: Interface) -> InterfaceKey {
         let key =
             InterfaceKey(u32::try_from(self.entries.len()).expect("interface count fits a u32"));
-        let joiner = MulticastJoiner::new();
+        let joiner = if self.join_groups {
+            MulticastJoiner::new()
+        } else {
+            MulticastJoiner::inert()
+        };
         self.entries.push(InterfaceEntry { interface, joiner });
         key
     }
