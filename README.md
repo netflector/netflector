@@ -53,7 +53,7 @@ pinned in `ci/freebsd14.env` and running on that release or newer.
 ## Run
 
 ```sh
-netflector [--check-config] [--] [config.toml]
+netflector [--check-config] [--no-join] [--] [config.toml]
 ```
 
 Configuration comes from a TOML file, from environment variables, or from both. With a path argument
@@ -69,6 +69,7 @@ volumes.
 | Option | |
 | --- | --- |
 | `--check-config` | Load and validate the configuration, print a summary, exit. |
+| `--no-join` | Do not join multicast groups. Group traffic then reaches netflector only where the link delivers it without a membership, as an emulated or promiscuous fabric does. A warning is logged at startup. |
 | `-V`, `--version` | Print the version and exit. |
 | `-h`, `--help` | Print the usage and exit. |
 | `--` | End of options. Needed only for a config file whose name begins with a dash. |

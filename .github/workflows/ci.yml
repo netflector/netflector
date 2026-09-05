@@ -424,10 +424,13 @@ jobs:
         run: |
           triple='${{ matrix.target.triple }}'
           cargo build --release --locked ${triple:+--target "$triple"}
+      # qemu-user has no MCAST_JOIN_GROUP; the veth fabric delivers the groups' frames to the
+      # capture without a membership, so the emulated lanes run the daemon with --no-join.
       - name: Run e2e natively
         run: |
           triple='${{ matrix.target.triple }}'
-          sudo python3 e2e/run.py --backend native --binary "target/${triple:+$triple/}release/netflector"
+          sudo python3 e2e/run.py --backend native --binary "target/${triple:+$triple/}release/netflector" \
+            ${{ matrix.target.emulated && '--no-join' || '' }}
 
   # The unit suite under Miri, for every shipped target. Valgrind (below) catches accesses that are
   # actually invalid; it is blind to UB that performs no invalid access -- an unaligned read the hardware

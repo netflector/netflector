@@ -1896,6 +1896,10 @@ class NativeBackend(Backend):
     def _netflector_command(self, config_path: Path) -> list[str]:
         raise NotImplementedError
 
+    def _netflector_args(self, config_path: Path) -> list[str]:
+        flags = ["--no-join"] if self.args.no_join else []
+        return [str(self.args.binary), *flags, str(config_path)]
+
     def _teardown_fabric(self) -> None:
         raise NotImplementedError
 
@@ -2123,7 +2127,7 @@ class NativeLinuxBackend(NativeBackend):
         return ["ip", "netns", "exec", self.ns[segment]]
 
     def _netflector_command(self, config_path: Path) -> list[str]:
-        return ["ip", "netns", "exec", self.ns["dut"], str(self.args.binary), str(config_path)]
+        return ["ip", "netns", "exec", self.ns["dut"], *self._netflector_args(config_path)]
 
     def admin(self, script: str, *, capture: bool = False) -> str:
         # The harness already runs as root, so netflector's network view is one netns exec
@@ -2273,7 +2277,7 @@ class NativeFreeBSDBackend(NativeBackend):
         return ["jexec", self.jails[segment]]
 
     def _netflector_command(self, config_path: Path) -> list[str]:
-        return ["jexec", self.jails["dut"], str(self.args.binary), str(config_path)]
+        return ["jexec", self.jails["dut"], *self._netflector_args(config_path)]
 
     def admin(self, script: str, *, capture: bool = False) -> str:
         result = run_command(["jexec", self.jails["dut"], "sh", "-ec", script])
@@ -3277,6 +3281,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--binary", type=Path, default=None,
         help="netflector binary to run (native backend, required); build it unprivileged first, "
              "e.g. cargo build --release --locked")
+    parser.add_argument("--no-join", action="store_true",
+        help="run netflector with --no-join (native backend); for a fabric whose kernel cannot join "
+             "groups but delivers their frames regardless, such as qemu-user")
     parser.add_argument("--keep-on-failure", action="store_true", help="leave resources behind after a failure")
     parser.add_argument("--keep-stale", action="store_true",
         help="skip the preflight sweep, keeping what an earlier --keep-on-failure run left behind")
@@ -3299,6 +3306,8 @@ def parse_args() -> argparse.Namespace:
                      "(cargo build --release --locked)")
     if args.backend == "docker" and args.binary is not None:
         parser.error("--binary only applies to --backend native")
+    if args.backend == "docker" and args.no_join:
+        parser.error("--no-join only applies to --backend native")
     return args
 
 
