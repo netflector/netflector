@@ -27,11 +27,12 @@ mod multicast;
 mod pair_tests;
 
 pub(crate) use self::counters::{MessageType, Outcome};
+pub(crate) use self::datagram::DatagramSource;
 pub(crate) use self::dial_context::{DialContext, DialProxyKey};
 pub(crate) use self::multicast::join_deferrable;
 
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::ops::Deref;
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::{Duration, Instant};
@@ -151,12 +152,20 @@ pub(crate) struct Filter {
     /// Allow-set on the source MAC: the packet's source must be a member.
     pub(crate) src_mac: Option<MacSet>,
     pub(crate) dst_mac: Option<MacAddr>,
+    /// Require an IPv4 broadcast destination: the ingress's own directed broadcast or the limited
+    /// one. Resolved against the ingress's addresses at match time, so it follows a prefix change
+    /// without re-registering.
+    pub(crate) broadcast: bool,
 }
 
 impl Filter {
-    /// Whether `p` satisfies every set field (an unset field matches anything).
-    fn matches(&self, p: &Packet) -> bool {
-        self.src_ip.is_none_or(|ip| p.source.ip() == ip)
+    /// Whether `p` satisfies every set field (an unset field matches anything), given the ingress's
+    /// current directed broadcast for the `broadcast` field.
+    fn matches(&self, p: &Packet, ingress_directed_broadcast: Option<Ipv4Addr>) -> bool {
+        (!self.broadcast
+            || matches!(p.dest.ip(), IpAddr::V4(v4)
+                if v4.is_broadcast() || Some(v4) == ingress_directed_broadcast))
+            && self.src_ip.is_none_or(|ip| p.source.ip() == ip)
             && self
                 .dst_ip
                 .as_ref()
@@ -431,23 +440,23 @@ impl PacketDispatcher {
         self.table.capture(egress).map(Capture::link_type)
     }
 
-    /// Build a UDP datagram, sourced from the egress's own address, with `dst_mac` as the L2
-    /// destination, and inject it on `egress`. The caller supplies the L2 MAC, so this serves
-    /// unicast, multicast, and broadcast alike; the link framing (Ethernet vs `DLT_NULL`) follows
-    /// the egress's link type, and the source port, `ttl`, and `payload` are carried verbatim.
-    /// Builds into the dispatcher's reused scratch buffer, so the data path never allocates. An
-    /// unknown or draining egress is a logged drop, like [`send`](Self::send).
+    /// Build a UDP datagram from `source` with `dst_mac` as the L2 destination, and inject it on
+    /// `egress`. The caller supplies the L2 MAC, so this serves unicast, multicast, and broadcast
+    /// alike; the link framing (Ethernet vs `DLT_NULL`) follows the egress's link type, and `ttl`
+    /// and `payload` are carried verbatim. Builds into the dispatcher's reused scratch buffer, so
+    /// the data path never allocates. An unknown or draining egress is a logged drop, like
+    /// [`send`](Self::send).
     ///
     /// # Errors
     /// Propagates a send failure, and reports a frame that can't be built from the egress's
-    /// current state: no source address/MAC for the datagram, or a payload that overflows
-    /// the scratch buffer or the datagram length fields.
+    /// current state: no source address/MAC for the datagram, a captured source of the other
+    /// family, or a payload that overflows the scratch buffer or the datagram length fields.
     pub(crate) fn send_udp(
         &mut self,
         egress: CaptureKey,
         dst: SocketAddr,
         dst_mac: MacAddr,
-        src_port: u16,
+        source: DatagramSource,
         ttl: u8,
         payload: &[u8],
     ) -> io::Result<()> {
@@ -464,7 +473,7 @@ impl PacketDispatcher {
             link,
             dst,
             dst_mac,
-            src_port,
+            source,
             ttl,
             payload,
             &mut self.scratch,
@@ -485,17 +494,23 @@ impl PacketDispatcher {
         &mut self,
         egress: CaptureKey,
         dst: SocketAddr,
-        src_port: u16,
+        source: DatagramSource,
         ttl: u8,
         payload: &[u8],
     ) -> io::Result<()> {
-        let dst_mac = ethernet_dst(
+        let dst_mac = self.group_mac(egress, dst)?;
+        self.send_udp(egress, dst, dst_mac, source, ttl, payload)
+    }
+
+    /// The L2 destination for a broadcast/multicast `dst` on `egress`: its own directed broadcast
+    /// counts as broadcast there.
+    fn group_mac(&self, egress: CaptureKey, dst: SocketAddr) -> io::Result<MacAddr> {
+        ethernet_dst(
             dst.ip(),
             self.egress_addrs(egress)
                 .and_then(InterfaceAddresses::v4_directed_broadcast),
         )
-        .map_err(io::Error::other)?;
-        self.send_udp(egress, dst, dst_mac, src_port, ttl, payload)
+        .map_err(io::Error::other)
     }
 
     /// Drain the capture `ingress` addresses and route each parsed packet. Reads up to
@@ -612,13 +627,16 @@ impl PacketDispatcher {
                 .iter()
                 .map(|(key, _)| RegistrationKey(key)),
         );
+        let ingress_directed_broadcast = self
+            .table
+            .egress_addrs(ingress)
+            .and_then(InterfaceAddresses::v4_directed_broadcast);
         let mut final_outcome: Option<Outcome> = None;
         for i in 0..self.route_keys.len() {
             let key = self.route_keys[i];
-            let applies = self
-                .registrations
-                .get(key.0)
-                .is_some_and(|reg| reg.ingress == ingress && reg.filter.matches(packet));
+            let applies = self.registrations.get(key.0).is_some_and(|reg| {
+                reg.ingress == ingress && reg.filter.matches(packet, ingress_directed_broadcast)
+            });
             if !applies {
                 continue;
             }
@@ -1219,7 +1237,7 @@ mod tests {
 
     #[test]
     fn wildcard_filter_matches_anything() {
-        assert!(Filter::default().matches(&packet("10.0.0.1:1", "10.0.0.2:2", None, None)));
+        assert!(Filter::default().matches(&packet("10.0.0.1:1", "10.0.0.2:2", None, None), None));
     }
 
     #[test]
@@ -1229,10 +1247,40 @@ mod tests {
             dst_port: Some(5353.into()),
             ..Filter::default()
         };
-        assert!(f.matches(&packet("10.0.0.1:5353", "224.0.0.251:5353", None, None)));
+        assert!(f.matches(
+            &packet("10.0.0.1:5353", "224.0.0.251:5353", None, None),
+            None
+        ));
         // Wrong group, and wrong port, each miss.
-        assert!(!f.matches(&packet("10.0.0.1:5353", "224.0.0.252:5353", None, None)));
-        assert!(!f.matches(&packet("10.0.0.1:5353", "224.0.0.251:1900", None, None)));
+        assert!(!f.matches(
+            &packet("10.0.0.1:5353", "224.0.0.252:5353", None, None),
+            None
+        ));
+        assert!(!f.matches(
+            &packet("10.0.0.1:5353", "224.0.0.251:1900", None, None),
+            None
+        ));
+    }
+
+    #[test]
+    fn filter_broadcast_takes_the_ingress_directed_or_limited_broadcast() {
+        let f = Filter {
+            broadcast: true,
+            ..Filter::default()
+        };
+        let directed = Some(Ipv4Addr::new(10, 0, 0, 255));
+        assert!(f.matches(
+            &packet("10.0.0.1:1", "255.255.255.255:9", None, None),
+            directed
+        ));
+        assert!(f.matches(&packet("10.0.0.1:1", "10.0.0.255:9", None, None), directed));
+        // Another subnet's broadcast, a unicast, and a group are not broadcasts here; without a
+        // known prefix only the limited broadcast qualifies.
+        assert!(!f.matches(&packet("10.0.0.1:1", "10.0.1.255:9", None, None), directed));
+        assert!(!f.matches(&packet("10.0.0.1:1", "10.0.0.2:9", None, None), directed));
+        assert!(!f.matches(&packet("10.0.0.1:1", "224.0.0.251:9", None, None), directed));
+        assert!(!f.matches(&packet("10.0.0.1:1", "10.0.0.255:9", None, None), None));
+        assert!(f.matches(&packet("10.0.0.1:1", "255.255.255.255:9", None, None), None));
     }
 
     #[test]
@@ -1249,11 +1297,23 @@ mod tests {
             dst_port: Some(5353.into()),
             ..Filter::default()
         };
-        assert!(f.matches(&packet("10.0.0.1:5353", "224.0.0.251:5353", None, None)));
-        assert!(f.matches(&packet("[fe80::1]:5353", "[ff02::fb]:5353", None, None)));
+        assert!(f.matches(
+            &packet("10.0.0.1:5353", "224.0.0.251:5353", None, None),
+            None
+        ));
+        assert!(f.matches(
+            &packet("[fe80::1]:5353", "[ff02::fb]:5353", None, None),
+            None
+        ));
         // A group outside the set, and a member on the wrong port, each miss.
-        assert!(!f.matches(&packet("10.0.0.1:5353", "239.255.255.250:5353", None, None)));
-        assert!(!f.matches(&packet("10.0.0.1:5353", "224.0.0.251:1900", None, None)));
+        assert!(!f.matches(
+            &packet("10.0.0.1:5353", "239.255.255.250:5353", None, None),
+            None
+        ));
+        assert!(!f.matches(
+            &packet("10.0.0.1:5353", "224.0.0.251:1900", None, None),
+            None
+        ));
     }
 
     #[test]
@@ -1263,10 +1323,10 @@ mod tests {
             dst_port: Some([7u16, 9].into()),
             ..Filter::default()
         };
-        assert!(f.matches(&packet("10.0.0.1:1", "255.255.255.255:7", None, None)));
-        assert!(f.matches(&packet("10.0.0.1:1", "255.255.255.255:9", None, None)));
+        assert!(f.matches(&packet("10.0.0.1:1", "255.255.255.255:7", None, None), None));
+        assert!(f.matches(&packet("10.0.0.1:1", "255.255.255.255:9", None, None), None));
         // A port outside the set misses.
-        assert!(!f.matches(&packet("10.0.0.1:1", "255.255.255.255:8", None, None)));
+        assert!(!f.matches(&packet("10.0.0.1:1", "255.255.255.255:8", None, None), None));
     }
 
     #[test]
@@ -1276,16 +1336,17 @@ mod tests {
             src_mac: Some(MacSet::from(device)),
             ..Filter::default()
         };
-        assert!(f.matches(&packet(
-            "10.0.0.1:5353",
-            "10.0.0.2:5353",
-            None,
-            Some(device)
-        )));
+        assert!(f.matches(
+            &packet("10.0.0.1:5353", "10.0.0.2:5353", None, Some(device)),
+            None
+        ));
         // A different device, and a MAC-less (DLT_NULL) packet, both miss.
         let other = MacAddr::from([0x02, 0, 0, 0, 0, 0x02]);
-        assert!(!f.matches(&packet("10.0.0.1:5353", "10.0.0.2:5353", None, Some(other))));
-        assert!(!f.matches(&packet("10.0.0.1:5353", "10.0.0.2:5353", None, None)));
+        assert!(!f.matches(
+            &packet("10.0.0.1:5353", "10.0.0.2:5353", None, Some(other)),
+            None
+        ));
+        assert!(!f.matches(&packet("10.0.0.1:5353", "10.0.0.2:5353", None, None), None));
     }
 
     #[test]
@@ -1296,11 +1357,20 @@ mod tests {
             src_mac: Some(MacSet::try_from(vec![a, b]).unwrap()),
             ..Filter::default()
         };
-        assert!(f.matches(&packet("10.0.0.1:5353", "10.0.0.2:5353", None, Some(a))));
-        assert!(f.matches(&packet("10.0.0.1:5353", "10.0.0.2:5353", None, Some(b))));
+        assert!(f.matches(
+            &packet("10.0.0.1:5353", "10.0.0.2:5353", None, Some(a)),
+            None
+        ));
+        assert!(f.matches(
+            &packet("10.0.0.1:5353", "10.0.0.2:5353", None, Some(b)),
+            None
+        ));
         // A device outside the set misses.
         let other = MacAddr::from([0x02, 0, 0, 0, 0, 0x03]);
-        assert!(!f.matches(&packet("10.0.0.1:5353", "10.0.0.2:5353", None, Some(other))));
+        assert!(!f.matches(
+            &packet("10.0.0.1:5353", "10.0.0.2:5353", None, Some(other)),
+            None
+        ));
     }
 
     #[test]
@@ -1310,15 +1380,16 @@ mod tests {
             dst_mac: Some(device),
             ..Filter::default()
         };
-        assert!(f.matches(&packet(
-            "10.0.0.1:5353",
-            "10.0.0.2:5353",
-            Some(device),
+        assert!(f.matches(
+            &packet("10.0.0.1:5353", "10.0.0.2:5353", Some(device), None),
             None
-        )));
+        ));
         let other = MacAddr::from([0x02, 0, 0, 0, 0, 0x0b]);
-        assert!(!f.matches(&packet("10.0.0.1:5353", "10.0.0.2:5353", Some(other), None)));
-        assert!(!f.matches(&packet("10.0.0.1:5353", "10.0.0.2:5353", None, None)));
+        assert!(!f.matches(
+            &packet("10.0.0.1:5353", "10.0.0.2:5353", Some(other), None),
+            None
+        ));
+        assert!(!f.matches(&packet("10.0.0.1:5353", "10.0.0.2:5353", None, None), None));
     }
 
     // An IP filter is family-specific: a v4 criterion can't match a v6 packet, or vice
@@ -1329,12 +1400,18 @@ mod tests {
             dst_ip: Some("224.0.0.251".parse::<IpAddr>().unwrap().into()),
             ..Filter::default()
         };
-        assert!(!v4.matches(&packet("[fe80::1]:5353", "[ff02::fb]:5353", None, None)));
+        assert!(!v4.matches(
+            &packet("[fe80::1]:5353", "[ff02::fb]:5353", None, None),
+            None
+        ));
         let v6 = Filter {
             dst_ip: Some("ff02::fb".parse::<IpAddr>().unwrap().into()),
             ..Filter::default()
         };
-        assert!(!v6.matches(&packet("10.0.0.1:5353", "224.0.0.251:5353", None, None)));
+        assert!(!v6.matches(
+            &packet("10.0.0.1:5353", "224.0.0.251:5353", None, None),
+            None
+        ));
     }
 
     const PROBE: &[u8] = b"netflector-dispatch-probe";
@@ -1371,7 +1448,7 @@ mod tests {
                     self.egress,
                     dst,
                     MacAddr::from([0xff; 6]),
-                    src.port(),
+                    DatagramSource::Egress { port: src.port() },
                     packet.ttl,
                     packet.payload,
                 )
@@ -1999,7 +2076,11 @@ mod tests {
         assert!(dispatcher.send(bogus, b"x").is_ok());
         // send_udp_group on an unknown egress is the same logged drop, not a build attempt.
         let dst = SocketAddr::from((Ipv4Addr::BROADCAST, 9));
-        assert!(dispatcher.send_udp_group(bogus, dst, 1, 64, b"x").is_ok());
+        assert!(
+            dispatcher
+                .send_udp_group(bogus, dst, DatagramSource::Egress { port: 1 }, 64, b"x")
+                .is_ok()
+        );
         Ok(())
     }
 

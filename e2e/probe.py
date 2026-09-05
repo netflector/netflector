@@ -19,6 +19,7 @@ import argparse
 import binascii
 import errno
 import http.server
+import ipaddress
 import signal
 import socket
 import struct
@@ -115,6 +116,8 @@ def send(args: argparse.Namespace) -> int:
 
     if is_ipv6(args.address):
         with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
+            if args.source_port is not None:
+                sock.bind(("::", args.source_port))
             scope_id = 0
             if args.interface:
                 scope_id = socket.if_nametoindex(args.interface)
@@ -124,6 +127,8 @@ def send(args: argparse.Namespace) -> int:
             sock.sendto(payload, (args.address, args.port, 0, scope_id))
     else:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
+            if args.source_port is not None:
+                sock.bind(("0.0.0.0", args.source_port))
             if is_ipv4_multicast(args.address):
                 sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
                 if args.interface:
@@ -202,6 +207,8 @@ def _receive(args, expected, deadline, family, bind_address) -> int:
                 return 1
 
             if payload == expected:
+                if not source_as_expected(args, peer):
+                    return 1
                 if args.expect_source_not_link_local and peer[0].lower().startswith("fe80"):
                     print(
                         f"forwarded from link-local source {peer[0]}; expected a routable (non-fe80::) address",
@@ -224,6 +231,19 @@ def _receive(args, expected, deadline, family, bind_address) -> int:
 
     print(f"timed out waiting for expected packet after {args.timeout:.3f}s", file=sys.stderr, flush=True)
     return 1
+
+
+def source_as_expected(args: argparse.Namespace, peer: tuple) -> bool:
+    # The relay keeps the sender's own ip:port on the re-emit, so the receiver sees a peer from the
+    # other segment at the port the sender bound, not netflector's egress address.
+    address = ipaddress.ip_address(peer[0].split("%")[0])
+    if args.expect_source_net is not None and address not in ipaddress.ip_network(args.expect_source_net):
+        print(f"received from {peer[0]}; expected a source in {args.expect_source_net}", file=sys.stderr, flush=True)
+        return False
+    if args.expect_source_port is not None and peer[1] != args.expect_source_port:
+        print(f"received from port {peer[1]}; expected {args.expect_source_port}", file=sys.stderr, flush=True)
+        return False
+    return True
 
 
 def drain_for_duplicate(sock: socket.socket, expected: bytes) -> int:
@@ -731,6 +751,7 @@ def main() -> int:
     send_parser.add_argument("--port", required=True, type=int, help="destination UDP port")
     send_parser.add_argument("--address", default="255.255.255.255", help="destination IP address")
     send_parser.add_argument("--interface", help="egress interface (IPv6 link-local scope)")
+    send_parser.add_argument("--source-port", type=int, help="UDP port to send from")
     send_parser.set_defaults(func=send)
 
     receive_parser = subparsers.add_parser("receive", help="receive or reject UDP packets")
@@ -744,6 +765,8 @@ def main() -> int:
     expectation.add_argument("--expect-mac", help="MAC address whose magic packet must be received")
     expectation.add_argument("--expect-payload-hex", type=parse_payload_hex, help="exact UDP payload that must be received")
     expectation.add_argument("--expect-none", action="store_true", help="fail if any UDP packet is received")
+    receive_parser.add_argument("--expect-source-net", help="network the packet's source address must be in")
+    receive_parser.add_argument("--expect-source-port", type=int, help="port the packet's source must be")
     receive_parser.add_argument("--expect-source-not-link-local", action="store_true",
                                 help="also require the matched packet's source to be a routable (non-fe80::) address")
     receive_parser.set_defaults(func=receive)

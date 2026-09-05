@@ -6,7 +6,7 @@
 //! [`WakeClassifier`] validates the payload and applies the optional device allow-set and the
 //! family policy; the shared [`SimpleReflector`] re-emits on the target interface link-wide (a v4
 //! limited broadcast or v6 all-nodes multicast), sourced from that interface's own address at the
-//! captured source port and TTL ([`Emit::captured`]).
+//! captured source port and TTL ([`Emit::captured_from_egress`]).
 
 use std::net::SocketAddr;
 
@@ -128,7 +128,7 @@ pub(crate) fn build(
                 target_macs: reflector.macs.clone(),
                 family: reflector.address_family,
             },
-            Emit::captured(),
+            Emit::captured_from_egress(),
         )),
     );
     log::info!(

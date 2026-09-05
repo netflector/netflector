@@ -1,0 +1,17 @@
+log_level = "debug"
+
+# The transparent relay in the Roon shape: one port, its group, the broadcasts, both ways. The
+# one-way entry on the next port proves the reverse direction is a choice, not a given.
+[reflectors.relay]
+source_if = "nf_source"
+target_if = "nf_target"
+udp_ports = [9003]
+udp_groups = ["239.255.90.90", "ff02::5a5a"]
+udp_broadcast = true
+bidirectional = true
+
+[reflectors.relay-one-way]
+source_if = "nf_source"
+target_if = "nf_target"
+udp_ports = [9004]
+udp_groups = ["239.255.90.90"]

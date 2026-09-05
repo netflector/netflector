@@ -14,7 +14,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use crate::dispatch::{
-    CaptureKey, Filter, MessageType, Outcome, PacketDispatcher, PacketHandler, RegistrationKey,
+    CaptureKey, DatagramSource, Filter, MessageType, Outcome, PacketDispatcher, PacketHandler,
+    RegistrationKey,
 };
 use crate::interface::{InterfaceAddresses, Ipv6Scope};
 use crate::linear_map::LinearMap;
@@ -109,7 +110,9 @@ impl PacketHandler for ResponseReflector {
             self.egress,
             self.searcher,
             self.searcher_mac,
-            packet.source.port(),
+            DatagramSource::Egress {
+                port: packet.source.port(),
+            },
             self.ttl,
             payload,
         ) {
@@ -347,7 +350,7 @@ impl PacketHandler for SearchReflector {
             return match dispatcher.send_udp_group(
                 self.target,
                 packet.dest,
-                port,
+                DatagramSource::Egress { port },
                 self.ttl,
                 packet.payload,
             ) {
@@ -382,7 +385,13 @@ impl PacketHandler for SearchReflector {
             Err(outcome) => return outcome, // make_session logged the cause
         };
         let port = session.reservation.port();
-        match dispatcher.send_udp_group(self.target, packet.dest, port, self.ttl, packet.payload) {
+        match dispatcher.send_udp_group(
+            self.target,
+            packet.dest,
+            DatagramSource::Egress { port },
+            self.ttl,
+            packet.payload,
+        ) {
             Ok(()) => {
                 self.sessions.insert(key, session);
                 log::debug!(

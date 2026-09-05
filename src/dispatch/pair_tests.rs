@@ -23,7 +23,7 @@ use crate::{
     sys::sockaddr_for,
 };
 
-use super::datagram::{build_udp, ethernet_dst};
+use super::datagram::{DatagramSource, build_udp, ethernet_dst};
 use super::interface_table::InterfaceTable;
 use super::multicast::MulticastJoiner;
 
@@ -491,7 +491,9 @@ fn inject(
         injector.link_type(),
         dst,
         ethernet_dst(dst.ip(), None).expect("broadcast/multicast destination"),
-        INJECT_SRC_PORT,
+        DatagramSource::Egress {
+            port: INJECT_SRC_PORT,
+        },
         64,
         payload,
         &mut scratch,

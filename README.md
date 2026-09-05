@@ -5,7 +5,8 @@ talk to each other sit on different L2 segments that don't forward each other's 
 multicasts. The classic case: a router with a wired LAN on one side and a Wi-Fi or IoT VLAN on the
 other, where a phone on Wi-Fi can't discover or cast to a TV on the LAN.
 
-It reflects four link-local protocols and layers an optional DIAL proxy on top of SSDP:
+It reflects four link-local protocols, layers an optional DIAL proxy on top of SSDP, and relays any
+other UDP discovery protocol as sent:
 
 - **Wake-on-LAN**: magic packets sent on one interface are re-emitted on another, so a sender can
   wake a host on a different segment.
@@ -19,15 +20,19 @@ It reflects four link-local protocols and layers an optional DIAL proxy on top o
   `dial = true` on an SSDP entry; see [DIAL](#dial).
 - **WS-Discovery (WSD)**: SOAP-over-UDP discovery is relayed both ways, so a client on one segment can
   discover ONVIF cameras or Windows devices (printers, scanners) on the other.
+- **UDP relay**: datagrams to configured ports, sent to configured multicast groups or, optionally,
+  broadcast, cross unchanged, source address and port included, so a protocol netflector does not
+  know (Roon's SOOD, Syncthing's local discovery) works across segments too; see
+  [UDP relay](#udp-relay).
 
 Each named entry bridges one `source_if` → `target_if` interface pair and enables one or more of the
-four reflected protocols, in any mix; the DIAL proxy then layers onto SSDP.
+four reflected protocols and the relay, in any mix; the DIAL proxy then layers onto SSDP.
 
 ## Contents
 
 - [Platform support](#platform-support)
 - [Run](#run): [privileges](#runtime-privileges), [Docker](#run-in-docker), [MikroTik](#on-mikrotik-routeros), [FreeBSD/OPNsense packages](#install-on-freebsd-and-opnsense)
-- [Configuration](#configuration): [env vars](#environment-variables), [`macs`](#the-macs-field), [`address_family`](#address_family), [per-protocol behavior](#per-protocol-behavior), [DIAL](#dial), [duplicate detection](#duplicate-detection)
+- [Configuration](#configuration): [env vars](#environment-variables), [`macs`](#the-macs-field), [`address_family`](#address_family), [per-protocol behavior](#per-protocol-behavior), [DIAL](#dial), [UDP relay](#udp-relay), [duplicate detection](#duplicate-detection)
 - [Diagnostics](#diagnostics)
 - [Developing](#developing)
 - [License](#license)
@@ -382,6 +387,7 @@ the periodic reconcile (up to ~30 s).
 | SSDP | 1900 | `239.255.255.250` / `ff02::c` + `ff05::c` | M-SEARCH source→target, NOTIFY target→source |
 | DIAL | 1900 + ephemeral TCP | (uses SSDP discovery) | terminating HTTP reverse proxy (IPv4 only) |
 | WSD | 3702 | `239.255.255.250` / `ff02::c` | Probe/Resolve source→target, Hello/Bye target→source |
+| UDP relay | `udp_ports` | `udp_groups`, broadcasts with `udp_broadcast` | everything source→target, as sent |
 
 WoL matching requires the magic-packet sequence (six `0xFF` bytes followed by the target MAC repeated 16
 times) at the start of the UDP payload; trailing bytes such as a SecureOn password are ignored when
@@ -455,6 +461,41 @@ address); an `ipv6`-only entry with `dial = true` is rejected at startup. It is 
 every cap and timeout is a fixed constant. The proxy degrades benignly: a `LOCATION`/`Application-URL`
 netflector can't rewrite (an `https` URL, a hostname instead of an IPv4 literal, a listener cap/bind
 failure) is forwarded unchanged and logged, leaving on-subnet discovery unaffected.
+
+### UDP relay
+
+`udp_ports` turns an entry into a transparent relay for any other UDP discovery a device or app does
+by multicast or broadcast. A datagram captured on `source_if` to one of the ports, sent to a group in
+`udp_groups` or, with `udp_broadcast = true`, to a broadcast, is re-emitted on `target_if` exactly as
+sent: same payload, same source address and port, same TTL. A group goes to the same group
+(netflector joins it on `source_if`), the source segment's directed broadcast to the target segment's
+own, and `255.255.255.255` stays `255.255.255.255`. Nothing is parsed, so nothing is proxied: replies
+are the receiver's business.
+
+That is the point of keeping the source. A device on the target segment answers a relayed query by
+unicast to the address it came from, on the other segment, and the firewall routes that reply like
+any other packet. Allow it there: the reply is a new flow from the target segment to the source one,
+which no state from the multicast query covers. Two things follow from the source being off-subnet
+on the receiving segment: a host with strict reverse-path filtering (`rp_filter = 1` on Linux) drops
+the datagram, and a link-local IPv6 source is meaningless on the other link, so relay IPv6 only for
+protocols that use routable addresses.
+
+Roon, whose SOOD discovery queries `239.255.90.90` and the subnet broadcast on UDP 9003 from
+servers and endpoints alike, is the canonical recipe:
+
+```toml
+[reflectors.roon]
+source_if = "lan"
+target_if = "iot"
+udp_ports = [9003]
+udp_groups = ["239.255.90.90"]
+udp_broadcast = true
+bidirectional = true
+```
+
+The relay ignores `macs` (a datagram to a group or a broadcast has no device to select) and admits
+every datagram it captures, so it may not overlap a protocol relaying the same ones; see
+[duplicate detection](#duplicate-detection). Its counters report as `UDP relay`.
 
 ### Duplicate detection
 

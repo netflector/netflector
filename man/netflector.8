@@ -18,8 +18,9 @@
 relays link-local service-discovery traffic between two network interfaces:
 clients on the source interface discover, wake, and reach devices on the
 target interface, not the other way around.
-It reflects Wake-on-LAN, mDNS, SSDP, WS-Discovery, and DIAL; each is enabled
-per interface pair in the configuration.
+It reflects Wake-on-LAN, mDNS, SSDP, WS-Discovery, DIAL, and relays any
+other UDP protocol as sent; each is enabled per interface pair in the
+configuration.
 .Pp
 The daemon runs in the foreground and logs to standard error with UTC
 timestamps.

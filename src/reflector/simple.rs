@@ -4,14 +4,14 @@
 //! Wake-on-LAN are the same operation: classify the payload and, if it's a message for this leg,
 //! re-emit it on the egress interface, verbatim or through an optional [`ReplyRewrite`] (SSDP's
 //! advertisement direction rewrites the DIAL `LOCATION`). What differs per protocol enters as
-//! parameters: the [`Classify`] gate and the [`Emit`] policy (which source port and TTL the re-emit
+//! parameters: the [`Classify`] gate and the [`Emit`] policy (which source and TTL the re-emit
 //! carries). Where it goes follows from the captured destination alone ([`link_destination`]). The
 //! search directions are stateful (per-searcher sessions), so they use the shared `SearchReflector`
 //! instead.
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use crate::dispatch::{CaptureKey, Outcome, PacketDispatcher, PacketHandler};
+use crate::dispatch::{CaptureKey, DatagramSource, Outcome, PacketDispatcher, PacketHandler};
 use crate::interface::InterfaceAddresses;
 use crate::logging::log_rate;
 use crate::net::packet::Packet;
@@ -31,7 +31,28 @@ impl<F: Fn(&[u8]) -> Verdict> Classify for F {
     }
 }
 
-/// The UDP source port a re-emit carries.
+/// The IP source a re-emit carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Source {
+    /// The egress's own address, at the given port.
+    Egress(SourcePort),
+    /// The captured sender's own address and port, kept on the re-emit: the transparent relay,
+    /// whose peers take the sender from the datagram's source.
+    Captured,
+}
+
+impl Source {
+    fn resolve(self, packet: &Packet) -> DatagramSource {
+        match self {
+            Self::Egress(port) => DatagramSource::Egress {
+                port: port.resolve(packet),
+            },
+            Self::Captured => DatagramSource::Captured(packet.source),
+        }
+    }
+}
+
+/// The UDP source port an egress-sourced re-emit carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SourcePort {
     /// A protocol's well-known port.
@@ -66,27 +87,35 @@ impl Ttl {
     }
 }
 
-/// How a re-emit is stamped: the source port and TTL it carries. The address is always the
-/// egress's own; the destination follows from the captured one ([`link_destination`]).
+/// How a re-emit is stamped: the source and TTL it carries. The destination follows from the
+/// captured one ([`link_destination`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Emit {
-    pub(crate) source_port: SourcePort,
+    pub(crate) source: Source,
     pub(crate) ttl: Ttl,
 }
 
 impl Emit {
-    /// From `port` at `ttl`: the multicast-discovery protocols.
+    /// From the egress's address at `port`, at `ttl`: the multicast-discovery protocols.
     pub(crate) const fn fixed(port: u16, ttl: u8) -> Self {
         Self {
-            source_port: SourcePort::Fixed(port),
+            source: Source::Egress(SourcePort::Fixed(port)),
             ttl: Ttl::Fixed(ttl),
         }
     }
 
-    /// From the captured source port at the captured TTL: Wake-on-LAN.
+    /// From the egress's address at the captured source port, at the captured TTL: Wake-on-LAN.
+    pub(crate) const fn captured_from_egress() -> Self {
+        Self {
+            source: Source::Egress(SourcePort::Captured),
+            ttl: Ttl::Captured,
+        }
+    }
+
+    /// From the captured sender's own ip:port, at the captured TTL: the transparent UDP relay.
     pub(crate) const fn captured() -> Self {
         Self {
-            source_port: SourcePort::Captured,
+            source: Source::Captured,
             ttl: Ttl::Captured,
         }
     }
@@ -207,7 +236,7 @@ impl<C: Classify> PacketHandler for SimpleReflector<C> {
         match dispatcher.send_udp_group(
             self.egress,
             dest,
-            self.emit.source_port.resolve(packet),
+            self.emit.source.resolve(packet),
             self.emit.ttl.resolve(packet),
             payload,
         ) {

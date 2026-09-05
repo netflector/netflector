@@ -160,8 +160,8 @@ fn build_reflector(
     interfaces: &InterfaceMap,
     dispatcher: &mut PacketDispatcher,
 ) -> Result<()> {
-    use crate::reflector::{mdns, ssdp, wol, wsd};
-    for build in [wol::build, mdns::build, ssdp::build, wsd::build] {
+    use crate::reflector::{mdns, ssdp, udp, wol, wsd};
+    for build in [wol::build, mdns::build, ssdp::build, wsd::build, udp::build] {
         build(reflector, interfaces, dispatcher)
             .map_err(|e| Error::reflector(reflector.name.as_str(), e))?;
     }
