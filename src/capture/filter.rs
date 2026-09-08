@@ -67,6 +67,36 @@ pub(crate) const DROP_OUTGOING_PROLOGUE: [BpfInsn; 3] = [
     insn(0x0006, 0, 0, 0x0000_0000), // BPF_RET|BPF_K drop
 ];
 
+/// Accept IPv4 UDP or IPv6 UDP on a raw IP link (a Linux tunnel), drop everything
+/// else in-kernel. There is no link header: the IP version nibble at offset 0 picks
+/// the layout.
+///
+/// ```text
+/// ldb [0]                  version nibble + IHL / traffic class
+/// and 0xf0                 keep the version
+/// jeq 0x40 -> IPv4@6       else fall through
+/// jeq 0x60 -> IPv6 fall    else drop@9
+/// ldb [6]                  IPv6 next-header
+/// jeq 17   -> accept@8     else drop@9
+/// ldb [9]                  IPv4 protocol
+/// jeq 17   -> accept@8     else drop@9
+/// ret 0xffffffff           accept
+/// ret 0                    drop
+/// ```
+#[cfg(target_os = "linux")]
+pub(crate) const RAW_IP_UDP_FILTER: [BpfInsn; 10] = [
+    insn(0x0030, 0, 0, 0x0000_0000), // BPF_LD|BPF_B|BPF_ABS  [0] version nibble + IHL
+    insn(0x0054, 0, 0, 0x0000_00f0), // BPF_ALU|BPF_AND|BPF_K 0xf0 keep the version
+    insn(0x0015, 3, 0, 0x0000_0040), // BPF_JMP|BPF_JEQ|BPF_K 4 IPv4
+    insn(0x0015, 0, 5, 0x0000_0060), // BPF_JMP|BPF_JEQ|BPF_K 6 IPv6
+    insn(0x0030, 0, 0, 0x0000_0006), // BPF_LD|BPF_B|BPF_ABS  [6] IPv6 next-header
+    insn(0x0015, 2, 3, 0x0000_0011), // BPF_JMP|BPF_JEQ|BPF_K 17 UDP
+    insn(0x0030, 0, 0, 0x0000_0009), // BPF_LD|BPF_B|BPF_ABS  [9] IPv4 protocol
+    insn(0x0015, 0, 1, 0x0000_0011), // BPF_JMP|BPF_JEQ|BPF_K 17 UDP
+    insn(0x0006, 0, 0, 0xffff_ffff), // BPF_RET|BPF_K accept
+    insn(0x0006, 0, 0, 0x0000_0000), // BPF_RET|BPF_K drop
+];
+
 /// Convert a host-order address family to the value a `BPF_LD|BPF_W|BPF_ABS` load
 /// compares against. The classic-BPF VM assembles a loaded word big-endian
 /// regardless of host, but a `DLT_NULL` frame stores the family in host order.

@@ -14,20 +14,18 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use libc::{c_int, c_void};
 
 use super::Read;
-use super::filter::{BpfInsn, DROP_OUTGOING_PROLOGUE, ETHERNET_UDP_FILTER};
+use super::filter::{BpfInsn, DROP_OUTGOING_PROLOGUE, ETHERNET_UDP_FILTER, RAW_IP_UDP_FILTER};
 use crate::interface::if_index;
 use crate::logging::{WARN_WINDOW, log_rate};
 use crate::net::LinkType;
 use crate::sys::{IoStatus, socklen_of};
-
-/// The fallback filter length: the egress-drop prologue plus the UDP classifier.
-const DROP_OUTGOING_FILTER_LEN: usize = DROP_OUTGOING_PROLOGUE.len() + ETHERNET_UDP_FILTER.len();
 
 /// A raw-capture handle on one interface. The socket's bind is the only holder of the
 /// interface's kernel index: sends rely on it, so nothing here goes stale if the index changes.
 pub(crate) struct Capture {
     fd: OwnedFd,
     buf: Box<[u8]>,
+    link_type: LinkType,
     name: String,
     /// Frames dropped for exceeding the receive buffer since the last
     /// [`take_oversized`](Self::take_oversized) drain.
@@ -38,11 +36,10 @@ impl Capture {
     /// Open an `AF_PACKET` capture bound to `if_name`.
     ///
     /// # Errors
-    /// Returns an error if the interface is unknown, the socket can't be created,
-    /// the filter can't be attached, or the bind fails.
+    /// Returns an error if the interface is unknown or of a hardware type that is neither
+    /// Ethernet nor raw IP, the socket can't be created, the filter can't be attached, or the
+    /// bind fails.
     pub(crate) fn open(if_name: &str) -> io::Result<Self> {
-        let ifindex = resolve_ifindex(if_name)?;
-
         // Protocol 0: capture nothing until the filter + loop-prevention are in place.
         // SAFETY: a `socket` call with a valid domain/type/protocol returns a fresh fd or -1.
         let fd = crate::sys::owned_fd_from(unsafe {
@@ -52,49 +49,30 @@ impl Capture {
                 0,
             )
         })?;
-
-        // Loop prevention: stop the kernel from handing us our own injected frames. A link that
-        // returns them as received frames (a hairpin bridge port) gets past this; the dispatcher's
-        // echo drop catches those. PACKET_IGNORE_OUTGOING (Linux 4.20+) drops them at the socket;
-        // if the kernel lacks it (or user-mode QEMU rejects it), prepend an in-filter drop instead.
-        match set_ignore_outgoing(&fd) {
-            Ok(()) => attach_filter(&fd, &ETHERNET_UDP_FILTER)?,
-            Err(e) => {
-                log::info!(
-                    "PACKET_IGNORE_OUTGOING unavailable ({e}); dropping our own frames in the \
-                     BPF filter"
-                );
-                attach_filter(&fd, &drop_outgoing_filter())?;
-            }
-        }
-
-        // Bind with ETH_P_ALL to start capturing. The filter is already installed, so
-        // there is no unfiltered-capture window.
-        bind_interface(&fd, link_addr(ifindex))?;
-
+        let link_type = attach(&fd, if_name)?;
         log::debug!(
-            "opened AF_PACKET capture on {if_name} (fd {}, ifindex {ifindex})",
+            "opened AF_PACKET capture on {if_name} (fd {}, {link_type:?})",
             fd.as_raw_fd()
         );
         Ok(Self {
             fd,
             buf: vec![0u8; crate::net::MAX_FRAME_LEN].into_boxed_slice(),
+            link_type,
             name: if_name.into(),
             oversized: 0,
         })
     }
 
-    /// Re-bind the socket to the interface currently named at open, re-hooking delivery to its
-    /// (possibly recreated) kernel object. The fd, filter, and loop prevention all persist
-    /// across a `bind(2)`, so the filter-before-bind init invariant holds with no unfiltered
-    /// window, and the reactor's watch stays valid.
+    /// Re-attach the socket to the interface currently named at open, re-hooking delivery to
+    /// its (possibly recreated) kernel object. Same fd, so the reactor's watch stays valid;
+    /// [`attach`] re-reads the framing and re-installs the filter ahead of the bind, so the
+    /// init invariant holds with no unfiltered window.
     ///
     /// # Errors
-    /// [`io::ErrorKind::NotFound`] while no interface bears the name; otherwise the `bind`
+    /// [`io::ErrorKind::NotFound`] while no interface bears the name; otherwise the attach
     /// failure.
     pub(crate) fn rebind(&mut self) -> io::Result<()> {
-        let ifindex = resolve_ifindex(&self.name)?;
-        bind_interface(&self.fd, link_addr(ifindex))?;
+        self.link_type = attach(&self.fd, &self.name)?;
         // The kernel parked ENETDOWN on the socket when the old interface died; consume it so
         // the first post-rebind recv surfaces frames, not the stale failure.
         match crate::sys::so_error(self.fd.as_raw_fd()) {
@@ -112,8 +90,9 @@ impl Capture {
             ),
         }
         log::debug!(
-            "re-bound AF_PACKET capture to {} (ifindex {ifindex})",
-            self.name
+            "re-bound AF_PACKET capture to {} ({:?})",
+            self.name,
+            self.link_type
         );
         Ok(())
     }
@@ -137,10 +116,9 @@ impl Capture {
         rc == 0 && u32::try_from(addr.sll_ifindex).is_ok_and(|bound| bound == ifindex)
     }
 
-    /// The link framing: always Ethernet on Linux, loopback included.
-    #[allow(clippy::unused_self)] // uniform Capture API; the BPF backend reads self
+    /// The link framing, from the interface's hardware type.
     pub(crate) fn link_type(&self) -> LinkType {
-        LinkType::Ethernet
+        self.link_type
     }
 
     pub(crate) fn if_name(&self) -> &str {
@@ -195,7 +173,8 @@ impl Capture {
     pub(crate) fn send(&self, frame: &[u8]) -> io::Result<()> {
         // SOCK_RAW carries the whole L2 frame and the socket is bound to its interface, so a
         // plain `send` suffices: the kernel takes the egress from the bind, and the
-        // destination MAC is in the frame.
+        // destination MAC is in the frame. A raw IP link has no header to read the protocol
+        // off; since Linux 5.8 the kernel takes it from the IP version instead.
         // SAFETY: `frame` is a valid readable slice of `frame.len()` bytes.
         let sent = unsafe {
             libc::send(
@@ -240,13 +219,78 @@ impl AsRawFd for Capture {
     }
 }
 
-/// [`DROP_OUTGOING_PROLOGUE`] followed by [`ETHERNET_UDP_FILTER`]: the
-/// loop-prevention fallback for kernels without `PACKET_IGNORE_OUTGOING`.
-fn drop_outgoing_filter() -> [BpfInsn; DROP_OUTGOING_FILTER_LEN] {
-    std::array::from_fn(|i| match DROP_OUTGOING_PROLOGUE.get(i) {
-        Some(&prologue_insn) => prologue_insn,
-        None => ETHERNET_UDP_FILTER[i - DROP_OUTGOING_PROLOGUE.len()],
-    })
+/// Attach `fd` to `if_name` and normalize the per-attachment state: read the link framing,
+/// install the matching UDP filter with loop prevention, then bind with `ETH_P_ALL` to start
+/// delivery. Shared by [`Capture::open`] and [`Capture::rebind`]; the filter goes in before the
+/// bind, so no frame is ever delivered unfiltered.
+fn attach(fd: &OwnedFd, if_name: &str) -> io::Result<LinkType> {
+    let ifindex = resolve_ifindex(if_name)?;
+    let link_type = link_type_of(fd, if_name)?;
+    install_filter(fd, link_type)?;
+    bind_interface(fd, link_addr(ifindex))?;
+    Ok(link_type)
+}
+
+/// The link framing of `if_name`, from its hardware type: Ethernet (a loopback is framed the
+/// same), or the bare IP packets of a link with no header (`ARPHRD_NONE`: `WireGuard`, tun).
+/// Anything else is refused rather than read as Ethernet.
+fn link_type_of(fd: &OwnedFd, if_name: &str) -> io::Result<LinkType> {
+    // SAFETY: an all-zero `ifreq` is valid (a zeroed name and union).
+    let mut ifr: libc::ifreq = unsafe { core::mem::zeroed() };
+    let n = if_name.len().min(libc::IFNAMSIZ - 1);
+    // SAFETY: copy `n` name bytes into the zeroed `c_char` buffer (same layout as `u8`);
+    // the trailing zero keeps it NUL-terminated.
+    unsafe {
+        std::ptr::copy_nonoverlapping(if_name.as_ptr(), ifr.ifr_name.as_mut_ptr().cast::<u8>(), n);
+    }
+    let request =
+        libc::Ioctl::try_from(libc::SIOCGIFHWADDR).expect("SIOCGIFHWADDR fits the request type");
+    // SAFETY: the ioctl reads the name and writes the hardware address back into the union; any
+    // socket serves it.
+    if unsafe { libc::ioctl(fd.as_raw_fd(), request, &raw mut ifr) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a successful ioctl wrote `ifru_hwaddr`, whose family is the hardware type.
+    match unsafe { ifr.ifr_ifru.ifru_hwaddr.sa_family } {
+        libc::ARPHRD_ETHER | libc::ARPHRD_LOOPBACK => Ok(LinkType::Ethernet),
+        libc::ARPHRD_NONE => Ok(LinkType::RawIp),
+        other => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("hardware type {other} is neither Ethernet nor a raw IP link"),
+        )),
+    }
+}
+
+/// Install the UDP classifier for `link_type`, with loop prevention: stop the kernel from handing
+/// us our own injected frames. A link that returns them as received frames (a hairpin bridge
+/// port) gets past this; the dispatcher's echo drop catches those. `PACKET_IGNORE_OUTGOING`
+/// (Linux 4.20+) drops them at the socket; if the kernel lacks it (or user-mode QEMU rejects
+/// it), an in-filter drop precedes the classifier instead.
+fn install_filter(fd: &OwnedFd, link_type: LinkType) -> io::Result<()> {
+    let classifier: &[BpfInsn] = match link_type {
+        LinkType::Ethernet => &ETHERNET_UDP_FILTER,
+        LinkType::RawIp => &RAW_IP_UDP_FILTER,
+    };
+    match set_ignore_outgoing(fd) {
+        Ok(()) => attach_filter(fd, classifier),
+        Err(e) => {
+            log::info!(
+                "PACKET_IGNORE_OUTGOING unavailable ({e}); dropping our own frames in the BPF \
+                 filter"
+            );
+            attach_filter(fd, &drop_outgoing_filter(classifier))
+        }
+    }
+}
+
+/// [`DROP_OUTGOING_PROLOGUE`] followed by `classifier`: the loop-prevention fallback for
+/// kernels without `PACKET_IGNORE_OUTGOING`.
+fn drop_outgoing_filter(classifier: &[BpfInsn]) -> Vec<BpfInsn> {
+    DROP_OUTGOING_PROLOGUE
+        .iter()
+        .chain(classifier)
+        .copied()
+        .collect()
 }
 
 /// Resolve `if_name` to its kernel index as the `c_int` a `sockaddr_ll` carries, with a clear
@@ -335,12 +379,20 @@ fn bind_interface(fd: &OwnedFd, mut addr: libc::sockaddr_ll) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
+    use std::fs::File;
+    use std::io::{Read as _, Write as _};
+    use std::net::{Ipv4Addr, SocketAddrV4, SocketAddrV6, UdpSocket};
+    use std::time::{Duration, Instant};
+
+    use libc::c_short;
 
     use super::*;
     use crate::capture::{loopback_lock, open_or_skip};
     use crate::net::frame;
     use crate::net::mac::MacAddr;
+
+    /// How long a live tun test waits for a packet to cross the device.
+    const WAIT_BUDGET: Duration = Duration::from_secs(2);
 
     /// `BpfInsn` is libc's type, which derives no `PartialEq`/`Debug`; compare as field tuples.
     fn as_tuples(insns: &[BpfInsn]) -> Vec<(u16, u8, u8, u32)> {
@@ -349,15 +401,184 @@ mod tests {
 
     #[test]
     fn drop_outgoing_filter_prepends_the_prologue() {
-        let filter = drop_outgoing_filter();
-        assert_eq!(
-            as_tuples(&filter[..DROP_OUTGOING_PROLOGUE.len()]),
-            as_tuples(&DROP_OUTGOING_PROLOGUE)
-        );
-        assert_eq!(
-            as_tuples(&filter[DROP_OUTGOING_PROLOGUE.len()..]),
-            as_tuples(&ETHERNET_UDP_FILTER)
-        );
+        for classifier in [&ETHERNET_UDP_FILTER[..], &RAW_IP_UDP_FILTER[..]] {
+            let filter = drop_outgoing_filter(classifier);
+            assert_eq!(
+                as_tuples(&filter[..DROP_OUTGOING_PROLOGUE.len()]),
+                as_tuples(&DROP_OUTGOING_PROLOGUE)
+            );
+            assert_eq!(
+                as_tuples(&filter[DROP_OUTGOING_PROLOGUE.len()..]),
+                as_tuples(classifier)
+            );
+        }
+    }
+
+    /// A tun device attached to this process: its kernel side is a raw IP link, `far_end` the
+    /// other side, where a packet written arrives on the link and one sent on the link comes
+    /// out. Gone when the file closes.
+    struct Tun {
+        far_end: File,
+        name: String,
+    }
+
+    impl Tun {
+        /// `None`, with a note, where the test can't run: no root, no `/dev/net/tun`, or a
+        /// kernel (user-mode QEMU) that refuses the attach.
+        fn create() -> Option<Self> {
+            // A `%d` template asks for a kernel-assigned name, written back by the ioctl.
+            const TEMPLATE: &[u8] = b"nftun%d";
+            // SAFETY: geteuid takes no arguments and cannot fail.
+            if unsafe { libc::geteuid() } != 0 {
+                eprintln!("skip tun test: creating a tun device requires root");
+                return None;
+            }
+            let far_end = match File::options().read(true).write(true).open("/dev/net/tun") {
+                Ok(file) => file,
+                Err(e) => {
+                    eprintln!("skip tun test: /dev/net/tun: {e}");
+                    return None;
+                }
+            };
+            // SAFETY: an all-zero `ifreq` is valid (a zeroed name and union).
+            let mut ifr: libc::ifreq = unsafe { core::mem::zeroed() };
+            // SAFETY: the template fits `ifr_name` with the terminator the zeroed `ifr` provides.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    TEMPLATE.as_ptr(),
+                    ifr.ifr_name.as_mut_ptr().cast::<u8>(),
+                    TEMPLATE.len(),
+                );
+            }
+            ifr.ifr_ifru.ifru_flags =
+                c_short::try_from(libc::IFF_TUN | libc::IFF_NO_PI).expect("tun flags fit");
+            // SAFETY: TUNSETIFF reads the flags and name template, and writes the name back.
+            if unsafe { libc::ioctl(far_end.as_raw_fd(), libc::TUNSETIFF, &raw mut ifr) } < 0 {
+                eprintln!("skip tun test: TUNSETIFF: {}", io::Error::last_os_error());
+                return None;
+            }
+            // SAFETY: the kernel wrote a NUL-terminated name into `ifr_name`.
+            let name = unsafe { std::ffi::CStr::from_ptr(ifr.ifr_name.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            let up = std::process::Command::new("ip")
+                .args(["link", "set", "dev", &name, "up"])
+                .status()
+                .is_ok_and(|status| status.success());
+            if !up {
+                eprintln!("skip tun test: cannot bring {name} up (no ip(8)?)");
+                return None;
+            }
+            Some(Self { far_end, name })
+        }
+
+        /// Whether a packet equal to `want` comes out of the far end within [`WAIT_BUDGET`].
+        fn read_until(&self, want: &[u8]) -> io::Result<bool> {
+            let deadline = Instant::now() + WAIT_BUDGET;
+            let mut buf = [0u8; crate::net::MAX_FRAME_LEN];
+            while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+                let mut pfd = libc::pollfd {
+                    fd: self.far_end.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let timeout = c_int::try_from(left.as_millis()).unwrap_or(c_int::MAX);
+                // SAFETY: one `pollfd`, as declared.
+                match unsafe { libc::poll(&raw mut pfd, 1, timeout) } {
+                    0 => break,
+                    n if n < 0 => return Err(io::Error::last_os_error()),
+                    _ => {}
+                }
+                // One packet per read (`IFF_NO_PI`: no header).
+                let n = (&self.far_end).read(&mut buf)?;
+                if &buf[..n] == want {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+    }
+
+    /// A bare IPv4 UDP datagram and a bare IPv6 one, each carrying `payload`.
+    fn bare_datagrams(payload: &[u8]) -> [Vec<u8>; 2] {
+        let mut buf = [0u8; 128];
+        let v4 = frame::ipv4_udp(
+            SocketAddrV4::new(Ipv4Addr::new(10, 99, 200, 2), 40000),
+            SocketAddrV4::new(Ipv4Addr::new(10, 99, 200, 1), 40001),
+            64,
+            payload,
+            &mut buf,
+        )
+        .expect("build the IPv4 datagram")
+        .len;
+        let v4 = buf[..v4].to_vec();
+        let v6 = frame::ipv6_udp(
+            SocketAddrV6::new("fd00:99::2".parse().unwrap(), 40000, 0, 0),
+            SocketAddrV6::new("fd00:99::1".parse().unwrap(), 40001, 0, 0),
+            64,
+            payload,
+            &mut buf,
+        )
+        .expect("build the IPv6 datagram")
+        .len;
+        [v4, buf[..v6].to_vec()]
+    }
+
+    /// Whether `capture` yields a frame equal to `want` within [`WAIT_BUDGET`].
+    fn captures(capture: &mut Capture, want: &[u8]) -> io::Result<bool> {
+        let deadline = Instant::now() + WAIT_BUDGET;
+        while Instant::now() < deadline {
+            while let Some(read) = capture.next_frame()? {
+                if matches!(read, Read::Frame(frame) if frame == want) {
+                    return Ok(true);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Ok(false)
+    }
+
+    // Live raw IP link, receive side: a tun device is `ARPHRD_NONE`, so a packet its far end
+    // writes is captured as the bare IP packet it is, in either family.
+    #[test]
+    #[cfg_attr(miri, ignore = "needs a real capture device")]
+    fn a_tun_link_captures_bare_ip_packets() -> io::Result<()> {
+        let Some(mut tun) = Tun::create() else {
+            return Ok(());
+        };
+        let mut capture = Capture::open(&tun.name)?;
+        assert_eq!(capture.link_type(), LinkType::RawIp);
+        for packet in bare_datagrams(b"netflector-tun-in") {
+            tun.far_end.write_all(&packet)?;
+            assert!(
+                captures(&mut capture, &packet)?,
+                "did not capture the IPv{} packet written to {}",
+                packet[0] >> 4,
+                tun.name
+            );
+        }
+        Ok(())
+    }
+
+    // Live raw IP link, send side: a packet sent on the capture comes out of the tun's far end
+    // as the bare IP packet it was built as, in either family.
+    #[test]
+    #[cfg_attr(miri, ignore = "needs a real capture device")]
+    fn a_tun_link_sends_bare_ip_packets() -> io::Result<()> {
+        let Some(tun) = Tun::create() else {
+            return Ok(());
+        };
+        let capture = Capture::open(&tun.name)?;
+        for packet in bare_datagrams(b"netflector-tun-out") {
+            capture.send(&packet)?;
+            assert!(
+                tun.read_until(&packet)?,
+                "the IPv{} packet sent on {} did not reach its far end",
+                packet[0] >> 4,
+                tun.name
+            );
+        }
+        Ok(())
     }
 
     // Live capture against the real kernel: send UDP to 127.0.0.1 and capture the

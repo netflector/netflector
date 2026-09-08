@@ -26,7 +26,7 @@ pub(crate) struct Packet<'a> {
     pub(crate) dest: SocketAddr,
     /// IPv4 TTL or IPv6 hop limit, as captured.
     pub(crate) ttl: u8,
-    /// Ethernet destination/source MAC, or `None` on `DLT_NULL` (loopback/tunnel, no L2).
+    /// Ethernet destination/source MAC, or `None` on a link without them (`DLT_NULL`, raw IP).
     pub(crate) dst_mac: Option<MacAddr>,
     pub(crate) src_mac: Option<MacAddr>,
     pub(crate) payload: &'a [u8],
@@ -85,7 +85,7 @@ impl<'a> Packet<'a> {
     }
 }
 
-/// A frame's link header: its L2 addresses (absent on `DLT_NULL`) and the L3 bytes
+/// A frame's link header: its L2 addresses (absent on a MAC-less link) and the L3 bytes
 /// that follow.
 #[derive(Clone, Copy)]
 struct LinkHeader<'a> {
@@ -116,6 +116,12 @@ fn parse_link_header(link_type: LinkType, frame: &[u8]) -> Result<LinkHeader<'_>
             l3: frame
                 .get(DLT_NULL_HEADER_SIZE..)
                 .ok_or(ParseError::Truncated)?,
+        }),
+        #[cfg(target_os = "linux")]
+        LinkType::RawIp => Ok(LinkHeader {
+            dst_mac: None,
+            src_mac: None,
+            l3: frame,
         }),
     }
 }
@@ -322,6 +328,49 @@ mod tests {
             .len;
 
         let packet = Packet::parse(LinkType::DltNull, &buf[..n]).unwrap();
+        assert_eq!(packet.source, SocketAddr::V6(src));
+        assert_eq!(packet.dest, SocketAddr::V6(dst));
+        assert_eq!(packet.ttl, 255);
+        assert_eq!(packet.payload, &payload);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn round_trips_raw_ip_ipv4() {
+        let src = SocketAddrV4::new(Ipv4Addr::new(10, 10, 10, 2), 5353);
+        let dst = SocketAddrV4::new(Ipv4Addr::new(10, 10, 10, 1), 5354);
+        let payload = [0x01, 0x02];
+        let mut buf = [0u8; 64];
+        let n = frame::ipv4_udp(src, dst, 64, &payload, &mut buf)
+            .unwrap()
+            .len;
+
+        let packet = Packet::parse(LinkType::RawIp, &buf[..n]).unwrap();
+        assert_eq!(packet.source, SocketAddr::V4(src));
+        assert_eq!(packet.dest, SocketAddr::V4(dst));
+        assert_eq!(packet.ttl, 64);
+        // No link header, so no MACs to report.
+        assert_eq!(packet.dst_mac, None);
+        assert_eq!(packet.src_mac, None);
+        assert_eq!(packet.payload, &payload);
+        assert_eq!(
+            Packet::parse(LinkType::RawIp, &[]),
+            Err(ParseError::Truncated)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn round_trips_raw_ip_ipv6() {
+        let src = SocketAddrV6::new(Ipv6Addr::LOCALHOST, 5353, 0, 0);
+        let dst = SocketAddrV6::new(Ipv6Addr::LOCALHOST, 5354, 0, 0);
+        let payload = [0x09];
+        let mut buf = [0u8; 80];
+        let n = frame::ipv6_udp(src, dst, 255, &payload, &mut buf)
+            .unwrap()
+            .len;
+
+        let packet = Packet::parse(LinkType::RawIp, &buf[..n]).unwrap();
         assert_eq!(packet.source, SocketAddr::V6(src));
         assert_eq!(packet.dest, SocketAddr::V6(dst));
         assert_eq!(packet.ttl, 255);

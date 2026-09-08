@@ -330,9 +330,9 @@ devices:
   allow-set (exposing just those devices); the source→target direction is never MAC-filtered. For SSDP
   and WSD the same filter scopes the proxied unicast replies: only the allow-set's responses are
   carried back to a searcher. Because the filter reads the frame's L2 source, these protocols refuse
-  `macs` at startup when the target link carries no MAC addresses (a BSD `DLT_NULL` link such as a
-  loopback or an L3 tunnel) - it could never match. WoL is unaffected: it matches the MAC inside the
-  magic packet's payload.
+  `macs` at startup when the target link carries no MAC addresses (a loopback, or an L3 tunnel such
+  as WireGuard) - it could never match. WoL is unaffected: it matches the MAC inside the magic
+  packet's payload.
 - **The UDP relay** ignores the allow-set. An entry with only the relay enabled may not set `macs`.
 
 Omit `macs` for a network-level entry: WoL proxies every valid magic packet, and mDNS/SSDP/WSD relay
@@ -417,9 +417,11 @@ itself link-local. The DIAL proxy itself refuses to proxy a device whose `LOCATI
 `Application-URL` names a never-a-device address. Suppressed messages count as `dropped` and log at
 debug level.
 
-netflector reads untagged Ethernet frames carrying IPv4 or IPv6 UDP. VLAN-tagged frames and IPv6
-extension headers are not parsed, so configure the VLAN as its own interface (`vlan10`, `em0.10`) and
-name that as the entry's `source_if` / `target_if` rather than the trunk.
+netflector reads untagged Ethernet frames carrying IPv4 or IPv6 UDP, and the bare IP packets of a
+link that has no Ethernet header: a loopback, or a WireGuard or tun tunnel (Linux 5.8 or later).
+Other link types are refused at startup. VLAN-tagged frames and IPv6 extension headers are not
+parsed, so configure the VLAN as its own interface (`vlan10`, `em0.10`) and name that as the entry's
+`source_if` / `target_if` rather than the trunk.
 
 For SSDP, multicast reflection delivers **passive** discovery: devices' periodic `NOTIFY ssdp:alive`
 advertisements reach the source segment so clients see them. **Active** discovery works end to end as
