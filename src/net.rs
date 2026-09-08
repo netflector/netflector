@@ -20,14 +20,17 @@ pub(crate) mod wsd;
 
 /// Link-layer framing of a captured or injected frame. The capture layer reports
 /// it per interface; [`frame`] adds the matching link header and [`packet`] strips
-/// it before parsing L3. Either a 14-byte Ethernet header, or on BSD `DLT_NULL`'s
-/// 4-byte host-order address family (loopback/tunnel interfaces). Linux frames every
-/// interface as Ethernet, loopback included.
+/// it before parsing L3. A 14-byte Ethernet header; on BSD `DLT_NULL`'s 4-byte
+/// host-order address family (loopback/tunnel interfaces); on Linux no header at all,
+/// the bare IP packet a tunnel (`WireGuard`, tun) carries. Linux frames loopback as
+/// Ethernet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LinkType {
     Ethernet,
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     DltNull,
+    #[cfg(target_os = "linux")]
+    RawIp,
 }
 
 /// IANA protocol number for UDP.

@@ -4,7 +4,8 @@
 //! data-path allocation) and return the byte count, filling checksums via
 //! [`super::checksum`]. Ethernet builders prefix destination/source MACs and an
 //! ethertype. The BSD `DLT_NULL` builders (macOS/FreeBSD) prefix a 4-byte
-//! host-order address family instead, matching the capture-side framing.
+//! host-order address family instead, matching the capture-side framing. A Linux raw
+//! IP link (`WireGuard`, tun) takes the bare datagram that [`ipv4_udp`] / [`ipv6_udp`] write.
 
 use std::net::{SocketAddrV4, SocketAddrV6};
 
@@ -144,7 +145,11 @@ pub(crate) fn dlt_null_ipv6_udp(
 
 /// Write an IPv4 + UDP datagram (headers and `payload`, with the IPv4-header and
 /// UDP checksums filled) into `out`.
-fn ipv4_udp(
+///
+/// # Errors
+/// [`FrameError::PayloadTooLarge`] if the datagram overflows the 16-bit length
+/// fields, or [`FrameError::BufferTooSmall`] if `out` cannot hold it.
+pub(crate) fn ipv4_udp(
     src: SocketAddrV4,
     dst: SocketAddrV4,
     ttl: u8,
@@ -185,7 +190,11 @@ fn ipv4_udp(
 
 /// Write an IPv6 + UDP datagram (headers and `payload`, with the UDP checksum
 /// filled) into `out`. The IPv6 header carries no checksum of its own.
-fn ipv6_udp(
+///
+/// # Errors
+/// [`FrameError::PayloadTooLarge`] if the datagram overflows the 16-bit length
+/// fields, or [`FrameError::BufferTooSmall`] if `out` cannot hold it.
+pub(crate) fn ipv6_udp(
     src: SocketAddrV6,
     dst: SocketAddrV6,
     hop_limit: u8,

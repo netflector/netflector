@@ -60,8 +60,8 @@ pub(super) fn ethernet_dst(
 /// Assemble a UDP datagram for an egress with addresses `addrs` and link framing `link` into
 /// `scratch`. The IP source is `source`, the L2 source the egress's own
 /// MAC; the L2 destination is the caller-supplied `dst_mac` (so this serves unicast, multicast, and
-/// broadcast alike). BSD `DLT_NULL` (loopback/tunnel) carries no L2 addresses, so it ignores
-/// `dst_mac` and needs no source MAC.
+/// broadcast alike). A link without L2 addresses (BSD `DLT_NULL`, a Linux raw IP tunnel)
+/// ignores `dst_mac` and needs no source MAC.
 // A frame builder takes the full wire spec (egress addrs + link, dst addr + MAC, source, ttl,
 // payload, buffer); bundling any of these would obscure more than the arg count costs.
 #[allow(clippy::too_many_arguments)]
@@ -98,6 +98,8 @@ pub(super) fn build_udp(
                 )?),
                 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
                 LinkType::DltNull => Ok(frame::dlt_null_ipv4_udp(src, dst, ttl, payload, scratch)?),
+                #[cfg(target_os = "linux")]
+                LinkType::RawIp => Ok(frame::ipv4_udp(src, dst, ttl, payload, scratch)?),
             }
         }
         SocketAddr::V6(dst) => {
@@ -127,6 +129,8 @@ pub(super) fn build_udp(
                 )?),
                 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
                 LinkType::DltNull => Ok(frame::dlt_null_ipv6_udp(src, dst, ttl, payload, scratch)?),
+                #[cfg(target_os = "linux")]
+                LinkType::RawIp => Ok(frame::ipv6_udp(src, dst, ttl, payload, scratch)?),
             }
         }
     }

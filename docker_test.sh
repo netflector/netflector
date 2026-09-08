@@ -20,6 +20,8 @@
 #               veths the fixture creates later. Do NOT reach for `systempaths=unconfined` to
 #               make /proc/sys writable instead: that also unmasks /proc/sysrq-trigger (a write
 #               there panics the HOST) and /proc/kcore (the live kernel memory image).
+#   --device    /dev/net/tun, so the raw IP link test can attach a tun device (a Linux host
+#               without the node wants `modprobe tun`)
 # rust:slim also ships no `ip`, and without it the veth fixture skips every pair test instead of
 # failing, so the image adds iproute2. The layer is cached, so later runs pay nothing for it.
 set -euo pipefail
@@ -42,6 +44,7 @@ exec docker run --rm \
     --cap-add=NET_ADMIN \
     --cap-add=NET_RAW \
     --sysctl net.ipv4.conf.all.accept_local=1 \
+    --device /dev/net/tun \
     -v "$PWD":/netflector \
     -v netflector-linux-target:/linux-target \
     -v netflector-cargo-registry:/usr/local/cargo/registry \

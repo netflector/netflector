@@ -141,8 +141,8 @@ pub(crate) type IpSet = FilterSet<IpAddr>;
 pub(crate) type PortSet = FilterSet<u16>;
 
 /// An optional-field packet filter: an unset field
-/// matches anything. A `src_mac`/`dst_mac` filter never matches a `DLT_NULL` packet,
-/// which has no L2 addresses. `dst_ip`/`dst_port` match membership in their [`FilterSet`].
+/// matches anything. A `src_mac`/`dst_mac` filter never matches a packet from a link without
+/// L2 addresses (`DLT_NULL`, raw IP). `dst_ip`/`dst_port` match membership in their [`FilterSet`].
 #[derive(Clone, Default)]
 pub(crate) struct Filter {
     pub(crate) src_ip: Option<IpAddr>,
