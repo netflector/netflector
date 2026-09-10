@@ -1,6 +1,7 @@
 //! The dispatcher's interface table: every interface with its multicast joiner, and every capture
 //! linked to its interface, all addressed by `Copy` index keys.
 
+use std::hash::{DefaultHasher, Hasher};
 use std::io;
 use std::net::IpAddr;
 use std::num::NonZeroU32;
@@ -38,17 +39,11 @@ struct CaptureEntry {
     capture: Option<Capture>,
     interface: InterfaceKey,
     counters: CaptureCounters,
-    last_sent: SentFrame,
-}
-
-/// The last frame sent on a capture, tagged with the packet whose routing sent it. A packet's
-/// routing sends one frame per egress, so an equal frame for the same packet is a second handler
-/// relaying what the first already did. `packet` counts from 1, so the default never matches.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) struct SentFrame {
-    pub(super) packet: u64,
-    pub(super) len: usize,
-    pub(super) checksum: u16,
+    /// The packet whose routing last sent here (they count from 1), and a hash of each frame it
+    /// sent: an equal frame for the same packet is a second handler relaying what the first
+    /// already did. The list grows once, to the largest fan-out on the capture.
+    sent_packet: u64,
+    sent: Vec<u64>,
 }
 
 /// One interface paired with its multicast joiner. Bundling them keeps the two from desyncing (one
@@ -134,17 +129,22 @@ impl InterfaceTable {
         Ok(self.add_interface(Interface::open(name)?))
     }
 
-    /// Whether `frame` is the last one sent on `egress`. An unknown key never sent anything.
-    pub(super) fn is_last_sent(&self, egress: CaptureKey, frame: SentFrame) -> bool {
+    /// Whether `frame` already went out on `egress` for `packet`. An unknown key sent nothing.
+    pub(super) fn was_sent(&self, egress: CaptureKey, packet: u64, frame: &[u8]) -> bool {
         self.captures
             .get(egress.0 as usize)
-            .is_some_and(|entry| entry.last_sent == frame)
+            .is_some_and(|entry| entry.sent_packet == packet && entry.sent.contains(&hash(frame)))
     }
 
-    /// Set `frame` as the last one sent on `egress`, once its send succeeded.
-    pub(super) fn set_last_sent(&mut self, egress: CaptureKey, frame: SentFrame) {
+    /// Record `frame` as sent on `egress` for `packet`, once its send succeeded. A new packet's
+    /// first frame drops the previous packet's.
+    pub(super) fn record_sent(&mut self, egress: CaptureKey, packet: u64, frame: &[u8]) {
         if let Some(entry) = self.captures.get_mut(egress.0 as usize) {
-            entry.last_sent = frame;
+            if entry.sent_packet != packet {
+                entry.sent_packet = packet;
+                entry.sent.clear();
+            }
+            entry.sent.push(hash(frame));
         }
     }
 
@@ -155,7 +155,8 @@ impl InterfaceTable {
             capture: Some(capture),
             interface,
             counters: CaptureCounters::default(),
-            last_sent: SentFrame::default(),
+            sent_packet: 0,
+            sent: Vec::new(),
         });
         key
     }
@@ -499,6 +500,13 @@ impl InterfaceTable {
     }
 }
 
+/// The hash a sent frame is remembered by.
+fn hash(frame: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    hasher.write(frame);
+    hasher.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
@@ -535,7 +543,8 @@ mod tests {
                 capture: None,
                 interface: InterfaceKey(0),
                 counters: CaptureCounters::default(),
-                last_sent: SentFrame::default(),
+                sent_packet: 0,
+                sent: Vec::new(),
             });
             key
         }
@@ -574,32 +583,26 @@ mod tests {
     // the changed fields (`None` for an unwatched index). Resolution is unprivileged (no capture
     // needed), so this exercises the monitor's refresh path without CAP_NET_RAW.
     #[test]
-    fn is_last_sent_matches_only_the_set_frame_for_the_same_packet() {
+    fn was_sent_remembers_every_frame_of_the_packet_being_routed() {
         let mut table = InterfaceTable::new();
         let egress = table.add_test_capture();
         let other = table.add_test_capture();
-        let frame = SentFrame {
-            packet: 1,
-            len: 60,
-            checksum: 0x1234,
-        };
-        // Nothing set yet: a failed send leaves it that way, so a retry goes out.
-        assert!(!table.is_last_sent(egress, frame));
-        table.set_last_sent(egress, frame);
-        assert!(table.is_last_sent(egress, frame));
-        // Another egress, another length or checksum, or the next packet: not the same frame.
-        assert!(!table.is_last_sent(other, frame));
-        assert!(!table.is_last_sent(egress, SentFrame { len: 61, ..frame }));
-        assert!(!table.is_last_sent(
-            egress,
-            SentFrame {
-                checksum: 0x1235,
-                ..frame
-            }
-        ));
-        assert!(!table.is_last_sent(egress, SentFrame { packet: 2, ..frame }));
-        assert!(!table.is_last_sent(CaptureKey::from_u64(999), frame));
-        table.set_last_sent(CaptureKey::from_u64(999), frame); // an unknown key is a no-op
+        // Nothing recorded yet: a failed send leaves it that way, so a retry goes out.
+        assert!(!table.was_sent(egress, 1, b"first"));
+        table.record_sent(egress, 1, b"first");
+        table.record_sent(egress, 1, b"second");
+        assert!(table.was_sent(egress, 1, b"first"));
+        assert!(table.was_sent(egress, 1, b"second"));
+        // Another egress, other bytes, or the next packet: not a sent frame.
+        assert!(!table.was_sent(other, 1, b"first"));
+        assert!(!table.was_sent(egress, 1, b"third"));
+        assert!(!table.was_sent(egress, 2, b"first"));
+        // The next packet's first frame clears the previous packet's.
+        table.record_sent(egress, 2, b"third");
+        assert!(table.was_sent(egress, 2, b"third"));
+        assert!(!table.was_sent(egress, 1, b"first"));
+        assert!(!table.was_sent(CaptureKey::from_u64(999), 2, b"third"));
+        table.record_sent(CaptureKey::from_u64(999), 2, b"third"); // an unknown key is a no-op
     }
 
     #[test]

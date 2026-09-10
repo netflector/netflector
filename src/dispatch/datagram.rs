@@ -8,7 +8,7 @@ use thiserror::Error;
 
 use crate::interface::{InterfaceAddresses, Ipv6Scope};
 use crate::net::LinkType;
-use crate::net::frame::{self, Built, FrameError};
+use crate::net::frame::{self, FrameError};
 use crate::net::mac::MacAddr;
 
 /// Why a datagram could not be assembled for an egress: from [`build_udp`] (no source address or
@@ -74,7 +74,7 @@ pub(super) fn build_udp(
     ttl: u8,
     payload: &[u8],
     scratch: &mut [u8],
-) -> Result<Built, DatagramError> {
+) -> Result<usize, DatagramError> {
     match dst {
         SocketAddr::V4(dst) => {
             let src = match source {
@@ -168,8 +168,7 @@ mod tests {
             b"ssdp",
             &mut scratch,
         )
-        .unwrap()
-        .len;
+        .unwrap();
         // The IPv6 source address sits at bytes [22..38] of the frame (14 Ethernet + offset 8 into
         // the v6 header).
         assert_eq!(
@@ -202,8 +201,7 @@ mod tests {
             b"sood",
             &mut scratch,
         )
-        .unwrap()
-        .len;
+        .unwrap();
         assert_eq!(&scratch[26..30], &[192, 0, 2, 7]);
         assert_eq!(&scratch[34..36], &40001u16.to_be_bytes());
         assert!(n > 36);
@@ -276,8 +274,7 @@ mod tests {
             b"wol",
             &mut scratch,
         )
-        .unwrap()
-        .len;
+        .unwrap();
         // L2 header: the supplied destination MAC, the egress's own MAC as source.
         assert_eq!(&scratch[0..6], MacAddr::broadcast().octets().as_slice());
         assert_eq!(&scratch[6..12], addrs.mac().unwrap().octets().as_slice());
@@ -324,8 +321,7 @@ mod tests {
             b"ok",
             &mut scratch,
         )
-        .unwrap()
-        .len;
+        .unwrap();
         // The supplied unicast MAC is the L2 destination; the egress's own MAC is the source.
         assert_eq!(&scratch[0..6], searcher_mac.octets().as_slice());
         assert_eq!(&scratch[6..12], addrs.mac().unwrap().octets().as_slice());

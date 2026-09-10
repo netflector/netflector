@@ -421,8 +421,7 @@ mod tests {
             payload,
             &mut buf,
         )
-        .expect("build the IPv4 datagram")
-        .len;
+        .expect("build the IPv4 datagram");
         let v4 = buf[..v4].to_vec();
         let v6 = frame::ipv6_udp(
             SocketAddrV6::new("fd00:99::2".parse().unwrap(), 40000, 0, 0),
@@ -431,8 +430,7 @@ mod tests {
             payload,
             &mut buf,
         )
-        .expect("build the IPv6 datagram")
-        .len;
+        .expect("build the IPv6 datagram");
         [v4, buf[..v6].to_vec()]
     }
 
@@ -588,8 +586,7 @@ mod tests {
         let mac = MacAddr::broadcast();
         let mut buf = [0u8; 256];
         let n = frame::ethernet_ipv4_udp(mac, mac, src, dst, 64, PROBE, &mut buf)
-            .expect("build Ethernet frame")
-            .len;
+            .expect("build Ethernet frame");
 
         // The injected frame loops to the input tap and waits there until drained, so
         // one send then polling captures it.
