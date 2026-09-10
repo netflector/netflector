@@ -20,8 +20,8 @@ use crate::net::mdns::{
 };
 
 use super::{
-    BuildError, Emit, InterfaceMap, SimpleReflector, Verdict, require_bidirectional_families,
-    require_group_join, require_macs_matchable,
+    BuildError, Delivery, Emit, InterfaceMap, SimpleReflector, Verdict,
+    require_bidirectional_families, require_group_join, require_macs_matchable,
 };
 
 /// mDNS's classifier kind *is* its message type: `Query`/`Response` map straight across.
@@ -114,6 +114,7 @@ pub(crate) fn build(
         },
         Box::new(SimpleReflector::new(
             target,
+            Delivery::new(reflector.target_peers.as_ref()),
             "mDNS",
             "query",
             query_verdict,
@@ -132,6 +133,9 @@ pub(crate) fn build(
         Box::new(
             SimpleReflector::new(
                 source,
+                // Never to peers: a client takes a unicast answer only to its own question that
+                // asked for one (§5.4); the config refuses peers on this side.
+                Delivery::Link,
                 "mDNS",
                 "response",
                 response_verdict,

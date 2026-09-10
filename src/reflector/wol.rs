@@ -16,7 +16,8 @@ use crate::net::mac::{MacAddr, MacSet};
 use crate::net::packet::Packet;
 
 use super::{
-    BuildError, Classify, Emit, InterfaceMap, SimpleReflector, Verdict, missing_required_family,
+    BuildError, Classify, Delivery, Emit, InterfaceMap, SimpleReflector, Verdict,
+    missing_required_family,
 };
 
 const PREFIX_LEN: usize = 6;
@@ -122,6 +123,7 @@ pub(crate) fn build(
         },
         Box::new(SimpleReflector::new(
             egress,
+            Delivery::new(reflector.target_peers.as_ref()),
             "WoL",
             "wake",
             WakeClassifier {

@@ -125,6 +125,19 @@ impl Tun {
         Some(Self { far_end, name })
     }
 
+    /// Give the device an address, `cidr` as `ip address add` takes it. IPv6 skips duplicate
+    /// address detection, so the address is usable at once.
+    pub(crate) fn add_address(&self, cidr: &str) -> bool {
+        let mut args = vec!["address", "add", cidr, "dev", &self.name];
+        if cidr.contains(':') {
+            args.push("nodad");
+        }
+        std::process::Command::new("ip")
+            .args(args)
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
     /// The next packet out of the far end, or `None` once `deadline` passes.
     pub(crate) fn next_packet(
         &self,

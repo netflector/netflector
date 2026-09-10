@@ -6,7 +6,7 @@
 //! frees the port.
 
 use std::io;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
 use crate::sys::{open_socket, sockaddr_for, socklen_of};
@@ -16,7 +16,7 @@ use crate::sys::{open_socket, sockaddr_for, socklen_of};
 pub(crate) struct PortReservation {
     /// Held to keep the port claimed; never read.
     _fd: OwnedFd,
-    port: u16,
+    source: SocketAddr,
 }
 
 impl PortReservation {
@@ -47,12 +47,20 @@ impl PortReservation {
             return Err(io::Error::last_os_error());
         }
         let port = bound_port(fd.as_raw_fd())?;
-        Ok(Self { _fd: fd, port })
+        Ok(Self {
+            _fd: fd,
+            source: SocketAddr::new(addr, port),
+        })
     }
 
     /// The OS-assigned ephemeral port the reservation holds.
     pub(crate) fn port(&self) -> u16 {
-        self.port
+        self.source.port()
+    }
+
+    /// The reserved address and port: what the reflector sends from and devices reply to.
+    pub(crate) fn source(&self) -> SocketAddr {
+        self.source
     }
 }
 

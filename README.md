@@ -251,6 +251,8 @@ counters_interval_secs = 0         # optional; seconds between per-interface pac
 [reflectors.tv]
 source_if = "en0"                # required; interface to listen on (must differ from target_if)
 target_if = "lo0"                # required; interface to emit reflected traffic on
+target_peers = ["10.10.10.2"]    # optional; the hosts behind target_if when a group sent there reaches nobody (see Peers)
+# source_peers = ["10.0.0.2"]    # optional; the same for source_if; not with mdns, whose answers go there
 macs      = ["B0:37:95:C5:60:BE"] # optional; device(s) to scope to (see below). Omit for a whole network.
 wol       = true                 # optional; enable Wake-on-LAN reflection (default false)
 mdns      = true                 # optional; enable mDNS reflection (default false)
@@ -267,7 +269,8 @@ udp_broadcast = true             # optional; also relay broadcasts on those port
 
 An entry must enable at least one protocol or set `udp_ports`, and expands into one reflector per
 enabled protocol, all sharing the entry's interfaces, MAC selection, and `address_family`. The same shape serves one or a few
-specific devices (set `macs`) or a whole network (omit it). No IP addresses ever appear in the config.
+specific devices (set `macs`) or a whole network (omit it). Apart from peers, no IP addresses appear
+in the config.
 `dial` is not a separate reflector; it augments the entry's SSDP reflector with the DIAL application
 proxy (so it requires `ssdp`; see [DIAL](#dial)).
 
@@ -286,13 +289,13 @@ then optional; with none, the environment is the whole configuration. Variables 
 
 - `<TAG>` ties one entry's parameters together: any alphanumeric string (`1`, `2`, `TV`, …). It also
   becomes the entry's name (and thus its log label) unless a `NAME` parameter overrides it.
-- `<PARAM>` is `NAME` or any field from the entry table above (`SOURCE_IF`, `TARGET_IF`, `MACS`,
-  `WOL`, `MDNS`, `SSDP`, `WSD`, `DIAL`, `WOL_PORTS`, `ADDRESS_FAMILY`, `BIDIRECTIONAL`, `UDP_PORTS`,
-  `UDP_GROUPS`, `UDP_BROADCAST`), case-insensitive.
+- `<PARAM>` is `NAME` or any field from the entry table above (`SOURCE_IF`, `TARGET_IF`,
+  `SOURCE_PEERS`, `TARGET_PEERS`, `MACS`, `WOL`, `MDNS`, `SSDP`, `WSD`, `DIAL`, `WOL_PORTS`,
+  `ADDRESS_FAMILY`, `BIDIRECTIONAL`, `UDP_PORTS`, `UDP_GROUPS`, `UDP_BROADCAST`), case-insensitive.
 
 The globals are `NETFLECTOR_LOG_LEVEL`, `NETFLECTOR_DEBUG_MEMORY_INTERVAL_SECS`, and
 `NETFLECTOR_COUNTERS_INTERVAL_SECS`, so `LOG`, `DEBUG`, and `COUNTERS` are reserved tags. Booleans are
-`true`/`false` or `1`/`0`; `WOL_PORTS`, `UDP_PORTS`, `UDP_GROUPS`
+`true`/`false` or `1`/`0`; `WOL_PORTS`, `UDP_PORTS`, `UDP_GROUPS`, `SOURCE_PEERS`, `TARGET_PEERS`
 and `MACS` are comma-separated (`7,9` / `B0:...,C4:...`). The `[reflectors.tv]` entry above looks like
 this in the environment:
 
@@ -490,6 +493,30 @@ UDP 9003, from servers and endpoints alike:
 [reflectors.roon]
 source_if = "lan"
 target_if = "iot"
+udp_ports = [9003]
+udp_groups = ["239.255.90.90"]
+udp_broadcast = true
+bidirectional = true
+```
+
+### Peers
+
+A WireGuard tunnel delivers a datagram only to the peer whose allowed addresses cover its
+destination, so one sent to a group or a broadcast reaches nobody and comes back as an ICMP
+unreachable. List the hosts behind such an interface in `source_peers` or `target_peers`, and every
+group or broadcast the entry would send there goes to each of them as a unicast copy instead, same
+port, same source, for every protocol the entry enables. A tunnel that carries multicast, such as
+GRE, needs no peers. Peers work on any link; on Ethernet each copy travels in a broadcast frame,
+since netflector resolves no MAC addresses. The exception is mDNS answers: a client takes a
+unicast answer only to a question it asked with the unicast-response bit, so an entry with `mdns`
+may list `target_peers` for its queries but no peers on the side its answers go to. Roon for road
+warriors, with the server on the LAN and the phones behind the tunnel:
+
+```toml
+[reflectors.roon-remote]
+source_if = "lan"
+target_if = "wg0"
+target_peers = ["10.10.10.2", "10.10.10.3"]
 udp_ports = [9003]
 udp_groups = ["239.255.90.90"]
 udp_broadcast = true

@@ -23,8 +23,9 @@ use crate::reactor::Reactor;
 
 use super::dial::{ProxyPlacement, rewrite_location};
 use super::{
-    BuildError, Emit, InterfaceMap, NoRewrite, ReplyRewrite, SearchReflector, SimpleReflector,
-    Verdict, require_bidirectional_families, require_group_join, require_macs_matchable,
+    BuildError, Delivery, Emit, InterfaceMap, NoRewrite, ReplyRewrite, SearchReflector,
+    SimpleReflector, Verdict, require_bidirectional_families, require_group_join,
+    require_macs_matchable,
 };
 
 /// What a DIAL-enabled SSDP reflector needs to rewrite a device's `LOCATION` to a source-side proxy: the
@@ -201,6 +202,7 @@ pub(crate) fn build(
     // the source side can never use.
     let advertisement = SimpleReflector::new(
         source,
+        Delivery::new(reflector.source_peers.as_ref()),
         "SSDP",
         "advertisement",
         advertisement_verdict,
@@ -243,6 +245,7 @@ pub(crate) fn build(
         Box::new(SearchReflector::new(
             source,
             target,
+            Delivery::new(reflector.target_peers.as_ref()),
             reflector.macs.clone(),
             "SSDP",
             MessageType::SsdpResponse,

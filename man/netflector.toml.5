@@ -62,6 +62,30 @@ Required; must differ from
 .It Ic target_if
 The interface the devices are on.
 Required.
+.It Ic source_peers , target_peers
+The hosts behind
+.Ic source_if
+or
+.Ic target_if
+when a group or broadcast datagram sent there reaches nobody, as on a
+.Xr wg 4
+tunnel.
+Such a datagram goes to each listed host as a unicast copy instead, same port
+and source, for every protocol the entry enables.
+A tunnel that carries multicast, such as
+.Xr gre 4 ,
+needs none.
+On Ethernet each copy travels in a broadcast frame, since the daemon resolves
+no MAC addresses.
+An entry with
+.Ic mdns
+may list
+.Ic target_peers
+for its queries but no peers on the side its answers go to: a client takes a
+unicast answer only to a question it asked with the unicast-response bit.
+A list of unicast addresses of the families the entry's
+.Ic address_family
+uses.
 .It Ic macs
 Optional list of MAC addresses limiting the entry to specific devices on
 .Ic target_if :
@@ -195,9 +219,9 @@ parameter overrides it.
 .It Aq Ar PARAM
 .Ic NAME ,
 or any entry field:
-.Ic SOURCE_IF , TARGET_IF , MACS , WOL , MDNS , SSDP , WSD , DIAL ,
-.Ic WOL_PORTS , ADDRESS_FAMILY , BIDIRECTIONAL , UDP_PORTS , UDP_GROUPS ,
-.Ic UDP_BROADCAST .
+.Ic SOURCE_IF , TARGET_IF , SOURCE_PEERS , TARGET_PEERS , MACS , WOL , MDNS ,
+.Ic SSDP , WSD , DIAL , WOL_PORTS , ADDRESS_FAMILY , BIDIRECTIONAL , UDP_PORTS ,
+.Ic UDP_GROUPS , UDP_BROADCAST .
 Case-insensitive.
 .El
 .Pp
@@ -305,6 +329,18 @@ endpoints:
 [reflectors.roon]
 source_if     = "lan"
 target_if     = "iot"
+udp_ports     = [9003]
+udp_groups    = ["239.255.90.90"]
+udp_broadcast = true
+bidirectional = true
+.Ed
+.Pp
+The same for phones behind a WireGuard tunnel, which has no broadcast domain:
+.Bd -literal -offset indent
+[reflectors.roon-remote]
+source_if     = "lan"
+target_if     = "wg0"
+target_peers  = ["10.10.10.2", "10.10.10.3"]
 udp_ports     = [9003]
 udp_groups    = ["239.255.90.90"]
 udp_broadcast = true

@@ -16,12 +16,15 @@ pub(crate) use search::SearchReflector;
 pub(crate) use simple::{Classify, Emit, SimpleReflector};
 
 use std::fmt;
+use std::io;
 use std::net::{IpAddr, SocketAddr};
 
 use thiserror::Error;
 
-use crate::config::AddressFamily;
-use crate::dispatch::{CaptureKey, MessageType, PacketDispatcher, join_capped, join_deferrable};
+use crate::config::{AddressFamily, PeerList};
+use crate::dispatch::{
+    CaptureKey, DatagramSource, MessageType, PacketDispatcher, join_capped, join_deferrable,
+};
 use crate::interface::InterfaceAddresses;
 use crate::linear_map::LinearMap;
 use crate::logging::WARN_WINDOW;
@@ -46,6 +49,60 @@ pub(crate) enum Verdict {
     Excluded,
     /// Not a recognizable protocol message on this dedicated group. Drop it with a debug log.
     Junk,
+}
+
+/// Where a leg's group and broadcast re-emits go: onto the link, or, behind a link without a
+/// broadcast domain, to each of the entry's peers as unicast.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Delivery {
+    Link,
+    Peers(Box<[IpAddr]>),
+}
+
+impl Delivery {
+    /// The delivery an entry's `source_peers` / `target_peers` value describes.
+    pub(crate) fn new(peers: Option<&PeerList>) -> Self {
+        match peers {
+            Some(peers) => Self::Peers(peers.iter().copied().collect()),
+            None => Self::Link,
+        }
+    }
+
+    /// The address a datagram to `dst` reaches under this delivery: `dst` on the link, or the
+    /// first peer of its family. A reply to it must be listened for on a source of that scope.
+    pub(crate) fn destination(&self, dst: IpAddr) -> IpAddr {
+        match self {
+            Self::Link => dst,
+            Self::Peers(peers) => peers
+                .iter()
+                .copied()
+                .find(|peer| peer.is_ipv4() == dst.is_ipv4())
+                .unwrap_or(dst),
+        }
+    }
+
+    /// Send a group or broadcast datagram on `egress` where the delivery says.
+    ///
+    /// # Errors
+    /// As the dispatcher's [`send_udp_group`](PacketDispatcher::send_udp_group) and
+    /// [`send_udp_to_peers`](PacketDispatcher::send_udp_to_peers): for peers, only when no copy
+    /// went out.
+    pub(crate) fn send(
+        &self,
+        dispatcher: &mut PacketDispatcher,
+        egress: CaptureKey,
+        dst: SocketAddr,
+        source: DatagramSource,
+        ttl: u8,
+        payload: &[u8],
+    ) -> io::Result<()> {
+        match self {
+            Self::Link => dispatcher.send_udp_group(egress, dst, source, ttl, payload),
+            Self::Peers(peers) => {
+                dispatcher.send_udp_to_peers(egress, peers, dst, source, ttl, payload)
+            }
+        }
+    }
 }
 
 /// Transforms a datagram's payload before it is re-emitted: the SSDP DIAL `LOCATION` rewrite, applied
@@ -285,6 +342,16 @@ mod tests {
             }
             Err(e) => panic!("unexpected loopback capture open failure: {e}"),
         }
+    }
+
+    #[test]
+    fn delivery_follows_the_entrys_peers() {
+        let peers: PeerList = "127.0.0.1".parse().unwrap();
+        assert_eq!(
+            Delivery::new(Some(&peers)),
+            Delivery::Peers(Box::new([IpAddr::V4(Ipv4Addr::LOCALHOST)]))
+        );
+        assert_eq!(Delivery::new(None), Delivery::Link);
     }
 
     #[test]

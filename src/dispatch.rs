@@ -40,6 +40,7 @@ use std::time::{Duration, Instant};
 use crate::capture::{Capture, Read};
 use crate::interface::{InterfaceAddresses, InterfaceEvent, InterfaceMonitor};
 use crate::linear_map::LinearMap;
+use crate::logging::{WARN_WINDOW, log_rate};
 use crate::net::LinkType;
 use crate::net::mac::{MacAddr, MacSet};
 use crate::net::packet::Packet;
@@ -497,6 +498,60 @@ impl PacketDispatcher {
     ) -> io::Result<()> {
         let dst_mac = self.group_mac(egress, dst)?;
         self.send_udp(egress, dst, dst_mac, source, ttl, payload)
+    }
+
+    /// Deliver a group or broadcast datagram to `peers` instead: one unicast copy per peer of
+    /// `dst`'s family, at `dst`'s port. Each copy is checked against the packet's earlier sends on
+    /// its own, so two entries whose lists share a peer deliver to it once.
+    ///
+    /// # Errors
+    /// As [`send_udp`](Self::send_udp) when no copy went out at all. A peer the link cannot reach
+    /// (a `WireGuard` peer without an endpoint) costs only its own copy, logged.
+    pub(crate) fn send_udp_to_peers(
+        &mut self,
+        egress: CaptureKey,
+        peers: &[IpAddr],
+        dst: SocketAddr,
+        source: DatagramSource,
+        ttl: u8,
+        payload: &[u8],
+    ) -> io::Result<()> {
+        let mut delivered = false;
+        let mut failure = None;
+        for &peer in peers.iter().filter(|peer| peer.is_ipv4() == dst.is_ipv4()) {
+            // Nothing here resolves neighbours: on a link with MACs the copy travels in a
+            // broadcast frame, and only the addressed host keeps it.
+            let to = SocketAddr::new(peer, dst.port());
+            let Some(len) =
+                self.build_frame(egress, to, MacAddr::broadcast(), source, ttl, payload)?
+            else {
+                return Ok(());
+            };
+            match self.send_built(egress, len) {
+                Ok(_) => delivered = true,
+                Err(e) => {
+                    log_rate!(
+                        log::Level::Warn,
+                        WARN_WINDOW,
+                        "{}: cannot send to peer {peer}: {e}",
+                        self.egress_name(egress)
+                    );
+                    failure = Some(e);
+                }
+            }
+        }
+        match failure {
+            Some(e) if !delivered => Err(e),
+            _ => Ok(()),
+        }
+    }
+
+    /// The name of the interface behind `egress`, for a message; `?` for an unknown key.
+    fn egress_name(&self, egress: CaptureKey) -> &str {
+        self.table
+            .interface_of(egress)
+            .and_then(|interface| self.table.interface_name(interface))
+            .unwrap_or("?")
     }
 
     /// Assemble the datagram for `egress` into the scratch buffer. `None` (logged) when the
@@ -1580,6 +1635,246 @@ mod tests {
         assert!(!records.is_empty(), "the reflector never fired");
         assert_eq!(records[0].0, PROBE, "reflector saw the wrong payload");
         assert!(records[0].1, "the keyed egress send failed");
+        Ok(())
+    }
+
+    /// Every `sood` datagram out of the tun's far end within a second: source, destination, TTL.
+    #[cfg(target_os = "linux")]
+    fn sood_deliveries(tun: &crate::capture::Tun) -> io::Result<Vec<(SocketAddr, SocketAddr, u8)>> {
+        let mut delivered = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while let Some(packet) = tun.next_packet(deadline)? {
+            if let Ok(parsed) = Packet::parse(LinkType::RawIp, &packet)
+                && parsed.payload == b"sood"
+            {
+                delivered.push((parsed.source, parsed.dest, parsed.ttl));
+            }
+        }
+        Ok(delivered)
+    }
+
+    // Peers behind a raw IP link: a group send fans out to one unicast copy per peer of the
+    // group's family, at the group's port, and a second relay of the same packet adds nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[cfg_attr(miri, ignore = "needs a real capture device")]
+    fn group_sends_fan_out_to_the_peers_of_a_raw_ip_link() -> io::Result<()> {
+        let Some(tun) = crate::capture::Tun::create() else {
+            return Ok(());
+        };
+        let mut dispatcher = PacketDispatcher::new();
+        let egress = dispatcher.add_capture(Capture::open(&tun.name)?)?;
+        let peers: [IpAddr; 3] = [
+            "10.99.200.2".parse().unwrap(),
+            "10.99.200.3".parse().unwrap(),
+            "fd00:99::2".parse().unwrap(),
+        ];
+
+        let group: SocketAddr = "239.255.90.90:9003".parse().unwrap();
+        let source: SocketAddr = "192.0.2.7:40001".parse().unwrap();
+        // Two handlers relaying one routed packet: the second fan-out duplicates the first.
+        dispatcher.packet = 1;
+        dispatcher.routing = true;
+        for _ in 0..2 {
+            dispatcher.send_udp_to_peers(
+                egress,
+                &peers,
+                group,
+                DatagramSource::Exact(source),
+                32,
+                b"sood",
+            )?;
+        }
+
+        let to = |peer: &str| -> SocketAddr { format!("{peer}:9003").parse().unwrap() };
+        assert_eq!(
+            sood_deliveries(&tun)?,
+            [
+                (source, to("10.99.200.2"), 32),
+                (source, to("10.99.200.3"), 32)
+            ]
+        );
+        Ok(())
+    }
+
+    // Two entries whose peer lists overlap relay one packet: each peer gets it once, whatever
+    // the lists' order or other members.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[cfg_attr(miri, ignore = "needs a real capture device")]
+    fn overlapping_peer_lists_deliver_to_each_peer_once() -> io::Result<()> {
+        let Some(tun) = crate::capture::Tun::create() else {
+            return Ok(());
+        };
+        let mut dispatcher = PacketDispatcher::new();
+        let egress = dispatcher.add_capture(Capture::open(&tun.name)?)?;
+        let peer = |host: u8| IpAddr::V4(Ipv4Addr::new(10, 99, 200, host));
+        let (x, y, z) = (peer(2), peer(3), peer(4));
+        let group: SocketAddr = "239.255.90.90:9003".parse().unwrap();
+        let source: SocketAddr = "192.0.2.7:40001".parse().unwrap();
+        dispatcher.packet = 1;
+        dispatcher.routing = true;
+        for list in [[x, y], [y, z]] {
+            dispatcher.send_udp_to_peers(
+                egress,
+                &list,
+                group,
+                DatagramSource::Exact(source),
+                32,
+                b"sood",
+            )?;
+        }
+
+        let delivered: Vec<IpAddr> = sood_deliveries(&tun)?
+            .into_iter()
+            .map(|(_, dest, _)| dest.ip())
+            .collect();
+        assert_eq!(delivered, [x, y, z]);
+        Ok(())
+    }
+
+    // 10.0.1.2 and 10.1.1.1 sum to the same checksum words, so their frames differ only in the
+    // destination; each peer must still get its copy.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[cfg_attr(miri, ignore = "needs a real capture device")]
+    fn peers_whose_frames_share_a_checksum_each_get_a_copy() -> io::Result<()> {
+        let Some(tun) = crate::capture::Tun::create() else {
+            return Ok(());
+        };
+        let mut dispatcher = PacketDispatcher::new();
+        let egress = dispatcher.add_capture(Capture::open(&tun.name)?)?;
+        let peers: [IpAddr; 2] = ["10.0.1.2".parse().unwrap(), "10.1.1.1".parse().unwrap()];
+        let group: SocketAddr = "239.255.90.90:9003".parse().unwrap();
+        let source: SocketAddr = "192.0.2.7:40001".parse().unwrap();
+        dispatcher.packet = 1;
+        dispatcher.routing = true;
+        dispatcher.send_udp_to_peers(
+            egress,
+            &peers,
+            group,
+            DatagramSource::Exact(source),
+            32,
+            b"sood",
+        )?;
+        let delivered: Vec<IpAddr> = sood_deliveries(&tun)?
+            .into_iter()
+            .map(|(_, dest, _)| dest.ip())
+            .collect();
+        assert_eq!(delivered, peers);
+        Ok(())
+    }
+
+    /// A `WireGuard` interface with two peers, one with an endpoint and one without. FreeBSD
+    /// only: `wg` ships in base there, and the interface is created as root.
+    #[cfg(target_os = "freebsd")]
+    struct WgPeers {
+        name: String,
+        reachable: IpAddr,
+        unreachable: IpAddr,
+    }
+
+    #[cfg(target_os = "freebsd")]
+    impl WgPeers {
+        /// The endpoint the reachable peer's handshake goes to.
+        const ENDPOINT: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51820);
+
+        /// `None`, with a note, where the test can't run: not root, or the static build, whose
+        /// process spawning crashes (see the pair tests).
+        fn create() -> Option<Self> {
+            if cfg!(target_feature = "crt-static") {
+                eprintln!("skip wg test: process spawning crashes static FreeBSD binaries");
+                return None;
+            }
+            // SAFETY: geteuid takes no arguments and cannot fail.
+            if unsafe { libc::geteuid() } != 0 {
+                eprintln!("skip wg test: interface creation requires root");
+                return None;
+            }
+            let name = sh_output("ifconfig wg create")?;
+            let this = Self {
+                name,
+                reachable: IpAddr::V4(Ipv4Addr::new(10, 99, 77, 2)),
+                unreachable: IpAddr::V4(Ipv4Addr::new(10, 99, 77, 3)),
+            };
+            let key = std::env::temp_dir().join(format!("netflector-{}.key", this.name));
+            let configured = sh(&format!(
+                "umask 077 && wg genkey > {key} && wg set {name} private-key {key} listen-port 0 \
+                 peer $(wg genkey | wg pubkey) allowed-ips {reachable}/32 endpoint {endpoint} \
+                 peer $(wg genkey | wg pubkey) allowed-ips {unreachable}/32 \
+                 && ifconfig {name} inet 10.99.77.1/24 up",
+                key = key.display(),
+                name = this.name,
+                reachable = this.reachable,
+                unreachable = this.unreachable,
+                endpoint = Self::ENDPOINT,
+            ));
+            std::fs::remove_file(&key).ok();
+            assert!(configured, "could not configure {}", this.name);
+            Some(this)
+        }
+    }
+
+    #[cfg(target_os = "freebsd")]
+    impl Drop for WgPeers {
+        fn drop(&mut self) {
+            sh(&format!("ifconfig {} destroy", self.name));
+        }
+    }
+
+    /// Run `command` through the shell, succeeding only on exit 0.
+    #[cfg(target_os = "freebsd")]
+    fn sh(command: &str) -> bool {
+        std::process::Command::new("sh")
+            .args(["-ec", command])
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    /// Run `command` through the shell and return its trimmed stdout, `None` on failure.
+    #[cfg(target_os = "freebsd")]
+    fn sh_output(command: &str) -> Option<String> {
+        let output = std::process::Command::new("sh")
+            .args(["-ec", command])
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    }
+
+    // WireGuard refuses a copy for a peer it has no endpoint for, and on FreeBSD the BPF write
+    // reports that at once. The other peers still get theirs: the send counts as delivered, and
+    // the reachable peer's handshake shows up at its endpoint. Only when every copy fails does
+    // the send fail.
+    #[cfg(target_os = "freebsd")]
+    #[test]
+    #[cfg_attr(miri, ignore = "needs a real capture device")]
+    fn a_peer_without_an_endpoint_costs_only_its_own_copy() -> io::Result<()> {
+        let Some(wg) = WgPeers::create() else {
+            return Ok(());
+        };
+        let endpoint = UdpSocket::bind(WgPeers::ENDPOINT)?;
+        endpoint.set_read_timeout(Some(Duration::from_secs(2)))?;
+        let mut dispatcher = PacketDispatcher::new();
+        let egress = dispatcher.add_capture(Capture::open(&wg.name)?)?;
+        let group: SocketAddr = "239.255.90.90:9003".parse().unwrap();
+        let source = DatagramSource::Egress { port: 40000 };
+
+        let peers = [wg.unreachable, wg.reachable];
+        dispatcher.send_udp_to_peers(egress, &peers, group, source, 1, b"sood")?;
+        let mut buf = [0u8; 256];
+        let (n, from) = endpoint.recv_from(&mut buf)?;
+        assert!(n > 0, "the reachable peer's handshake never reached {from}");
+
+        let only_unreachable = [wg.unreachable];
+        let failed =
+            dispatcher.send_udp_to_peers(egress, &only_unreachable, group, source, 1, b"sood");
+        assert_eq!(
+            failed.map_err(|e| e.raw_os_error()),
+            Err(Some(libc::EHOSTUNREACH))
+        );
         Ok(())
     }
 

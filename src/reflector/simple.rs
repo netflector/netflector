@@ -17,7 +17,7 @@ use crate::logging::log_rate;
 use crate::net::packet::Packet;
 use crate::reactor::Reactor;
 
-use super::{NoRewrite, ReplyRewrite, Verdict, WARN_WINDOW, egress_sources};
+use super::{Delivery, NoRewrite, ReplyRewrite, Verdict, WARN_WINDOW, egress_sources};
 
 /// A leg's ingress gate: is this packet a message for it? See [`Verdict`].
 pub(crate) trait Classify {
@@ -47,7 +47,7 @@ impl Source {
             Self::Egress(port) => DatagramSource::Egress {
                 port: port.resolve(packet),
             },
-            Self::Captured => DatagramSource::Captured(packet.source),
+            Self::Captured => DatagramSource::Exact(packet.source),
         }
     }
 }
@@ -126,6 +126,8 @@ impl Emit {
 /// [`ReplyRewrite`] transforms the payload before re-emit (default: forward verbatim).
 pub(crate) struct SimpleReflector<C> {
     egress: CaptureKey,
+    /// Where the re-emits go on `egress`.
+    delivery: Delivery,
     /// Protocol tag for logs, e.g. `"mDNS"`.
     name: &'static str,
     /// The message kind/direction this reflector handles, for logs, e.g. `"query"`.
@@ -142,6 +144,7 @@ pub(crate) struct SimpleReflector<C> {
 impl<C: Classify> SimpleReflector<C> {
     pub(crate) fn new(
         egress: CaptureKey,
+        delivery: Delivery,
         name: &'static str,
         kind: &'static str,
         classify: C,
@@ -149,6 +152,7 @@ impl<C: Classify> SimpleReflector<C> {
     ) -> Self {
         Self {
             egress,
+            delivery,
             name,
             kind,
             classify,
@@ -233,7 +237,8 @@ impl<C: Classify> PacketHandler for SimpleReflector<C> {
         }
         let payload = rewritten.unwrap_or(packet.payload);
 
-        match dispatcher.send_udp_group(
+        match self.delivery.send(
+            dispatcher,
             self.egress,
             dest,
             self.emit.source.resolve(packet),
@@ -328,6 +333,7 @@ mod tests {
         let reactor = Reactor::new().expect("reactor");
         let reflector = SimpleReflector::new(
             egress,
+            Delivery::Link,
             "TEST",
             "response",
             reflect_all as fn(&[u8]) -> Verdict,

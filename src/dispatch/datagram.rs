@@ -35,8 +35,8 @@ pub(super) enum DatagramError {
 pub(crate) enum DatagramSource {
     /// The egress's own address of the destination's family, at `port`.
     Egress { port: u16 },
-    /// A captured sender's own address and port, kept on the re-emit.
-    Captured(SocketAddr),
+    /// This address and port: a relayed sender's own, or a session's reserved one.
+    Exact(SocketAddr),
 }
 
 /// The Ethernet destination MAC for an injected datagram to `dst`: the all-ones broadcast
@@ -81,8 +81,8 @@ pub(super) fn build_udp(
                 DatagramSource::Egress { port } => {
                     SocketAddrV4::new(addrs.v4().ok_or(DatagramError::NoSourceAddress)?, port)
                 }
-                DatagramSource::Captured(SocketAddr::V4(src)) => src,
-                DatagramSource::Captured(SocketAddr::V6(_)) => {
+                DatagramSource::Exact(SocketAddr::V4(src)) => src,
+                DatagramSource::Exact(SocketAddr::V6(_)) => {
                     return Err(DatagramError::SourceFamilyMismatch);
                 }
             };
@@ -112,8 +112,8 @@ pub(super) fn build_udp(
                         .ok_or(DatagramError::NoSourceAddress)?;
                     SocketAddrV6::new(src_ip, port, 0, 0)
                 }
-                DatagramSource::Captured(SocketAddr::V6(src)) => src,
-                DatagramSource::Captured(SocketAddr::V4(_)) => {
+                DatagramSource::Exact(SocketAddr::V6(src)) => src,
+                DatagramSource::Exact(SocketAddr::V4(_)) => {
                     return Err(DatagramError::SourceFamilyMismatch);
                 }
             };
@@ -196,7 +196,7 @@ mod tests {
             LinkType::Ethernet,
             dst,
             MacAddr::broadcast(),
-            DatagramSource::Captured(captured),
+            DatagramSource::Exact(captured),
             32,
             b"sood",
             &mut scratch,
@@ -212,7 +212,7 @@ mod tests {
                 LinkType::Ethernet,
                 dst,
                 MacAddr::broadcast(),
-                DatagramSource::Captured("[fe80::7]:40001".parse().unwrap()),
+                DatagramSource::Exact("[fe80::7]:40001".parse().unwrap()),
                 32,
                 b"sood",
                 &mut scratch,
