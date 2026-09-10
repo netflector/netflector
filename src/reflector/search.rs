@@ -213,7 +213,7 @@ impl SearchReflector {
     /// capture. `message_type` is the search's own type, carried on the
     /// failure outcomes. `Err` (logged) is either [`Outcome::Stalled`] (the target has no source
     /// address of the search's family yet; transient / best-effort v6) or [`Outcome::Dropped`] (a real
-    /// inability to open the session: session cap, no source MAC to reply to, reservation failure).
+    /// inability to open the session: session cap, reservation failure).
     fn make_session(
         &self,
         packet: &Packet,
@@ -231,16 +231,8 @@ impl SearchReflector {
             );
             return Err(Outcome::Dropped(message_type));
         }
-        let Some(searcher_mac) = packet.src_mac else {
-            log_rate!(
-                log::Level::Warn,
-                WARN_WINDOW,
-                "{}: cannot reflect search from {}: frame has no source MAC to reply to",
-                self.name,
-                packet.source
-            );
-            return Err(Outcome::Dropped(message_type));
-        };
+        // A frame off a link without MACs has none; the reply's L2 destination goes unused there.
+        let searcher_mac = packet.src_mac.unwrap_or(MacAddr::broadcast());
         let destination = self.delivery.destination(packet.dest.ip());
         let Some(our_addr) = reply_source(dispatcher, self.target, destination) else {
             log::debug!(
@@ -813,33 +805,6 @@ mod tests {
 
     #[test]
     #[cfg_attr(miri, ignore = "needs a real socket")]
-    fn make_session_drops_a_search_with_no_source_mac() {
-        // No source MAC means no L2 address to reply to, so make_session drops the search rather than
-        // open a session it could never answer.
-        let mut dispatcher = PacketDispatcher::new();
-        let reflector = test_reflector();
-        let packet = Packet {
-            source: "10.0.0.1:5".parse().unwrap(),
-            dest: "239.255.255.250:1900".parse().unwrap(),
-            ttl: TEST_TTL,
-            dst_mac: None,
-            src_mac: None,
-            payload: b"search",
-        };
-        let outcome = reflector.make_session(
-            &packet,
-            &mut dispatcher,
-            Instant::now(),
-            MessageType::SsdpSearch,
-        );
-        assert!(matches!(
-            outcome,
-            Err(Outcome::Dropped(MessageType::SsdpSearch))
-        ));
-    }
-
-    #[test]
-    #[cfg_attr(miri, ignore = "needs a real socket")]
     fn make_session_drops_at_the_session_cap() {
         // At MAX_SESSIONS in flight a new searcher is dropped; no live session is evicted early.
         let mut dispatcher = PacketDispatcher::new();
@@ -980,6 +945,46 @@ mod tests {
             }
             Err(e) => panic!("unexpected loopback capture open failure: {e}"),
         }
+    }
+
+    // A search off a link without MACs (a tunnel) carries no source MAC; the reply needs none
+    // there, so the session opens all the same.
+    #[test]
+    #[cfg_attr(miri, ignore = "needs a real capture device")]
+    fn a_search_without_a_source_mac_opens_a_session() {
+        let _serial = loopback_lock();
+        let Some(target_cap) = open_loopback_or_skip() else {
+            return;
+        };
+        let mut dispatcher = PacketDispatcher::new();
+        let target = dispatcher
+            .add_capture(target_cap)
+            .expect("add the loopback capture");
+        let mut reactor = Reactor::new().expect("reactor");
+        let mut reflector = SearchReflector::new(
+            CaptureKey::from_u64(999),
+            target,
+            Delivery::Link,
+            None,
+            "TEST",
+            MessageType::SsdpResponse,
+            TEST_TTL,
+            always_reflect,
+            fixed_window,
+            Box::new(|| Box::new(NoRewrite) as Box<dyn ReplyRewrite>),
+            |_| false,
+        );
+        let packet = Packet {
+            source: "10.0.0.1:5".parse().unwrap(),
+            dest: "239.255.255.250:1900".parse().unwrap(),
+            ttl: TEST_TTL,
+            dst_mac: None,
+            src_mac: None,
+            payload: b"M-SEARCH",
+        };
+        let outcome = reflector.on_packet(&packet, &mut dispatcher, &mut reactor);
+        assert_eq!(outcome, Outcome::Reflected(MessageType::SsdpSearch));
+        assert_eq!(reflector.sessions.len(), 1);
     }
 
     // Peers behind a tunnel are reached by routable addresses, so a session for a link-local
