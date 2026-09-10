@@ -76,6 +76,14 @@ impl AddressFamily {
         matches!(self, Self::Default | Self::Dual | Self::Ipv6)
     }
 
+    /// Whether the policy handles `ip`'s IP version.
+    pub(crate) fn uses(self, ip: IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(_) => self.uses_ipv4(),
+            IpAddr::V6(_) => self.uses_ipv6(),
+        }
+    }
+
     /// A v4 source must be present at startup, else the reflector fails to build. Same set as
     /// `uses_ipv4`, but distinct in meaning: `Default` requires v4 while treating v6 as
     /// best-effort.
@@ -328,9 +336,113 @@ impl<'de> Deserialize<'de> for GroupList {
     }
 }
 
+/// A non-empty, duplicate-free list of unicast addresses, of either family: the hosts behind an
+/// interface that has no broadcast domain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PeerList(Vec<IpAddr>);
+
+impl Deref for PeerList {
+    type Target = [IpAddr];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub(crate) enum PeerListError {
+    #[error("peer list must not be empty")]
+    Empty,
+    #[error("duplicate peer {0}")]
+    Duplicate(IpAddr),
+    #[error("{0} is not a unicast address")]
+    NotUnicast(IpAddr),
+    /// A comma-separated token was not an IP address.
+    #[error("invalid peer \"{0}\"")]
+    BadAddress(String),
+}
+
+impl TryFrom<Vec<IpAddr>> for PeerList {
+    type Error = PeerListError;
+
+    fn try_from(peers: Vec<IpAddr>) -> Result<Self, Self::Error> {
+        if peers.is_empty() {
+            return Err(PeerListError::Empty);
+        }
+        for (i, peer) in peers.iter().enumerate() {
+            let unicast = match peer {
+                IpAddr::V4(v4) => !v4.is_multicast() && !v4.is_broadcast() && !v4.is_unspecified(),
+                IpAddr::V6(v6) => !v6.is_multicast() && !v6.is_unspecified(),
+            };
+            if !unicast {
+                return Err(PeerListError::NotUnicast(*peer));
+            }
+            if peers[..i].contains(peer) {
+                return Err(PeerListError::Duplicate(*peer));
+            }
+        }
+        Ok(Self(peers))
+    }
+}
+
+impl FromStr for PeerList {
+    type Err = PeerListError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let peers = s
+            .split(',')
+            .map(|token| {
+                let token = token.trim();
+                token
+                    .parse::<IpAddr>()
+                    .map_err(|_| PeerListError::BadAddress(token.to_owned()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        PeerList::try_from(peers)
+    }
+}
+
+impl<'de> Deserialize<'de> for PeerList {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Vec::<IpAddr>::deserialize(deserializer)?
+            .try_into()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peer_list_takes_unicast_addresses_only() {
+        let peers: PeerList = "10.10.10.2, fd00::2".parse().unwrap();
+        assert_eq!(peers.len(), 2);
+        for bad in [
+            "239.255.90.90",
+            "255.255.255.255",
+            "0.0.0.0",
+            "ff02::1",
+            "::",
+        ] {
+            assert!(matches!(
+                bad.parse::<PeerList>(),
+                Err(PeerListError::NotUnicast(_))
+            ));
+        }
+        assert!(matches!(
+            "10.10.10.2,10.10.10.2".parse::<PeerList>(),
+            Err(PeerListError::Duplicate(_))
+        ));
+        assert!(matches!(
+            "".parse::<PeerList>(),
+            Err(PeerListError::BadAddress(_))
+        ));
+        assert!(matches!(
+            PeerList::try_from(Vec::new()),
+            Err(PeerListError::Empty)
+        ));
+    }
 
     #[test]
     fn address_family_uses_and_requires() {
