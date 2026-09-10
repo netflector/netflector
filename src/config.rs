@@ -696,6 +696,22 @@ mod tests {
         from_toml(text).unwrap_err()
     }
 
+    // Every TOML block in the README is a whole configuration the checks accept.
+    #[test]
+    fn the_readme_examples_are_valid_configurations() {
+        let readme = include_str!("../README.md");
+        let blocks: Vec<&str> = readme
+            .split("```toml\n")
+            .skip(1)
+            .map(|rest| rest.split("```").next().unwrap_or(""))
+            .collect();
+        assert!(blocks.len() >= 4, "the README lost its examples");
+        for block in blocks {
+            from_toml(block)
+                .unwrap_or_else(|e| panic!("README example does not load: {e}\n{block}"));
+        }
+    }
+
     #[test]
     fn minimal_reflector_uses_defaults() {
         let cfg = from_toml(

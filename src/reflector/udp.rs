@@ -7,7 +7,7 @@ use crate::config::Reflector;
 use crate::dispatch::{Filter, MessageType, PacketDispatcher, PortSet};
 
 use super::{
-    BuildError, Emit, InterfaceMap, SimpleReflector, Verdict, missing_required_family,
+    BuildError, Delivery, Emit, InterfaceMap, SimpleReflector, Verdict, missing_required_family,
     require_group_join,
 };
 
@@ -77,6 +77,7 @@ pub(crate) fn build(
             filter,
             Box::new(SimpleReflector::new(
                 egress,
+                Delivery::new(reflector.target_peers.as_ref()),
                 "UDP relay",
                 "datagram",
                 relay,

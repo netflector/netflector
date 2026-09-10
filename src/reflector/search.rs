@@ -25,7 +25,7 @@ use crate::net::packet::Packet;
 use crate::net::port_reservation::PortReservation;
 use crate::reactor::Reactor;
 
-use super::{ReplyRewrite, Verdict, WARN_WINDOW, egress_sources};
+use super::{Delivery, ReplyRewrite, Verdict, WARN_WINDOW, egress_sources};
 
 /// In-flight session cap, so a burst of searchers can't exhaust ephemeral ports or registrations. At
 /// the cap a new search is dropped (no live session is evicted early).
@@ -154,6 +154,8 @@ pub(crate) struct SearchReflector {
     source: CaptureKey,
     /// The target capture: where the search is re-emitted and the replies are captured.
     target: CaptureKey,
+    /// Where the re-emitted searches go on `target`.
+    delivery: Delivery,
     /// The configured device allow-set, scoping the response registration as the announcement direction is.
     device_macs: Option<MacSet>,
     /// Protocol label for logs, e.g. `"SSDP"`.
@@ -179,6 +181,7 @@ impl SearchReflector {
     pub(crate) fn new(
         source: CaptureKey,
         target: CaptureKey,
+        delivery: Delivery,
         device_macs: Option<MacSet>,
         name: &'static str,
         response_type: MessageType,
@@ -191,6 +194,7 @@ impl SearchReflector {
         Self {
             source,
             target,
+            delivery,
             device_macs,
             name,
             response_type,
@@ -203,9 +207,10 @@ impl SearchReflector {
         }
     }
 
-    /// Open a session for a new searcher: reserve an ephemeral port on the target's own address of the
-    /// search's family and register the reply capture there, before the caller reflects, so a fast
-    /// responder can't beat the capture. `message_type` is the search's own type, carried on the
+    /// Open a session for a new searcher: reserve an ephemeral port on the target's own address of
+    /// the scope the search reaches (the group's, or the peers' behind a tunnel) and register the
+    /// reply capture there, before the caller reflects, so a fast responder can't beat the
+    /// capture. `message_type` is the search's own type, carried on the
     /// failure outcomes. `Err` (logged) is either [`Outcome::Stalled`] (the target has no source
     /// address of the search's family yet; transient / best-effort v6) or [`Outcome::Dropped`] (a real
     /// inability to open the session: session cap, no source MAC to reply to, reservation failure).
@@ -236,12 +241,13 @@ impl SearchReflector {
             );
             return Err(Outcome::Dropped(message_type));
         };
-        let Some(our_addr) = reply_source(dispatcher, self.target, packet.dest.ip()) else {
+        let destination = self.delivery.destination(packet.dest.ip());
+        let Some(our_addr) = reply_source(dispatcher, self.target, destination) else {
             log::debug!(
-                "{}: cannot reflect search from {}: target has no source address for {} yet",
+                "{}: cannot reflect search from {}: target has no source address for \
+                 {destination} yet",
                 self.name,
-                packet.source,
-                packet.dest.ip()
+                packet.source
             );
             return Err(Outcome::Stalled(message_type));
         };
@@ -346,11 +352,12 @@ impl PacketHandler for SearchReflector {
             dest: packet.dest,
         };
         if let Some(session) = self.sessions.get_mut(&key) {
-            let port = session.reservation.port();
-            return match dispatcher.send_udp_group(
+            let source = session.reservation.source();
+            return match self.delivery.send(
+                dispatcher,
                 self.target,
                 packet.dest,
-                DatagramSource::Egress { port },
+                DatagramSource::Exact(source),
                 self.ttl,
                 packet.payload,
             ) {
@@ -359,7 +366,7 @@ impl PacketHandler for SearchReflector {
                     // MX window, so a retransmit with a smaller MX must not cut their replies off.
                     session.expiry = session.expiry.max(expiry);
                     log::debug!(
-                        "re-reflected {} search from {} to {} on reserved port {port}",
+                        "re-reflected {} search from {} to {} from {source}",
                         self.name,
                         packet.source,
                         packet.dest
@@ -384,18 +391,19 @@ impl PacketHandler for SearchReflector {
             Ok(session) => session,
             Err(outcome) => return outcome, // make_session logged the cause
         };
-        let port = session.reservation.port();
-        match dispatcher.send_udp_group(
+        let source = session.reservation.source();
+        match self.delivery.send(
+            dispatcher,
             self.target,
             packet.dest,
-            DatagramSource::Egress { port },
+            DatagramSource::Exact(source),
             self.ttl,
             packet.payload,
         ) {
             Ok(()) => {
                 self.sessions.insert(key, session);
                 log::debug!(
-                    "reflected {} search from {} to {} on reserved port {port}; opened a session, {} active",
+                    "reflected {} search from {} to {} from {source}; opened a session, {} active",
                     self.name,
                     packet.source,
                     packet.dest,
@@ -477,6 +485,8 @@ mod tests {
 
     use super::*;
     use crate::capture::{Capture, loopback_lock};
+    #[cfg(target_os = "linux")]
+    use crate::net::LinkType;
     use crate::reflector::NoRewrite;
 
     const TEST_TTL: u8 = 2;
@@ -496,6 +506,7 @@ mod tests {
         SearchReflector::new(
             CaptureKey::from_u64(1),
             CaptureKey::from_u64(0),
+            Delivery::Link,
             None,
             "TEST",
             MessageType::SsdpResponse,
@@ -971,6 +982,67 @@ mod tests {
         }
     }
 
+    // Peers behind a tunnel are reached by routable addresses, so a session for a link-local
+    // group must listen on the address its search copies are sent from, or the replies land
+    // where nothing waits for them.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[cfg_attr(miri, ignore = "needs a real capture device")]
+    fn a_session_listens_where_its_search_copies_come_from() -> std::io::Result<()> {
+        let Some(tun) = crate::capture::Tun::create() else {
+            return Ok(());
+        };
+        assert!(tun.add_address("fe80::1/64") && tun.add_address("fd00:99::1/64"));
+        let mut dispatcher = PacketDispatcher::new();
+        let target = dispatcher.add_capture(Capture::open(&tun.name)?)?;
+        let mut reactor = Reactor::new()?;
+        let peer: IpAddr = "fd00:99::2".parse().unwrap();
+        let mut reflector = SearchReflector::new(
+            CaptureKey::from_u64(999),
+            target,
+            Delivery::Peers(Box::new([peer])),
+            None,
+            "TEST",
+            MessageType::SsdpResponse,
+            TEST_TTL,
+            always_reflect,
+            fixed_window,
+            Box::new(|| Box::new(NoRewrite) as Box<dyn ReplyRewrite>),
+            |_| false,
+        );
+        let packet = Packet {
+            source: "[fe80::a]:1900".parse().unwrap(),
+            dest: "[ff02::c]:1900".parse().unwrap(),
+            ttl: TEST_TTL,
+            dst_mac: None,
+            src_mac: Some(MacAddr::from([0x02, 0, 0, 0, 0, 1])),
+            payload: b"M-SEARCH",
+        };
+        let outcome = reflector.on_packet(&packet, &mut dispatcher, &mut reactor);
+        assert_eq!(outcome, Outcome::Reflected(MessageType::SsdpSearch));
+        let listening = reflector
+            .sessions
+            .iter()
+            .map(|(_, session)| session.reservation.source())
+            .next()
+            .expect("a session");
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let copy = loop {
+            let Some(bytes) = tun.next_packet(deadline)? else {
+                panic!("the search copy never reached the far end");
+            };
+            if let Ok(parsed) = Packet::parse(LinkType::RawIp, &bytes)
+                && parsed.payload == b"M-SEARCH"
+            {
+                break (parsed.source, parsed.dest);
+            }
+        };
+        assert_eq!(copy.1, SocketAddr::new(peer, 1900));
+        assert_eq!(copy.0, listening);
+        Ok(())
+    }
+
     #[test]
     #[cfg_attr(miri, ignore = "needs a real capture device")]
     fn a_failed_reflect_rolls_back_the_session_registration() {
@@ -989,6 +1061,7 @@ mod tests {
         let mut reflector = SearchReflector::new(
             CaptureKey::from_u64(999), // synthetic source: no reply comes back in this test
             target,
+            Delivery::Link,
             None,
             "TEST",
             MessageType::SsdpResponse,

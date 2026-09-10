@@ -15,8 +15,9 @@ use crate::net::wsd::{
 };
 
 use super::{
-    BuildError, Emit, InterfaceMap, NoRewrite, ReplyRewrite, SearchReflector, SimpleReflector,
-    Verdict, require_bidirectional_families, require_group_join, require_macs_matchable,
+    BuildError, Delivery, Emit, InterfaceMap, NoRewrite, ReplyRewrite, SearchReflector,
+    SimpleReflector, Verdict, require_bidirectional_families, require_group_join,
+    require_macs_matchable,
 };
 
 /// WSD's classifier kind maps to its group message types. The `ProbeMatches`/`ResolveMatches` unicast
@@ -127,6 +128,7 @@ pub(crate) fn build(
         Box::new(
             SimpleReflector::new(
                 source,
+                Delivery::new(reflector.source_peers.as_ref()),
                 "WSD",
                 "announcement",
                 announcement_verdict,
@@ -151,6 +153,7 @@ pub(crate) fn build(
         Box::new(SearchReflector::new(
             source,
             target,
+            Delivery::new(reflector.target_peers.as_ref()),
             reflector.macs.clone(),
             "WSD",
             MessageType::WsdResponse,
