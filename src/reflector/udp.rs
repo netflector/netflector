@@ -81,7 +81,7 @@ pub(crate) fn build(
                 "UDP relay",
                 "datagram",
                 relay,
-                Emit::captured(),
+                Emit::captured().unicast_to_broadcast(),
             )),
         );
     }

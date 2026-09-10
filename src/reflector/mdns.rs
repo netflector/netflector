@@ -3,12 +3,14 @@
 //! every in-use family's group: queries flow source → target, responses target → source. Atop the
 //! capture's own-egress drop, this breaks the reflection loop. Each re-emits to the same group at
 //! TTL 255 (RFC 6762 §11), sourced from the egress interface. The dispatcher's filter pins the
-//! group, so the reflector only gates on the query/response classifier.
+//! group for queries; for responses it also takes an answer sent to the target interface itself,
+//! which a device sends when the query asked for a unicast response (the QU bit, RFC 6762 §5.4)
+//! or arrived as unicast (a copy to a peer, §5.5). Such an answer goes out on the source's group.
 //!
-//! Limitation: this is a multicast-only relay. A one-shot / legacy querier — one that asks from an
-//! ephemeral source port, or sets the unicast-response (QU) bit — is answered *unicast* to that port,
-//! off the group, so its answer is never captured or reflected across the link. (SSDP and WSD instead
-//! proxy each searcher's unicast reply through a per-searcher session; mDNS does not.)
+//! Limitation: a legacy querier asking from an ephemeral port expects its answer there, but the
+//! relayed query is sourced from port 5353, so the device answers on the group, which that
+//! querier does not listen on. (SSDP and WSD instead proxy each searcher's unicast reply through
+//! a per-searcher session; mDNS does not.)
 
 use std::net::SocketAddr;
 
@@ -121,13 +123,18 @@ pub(crate) fn build(
             Emit::fixed(MDNS_PORT, MDNS_TTL),
         )),
     );
-    // target → source: reflect responses, optionally only from the configured device's MAC.
+    // target → source: reflect responses, optionally only from the configured device's MAC. An
+    // answer to a query that asked for a unicast response, or that reached a peer as unicast,
+    // comes to this host rather than the group (RFC 6762 §5.4, §5.5) and is taken in as well. A
+    // response comes from port 5353, and one from elsewhere is ignored by every client (§6).
     dispatcher.register(
         target,
         Filter {
+            src_port: Some(MDNS_PORT),
             dst_ip: Some(group_ips),
             dst_port: Some(MDNS_PORT.into()),
             src_mac: reflector.macs.clone(),
+            dst_own: Some(reflector.address_family),
             ..Filter::default()
         },
         Box::new(
@@ -139,7 +146,7 @@ pub(crate) fn build(
                 "mDNS",
                 "response",
                 response_verdict,
-                Emit::fixed(MDNS_PORT, MDNS_TTL),
+                Emit::fixed(MDNS_PORT, MDNS_TTL).unicast_to_group(MDNS_GROUP_V4, MDNS_GROUP_V6),
             )
             // A response whose A/AAAA records are all link-local or otherwise never a peer
             // advertises endpoints the source side can never use; queries carry no advertisement,

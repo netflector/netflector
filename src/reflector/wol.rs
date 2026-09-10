@@ -130,7 +130,7 @@ pub(crate) fn build(
                 target_macs: reflector.macs.clone(),
                 family: reflector.address_family,
             },
-            Emit::captured_from_egress(),
+            Emit::captured_from_egress().unicast_to_broadcast(),
         )),
     );
     log::info!(

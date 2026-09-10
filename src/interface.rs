@@ -11,7 +11,7 @@
 
 use std::fmt;
 use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::net::mac::MacAddr;
 
@@ -65,6 +65,14 @@ impl InterfaceAddresses {
         match dest_scope {
             Ipv6Scope::LinkLocal => self.v6,
             Ipv6Scope::Routable => self.v6_routable.or(self.v6),
+        }
+    }
+
+    /// Whether `ip` is one of the interface's own addresses.
+    pub(crate) fn has(&self, ip: IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(v4) => self.v4 == Some(v4),
+            IpAddr::V6(v6) => self.v6 == Some(v6) || self.v6_routable == Some(v6),
         }
     }
 
