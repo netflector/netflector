@@ -9,7 +9,9 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 
 use super::error::ConfigError;
-use super::value::{AddressFamily, GroupList, InterfaceName, LogLevel, PortList, ReflectorName};
+use super::value::{
+    AddressFamily, GroupList, InterfaceName, LogLevel, PeerList, PortList, ReflectorName,
+};
 use crate::net::mac::MacSet;
 
 #[derive(Debug, Default, Deserialize)]
@@ -37,6 +39,8 @@ pub(super) struct RawReflector {
     pub(super) name: Option<ReflectorName>,
     pub(super) source_if: InterfaceName,
     pub(super) target_if: InterfaceName,
+    pub(super) source_peers: Option<PeerList>,
+    pub(super) target_peers: Option<PeerList>,
     pub(super) macs: Option<MacSet>,
     #[serde(default)]
     pub(super) address_family: AddressFamily,

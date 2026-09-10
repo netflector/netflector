@@ -23,7 +23,7 @@ mod value;
 
 pub(crate) use self::error::{ConfigError, Protocol};
 pub(crate) use self::value::{
-    AddressFamily, GroupList, InterfaceName, LogLevel, PortList, ReflectorName,
+    AddressFamily, GroupList, InterfaceName, LogLevel, PeerList, PortList, ReflectorName,
 };
 
 use std::net::IpAddr;
@@ -75,7 +75,7 @@ impl Reach {
         match (self, other) {
             (Self::Any(a), Self::Any(b)) => families_overlap(a, b),
             (Self::Any(family), Self::Group(group)) | (Self::Group(group), Self::Any(family)) => {
-                family_uses(family, group)
+                family.uses(group)
             }
             (Self::Any(family), Self::Broadcast) | (Self::Broadcast, Self::Any(family)) => {
                 family.uses_ipv4()
@@ -150,6 +150,10 @@ pub(crate) struct Reflector {
     pub(crate) source_if: InterfaceName,
     /// Interface to emit on (always different from `source_if`).
     pub(crate) target_if: InterfaceName,
+    /// The hosts behind `source_if` / `target_if` when that interface has no broadcast domain:
+    /// a group or broadcast re-emitted there goes to each of them as unicast instead.
+    pub(crate) source_peers: Option<PeerList>,
+    pub(crate) target_peers: Option<PeerList>,
     /// Optional device allow-filter; `None` matches any device, `Some` a non-empty set.
     pub(crate) macs: Option<MacSet>,
     /// IP-version policy for this reflector.
@@ -175,6 +179,8 @@ impl Reflector {
         Reflector {
             source_if: self.target_if.clone(),
             target_if: self.source_if.clone(),
+            source_peers: self.target_peers.clone(),
+            target_peers: self.source_peers.clone(),
             ..self.clone()
         }
     }
@@ -196,7 +202,7 @@ impl Reflector {
         let family = self.address_family;
         let mut flows = Vec::new();
         let mut discovery = |protocol, port, groups: &[IpAddr]| {
-            for group in groups.iter().filter(|group| family_uses(family, **group)) {
+            for group in groups.iter().filter(|group| family.uses(**group)) {
                 let legs = [
                     (&self.source_if, &self.target_if),
                     (&self.target_if, &self.source_if),
@@ -308,25 +314,61 @@ impl Reflector {
     }
 }
 
-/// Whether `family` handles `ip`'s IP version.
-fn family_uses(family: AddressFamily, ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(_) => family.uses_ipv4(),
-        IpAddr::V6(_) => family.uses_ipv6(),
+/// The first listed peer of a family the entry's `address_family` does not use, if any.
+fn peer_of_unused_family(raw: &RawReflector) -> Option<IpAddr> {
+    [&raw.source_peers, &raw.target_peers]
+        .into_iter()
+        .flat_map(|peers| peers.as_deref().unwrap_or(&[]))
+        .find(|peer| !raw.address_family.uses(**peer))
+        .copied()
+}
+
+/// The peers parameter an mDNS entry's answers would go to, if any: `source_peers`, or
+/// `target_peers` once the entry is bidirectional. A client takes a unicast answer only to a
+/// question it asked with the unicast-response bit (RFC 6762 §5.4), so such peers get nothing.
+fn mdns_answers_to_peers(raw: &RawReflector) -> Option<&'static str> {
+    if !raw.mdns {
+        return None;
     }
+    if raw.source_peers.is_some() {
+        Some("source_peers")
+    } else if raw.bidirectional && raw.target_peers.is_some() {
+        Some("target_peers")
+    } else {
+        None
+    }
+}
+
+/// The peers checks: every peer of a family the entry uses, and none where an mDNS answer goes.
+fn check_peers(raw: &RawReflector, name: &ReflectorName) -> Result<(), ConfigError> {
+    if let Some(peer) = peer_of_unused_family(raw) {
+        return Err(ConfigError::PeerFamily {
+            name: name.clone(),
+            peer,
+        });
+    }
+    if let Some(param) = mdns_answers_to_peers(raw) {
+        return Err(ConfigError::MdnsAnswersToPeers {
+            name: name.clone(),
+            param,
+        });
+    }
+    Ok(())
 }
 
 impl TryFrom<(String, RawReflector)> for Reflector {
     type Error = ConfigError;
 
-    fn try_from((key, raw): (String, RawReflector)) -> Result<Self, ConfigError> {
+    fn try_from((key, mut raw): (String, RawReflector)) -> Result<Self, ConfigError> {
         // Env `NAME` override is already validated; the identity key (file table
         // key / env tag) is validated here.
-        let name = match raw.name {
+        let name = match raw.name.take() {
             Some(name) => name,
             None => ReflectorName::from_str(&key)
                 .map_err(|_| ConfigError::EmptyReflectorName { key: key.clone() })?,
         };
+        check_peers(&raw, &name)?;
+
         let source_if = raw.source_if;
         let target_if = raw.target_if;
         if source_if == target_if {
@@ -350,7 +392,7 @@ impl TryFrom<(String, RawReflector)> for Reflector {
                     .as_deref()
                     .unwrap_or(&[])
                     .iter()
-                    .find(|group| !family_uses(raw.address_family, **group));
+                    .find(|group| !raw.address_family.uses(**group));
                 if let Some(group) = foreign {
                     return Err(ConfigError::UdpGroupFamily {
                         name,
@@ -397,6 +439,8 @@ impl TryFrom<(String, RawReflector)> for Reflector {
             name,
             source_if,
             target_if,
+            source_peers: raw.source_peers,
+            target_peers: raw.target_peers,
             macs: raw.macs,
             address_family: raw.address_family,
             wol,
@@ -736,6 +780,68 @@ mod tests {
         );
         assert!(udp.broadcast);
         assert!(cfg.reflectors[0].wol.is_none());
+    }
+
+    #[test]
+    fn peers_parse_and_swap_with_the_direction() {
+        let cfg = from_toml(
+            r#"
+            [reflectors.roon]
+            source_if = "lan"
+            target_if = "wg0"
+            udp_ports = [9003]
+            udp_groups = ["239.255.90.90"]
+            target_peers = ["10.10.10.2", "10.10.10.3"]
+            bidirectional = true
+            "#,
+        )
+        .unwrap();
+        let roon = &cfg.reflectors[0];
+        assert!(roon.source_peers.is_none());
+        assert_eq!(roon.target_peers.as_deref().map(<[IpAddr]>::len), Some(2));
+        let reversed = roon.reversed();
+        assert_eq!(reversed.source_peers, roon.target_peers);
+        assert!(reversed.target_peers.is_none());
+    }
+
+    #[test]
+    fn mdns_answers_cannot_go_to_peers() {
+        let entry = |extra: &str| {
+            format!(
+                "[reflectors.a]\nsource_if = \"lan\"\ntarget_if = \"wg0\"\nmdns = true\n{extra}"
+            )
+        };
+        assert!(matches!(
+            err(&entry("source_peers = [\"192.0.2.2\"]\n")),
+            ConfigError::MdnsAnswersToPeers {
+                param: "source_peers",
+                ..
+            }
+        ));
+        assert!(matches!(
+            err(&entry(
+                "target_peers = [\"10.10.10.2\"]\nbidirectional = true\n"
+            )),
+            ConfigError::MdnsAnswersToPeers {
+                param: "target_peers",
+                ..
+            }
+        ));
+        // Queries may go to peers: a device answers a direct unicast query.
+        assert!(from_toml(&entry("target_peers = [\"10.10.10.2\"]\n")).is_ok());
+    }
+
+    #[test]
+    fn peer_must_be_of_a_used_family() {
+        let text = r#"
+            [reflectors.roon]
+            source_if = "lan"
+            target_if = "wg0"
+            address_family = "ipv4"
+            mdns = true
+            target_peers = ["fd00::2"]
+        "#;
+        assert!(matches!(err(text), ConfigError::PeerFamily { .. }));
     }
 
     #[test]

@@ -9,7 +9,9 @@ use std::str::FromStr;
 
 use super::error::{ConfigError, ParseBoolError, ParseValueError, RequiredField};
 use super::raw::{RawConfig, RawReflector};
-use super::value::{AddressFamily, GroupList, InterfaceName, LogLevel, PortList, ReflectorName};
+use super::value::{
+    AddressFamily, GroupList, InterfaceName, LogLevel, PeerList, PortList, ReflectorName,
+};
 use crate::net::mac::MacSet;
 
 /// Accumulates a reflector's fields across its `NETFLECTOR_<tag>_<param>` variables,
@@ -19,6 +21,8 @@ struct PartialReflector {
     name: Option<ReflectorName>,
     source_if: Option<InterfaceName>,
     target_if: Option<InterfaceName>,
+    source_peers: Option<PeerList>,
+    target_peers: Option<PeerList>,
     macs: Option<MacSet>,
     wol: Option<bool>,
     mdns: Option<bool>,
@@ -57,6 +61,8 @@ impl PartialReflector {
             "name" => put(&mut self.name, env_value(value, var)?, param, var),
             "source_if" => put(&mut self.source_if, env_value(value, var)?, param, var),
             "target_if" => put(&mut self.target_if, env_value(value, var)?, param, var),
+            "source_peers" => put(&mut self.source_peers, env_value(value, var)?, param, var),
+            "target_peers" => put(&mut self.target_peers, env_value(value, var)?, param, var),
             "macs" => put(&mut self.macs, env_value(value, var)?, param, var),
             "wol_ports" => put(&mut self.wol_ports, env_value(value, var)?, param, var),
             "address_family" => put(&mut self.address_family, env_value(value, var)?, param, var),
@@ -88,6 +94,8 @@ impl PartialReflector {
                 name: name.to_owned(),
                 field: RequiredField::TargetIf,
             })?,
+            source_peers: self.source_peers,
+            target_peers: self.target_peers,
             macs: self.macs,
             wol: self.wol.unwrap_or(false),
             mdns: self.mdns.unwrap_or(false),
@@ -285,6 +293,20 @@ mod tests {
         let r = &cfg.reflectors[0];
         assert!(r.wol.is_some());
         assert!(!r.mdns);
+    }
+
+    #[test]
+    fn env_peer_lists() {
+        let cfg = from_env(&[
+            ("NETFLECTOR_ROON_SOURCE_IF", "lan"),
+            ("NETFLECTOR_ROON_TARGET_IF", "wg0"),
+            ("NETFLECTOR_ROON_MDNS", "true"),
+            ("NETFLECTOR_ROON_TARGET_PEERS", "10.10.10.2, 10.10.10.3"),
+        ])
+        .unwrap();
+        let peers = cfg.reflectors[0].target_peers.as_deref().unwrap();
+        assert_eq!(peers.len(), 2);
+        assert!(cfg.reflectors[0].source_peers.is_none());
     }
 
     #[test]

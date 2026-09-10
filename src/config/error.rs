@@ -11,7 +11,7 @@ use thiserror::Error;
 
 use super::value::{
     GroupListError, InterfaceName, ParseAddressFamilyError, ParseInterfaceNameError,
-    ParseLogLevelError, ParseReflectorNameError, PortListError, ReflectorName,
+    ParseLogLevelError, ParseReflectorNameError, PeerListError, PortListError, ReflectorName,
 };
 use crate::net::mac::MacSetError;
 
@@ -59,6 +59,9 @@ pub(crate) enum ConfigError {
     )]
     UdpGroupFamily { name: ReflectorName, group: IpAddr },
 
+    #[error("reflector \"{name}\" lists peer {peer}, whose family its address_family does not use")]
+    PeerFamily { name: ReflectorName, peer: IpAddr },
+
     #[error("reflector \"{name}\" sets udp_broadcast but its address_family has no IPv4")]
     UdpBroadcastFamily { name: ReflectorName },
 
@@ -81,6 +84,15 @@ pub(crate) enum ConfigError {
 
     #[error("reflector \"{name}\" sets dial but does not enable ssdp")]
     DialWithoutSsdp { name: ReflectorName },
+
+    #[error(
+        "reflector \"{name}\" enables mdns with {param}, but a client takes a unicast mDNS answer \
+         only to a question it asked with the unicast-response bit"
+    )]
+    MdnsAnswersToPeers {
+        name: ReflectorName,
+        param: &'static str,
+    },
 
     #[error(
         "reflector \"{name}\" enables dial but the address family has no IPv4 (DIAL is IPv4-only)"
@@ -211,6 +223,8 @@ pub(crate) enum ParseValueError {
     /// `UDP_GROUPS`.
     #[error(transparent)]
     GroupList(#[from] GroupListError),
+    #[error(transparent)]
+    PeerList(#[from] PeerListError),
     /// `NAME`.
     #[error(transparent)]
     ReflectorName(#[from] ParseReflectorNameError),
