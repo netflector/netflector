@@ -32,12 +32,13 @@ pub(crate) use self::dial_context::{DialContext, DialProxyKey};
 pub(crate) use self::multicast::{join_capped, join_deferrable};
 
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::ops::Deref;
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::{Duration, Instant};
 
 use crate::capture::{Capture, Read};
+use crate::config::AddressFamily;
 use crate::interface::{InterfaceAddresses, InterfaceEvent, InterfaceMonitor};
 use crate::linear_map::LinearMap;
 use crate::logging::{WARN_WINDOW, log_rate};
@@ -155,18 +156,26 @@ pub(crate) struct Filter {
     pub(crate) dst_mac: Option<MacAddr>,
     /// Require an IPv4 broadcast destination, see [`Packet::is_broadcast`].
     pub(crate) broadcast: bool,
+    /// Widen `dst_ip` to the ingress interface's own addresses of these families: an answer sent
+    /// to this host.
+    pub(crate) dst_own: Option<AddressFamily>,
 }
 
 impl Filter {
-    /// Whether `p` satisfies every set field (an unset field matches anything), given the ingress's
-    /// directed broadcast for the `broadcast` field on a link without MACs.
-    fn matches(&self, p: &Packet, ingress_directed_broadcast: Option<Ipv4Addr>) -> bool {
-        (!self.broadcast || p.is_broadcast(ingress_directed_broadcast))
+    /// Whether `p` satisfies every set field (an unset field matches anything), given the
+    /// ingress's addresses: its directed broadcast for the `broadcast` field on a link without
+    /// MACs, its own addresses for `dst_own`.
+    fn matches(&self, p: &Packet, ingress: Option<&InterfaceAddresses>) -> bool {
+        (!self.broadcast
+            || p.is_broadcast(ingress.and_then(InterfaceAddresses::v4_directed_broadcast)))
             && self.src_ip.is_none_or(|ip| p.source.ip() == ip)
-            && self
-                .dst_ip
-                .as_ref()
-                .is_none_or(|set| set.contains(&p.dest.ip()))
+            && self.dst_ip.as_ref().is_none_or(|set| {
+                set.contains(&p.dest.ip())
+                    || self.dst_own.is_some_and(|family| {
+                        family.uses(p.dest.ip())
+                            && ingress.is_some_and(|addrs| addrs.has(p.dest.ip()))
+                    })
+            })
             && self.src_port.is_none_or(|port| p.source.port() == port)
             && self
                 .dst_port
@@ -739,17 +748,14 @@ impl PacketDispatcher {
                 .iter()
                 .map(|(key, _)| RegistrationKey(key)),
         );
-        let ingress_directed_broadcast = self
-            .table
-            .egress_addrs(ingress)
-            .and_then(InterfaceAddresses::v4_directed_broadcast);
+        let ingress_addrs = self.table.egress_addrs(ingress).copied();
         self.packet += 1;
         self.routing = true;
         let mut final_outcome: Option<Outcome> = None;
         for i in 0..self.route_keys.len() {
             let key = self.route_keys[i];
             let applies = self.registrations.get(key.0).is_some_and(|reg| {
-                reg.ingress == ingress && reg.filter.matches(packet, ingress_directed_broadcast)
+                reg.ingress == ingress && reg.filter.matches(packet, ingress_addrs.as_ref())
             });
             if !applies {
                 continue;
@@ -1378,6 +1384,70 @@ mod tests {
     }
 
     #[test]
+    fn filter_dst_own_widens_dst_ip_to_the_ingress_addresses() {
+        let group: IpAddr = "224.0.0.251".parse().unwrap();
+        let ingress = InterfaceAddresses::new(
+            None,
+            Some(Ipv4Addr::new(10, 0, 0, 1)),
+            Some("fe80::1".parse().unwrap()),
+            Some("fd00::1".parse().unwrap()),
+        );
+        let widened = Filter {
+            dst_ip: Some(group.into()),
+            dst_own: Some(AddressFamily::Dual),
+            ..Filter::default()
+        };
+        assert!(widened.matches(
+            &packet("10.0.0.2:1", "224.0.0.251:9", None, None),
+            Some(&ingress)
+        ));
+        // Every address the ingress owns, in either family.
+        for own in ["10.0.0.1:9", "[fe80::1]:9", "[fd00::1]:9"] {
+            assert!(widened.matches(&packet("10.0.0.2:1", own, None, None), Some(&ingress)));
+        }
+        // Only the families the widening names: an answer of the other family is not taken.
+        let v4_only = Filter {
+            dst_own: Some(AddressFamily::Ipv4),
+            ..widened.clone()
+        };
+        assert!(v4_only.matches(
+            &packet("10.0.0.2:1", "10.0.0.1:9", None, None),
+            Some(&ingress)
+        ));
+        assert!(!v4_only.matches(
+            &packet("[fe80::2]:1", "[fe80::1]:9", None, None),
+            Some(&ingress)
+        ));
+        let v6_only = Filter {
+            dst_own: Some(AddressFamily::Ipv6),
+            ..widened.clone()
+        };
+        assert!(v6_only.matches(
+            &packet("[fe80::2]:1", "[fd00::1]:9", None, None),
+            Some(&ingress)
+        ));
+        assert!(!v6_only.matches(
+            &packet("10.0.0.2:1", "10.0.0.1:9", None, None),
+            Some(&ingress)
+        ));
+        // Another host's address, and an ingress with no known addresses, both miss.
+        assert!(!widened.matches(
+            &packet("10.0.0.2:1", "10.0.0.3:9", None, None),
+            Some(&ingress)
+        ));
+        assert!(!widened.matches(&packet("10.0.0.2:1", "10.0.0.1:9", None, None), None));
+        // Without the widening the group alone matches.
+        let group_only = Filter {
+            dst_ip: Some(group.into()),
+            ..Filter::default()
+        };
+        assert!(!group_only.matches(
+            &packet("10.0.0.2:1", "10.0.0.1:9", None, None),
+            Some(&ingress)
+        ));
+    }
+
+    #[test]
     fn filter_broadcast_takes_the_all_ones_mac_or_the_limited_broadcast() {
         let f = Filter {
             broadcast: true,
@@ -1385,7 +1455,10 @@ mod tests {
         };
         let all_ones = Some(MacAddr::broadcast());
         let unicast = Some(MacAddr::from([0x02, 0, 0, 0, 0, 1]));
-        let own = Some(Ipv4Addr::new(10, 0, 0, 255));
+        // The ingress owns 10.0.0.1/24, so its directed broadcast is 10.0.0.255.
+        let ingress = InterfaceAddresses::new(None, Some(Ipv4Addr::new(10, 0, 0, 1)), None, None)
+            .with_v4_prefix(24);
+        let own = Some(&ingress);
         // On the all-ones MAC every subnet's directed broadcast qualifies, the limited one too.
         assert!(f.matches(&packet("10.0.0.1:1", "10.0.0.255:9", all_ones, None), own));
         assert!(f.matches(&packet("10.0.1.1:1", "10.0.1.255:9", all_ones, None), own));
@@ -1762,6 +1835,86 @@ mod tests {
             .map(|(_, dest, _)| dest.ip())
             .collect();
         assert_eq!(delivered, peers);
+        Ok(())
+    }
+
+    // A query relayed to a peer as unicast is answered by unicast to this host; the mDNS response
+    // leg takes that answer off the tunnel and puts it on the source segment's group.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[cfg_attr(miri, ignore = "needs a real capture device")]
+    fn a_unicast_mdns_answer_from_a_peer_goes_to_the_group() -> io::Result<()> {
+        use std::io::Write as _;
+
+        use crate::net::frame;
+        use crate::net::mdns::{MDNS_GROUP_V4, MDNS_PORT};
+        use crate::reflector::{InterfaceMap, mdns};
+
+        let _serial = loopback_lock();
+        let Some(mut tun) = crate::capture::Tun::create() else {
+            return Ok(());
+        };
+        assert!(tun.add_address("10.99.200.1/24"));
+        let mut dispatcher = PacketDispatcher::without_group_joins();
+        let source = dispatcher.add_capture(Capture::open(LOOPBACK_IFACE)?)?;
+        let target = dispatcher.add_capture(Capture::open(&tun.name)?)?;
+        let mut interfaces = InterfaceMap::default();
+        interfaces.insert(LOOPBACK_IFACE.to_owned(), source);
+        interfaces.insert(tun.name.clone(), target);
+        let entry = crate::config::Config::from_sources(
+            Some(&format!(
+                "[reflectors.a]\nsource_if = \"{LOOPBACK_IFACE}\"\ntarget_if = \"{}\"\n\
+                 mdns = true\naddress_family = \"ipv4\"\ntarget_peers = [\"10.99.200.2\"]\n",
+                tun.name
+            )),
+            std::iter::empty(),
+        )
+        .expect("a valid configuration")
+        .reflectors
+        .remove(0);
+        mdns::build(&entry, &interfaces, &mut dispatcher).expect("build the mDNS reflector");
+        let mut observer = Capture::open(LOOPBACK_IFACE)?;
+
+        // A DNS header with QR set: a response with no records.
+        let answer = [0, 0, 0x84, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut packet = [0u8; 64];
+        let n = frame::ipv4_udp(
+            SocketAddrV4::new(Ipv4Addr::new(10, 99, 200, 2), MDNS_PORT),
+            SocketAddrV4::new(Ipv4Addr::new(10, 99, 200, 1), MDNS_PORT),
+            255,
+            &answer,
+            &mut packet,
+        )
+        .expect("build the answer");
+        tun.far_end.write_all(&packet[..n])?;
+
+        let mut reactor = Reactor::new()?;
+        let mut relayed = None;
+        pump_until(
+            2,
+            || {
+                while relayed.is_none()
+                    && let Some(read) = observer.next_frame().unwrap()
+                {
+                    if let Read::Frame(frame) = read
+                        && let Ok(parsed) = Packet::parse(LinkType::Ethernet, frame)
+                        && parsed.payload == answer
+                    {
+                        relayed = Some((parsed.source, parsed.dest));
+                    }
+                }
+                relayed.is_some()
+            },
+            || dispatcher.drain_and_route(target, &mut reactor),
+        );
+        assert_eq!(
+            relayed,
+            Some((
+                SocketAddr::from((Ipv4Addr::LOCALHOST, MDNS_PORT)),
+                SocketAddr::from((MDNS_GROUP_V4, MDNS_PORT)),
+            )),
+            "the answer was not relayed to the group on the source side"
+        );
         Ok(())
     }
 
