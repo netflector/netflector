@@ -379,15 +379,12 @@ fn bind_interface(fd: &OwnedFd, mut addr: libc::sockaddr_ll) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::File;
-    use std::io::{Read as _, Write as _};
+    use std::io::Write as _;
     use std::net::{Ipv4Addr, SocketAddrV4, SocketAddrV6, UdpSocket};
     use std::time::{Duration, Instant};
 
-    use libc::c_short;
-
     use super::*;
-    use crate::capture::{loopback_lock, open_or_skip};
+    use crate::capture::{Tun, loopback_lock, open_or_skip};
     use crate::net::frame;
     use crate::net::mac::MacAddr;
 
@@ -411,91 +408,6 @@ mod tests {
                 as_tuples(&filter[DROP_OUTGOING_PROLOGUE.len()..]),
                 as_tuples(classifier)
             );
-        }
-    }
-
-    /// A tun device attached to this process: its kernel side is a raw IP link, `far_end` the
-    /// other side, where a packet written arrives on the link and one sent on the link comes
-    /// out. Gone when the file closes.
-    struct Tun {
-        far_end: File,
-        name: String,
-    }
-
-    impl Tun {
-        /// `None`, with a note, where the test can't run: no root, no `/dev/net/tun`, or a
-        /// kernel (user-mode QEMU) that refuses the attach.
-        fn create() -> Option<Self> {
-            // A `%d` template asks for a kernel-assigned name, written back by the ioctl.
-            const TEMPLATE: &[u8] = b"nftun%d";
-            // SAFETY: geteuid takes no arguments and cannot fail.
-            if unsafe { libc::geteuid() } != 0 {
-                eprintln!("skip tun test: creating a tun device requires root");
-                return None;
-            }
-            let far_end = match File::options().read(true).write(true).open("/dev/net/tun") {
-                Ok(file) => file,
-                Err(e) => {
-                    eprintln!("skip tun test: /dev/net/tun: {e}");
-                    return None;
-                }
-            };
-            // SAFETY: an all-zero `ifreq` is valid (a zeroed name and union).
-            let mut ifr: libc::ifreq = unsafe { core::mem::zeroed() };
-            // SAFETY: the template fits `ifr_name` with the terminator the zeroed `ifr` provides.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    TEMPLATE.as_ptr(),
-                    ifr.ifr_name.as_mut_ptr().cast::<u8>(),
-                    TEMPLATE.len(),
-                );
-            }
-            ifr.ifr_ifru.ifru_flags =
-                c_short::try_from(libc::IFF_TUN | libc::IFF_NO_PI).expect("tun flags fit");
-            // SAFETY: TUNSETIFF reads the flags and name template, and writes the name back.
-            if unsafe { libc::ioctl(far_end.as_raw_fd(), libc::TUNSETIFF, &raw mut ifr) } < 0 {
-                eprintln!("skip tun test: TUNSETIFF: {}", io::Error::last_os_error());
-                return None;
-            }
-            // SAFETY: the kernel wrote a NUL-terminated name into `ifr_name`.
-            let name = unsafe { std::ffi::CStr::from_ptr(ifr.ifr_name.as_ptr()) }
-                .to_string_lossy()
-                .into_owned();
-            let up = std::process::Command::new("ip")
-                .args(["link", "set", "dev", &name, "up"])
-                .status()
-                .is_ok_and(|status| status.success());
-            if !up {
-                eprintln!("skip tun test: cannot bring {name} up (no ip(8)?)");
-                return None;
-            }
-            Some(Self { far_end, name })
-        }
-
-        /// Whether a packet equal to `want` comes out of the far end within [`WAIT_BUDGET`].
-        fn read_until(&self, want: &[u8]) -> io::Result<bool> {
-            let deadline = Instant::now() + WAIT_BUDGET;
-            let mut buf = [0u8; crate::net::MAX_FRAME_LEN];
-            while let Some(left) = deadline.checked_duration_since(Instant::now()) {
-                let mut pfd = libc::pollfd {
-                    fd: self.far_end.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                let timeout = c_int::try_from(left.as_millis()).unwrap_or(c_int::MAX);
-                // SAFETY: one `pollfd`, as declared.
-                match unsafe { libc::poll(&raw mut pfd, 1, timeout) } {
-                    0 => break,
-                    n if n < 0 => return Err(io::Error::last_os_error()),
-                    _ => {}
-                }
-                // One packet per read (`IFF_NO_PI`: no header).
-                let n = (&self.far_end).read(&mut buf)?;
-                if &buf[..n] == want {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
         }
     }
 
