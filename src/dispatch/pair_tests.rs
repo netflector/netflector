@@ -499,8 +499,7 @@ fn inject(
         payload,
         &mut scratch,
     )
-    .expect("build the injected frame")
-    .len;
+    .expect("build the injected frame");
     injector.send(&scratch[..n])
 }
 

@@ -606,8 +606,7 @@ mod tests {
         let dst = SocketAddrV4::new(Ipv4Addr::LOCALHOST, dst_port);
         let mut frame = [0u8; 256];
         let n = crate::net::frame::dlt_null_ipv4_udp(src, dst, 64, PROBE, &mut frame)
-            .expect("build DLT_NULL IPv4 frame")
-            .len;
+            .expect("build DLT_NULL IPv4 frame");
         expect_send_delivered(&cap, &receiver, &frame[..n], PROBE);
 
         // IPv6 loopback isn't guaranteed everywhere; cover it only when ::1 is usable.
@@ -617,8 +616,7 @@ mod tests {
             let dst = SocketAddrV6::new(Ipv6Addr::LOCALHOST, dst_port, 0, 0);
             let mut frame = [0u8; 256];
             let n = crate::net::frame::dlt_null_ipv6_udp(src, dst, 64, PROBE, &mut frame)
-                .expect("build DLT_NULL IPv6 frame")
-                .len;
+                .expect("build DLT_NULL IPv6 frame");
             expect_send_delivered(&cap, &receiver, &frame[..n], PROBE);
         } else {
             eprintln!("skip loopback_send IPv6: ::1 unavailable");

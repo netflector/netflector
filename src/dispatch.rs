@@ -47,7 +47,7 @@ use crate::reactor::{Arena, ControlEvent, Handler, Key, Reactor, ReadyEvent};
 
 use self::counters::log_counters;
 use self::datagram::{build_udp, ethernet_dst};
-use self::interface_table::{InterfaceTable, SentFrame};
+use self::interface_table::InterfaceTable;
 
 /// The most frames drained per readable event before yielding, so a flooded interface
 /// can't starve the others. `AF_PACKET` stops here and the level-triggered wait
@@ -473,51 +473,17 @@ impl PacketDispatcher {
         ttl: u8,
         payload: &[u8],
     ) -> io::Result<()> {
-        // Copy the addresses out (they're `Copy`) so the borrow of the table ends before the
-        // mutable borrow of `self.scratch`.
-        let (Some(addrs), Some(link)) =
-            (self.egress_addrs(egress).copied(), self.link_type(egress))
-        else {
-            log::warn!("egress {egress:?} unavailable (drained or unknown); datagram dropped");
-            return Ok(());
-        };
-        let built = build_udp(
-            &addrs,
-            link,
-            dst,
-            dst_mac,
-            source,
-            ttl,
-            payload,
-            &mut self.scratch,
-        )
-        .map_err(io::Error::other)?;
-        // Two entries whose legs coincide (per-device entries on one pair, whose query legs
-        // carry no MAC filter) both relay a packet; the second's frame equals the first's. Noted
-        // only once sent, so a failed send leaves the second to try.
-        let frame = self.routing.then_some(SentFrame {
-            packet: self.packet,
-            len: built.len,
-            checksum: built.udp_checksum,
-        });
-        if let Some(frame) = frame
-            && self.table.is_last_sent(egress, frame)
-        {
-            log::trace!("egress {egress:?}: an equal frame already went out for this packet");
-            return Ok(());
-        }
-        self.send(egress, &self.scratch[..built.len])?;
-        if let Some(frame) = frame {
-            self.table.set_last_sent(egress, frame);
+        if let Some(len) = self.build_frame(egress, dst, dst_mac, source, ttl, payload)? {
+            self.send_built(egress, len)?;
         }
         Ok(())
     }
 
     /// Inject a broadcast/multicast UDP datagram on `egress`, deriving the L2 destination MAC from
     /// `dst`'s address class (all-ones for the IPv4 limited broadcast, the RFC-derived group MAC
-    /// for multicast). A thin wrapper over [`send_udp`](Self::send_udp). A unicast `dst` has no
-    /// derivable group MAC, so it is a [`DatagramError::UnicastDestination`](datagram::DatagramError::UnicastDestination); use `send_udp` with an
-    /// explicit MAC for unicast.
+    /// for multicast). A unicast `dst` has no derivable group MAC, so it is a
+    /// [`DatagramError::UnicastDestination`](datagram::DatagramError::UnicastDestination); use
+    /// [`send_udp`](Self::send_udp) with an explicit MAC for unicast.
     ///
     /// # Errors
     /// As [`send_udp`](Self::send_udp), plus [`DatagramError::UnicastDestination`](datagram::DatagramError::UnicastDestination) for a unicast `dst`.
@@ -531,6 +497,61 @@ impl PacketDispatcher {
     ) -> io::Result<()> {
         let dst_mac = self.group_mac(egress, dst)?;
         self.send_udp(egress, dst, dst_mac, source, ttl, payload)
+    }
+
+    /// Assemble the datagram for `egress` into the scratch buffer. `None` (logged) when the
+    /// egress is unknown or taken out for its drain.
+    fn build_frame(
+        &mut self,
+        egress: CaptureKey,
+        dst: SocketAddr,
+        dst_mac: MacAddr,
+        source: DatagramSource,
+        ttl: u8,
+        payload: &[u8],
+    ) -> io::Result<Option<usize>> {
+        // Copy the addresses out (they're `Copy`) so the borrow of the table ends before the
+        // mutable borrow of `self.scratch`.
+        let (Some(addrs), Some(link)) =
+            (self.egress_addrs(egress).copied(), self.link_type(egress))
+        else {
+            log::warn!("egress {egress:?} unavailable (drained or unknown); datagram dropped");
+            return Ok(None);
+        };
+        build_udp(
+            &addrs,
+            link,
+            dst,
+            dst_mac,
+            source,
+            ttl,
+            payload,
+            &mut self.scratch,
+        )
+        .map(Some)
+        .map_err(io::Error::other)
+    }
+
+    /// Send the frame in the scratch buffer on `egress`, unless an equal one already went out
+    /// there for the packet being routed: two entries whose legs coincide (per-device entries
+    /// on one pair, whose query legs carry no MAC filter) both relay a packet, and the second's
+    /// frame equals the first's. Noted only once sent, so a failed send leaves the second to
+    /// try. Returns whether the frame went out.
+    fn send_built(&mut self, egress: CaptureKey, len: usize) -> io::Result<bool> {
+        if self.routing
+            && self
+                .table
+                .was_sent(egress, self.packet, &self.scratch[..len])
+        {
+            log::trace!("egress {egress:?}: an equal frame already went out for this packet");
+            return Ok(false);
+        }
+        self.send(egress, &self.scratch[..len])?;
+        if self.routing {
+            self.table
+                .record_sent(egress, self.packet, &self.scratch[..len]);
+        }
+        Ok(true)
     }
 
     /// The L2 destination for a broadcast/multicast `dst` on `egress`: its own directed broadcast

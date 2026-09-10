@@ -35,14 +35,6 @@ pub(crate) enum FrameError {
     PayloadTooLarge { payload: usize },
 }
 
-/// What a builder wrote: the frame's length in the output buffer, and the UDP checksum it
-/// carries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Built {
-    pub(crate) len: usize,
-    pub(crate) udp_checksum: u16,
-}
-
 /// Ethernet frame carrying an IPv4 UDP datagram into `out`: dst/src MAC header and
 /// ethertype, then the IPv4 + UDP datagram with checksums filled.
 ///
@@ -57,15 +49,12 @@ pub(crate) fn ethernet_ipv4_udp(
     ttl: u8,
     payload: &[u8],
     out: &mut [u8],
-) -> Result<Built, FrameError> {
+) -> Result<usize, FrameError> {
     let (header, body) = split_l2(out, ETHERNET_HEADER_SIZE)?;
     let datagram = ipv4_udp(src, dst, ttl, payload, body)
         .map_err(|e| with_l2_header(e, ETHERNET_HEADER_SIZE))?;
     write_ethernet_header(header, dst_mac, src_mac, IPV4_ETHERTYPE);
-    Ok(Built {
-        len: ETHERNET_HEADER_SIZE + datagram.len,
-        ..datagram
-    })
+    Ok(ETHERNET_HEADER_SIZE + datagram)
 }
 
 /// Ethernet frame carrying an IPv6 UDP datagram into `out`: dst/src MAC header and
@@ -82,15 +71,12 @@ pub(crate) fn ethernet_ipv6_udp(
     hop_limit: u8,
     payload: &[u8],
     out: &mut [u8],
-) -> Result<Built, FrameError> {
+) -> Result<usize, FrameError> {
     let (header, body) = split_l2(out, ETHERNET_HEADER_SIZE)?;
     let datagram = ipv6_udp(src, dst, hop_limit, payload, body)
         .map_err(|e| with_l2_header(e, ETHERNET_HEADER_SIZE))?;
     write_ethernet_header(header, dst_mac, src_mac, IPV6_ETHERTYPE);
-    Ok(Built {
-        len: ETHERNET_HEADER_SIZE + datagram.len,
-        ..datagram
-    })
+    Ok(ETHERNET_HEADER_SIZE + datagram)
 }
 
 /// `DLT_NULL` frame carrying an IPv4 UDP datagram into `out` (BSD `lo0`
@@ -107,15 +93,12 @@ pub(crate) fn dlt_null_ipv4_udp(
     ttl: u8,
     payload: &[u8],
     out: &mut [u8],
-) -> Result<Built, FrameError> {
+) -> Result<usize, FrameError> {
     let (header, body) = split_l2(out, DLT_NULL_HEADER_SIZE)?;
     let datagram = ipv4_udp(src, dst, ttl, payload, body)
         .map_err(|e| with_l2_header(e, DLT_NULL_HEADER_SIZE))?;
     write_dlt_null_header(header, libc::AF_INET);
-    Ok(Built {
-        len: DLT_NULL_HEADER_SIZE + datagram.len,
-        ..datagram
-    })
+    Ok(DLT_NULL_HEADER_SIZE + datagram)
 }
 
 /// `DLT_NULL` frame carrying an IPv6 UDP datagram into `out` (BSD `lo0`
@@ -132,15 +115,12 @@ pub(crate) fn dlt_null_ipv6_udp(
     hop_limit: u8,
     payload: &[u8],
     out: &mut [u8],
-) -> Result<Built, FrameError> {
+) -> Result<usize, FrameError> {
     let (header, body) = split_l2(out, DLT_NULL_HEADER_SIZE)?;
     let datagram = ipv6_udp(src, dst, hop_limit, payload, body)
         .map_err(|e| with_l2_header(e, DLT_NULL_HEADER_SIZE))?;
     write_dlt_null_header(header, libc::AF_INET6);
-    Ok(Built {
-        len: DLT_NULL_HEADER_SIZE + datagram.len,
-        ..datagram
-    })
+    Ok(DLT_NULL_HEADER_SIZE + datagram)
 }
 
 /// Write an IPv4 + UDP datagram (headers and `payload`, with the IPv4-header and
@@ -155,7 +135,7 @@ pub(crate) fn ipv4_udp(
     ttl: u8,
     payload: &[u8],
     out: &mut [u8],
-) -> Result<Built, FrameError> {
+) -> Result<usize, FrameError> {
     let udp_length = datagram_length(payload)?;
     let frame_size = IPV4_HEADER_SIZE + usize::from(udp_length);
     // The IPv4 total-length field is also 16-bit and spans header + datagram.
@@ -182,10 +162,7 @@ pub(crate) fn ipv4_udp(
     let udp_checksum = checksum::udp_v4(*src.ip(), *dst.ip(), &out[udp..]);
     out[udp + 6..udp + 8].copy_from_slice(&udp_checksum.to_be_bytes());
 
-    Ok(Built {
-        len: frame_size,
-        udp_checksum,
-    })
+    Ok(frame_size)
 }
 
 /// Write an IPv6 + UDP datagram (headers and `payload`, with the UDP checksum
@@ -200,7 +177,7 @@ pub(crate) fn ipv6_udp(
     hop_limit: u8,
     payload: &[u8],
     out: &mut [u8],
-) -> Result<Built, FrameError> {
+) -> Result<usize, FrameError> {
     let udp_length = datagram_length(payload)?;
     let frame_size = IPV6_HEADER_SIZE + usize::from(udp_length);
     let out = checked_out(out, frame_size)?;
@@ -220,10 +197,7 @@ pub(crate) fn ipv6_udp(
     let udp_checksum = checksum::udp_v6(*src.ip(), *dst.ip(), &out[udp..]);
     out[udp + 6..udp + 8].copy_from_slice(&udp_checksum.to_be_bytes());
 
-    Ok(Built {
-        len: frame_size,
-        udp_checksum,
-    })
+    Ok(frame_size)
 }
 
 /// The UDP datagram length (header + `payload`) as a `u16`, or
@@ -302,7 +276,7 @@ mod tests {
         let payload = [0xde, 0xad, 0xbe, 0xef];
         let mut buf = [0xAAu8; 64]; // sentinel: every frame byte must be overwritten
 
-        let n = ipv4_udp(src, dst, 1, &payload, &mut buf).unwrap().len;
+        let n = ipv4_udp(src, dst, 1, &payload, &mut buf).unwrap();
         assert_eq!(n, IPV4_HEADER_SIZE + UDP_HEADER_SIZE + payload.len());
         let frame = &buf[..n];
         let udp = IPV4_HEADER_SIZE;
@@ -349,7 +323,7 @@ mod tests {
         let payload = [0xaa, 0xbb, 0xcc];
         let mut buf = [0xAAu8; 80]; // sentinel: every frame byte must be overwritten
 
-        let n = ipv6_udp(src, dst, 255, &payload, &mut buf).unwrap().len;
+        let n = ipv6_udp(src, dst, 255, &payload, &mut buf).unwrap();
         assert_eq!(n, IPV6_HEADER_SIZE + UDP_HEADER_SIZE + payload.len());
         let frame = &buf[..n];
         let udp = IPV6_HEADER_SIZE;
@@ -447,8 +421,7 @@ mod tests {
         let mut buf = [0xAAu8; 64];
 
         let built = ethernet_ipv4_udp(dst_mac, src_mac, src, dst, 1, &payload, &mut buf).unwrap();
-        assert_eq!(built.udp_checksum, u16::from_be_bytes([buf[40], buf[41]]));
-        let n = built.len;
+        let n = built;
         assert_eq!(
             n,
             ETHERNET_HEADER_SIZE + IPV4_HEADER_SIZE + UDP_HEADER_SIZE + payload.len()
@@ -461,7 +434,7 @@ mod tests {
 
         // Past the Ethernet header is exactly the standalone IPv4 datagram.
         let mut datagram = [0u8; 64];
-        let dn = ipv4_udp(src, dst, 1, &payload, &mut datagram).unwrap().len;
+        let dn = ipv4_udp(src, dst, 1, &payload, &mut datagram).unwrap();
         assert_eq!(&frame[ETHERNET_HEADER_SIZE..], &datagram[..dn]);
     }
 
@@ -475,8 +448,7 @@ mod tests {
         let mut buf = [0xAAu8; 80];
 
         let built = ethernet_ipv6_udp(dst_mac, src_mac, src, dst, 255, &payload, &mut buf).unwrap();
-        assert_eq!(built.udp_checksum, u16::from_be_bytes([buf[60], buf[61]]));
-        let n = built.len;
+        let n = built;
         assert_eq!(
             n,
             ETHERNET_HEADER_SIZE + IPV6_HEADER_SIZE + UDP_HEADER_SIZE + payload.len()
@@ -488,9 +460,7 @@ mod tests {
         assert_eq!(u16::from_be_bytes([frame[12], frame[13]]), IPV6_ETHERTYPE);
 
         let mut datagram = [0u8; 80];
-        let dn = ipv6_udp(src, dst, 255, &payload, &mut datagram)
-            .unwrap()
-            .len;
+        let dn = ipv6_udp(src, dst, 255, &payload, &mut datagram).unwrap();
         assert_eq!(&frame[ETHERNET_HEADER_SIZE..], &datagram[..dn]);
     }
 
@@ -531,7 +501,7 @@ mod tests {
         let dst = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 2);
         let mut buf = [0u8; IPV4_HEADER_SIZE + UDP_HEADER_SIZE]; // exactly the empty-payload frame
         assert_eq!(
-            ipv4_udp(src, dst, 1, &[], &mut buf).map(|built| built.len),
+            ipv4_udp(src, dst, 1, &[], &mut buf),
             Ok(IPV4_HEADER_SIZE + UDP_HEADER_SIZE)
         );
     }
@@ -544,9 +514,7 @@ mod tests {
         let payload = [0xde, 0xad];
         let mut buf = [0xAAu8; 64];
 
-        let n = dlt_null_ipv4_udp(src, dst, 1, &payload, &mut buf)
-            .unwrap()
-            .len;
+        let n = dlt_null_ipv4_udp(src, dst, 1, &payload, &mut buf).unwrap();
         assert_eq!(
             n,
             DLT_NULL_HEADER_SIZE + IPV4_HEADER_SIZE + UDP_HEADER_SIZE + payload.len()
@@ -560,7 +528,7 @@ mod tests {
         );
         // Past the link header is exactly the standalone IPv4 datagram.
         let mut datagram = [0u8; 64];
-        let dn = ipv4_udp(src, dst, 1, &payload, &mut datagram).unwrap().len;
+        let dn = ipv4_udp(src, dst, 1, &payload, &mut datagram).unwrap();
         assert_eq!(&frame[DLT_NULL_HEADER_SIZE..], &datagram[..dn]);
     }
 
@@ -572,9 +540,7 @@ mod tests {
         let payload = [0xaa, 0xbb, 0xcc];
         let mut buf = [0xAAu8; 80];
 
-        let n = dlt_null_ipv6_udp(src, dst, 255, &payload, &mut buf)
-            .unwrap()
-            .len;
+        let n = dlt_null_ipv6_udp(src, dst, 255, &payload, &mut buf).unwrap();
         assert_eq!(
             n,
             DLT_NULL_HEADER_SIZE + IPV6_HEADER_SIZE + UDP_HEADER_SIZE + payload.len()
@@ -586,9 +552,7 @@ mod tests {
             libc::AF_INET6.cast_unsigned()
         );
         let mut datagram = [0u8; 80];
-        let dn = ipv6_udp(src, dst, 255, &payload, &mut datagram)
-            .unwrap()
-            .len;
+        let dn = ipv6_udp(src, dst, 255, &payload, &mut datagram).unwrap();
         assert_eq!(&frame[DLT_NULL_HEADER_SIZE..], &datagram[..dn]);
     }
 }
