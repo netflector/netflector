@@ -46,8 +46,9 @@ header_ci() {
 # ci/freebsd-pin.sh -- edit that, not this. Renovate bumps RELEASE when a new
 # ${1%%.*}.x point release ships (custom manager in renovate.json; majors move by
 # hand: the oldest supported major gives static binaries the widest reach).
-# Renovate cannot refresh the hashes, so its bump PR stays red on the
-# checksum gates until \`ci/freebsd-pin.sh\` runs on its branch.
+# The URLs follow RELEASE, the hashes do not: a bump fetches the new release
+# and stays red on the checksum gates until \`ci/freebsd-pin.sh\` runs on its
+# branch.
 # renovate: datasource=endoflife-date depName=freebsd
 EOF
 }
@@ -70,21 +71,24 @@ EOF
 
 # The mirror's naming conventions drift (14.2's images said "CLOUDINIT.ufs",
 # 14.4's say "CLOUDINIT-ufs"; base paths mix amd64 and arm64/aarch64), so
-# every URL is pinned alongside its hash: a wrong name or path fails the
-# checksum lookup right here, not in a lane.
+# every URL is verified alongside its hash: a wrong name or path fails the
+# checksum lookup right here. The pin file gets the URLs with the release as a
+# variable, so a bump of RELEASE alone fetches the new release.
 pin_one() { # $1 = release, $2 = variant ("" or "opnsense")
     local release=$1 variant=${2:-}
     local out="freebsd${release%%.*}${variant:+-$variant}.env"
     local mirror; mirror=$(mirror_for "$release" "$variant")
-    local image_url_amd64="$mirror/VM-IMAGES/${release}-RELEASE/amd64/Latest/FreeBSD-${release}-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz"
-    local image_url_arm64="$mirror/VM-IMAGES/${release}-RELEASE/aarch64/Latest/FreeBSD-${release}-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-ufs.qcow2.xz"
-    local base_url_amd64="$mirror/amd64/${release}-RELEASE/base.txz"
-    local base_url_arm64="$mirror/arm64/aarch64/${release}-RELEASE/base.txz"
+    # As written into the pin file: the shell that sources it expands \${RELEASE}.
+    local image_url_amd64="$mirror/VM-IMAGES/\${RELEASE}-RELEASE/amd64/Latest/FreeBSD-\${RELEASE}-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz"
+    local image_url_arm64="$mirror/VM-IMAGES/\${RELEASE}-RELEASE/aarch64/Latest/FreeBSD-\${RELEASE}-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-ufs.qcow2.xz"
+    local base_url_amd64="$mirror/amd64/\${RELEASE}-RELEASE/base.txz"
+    local base_url_arm64="$mirror/arm64/aarch64/\${RELEASE}-RELEASE/base.txz"
+    at() { printf '%s' "${1//'${RELEASE}'/$release}"; } # a pin-file URL at this release
     local image_sha512_amd64 image_sha512_arm64 base_sha256_amd64 base_sha256_arm64
-    image_sha512_amd64=$(image_sha "$image_url_amd64")
-    image_sha512_arm64=$(image_sha "$image_url_arm64")
-    base_sha256_amd64=$(base_sha "$base_url_amd64")
-    base_sha256_arm64=$(base_sha "$base_url_arm64")
+    image_sha512_amd64=$(image_sha "$(at "$image_url_amd64")")
+    image_sha512_arm64=$(image_sha "$(at "$image_url_arm64")")
+    base_sha256_amd64=$(base_sha "$(at "$base_url_amd64")")
+    base_sha256_arm64=$(base_sha "$(at "$base_url_arm64")")
     for v in image_sha512_amd64 image_sha512_arm64 base_sha256_amd64 base_sha256_arm64; do
         [ -n "${!v}" ] || { echo "error: no checksum for $v at $release" >&2; exit 1; }
     done
