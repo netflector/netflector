@@ -389,6 +389,11 @@ class TestCase:
     # Send from a fixed port and require the reflected packet to come from that port and from
     # the sender's own segment: the UDP relay keeps the source as sent.
     expect_source_preserved: bool = False
+    # The receiver binds to its own address, so only a unicast copy sent to it arrives: the
+    # config names the probe as a peer of its segment.
+    expect_unicast: bool = False
+    # The port to send from; an mDNS response must come from 5353 to count as one.
+    send_source_port: int | None = None
 
     @property
     def send_address(self) -> str:
@@ -522,6 +527,7 @@ MDNS_CASES = [
     ),
     TestCase(
         name="reflects_mdns_response",
+        send_source_port=MDNS_PORT,
         send_port=MDNS_PORT,
         receive_port=MDNS_PORT,
         expect_mac=None,
@@ -545,6 +551,7 @@ MDNS_CASES = [
     ),
     TestCase(
         name="reflects_mdns_response_ipv6",
+        send_source_port=MDNS_PORT,
         send_port=MDNS_PORT,
         receive_port=MDNS_PORT,
         expect_mac=None,
@@ -558,6 +565,7 @@ MDNS_CASES = [
     # A routable address beside the link-local one rescues the response from suppression.
     TestCase(
         name="reflects_mdns_response_with_mixed_addresses",
+        send_source_port=MDNS_PORT,
         send_port=MDNS_PORT,
         receive_port=MDNS_PORT,
         expect_mac=None,
@@ -568,8 +576,20 @@ MDNS_CASES = [
         direction="reverse",
     ),
     # Every address is link-local, so the response is suppressed rather than relayed.
+    # A response from any port but 5353 is not one (RFC 6762 §6), so it stays where it was sent.
+    TestCase(
+        name="ignores_mdns_response_from_another_port",
+        send_port=MDNS_PORT,
+        receive_port=MDNS_PORT,
+        expect_mac=None,
+        timeout_seconds=1.5,
+        send_payload_hex=MDNS_RESPONSE_HEX,
+        group=MDNS_GROUP_V4,
+        direction="reverse",
+    ),
     TestCase(
         name="ignores_mdns_link_local_only_response",
+        send_source_port=MDNS_PORT,
         send_port=MDNS_PORT,
         receive_port=MDNS_PORT,
         expect_mac=None,
@@ -594,6 +614,7 @@ MDNS_CASES = [
     ),
     TestCase(
         name="bidirectional_reflects_mdns_response_from_source",
+        send_source_port=MDNS_PORT,
         send_port=MDNS_PORT,
         receive_port=MDNS_PORT,
         expect_mac=None,
@@ -618,6 +639,7 @@ MDNS_CASES = [
     # A response sent source->target hits the source's query-only handler and is dropped.
     TestCase(
         name="ignores_mdns_response_in_query_direction",
+        send_source_port=MDNS_PORT,
         send_port=MDNS_PORT,
         receive_port=MDNS_PORT,
         expect_mac=None,
@@ -1101,6 +1123,79 @@ RELAY_CASES = [
 ]
 
 
+# The probe on a segment named as that segment's peer, on the target only, the source only, or
+# both (config-peers-*.toml). On a side with peers the re-emit that would go to the group or
+# broadcast arrives as a unicast copy, which only a socket bound to the probe's own address can
+# prove; on a side without, it still goes to the group or broadcast. Every protocol, both legs,
+# every config: the forward leg sends on the target, the reverse one (a response, an
+# announcement, or a bidirectional entry's second leg) on the source.
+PEERS_CONFIGS = {
+    "target": ("config-peers-target.toml", {"target"}),
+    "source": ("config-peers-source.toml", {"source"}),
+    "both": ("config-peers-both.toml", {"source", "target"}),
+}
+
+# (protocol, forward leg, reverse leg): a leg is (message name, its TestCase fields).
+PEERS_LEGS = [
+    ("wol",
+     ("wake", dict(send_port=ANY_MAC_PORT, receive_port=ANY_MAC_PORT, expect_mac=WRONG_MAC, send_mac=WRONG_MAC)),
+     ("wake", dict(send_port=ANY_MAC_PORT, receive_port=ANY_MAC_PORT, expect_mac=WRONG_MAC, send_mac=WRONG_MAC))),
+    ("mdns",
+     ("query", dict(send_port=MDNS_PORT, receive_port=MDNS_PORT, expect_mac=None, group=MDNS_GROUP_V4,
+                    send_payload_hex=MDNS_QUERY_HEX, expect_payload_hex=MDNS_QUERY_HEX)),
+     ("response", dict(send_port=MDNS_PORT, receive_port=MDNS_PORT, expect_mac=None, group=MDNS_GROUP_V4,
+                       send_payload_hex=MDNS_RESPONSE_HEX, expect_payload_hex=MDNS_RESPONSE_HEX,
+                       send_source_port=MDNS_PORT))),
+    ("ssdp",
+     ("msearch", dict(send_port=SSDP_PORT, receive_port=SSDP_PORT, expect_mac=None, group=SSDP_GROUP_V4,
+                      send_payload_hex=SSDP_MSEARCH_HEX, expect_payload_hex=SSDP_MSEARCH_HEX)),
+     ("notify", dict(send_port=SSDP_PORT, receive_port=SSDP_PORT, expect_mac=None, group=SSDP_GROUP_V4,
+                     send_payload_hex=SSDP_NOTIFY_HEX, expect_payload_hex=SSDP_NOTIFY_HEX))),
+    ("wsd",
+     ("probe", dict(send_port=WSD_PORT, receive_port=WSD_PORT, expect_mac=None, group=WSD_GROUP_V4,
+                    send_payload_hex=WSD_PROBE_HEX, expect_payload_hex=WSD_PROBE_HEX)),
+     ("hello", dict(send_port=WSD_PORT, receive_port=WSD_PORT, expect_mac=None, group=WSD_GROUP_V4,
+                    send_payload_hex=WSD_HELLO_HEX, expect_payload_hex=WSD_HELLO_HEX))),
+    # The relay's unicast copies keep the sender's source; the receiver does not check it, since
+    # the copy travels in a broadcast frame and the docker host masquerades it like a broadcast
+    # (see the relay broadcast cases). The native fabrics deliver it as sent.
+    ("relay",
+     ("datagram", dict(send_port=RELAY_PORT, receive_port=RELAY_PORT, expect_mac=None, group=RELAY_GROUP_V4,
+                       send_payload_hex=SOOD_QUERY_HEX, expect_payload_hex=SOOD_QUERY_HEX)),
+     ("datagram", dict(send_port=RELAY_PORT, receive_port=RELAY_PORT, expect_mac=None, group=RELAY_GROUP_V4,
+                       send_payload_hex=SOOD_QUERY_HEX, expect_payload_hex=SOOD_QUERY_HEX))),
+]
+
+
+def _peers_cases() -> list[TestCase]:
+    cases = []
+    for label, (config, sides) in PEERS_CONFIGS.items():
+        for protocol, forward, reverse in PEERS_LEGS:
+            # An mDNS entry may not list source peers (its answers go there), so the configs with
+            # source peers leave mDNS out.
+            if protocol == "mdns" and "source" in sides:
+                continue
+            for direction, (message, fields), side in (("forward", forward, "target"), ("reverse", reverse, "source")):
+                unicast = side in sides
+                reach = "peers" if unicast else ("broadcast" if protocol == "wol" else "group")
+                cases.append(TestCase(
+                    name=f"{protocol}_{message}_to_{side}_{reach}_with_{label}_peers",
+                    timeout_seconds=5.0, config=config, direction=direction, expect_unicast=unicast,
+                    **fields,
+                ))
+    return cases
+
+
+PEERS_CASES = [
+    *_peers_cases(),
+    # A copy to a routable IPv6 peer, for a query sent to the link-local group.
+    TestCase(name="mdns_query_to_target_peers_ipv6_with_target_peers", send_port=MDNS_PORT,
+        receive_port=MDNS_PORT, expect_mac=None, timeout_seconds=5.0, send_payload_hex=MDNS_QUERY_HEX,
+        expect_payload_hex=MDNS_QUERY_HEX, group=MDNS_GROUP_V6, family=6,
+        config="config-peers-target.toml", expect_unicast=True),
+]
+
+
 @dataclasses.dataclass(frozen=True)
 class RoundTripCase:
     name: str
@@ -1120,6 +1215,9 @@ class RoundTripCase:
     # "forward" searches from the source segment with the responder on the target; "reverse" swaps
     # them, the leg a bidirectional entry adds.
     direction: str = "forward"
+    # The responder binds to its own address, so only a unicast copy of the search arrives: the
+    # config names it as a peer of its segment.
+    responder_unicast: bool = False
 
 
 ROUNDTRIP_CASES = [
@@ -1147,6 +1245,46 @@ ROUNDTRIP_CASES = [
     RoundTripCase(name="wsd_resolve_roundtrip", family=4, group=WSD_GROUP_V4, port=WSD_PORT,
         probe_hex=WSD_RESOLVE_HEX, reply_hex=WSD_RESOLVEMATCHES_HEX, config="config-wsd.toml",
         evict_log="evicted WSD session"),
+    # Searches with peers: on a target with peers the copy reaches the responder at its own
+    # address and its reply finds the session; on one without, the search still goes to the
+    # group. The IPv6 case sends to the link-local group while the peer is a routable address,
+    # so the session must listen on netflector's routable address, not its link-local one.
+    *(
+        RoundTripCase(name=f"ssdp_msearch_roundtrip_to_target_{'peers' if 'target' in sides else 'group'}_with_{label}_peers",
+            family=4, group=SSDP_GROUP_V4, config=config, responder_unicast="target" in sides)
+        for label, (config, sides) in PEERS_CONFIGS.items()
+    ),
+    *(
+        RoundTripCase(name=f"wsd_probe_roundtrip_to_target_{'peers' if 'target' in sides else 'group'}_with_{label}_peers",
+            family=4, group=WSD_GROUP_V4, port=WSD_PORT, probe_hex=WSD_PROBE_HEX,
+            reply_hex=WSD_PROBEMATCHES_HEX, config=config, evict_log="evicted WSD session",
+            responder_unicast="target" in sides)
+        for label, (config, sides) in PEERS_CONFIGS.items()
+    ),
+    RoundTripCase(name="ssdp_msearch_roundtrip_to_target_peers_ipv6_with_target_peers", family=6,
+        group=SSDP_GROUP_V6, config="config-peers-target.toml", responder_unicast=True),
+]
+
+
+@dataclasses.dataclass(frozen=True)
+class AnswerCase:
+    # A query relayed to a peer as unicast is answered by unicast to netflector, and the answer
+    # must come out on the source segment's group. A sender on the source queries the group; a
+    # responder on the target, bound to its own address, answers whatever reaches it; a receiver
+    # on the source, joined to the group, must see the answer once.
+    name: str
+    group: str
+    port: int
+    query_hex: str
+    answer_hex: str
+    family: int = 4
+    timeout_seconds: float = 5.0
+    config: str = "config-peers-target.toml"
+
+
+ANSWER_CASES = [
+    AnswerCase(name="mdns_answer_from_target_peer_reaches_source_group_with_target_peers",
+        group=MDNS_GROUP_V4, port=MDNS_PORT, query_hex=MDNS_QUERY_HEX, answer_hex=MDNS_RESPONSE_HEX),
 ]
 
 
@@ -1173,6 +1311,7 @@ class SearchRecreateCase:
     direction: str = "forward"
     timeout_seconds: float = 8.0
     decoy: bool = False  # plant a decoy on the freed index so the recreation lands on a different one
+    responder_unicast: bool = False  # as RoundTripCase's; the responder is shared
 
 
 SEARCH_RECREATE_CASES = [
@@ -1350,10 +1489,10 @@ RECREATE_CASES = [
 
 ALL_CASES: list[
     TestCase | RoundTripCase | SearchRecreateCase | DialCase | DialAddressChangeCase
-    | AddressChangeCase | RecreateCase | DialRecreateCase
+    | AddressChangeCase | RecreateCase | DialRecreateCase | AnswerCase
 ] = [
-    *TEST_CASES, *MDNS_CASES, *SSDP_CASES, *WSD_CASES, *RELAY_CASES, *ROUNDTRIP_CASES,
-    *SEARCH_RECREATE_CASES,
+    *TEST_CASES, *MDNS_CASES, *SSDP_CASES, *WSD_CASES, *RELAY_CASES, *PEERS_CASES, *ROUNDTRIP_CASES,
+    *ANSWER_CASES, *SEARCH_RECREATE_CASES,
     *DIAL_CASES, *DIAL_ADDRESS_CHANGE_CASES, *ADDRESS_CHANGE_CASES, *RECREATE_CASES,
     *DIAL_RECREATE_CASES]
 
@@ -1444,6 +1583,10 @@ SEGMENTS = ("source", "target")
 # docker rejects a static address on an IPAM-auto subnet).
 SEGMENT_V4_SUBNET = {"source": "192.0.2", "target": "198.51.100"}
 SEGMENT_V6_PREFIX = {"source": "fd00:e2e0:1", "target": "fd00:e2e0:2"}
+# The host number of a segment's probe: what the native fabrics assign, and what docker pins when
+# a case names the probe as a peer in its config (config-peers-*.toml). Past what docker's IPAM
+# hands out on its own.
+HELPER_HOST = 20
 
 
 class Backend:
@@ -1497,8 +1640,15 @@ class Backend:
     def start_netflector(self, config_path: Path) -> None:
         raise NotImplementedError
 
+    def helper_address(self, segment: str, family: int) -> str:
+        # The probe's own address on `segment`, from the plan both fabrics follow.
+        if family == 6:
+            return f"{SEGMENT_V6_PREFIX[segment]}::{HELPER_HOST}"
+        return f"{SEGMENT_V4_SUBNET[segment]}.{HELPER_HOST}"
+
     def start_probe(
-        self, role: str, segment: str, ifname: str, probe_args: list[str], *, detach: bool = True
+        self, role: str, segment: str, ifname: str, probe_args: list[str], *,
+        detach: bool = True, pin_address: bool = False,
     ) -> None:
         # Run probe.py with `probe_args` single-homed on `segment`. detach=False blocks until
         # exit and raises on a non-zero code.
@@ -1718,20 +1868,24 @@ class DockerBackend(Backend):
             print("no bridge port reachable for hairpin; the daemon's default stands", flush=True)
 
     def start_probe(
-        self, role: str, segment: str, ifname: str, probe_args: list[str], *, detach: bool = True
+        self, role: str, segment: str, ifname: str, probe_args: list[str], *,
+        detach: bool = True, pin_address: bool = False,
     ) -> None:
         container = f"{self.prefix}-{role}"
         self.roles[role] = container
         command = ["run"]
         if detach:
             command.append("-d")
+        # Pin the helper's interface name so the probe can scope multicast egress / group
+        # joins to it deterministically (see start_netflector for the rationale).
+        network = f"name={self.networks[segment]},driver-opt=com.docker.network.endpoint.ifname={ifname}"
+        if pin_address:
+            network += f",ip={self.helper_address(segment, 4)},ip6={self.helper_address(segment, 6)}"
         command += [
             "--name",
             container,
-            # Pin the helper's interface name so the probe can scope multicast egress / group
-            # joins to it deterministically (see start_netflector for the rationale).
             "--network",
-            f"name={self.networks[segment]},driver-opt=com.docker.network.endpoint.ifname={ifname}",
+            network,
             "--mount",
             f"type=bind,source={E2E_DIR},target=/e2e,readonly",
             self.args.helper_image,
@@ -1868,7 +2022,6 @@ class DockerBackend(Backend):
 # and a segment's helper host 2, replacing Docker's IPAM discovery with a fixed plan (the kernel adds
 # fe80:: itself).
 NATIVE_NETFLECTOR_HOST = 1
-NATIVE_HELPER_HOST = 2
 
 
 class NativeBackend(Backend):
@@ -1954,9 +2107,11 @@ class NativeBackend(Backend):
         self._spawn("netflector", self._netflector_command(config_path))
 
     def start_probe(
-        self, role: str, segment: str, ifname: str, probe_args: list[str], *, detach: bool = True
+        self, role: str, segment: str, ifname: str, probe_args: list[str], *,
+        detach: bool = True, pin_address: bool = False,
     ) -> None:
         del ifname  # the far end is always probe0; the caller got that from helper_ifname()
+        del pin_address  # the fabric gives every probe the planned address
         command = [*self._probe_exec(segment), sys.executable, str(E2E_DIR / "probe.py"), *probe_args]
         self._spawn(role, command)
         if not detach:
@@ -2020,7 +2175,7 @@ class NativeBackend(Backend):
 
     def probe_ip(self, role: str, segment: str) -> str:
         del role  # one helper per segment; the plan gives them all the same host number
-        return f"{SEGMENT_V4_SUBNET[segment]}.{NATIVE_HELPER_HOST}"
+        return f"{SEGMENT_V4_SUBNET[segment]}.{HELPER_HOST}"
 
     def print_diagnostics(self) -> None:
         for logfile in sorted(self.logdir.iterdir()):
@@ -2085,8 +2240,8 @@ class NativeLinuxBackend(NativeBackend):
         dut, far = self.ns["dut"], self.ns[segment]
         self._ip(["-n", dut, "addr", "add", f"{v4}.{NATIVE_NETFLECTOR_HOST}/24", "dev", dut_ifname])
         self._ip(["-n", dut, "addr", "add", f"{v6}::{NATIVE_NETFLECTOR_HOST}/64", "dev", dut_ifname])
-        self._ip(["-n", far, "addr", "add", f"{v4}.{NATIVE_HELPER_HOST}/24", "dev", RECEIVER_IFNAME])
-        self._ip(["-n", far, "addr", "add", f"{v6}::{NATIVE_HELPER_HOST}/64", "dev", RECEIVER_IFNAME])
+        self._ip(["-n", far, "addr", "add", f"{v4}.{HELPER_HOST}/24", "dev", RECEIVER_IFNAME])
+        self._ip(["-n", far, "addr", "add", f"{v6}::{HELPER_HOST}/64", "dev", RECEIVER_IFNAME])
         self._ip(["-n", dut, "link", "set", dut_ifname, "up"])
         self._ip(["-n", far, "link", "set", RECEIVER_IFNAME, "up"])
         # The probe's 255.255.255.255 sends are routed, not interface-pinned; single-homed
@@ -2231,8 +2386,8 @@ class NativeFreeBSDBackend(NativeBackend):
         run_command([*jexec_dut, "ifconfig", dut_ifname, "inet", f"{v4}.{NATIVE_NETFLECTOR_HOST}/24"])
         run_command([*jexec_dut, "ifconfig", dut_ifname, "inet6", f"{v6}::{NATIVE_NETFLECTOR_HOST}/64"])
         run_command([*jexec_dut, "ifconfig", dut_ifname, "up"])
-        run_command([*jexec_far, "ifconfig", RECEIVER_IFNAME, "inet", f"{v4}.{NATIVE_HELPER_HOST}/24"])
-        run_command([*jexec_far, "ifconfig", RECEIVER_IFNAME, "inet6", f"{v6}::{NATIVE_HELPER_HOST}/64"])
+        run_command([*jexec_far, "ifconfig", RECEIVER_IFNAME, "inet", f"{v4}.{HELPER_HOST}/24"])
+        run_command([*jexec_far, "ifconfig", RECEIVER_IFNAME, "inet6", f"{v6}::{HELPER_HOST}/64"])
         run_command([*jexec_far, "ifconfig", RECEIVER_IFNAME, "up"])
         # The probe's 255.255.255.255 sends are routed, not interface-pinned; single-homed
         # plus this default route pins them to the segment.
@@ -2459,7 +2614,10 @@ class CaseRunner:
             probe_args.append("--expect-none")
 
         probe_args.extend(["--family", str(case.family)])
-        if case.group is not None:
+        if case.expect_unicast:
+            address = self.backend.helper_address(self.receiver_segment, case.family)
+            probe_args.extend(["--bind-address", address])
+        elif case.group is not None:
             probe_args.extend(["--join-group", case.group, "--interface", ifname])
         if case.expect_routable_source:
             probe_args.append("--expect-source-not-link-local")
@@ -2468,7 +2626,9 @@ class CaseRunner:
             subnet = f"{SEGMENT_V4_SUBNET[self.sender_segment]}.0/24"
             probe_args.extend(["--expect-source-net", subnet, "--expect-source-port", str(RELAY_SOURCE_PORT)])
 
-        self.backend.start_probe("receiver", self.receiver_segment, ifname, probe_args)
+        self.backend.start_probe(
+            "receiver", self.receiver_segment, ifname, probe_args, pin_address=case.expect_unicast
+        )
         self.wait_for_receiver()
 
     def wait_for_receiver(self) -> None:
@@ -2484,7 +2644,8 @@ class CaseRunner:
             raise RuntimeError(f"case {case.name} has no send payload")
 
         ifname = self.backend.helper_ifname(self.sender_ifname)
-        source_args = ["--source-port", str(RELAY_SOURCE_PORT)] if case.expect_source_preserved else []
+        source_port = RELAY_SOURCE_PORT if case.expect_source_preserved else case.send_source_port
+        source_args = ["--source-port", str(source_port)] if source_port is not None else []
         self.backend.start_probe(
             "sender",
             self.sender_segment,
@@ -2587,12 +2748,15 @@ class RoundTripRunner(CaseRunner):
 
     def start_responder(self) -> None:
         ifname = self.backend.helper_ifname(RECEIVER_IFNAME)
+        if self.rt.responder_unicast:
+            listen = ["--bind-address", self.backend.helper_address(self.responder_seg, self.rt.family)]
+        else:
+            listen = ["--join-group", self.rt.group, "--interface", ifname]
         self.backend.start_probe("responder", self.responder_seg, ifname, [
             "respond",
             "--port", str(self.rt.port), "--timeout", str(self.rt.timeout_seconds),
-            "--family", str(self.rt.family), "--join-group", self.rt.group,
-            "--interface", ifname, "--reply-hex", self.rt.reply_hex,
-        ])
+            "--family", str(self.rt.family), *listen, "--reply-hex", self.rt.reply_hex,
+        ], pin_address=self.rt.responder_unicast)
         self.wait_for_log("responder", "responder ready", "responder")
 
     def run_searcher(self) -> None:
@@ -2631,6 +2795,43 @@ class RoundTripRunner(CaseRunner):
         self.wait_for_log("netflector", self.rt.evict_log, "session eviction")
         print(f"{self.rt.name}: session evicted after expiry", flush=True)
         print(f"PASS {self.rt.name}", flush=True)
+        if self.args.show_netflector_logs:
+            time.sleep(0.5)
+            self.print_netflector_logs()
+
+
+class AnswerRunner(CaseRunner):
+    # See AnswerCase. The receiver sits on the sender's segment, unlike a TestCase's, and skips
+    # the sender's own query, which the group hands it too.
+    def __init__(self, args: argparse.Namespace, case: AnswerCase) -> None:
+        shim = TestCase(name=case.name, send_port=case.port, receive_port=case.port,
+            expect_mac=None, timeout_seconds=case.timeout_seconds, family=case.family,
+            group=case.group, send_payload_hex=case.query_hex, config=case.config)
+        super().__init__(args, shim)
+        self.answer = case
+
+    def run(self) -> None:
+        print(f"\n=== {self.answer.name} ===", flush=True)
+        self.backend.setup_segments()
+        self.start_netflector()
+        ifname = self.backend.helper_ifname(RECEIVER_IFNAME)
+        # Pinned: with peers on the source too, the answer comes to it as a unicast copy.
+        self.backend.start_probe("receiver", self.sender_segment, ifname, [
+            "receive", "--port", str(self.answer.port), "--timeout", str(self.answer.timeout_seconds),
+            "--family", str(self.answer.family), "--join-group", self.answer.group, "--interface", ifname,
+            "--expect-payload-hex", self.answer.answer_hex, "--ignore-payload-hex", self.answer.query_hex,
+        ], pin_address=True)
+        self.wait_for_receiver()
+        self.backend.start_probe("responder", self.receiver_segment, ifname, [
+            "respond", "--port", str(self.answer.port), "--timeout", str(self.answer.timeout_seconds),
+            "--family", str(self.answer.family),
+            "--bind-address", self.backend.helper_address(self.receiver_segment, self.answer.family),
+            "--reply-hex", self.answer.answer_hex,
+        ], pin_address=True)
+        self.wait_for_log("responder", "responder ready", "responder")
+        self.run_sender()
+        self.wait_for_result()
+        print(f"PASS {self.answer.name}", flush=True)
         if self.args.show_netflector_logs:
             time.sleep(0.5)
             self.print_netflector_logs()
@@ -3037,6 +3238,7 @@ class AddressChangeRunner(CaseRunner):
             timeout_seconds=timeout,
             send_mac=(CONFIGURED_MAC if is_wol else None),
             send_payload_hex=payload,
+            send_source_port=(MDNS_PORT if reverse else None),
             family=phase.family,
             direction=direction,
             group=group,
@@ -3240,7 +3442,9 @@ class RecreateRunner(AddressChangeRunner):
 
 def make_runner(args: argparse.Namespace,
         case: TestCase | RoundTripCase | SearchRecreateCase | DialCase | DialAddressChangeCase
-        | AddressChangeCase | RecreateCase | DialRecreateCase) -> CaseRunner:
+        | AddressChangeCase | RecreateCase | DialRecreateCase | AnswerCase) -> CaseRunner:
+    if isinstance(case, AnswerCase):
+        return AnswerRunner(args, case)
     if isinstance(case, SearchRecreateCase):
         return SearchRecreateRunner(args, case)
     if isinstance(case, RoundTripCase):
@@ -3265,7 +3469,7 @@ def build_netflector_image(image: str, target: str | None = None) -> None:
 
 def select_cases(case_names: list[str]) -> list[
         TestCase | RoundTripCase | SearchRecreateCase | DialCase | DialAddressChangeCase
-        | AddressChangeCase | RecreateCase | DialRecreateCase]:
+        | AddressChangeCase | RecreateCase | DialRecreateCase | AnswerCase]:
     if not case_names:
         return ALL_CASES
 

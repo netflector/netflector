@@ -163,7 +163,7 @@ def receive(args: argparse.Namespace) -> int:
     deadline = time.monotonic() + args.timeout
 
     family = socket.AF_INET6 if args.family == 6 else socket.AF_INET
-    bind_address = "::" if family == socket.AF_INET6 else "0.0.0.0"
+    bind_address = args.bind_address or ("::" if family == socket.AF_INET6 else "0.0.0.0")
 
     try:
         return _receive(args, expected, deadline, family, bind_address)
@@ -182,7 +182,7 @@ def _receive(args, expected, deadline, family, bind_address) -> int:
             # Multicast is only delivered to sockets that joined the group on the receiving
             # interface; broadcast/all-nodes (the WoL IPv4 path) needs no join.
             join_group(sock, family, args.join_group, args.interface)
-        print(f"receiver ready: UDP socket bound on port {args.port}", flush=True)
+        print(f"receiver ready: UDP socket bound on {bind_address} port {args.port}", flush=True)
 
         # An expect-none receiver outlives its own deadline: the harness stops it once the sender
         # has finished, so the window provably spans the send instead of racing it.
@@ -205,6 +205,10 @@ def _receive(args, expected, deadline, family, bind_address) -> int:
             if args.expect_none:
                 print("expected no packets, but one was received", file=sys.stderr, flush=True)
                 return 1
+
+            if payload in args.ignore_payload_hex:
+                print("ignored", flush=True)
+                continue
 
             if payload == expected:
                 if not source_as_expected(args, peer):
@@ -275,7 +279,7 @@ def respond(args: argparse.Namespace) -> int:
     # straight back to its sender. The sender is netflector's reserved port on the target segment,
     # which proxies the reply back to the searcher on the source segment.
     family = socket.AF_INET6 if args.family == 6 else socket.AF_INET
-    bind_address = "::" if family == socket.AF_INET6 else "0.0.0.0"
+    bind_address = args.bind_address or ("::" if family == socket.AF_INET6 else "0.0.0.0")
 
     with socket.socket(family, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -283,7 +287,7 @@ def respond(args: argparse.Namespace) -> int:
         if args.join_group is not None:
             join_group(sock, family, args.join_group, args.interface)
         # Readiness marker so run.py can sequence the searcher after the responder is listening.
-        print(f"responder ready: UDP socket bound on port {args.port}", flush=True)
+        print(f"responder ready: UDP socket bound on {bind_address} port {args.port}", flush=True)
 
         sock.settimeout(args.timeout)
         try:
@@ -760,6 +764,10 @@ def main() -> int:
     receive_parser.add_argument("--family", default=4, type=int, choices=(4, 6), help="IP version to bind")
     receive_parser.add_argument("--join-group", help="multicast group to join on --interface")
     receive_parser.add_argument("--interface", help="interface to join the multicast group on")
+    receive_parser.add_argument("--bind-address",
+                                help="bind to this address instead of the wildcard: only a datagram sent to it arrives")
+    receive_parser.add_argument("--ignore-payload-hex", type=parse_payload_hex, action="append", default=[],
+                                help="a UDP payload to skip rather than fail on; may be passed more than once")
 
     expectation = receive_parser.add_mutually_exclusive_group(required=True)
     expectation.add_argument("--expect-mac", help="MAC address whose magic packet must be received")
@@ -777,6 +785,8 @@ def main() -> int:
     respond_parser.add_argument("--family", default=4, type=int, choices=(4, 6), help="IP version to bind")
     respond_parser.add_argument("--join-group", help="multicast group to join on --interface")
     respond_parser.add_argument("--interface", help="interface to join the multicast group on")
+    respond_parser.add_argument("--bind-address",
+                                help="bind to this address instead of the wildcard: only a datagram sent to it arrives")
     respond_parser.add_argument("--reply-hex", required=True, type=parse_payload_hex, help="UDP payload to unicast back")
     respond_parser.set_defaults(func=respond)
 
