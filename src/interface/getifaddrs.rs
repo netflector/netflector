@@ -4,9 +4,10 @@
 
 use std::ffi::CStr;
 use std::io;
+use std::mem::offset_of;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::ptr;
+use std::{ptr, slice};
 
 use libc::c_int;
 
@@ -42,12 +43,13 @@ pub(super) fn resolve(if_name: &str) -> io::Result<(InterfaceAddresses, Option<u
         if ifa.ifa_addr.is_null() {
             continue;
         }
-        // SAFETY: `ifa_name` is a NUL-terminated name; `ifa_addr` is a non-null `sockaddr`
-        // whose `sa_family` tags the concrete type the helpers reinterpret it as.
-        let (name, family) = unsafe {
+        // SAFETY: `ifa_name` is a NUL-terminated name; `ifa_addr` is a non-null `sockaddr` the list
+        // owns until `freeifaddrs`, and its `sa_family` tags the concrete type.
+        let (name, family, sa) = unsafe {
             (
                 CStr::from_ptr(ifa.ifa_name),
                 c_int::from((*ifa.ifa_addr).sa_family),
+                sockaddr_bytes(ifa.ifa_addr),
             )
         };
         if name.to_bytes() != if_name.as_bytes() {
@@ -55,15 +57,17 @@ pub(super) fn resolve(if_name: &str) -> io::Result<(InterfaceAddresses, Option<u
         }
         match family {
             libc::AF_INET => {
-                let v4 = read_v4(ifa.ifa_addr);
+                let v4 = read_v4(sa);
                 // First address wins, matching the rtnetlink backend. Taking the last would let a
                 // secondary alias and the kernel's enumeration order flip the chosen v4 on unrelated
                 // alias churn, producing a spurious v4 delta that needlessly evicts DIAL proxies.
                 if addrs.v4.is_none() {
                     // An `AF_INET` entry's netmask, when present, is a `sockaddr_in` like the address.
                     let prefix = (!ifa.ifa_netmask.is_null())
-                        .then(|| prefix_len(read_v4(ifa.ifa_netmask)))
-                        .flatten();
+                        // SAFETY: a non-null `ifa_netmask` is a sockaddr the list owns, like `ifa_addr`.
+                        .then(|| unsafe { sockaddr_bytes(ifa.ifa_netmask) })
+                        .map(read_v4)
+                        .and_then(prefix_len);
                     match prefix {
                         Some(prefix) => log::trace!("{if_name}: v4 {v4}/{prefix}"),
                         None => log::trace!("{if_name}: v4 {v4} (no netmask)"),
@@ -75,7 +79,7 @@ pub(super) fn resolve(if_name: &str) -> io::Result<(InterfaceAddresses, Option<u
                 }
             }
             libc::AF_LINK => {
-                let mac = read_mac(ifa.ifa_addr);
+                let mac = read_mac(sa);
                 match mac {
                     Some(mac) => log::trace!("{if_name}: mac {mac}"),
                     None => log::trace!("{if_name}: link layer carries no mac"),
@@ -116,13 +120,25 @@ pub(super) fn resolve(if_name: &str) -> io::Result<(InterfaceAddresses, Option<u
     Ok((addrs, mtu))
 }
 
-/// The IPv4 address of an `AF_INET` `sockaddr`.
-fn read_v4(addr: *const libc::sockaddr) -> Ipv4Addr {
-    // SAFETY: the caller matched `AF_INET`, so `addr` points at a `sockaddr_in`;
-    // `read_unaligned` copies it without assuming alignment.
-    let sin = unsafe { ptr::read_unaligned(addr.cast::<libc::sockaddr_in>()) };
-    // `s_addr` is in network byte order, i.e. its in-memory bytes *are* the octets.
-    Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes())
+/// The bytes of a BSD sockaddr: `sa_len` of them.
+///
+/// # Safety
+/// `addr` must point at a live sockaddr whose `sa_len` is within its allocation.
+unsafe fn sockaddr_bytes<'a>(addr: *const libc::sockaddr) -> &'a [u8] {
+    // SAFETY: the caller's contract.
+    unsafe { slice::from_raw_parts(addr.cast::<u8>(), usize::from((*addr).sa_len)) }
+}
+
+/// The IPv4 address of an `AF_INET` sockaddr's bytes. A routing-table sockaddr (a netmask) can stop
+/// after its last non-zero byte, so a missing tail reads as zero.
+fn read_v4(sa: &[u8]) -> Ipv4Addr {
+    let tail = sa
+        .get(offset_of!(libc::sockaddr_in, sin_addr)..)
+        .unwrap_or(&[]);
+    let mut octets = [0u8; 4];
+    let n = tail.len().min(4);
+    octets[..n].copy_from_slice(&tail[..n]);
+    Ipv4Addr::from(octets)
 }
 
 /// The prefix length a contiguous IPv4 netmask encodes, or `None` for a non-contiguous one.
@@ -132,34 +148,15 @@ fn prefix_len(mask: Ipv4Addr) -> Option<u8> {
     (bits.count_ones() == ones).then(|| u8::try_from(ones).expect("at most 32"))
 }
 
-/// The MAC of an `AF_LINK` `sockaddr_dl`, or `None` if the link has none (e.g. loopback).
-/// The address sits in the variable-length tail, after the name.
-fn read_mac(addr: *const libc::sockaddr) -> Option<MacAddr> {
-    use std::mem::offset_of;
-
-    let base = addr.cast::<u8>();
-    // Read only the fixed `sockaddr_dl` header fields, not the whole `libc` struct: its
-    // `sdl_data` is larger than the kernel's variable tail (46 bytes on FreeBSD), so
-    // copying it whole would over-read a short sockaddr. `sdl_len` is the sockaddr's own
-    // byte count that getifaddrs sizes the allocation to, so it bounds every read.
-    // SAFETY: an `AF_LINK` sockaddr_dl always carries its 8-byte header, so these three
-    // bytes (offsets 0/5/6) are within the allocation.
-    let (sdl_len, nlen, alen) = unsafe {
-        (
-            usize::from(base.add(offset_of!(libc::sockaddr_dl, sdl_len)).read()),
-            usize::from(base.add(offset_of!(libc::sockaddr_dl, sdl_nlen)).read()),
-            base.add(offset_of!(libc::sockaddr_dl, sdl_alen)).read(),
-        )
-    };
-    // The address sits after the `nlen`-byte name. Bail on no link address (e.g. loopback)
-    // or a length that would run past the sockaddr. This is the bound check.
-    let offset = offset_of!(libc::sockaddr_dl, sdl_data) + nlen;
-    if alen != 6 || offset + 6 > sdl_len {
+/// The MAC of an `AF_LINK` `sockaddr_dl`'s bytes, or `None` if the link has none (loopback) or
+/// the address would run past the sockaddr. It sits after the `sdl_nlen`-byte name.
+fn read_mac(sa: &[u8]) -> Option<MacAddr> {
+    let nlen = usize::from(*sa.get(offset_of!(libc::sockaddr_dl, sdl_nlen))?);
+    if *sa.get(offset_of!(libc::sockaddr_dl, sdl_alen))? != 6 {
         return None;
     }
-    let mut mac = [0u8; 6];
-    // SAFETY: `offset + 6 <= sdl_len <= the allocation`, so the 6 bytes are within it.
-    unsafe { ptr::copy_nonoverlapping(base.add(offset), mac.as_mut_ptr(), 6) };
+    let offset = offset_of!(libc::sockaddr_dl, sdl_data) + nlen;
+    let mac: [u8; 6] = sa.get(offset..offset + 6)?.try_into().ok()?;
     Some(MacAddr::from(mac))
 }
 
@@ -274,10 +271,20 @@ mod tests {
         let data = offset_of!(libc::sockaddr_dl, sdl_data);
         let len = u8::try_from(data + 3 + 6).unwrap(); // header + "en0" + 6-byte MAC
         let buf = dl_bytes(b"en0", &mac, 6, len);
-        assert_eq!(
-            read_mac(buf.as_ptr().cast::<libc::sockaddr>()),
-            Some(MacAddr::from(mac))
-        );
+        assert_eq!(read_mac(&buf[..usize::from(len)]), Some(MacAddr::from(mac)));
+    }
+
+    #[test]
+    fn read_v4_zero_fills_a_netmask_cut_short_after_its_last_set_byte() {
+        // A routing-table netmask sockaddr for /24: sa_len 7 covers the address bytes up to the
+        // last 0xff; the missing final octet is 0.
+        let mut sa = [0u8; 16];
+        sa[0] = 7;
+        let addr = offset_of!(libc::sockaddr_in, sin_addr);
+        sa[addr..addr + 3].copy_from_slice(&[0xff, 0xff, 0xff]);
+        assert_eq!(read_v4(&sa[..7]), Ipv4Addr::new(255, 255, 255, 0));
+        // One that stops before the address is the all-zero mask.
+        assert_eq!(read_v4(&sa[..addr]), Ipv4Addr::UNSPECIFIED);
     }
 
     #[test]
@@ -295,7 +302,7 @@ mod tests {
         let data = offset_of!(libc::sockaddr_dl, sdl_data);
         let len = u8::try_from(data + 3).unwrap();
         let buf = dl_bytes(b"lo0", &[], 0, len);
-        assert_eq!(read_mac(buf.as_ptr().cast::<libc::sockaddr>()), None);
+        assert_eq!(read_mac(&buf[..usize::from(len)]), None);
     }
 
     #[test]
@@ -305,6 +312,6 @@ mod tests {
         let data = offset_of!(libc::sockaddr_dl, sdl_data);
         let short = u8::try_from(data + 3 + 3).unwrap(); // 3 bytes short of the MAC
         let buf = dl_bytes(b"en0", &mac, 6, short);
-        assert_eq!(read_mac(buf.as_ptr().cast::<libc::sockaddr>()), None);
+        assert_eq!(read_mac(&buf[..usize::from(short)]), None);
     }
 }
