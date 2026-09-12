@@ -224,8 +224,9 @@ fn env_bool(value: &str, var: &str) -> Result<bool, ConfigError> {
 
 #[cfg(test)]
 mod tests {
+    use crate::config::conflict::Protocol;
     use crate::config::error::{ParseValueError, RequiredField};
-    use crate::config::{Config, ConfigError, LogLevel, Protocol};
+    use crate::config::{Config, ConfigError, LogLevel};
 
     fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs
