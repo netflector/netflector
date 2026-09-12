@@ -1,12 +1,13 @@
-
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::*;
-use crate::capture::{Capture, loopback_lock};
+#[cfg(target_os = "linux")]
+use crate::capture::Capture;
 #[cfg(target_os = "linux")]
 use crate::net::LinkType;
 use crate::reflector::NoRewrite;
+use crate::test_support::{ReplaceRewrite, loopback_lock, open_loopback_or_skip};
 
 const TEST_TTL: u8 = 2;
 
@@ -366,22 +367,6 @@ fn make_session_drops_at_the_session_cap() {
     ));
 }
 
-/// A reply transform that replaces the payload wholesale, standing in for a DIAL rewrite that
-/// spliced in the proxy's own listener.
-struct ReplaceRewrite;
-
-impl ReplyRewrite for ReplaceRewrite {
-    fn rewrite<'a>(
-        &'a mut self,
-        _: &[u8],
-        _: CaptureKey,
-        _: &mut PacketDispatcher,
-        _: &mut Reactor,
-    ) -> Option<&'a [u8]> {
-        Some(b"REWRITTEN")
-    }
-}
-
 /// A reply for a `ResponseReflector` with the given transform and suppression check, plus the
 /// dispatcher/reactor it runs against, over a real loopback egress (`None` = skip, no
 /// `CAP_NET_RAW`).
@@ -461,19 +446,6 @@ fn a_rewritten_reply_is_exempt_from_suppression() {
     assert_eq!(outcome, Outcome::Reflected(MessageType::SsdpResponse));
 }
 
-/// Open a loopback capture, or `None` (skip) without `CAP_NET_RAW`. A real capture gives the target
-/// a resolvable address, so `make_session` can succeed.
-fn open_loopback_or_skip() -> Option<Capture> {
-    match Capture::open(crate::interface::LOOPBACK_IFACE) {
-        Ok(cap) => Some(cap),
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            eprintln!("skip: no CAP_NET_RAW to open a loopback capture ({e})");
-            None
-        }
-        Err(e) => panic!("unexpected loopback capture open failure: {e}"),
-    }
-}
-
 // A search off a link without MACs (a tunnel) carries no source MAC; the reply needs none
 // there, so the session opens all the same.
 #[test]
@@ -521,7 +493,7 @@ fn a_search_without_a_source_mac_opens_a_session() {
 #[test]
 #[cfg_attr(miri, ignore = "needs a real capture device")]
 fn a_session_listens_where_its_search_copies_come_from() -> std::io::Result<()> {
-    let Some(tun) = crate::capture::Tun::create() else {
+    let Some(tun) = crate::test_support::Tun::create() else {
         return Ok(());
     };
     assert!(tun.add_address("fe80::1/64") && tun.add_address("fd00:99::1/64"));

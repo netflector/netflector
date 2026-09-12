@@ -1,8 +1,7 @@
-
 use std::thread::sleep;
 
 use super::*;
-use crate::reactor::{Handler, ReadyEvent};
+use crate::test_support::NoopHandler;
 
 /// Drive a non-blocking op to completion on loopback (no reactor in the test).
 fn spin<T>(mut op: impl FnMut() -> io::Result<Option<T>>) -> T {
@@ -244,13 +243,6 @@ fn forward_reports_source_eof_when_the_peer_closes_its_write() {
         }
     };
     assert!(matches!(outcome, Forwarded::SourceEof));
-}
-
-/// A do-nothing handler, only needed so the reactor will hand out registrations for the
-/// state-machine tests below (they drive `Connection` directly, never through dispatch).
-struct NoopHandler;
-impl Handler for NoopHandler {
-    fn on_readable(&mut self, _event: ReadyEvent, _reactor: &mut Reactor) {}
 }
 
 /// A reactor plus a `Connection` whose client/device sockets are watched loopback pairs, with the

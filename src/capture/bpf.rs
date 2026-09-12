@@ -363,8 +363,8 @@ mod tests {
     use std::mem::offset_of;
 
     use super::*;
-    use crate::capture::{loopback_lock, open_or_skip};
     use crate::libcex::BPF_ALIGN;
+    use crate::test_support::{loopback_lock, open_or_skip};
 
     /// Append one synthetic BPF record (header + frame + word-align padding) to
     /// `batch`. Serializes the header field-by-field at its repr(C) offsets rather

@@ -345,21 +345,8 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
-    use crate::capture::{Capture, loopback_lock};
     use crate::dispatch::MessageType;
-
-    /// Open a loopback capture, or `None` (skip) without `CAP_NET_RAW`. A real capture gives the
-    /// egress a source address, so `on_packet` reaches the suppression gate.
-    fn open_loopback_or_skip() -> Option<Capture> {
-        match Capture::open(crate::interface::LOOPBACK_IFACE) {
-            Ok(cap) => Some(cap),
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                eprintln!("skip: no CAP_NET_RAW to open a loopback capture ({e})");
-                None
-            }
-            Err(e) => panic!("unexpected loopback capture open failure: {e}"),
-        }
-    }
+    use crate::test_support::{ReplaceRewrite, loopback_lock, open_loopback_or_skip};
 
     fn reflect_all(_: &[u8]) -> Verdict {
         Verdict::Reflect(MessageType::MdnsResponse)
@@ -538,22 +525,6 @@ mod tests {
             reflector.on_packet(&group_packet(), &mut dispatcher, &mut reactor),
             Outcome::Dropped(MessageType::MdnsResponse)
         );
-    }
-
-    /// A rewrite that replaces the payload wholesale, standing in for a DIAL rewrite that spliced
-    /// in the proxy's own listener.
-    struct ReplaceRewrite;
-
-    impl ReplyRewrite for ReplaceRewrite {
-        fn rewrite<'a>(
-            &'a mut self,
-            _: &[u8],
-            _: CaptureKey,
-            _: &mut PacketDispatcher,
-            _: &mut Reactor,
-        ) -> Option<&'a [u8]> {
-            Some(b"REWRITTEN")
-        }
     }
 
     #[test]

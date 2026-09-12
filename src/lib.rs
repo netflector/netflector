@@ -18,6 +18,8 @@ mod net;
 mod reactor;
 mod reflector;
 mod sys;
+#[cfg(test)]
+mod test_support;
 
 pub use self::error::{Error, Result};
 pub use self::logging::init as init_logging;
