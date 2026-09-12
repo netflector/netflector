@@ -52,15 +52,35 @@ impl<'a> Iterator for RtAttrs<'a> {
     }
 }
 
-/// Read a `repr(C)` POD `T` at `off` in `buf`, or `None` if `buf` is too short (or `off`
-/// overflows). Tolerates any alignment. `T` must be a plain wire struct: no padding-sensitive
-/// invariants, no `Drop`. The netlink headers/bodies all qualify.
-pub(super) fn read_at<T>(buf: &[u8], off: usize) -> Option<T> {
+/// A netlink wire struct [`read_at`] may copy out of a byte buffer.
+///
+/// # Safety
+/// Every bit pattern must be a valid value of the type: all-integer `repr(C)` fields, no `Drop`.
+pub(super) unsafe trait Pod: Copy {}
+
+// SAFETY: all-integer repr(C) kernel structs.
+unsafe impl Pod for libc::nlmsghdr {}
+// SAFETY: as above.
+unsafe impl Pod for libc::ifaddrmsg {}
+// SAFETY: as above.
+unsafe impl Pod for libc::ifinfomsg {}
+// SAFETY: as above.
+unsafe impl Pod for libc::rtattr {}
+// SAFETY: an integer.
+unsafe impl Pod for c_int {}
+// SAFETY: an integer.
+unsafe impl Pod for u32 {}
+// SAFETY: an integer.
+unsafe impl Pod for u16 {}
+
+/// Read a `T` at `off` in `buf`, or `None` if `buf` is too short (or `off` overflows). Tolerates
+/// any alignment.
+pub(super) fn read_at<T: Pod>(buf: &[u8], off: usize) -> Option<T> {
     if off.checked_add(size_of::<T>())? > buf.len() {
         return None;
     }
     // SAFETY: the bound check guarantees a full `T` lies within `buf`; `read_unaligned` imposes
-    // no alignment requirement, and `T` is a plain wire struct.
+    // no alignment requirement, and `Pod` makes every bit pattern a valid `T`.
     Some(unsafe { ptr::read_unaligned(buf.as_ptr().add(off).cast::<T>()) })
 }
 

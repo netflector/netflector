@@ -49,11 +49,13 @@ impl Capture {
 
         // Deliver each frame as it arrives instead of blocking until the buffer fills.
         let mut immediate: c_uint = 1;
-        ioctl(&fd, libc::BIOCIMMEDIATE, (&raw mut immediate).cast())?;
+        // SAFETY: BIOCIMMEDIATE takes a `c_uint`.
+        unsafe { ioctl(&fd, libc::BIOCIMMEDIATE, &mut immediate) }?;
 
         // Size the read buffer to the kernel's preferred BPF buffer length.
         let mut blen: c_uint = 0;
-        ioctl(&fd, libc::BIOCGBLEN, (&raw mut blen).cast())?;
+        // SAFETY: BIOCGBLEN writes a `c_uint`.
+        unsafe { ioctl(&fd, libc::BIOCGBLEN, &mut blen) }?;
 
         log::debug!(
             "opened BPF capture on {if_name} (fd {}, {link_type:?}, {blen}-byte buffer)",
@@ -100,7 +102,8 @@ impl Capture {
     /// signature uniform with the `AF_PACKET` backend, which compares bound indexes.
     pub(crate) fn attached(&self, _ifindex: u32) -> bool {
         let mut dlt: c_uint = 0;
-        ioctl(&self.fd, libc::BIOCGDLT, (&raw mut dlt).cast()).is_ok()
+        // SAFETY: BIOCGDLT writes a `c_uint`.
+        unsafe { ioctl(&self.fd, libc::BIOCGDLT, &mut dlt) }.is_ok()
     }
 
     /// The link-layer framing of the captured frames, so a consumer can strip the
@@ -286,11 +289,13 @@ fn attach(fd: &OwnedFd, if_name: &str) -> io::Result<LinkType> {
             name.len(),
         );
     }
-    ioctl(fd, libc::BIOCSETIF, (&raw mut ifr).cast())?;
+    // SAFETY: BIOCSETIF reads an `ifreq`.
+    unsafe { ioctl(fd, libc::BIOCSETIF, &mut ifr) }?;
 
     // The link framing selects the filter and the see-sent handling below.
     let mut dlt: c_uint = 0;
-    ioctl(fd, libc::BIOCGDLT, (&raw mut dlt).cast())?;
+    // SAFETY: BIOCGDLT writes a `c_uint`.
+    unsafe { ioctl(fd, libc::BIOCGDLT, &mut dlt) }?;
     let link_type = match dlt {
         libc::DLT_EN10MB => LinkType::Ethernet,
         libc::DLT_NULL => LinkType::DltNull,
@@ -309,7 +314,8 @@ fn attach(fd: &OwnedFd, if_name: &str) -> io::Result<LinkType> {
     // the interface entirely. Set explicitly both ways so a rebind onto different framing
     // restores the right mode.
     let mut see_sent: c_uint = c_uint::from(link_type == LinkType::DltNull);
-    ioctl(fd, libc::BIOCSSEESENT, (&raw mut see_sent).cast())?;
+    // SAFETY: BIOCSSEESENT reads a `c_uint`.
+    unsafe { ioctl(fd, libc::BIOCSSEESENT, &mut see_sent) }?;
 
     // Install the link-appropriate UDP filter (and flush whatever queued before it).
     let filter: &[BpfInsn] = match link_type {
@@ -320,7 +326,8 @@ fn attach(fd: &OwnedFd, if_name: &str) -> io::Result<LinkType> {
         bf_len: c_uint::try_from(filter.len()).expect("filter length fits c_uint"),
         bf_insns: filter.as_ptr().cast_mut(),
     };
-    ioctl(fd, libc::BIOCSETF, (&raw mut program).cast())?;
+    // SAFETY: BIOCSETF reads a `bpf_program`.
+    unsafe { ioctl(fd, libc::BIOCSETF, &mut program) }?;
     Ok(link_type)
 }
 
@@ -347,10 +354,13 @@ fn open_bpf_device() -> io::Result<OwnedFd> {
     Err(io::Error::other("all /dev/bpf devices are busy"))
 }
 
-/// One `ioctl` with a typed-but-opaque argument pointer, mapping failure to an error.
-fn ioctl(fd: &OwnedFd, request: c_ulong, arg: *mut c_void) -> io::Result<()> {
-    // SAFETY: `request` matches `arg`'s type per the BIOC* definitions; `fd` is valid.
-    check(unsafe { libc::ioctl(fd.as_raw_fd(), request, arg) })
+/// One `ioctl` on the BPF descriptor.
+///
+/// # Safety
+/// `request` must be a `BIOC*` request whose argument is exactly a `T`.
+unsafe fn ioctl<T>(fd: &OwnedFd, request: c_ulong, arg: &mut T) -> io::Result<()> {
+    // SAFETY: the caller pairs `request` with `T`; `fd` is a live descriptor.
+    check(unsafe { libc::ioctl(fd.as_raw_fd(), request, (&raw mut *arg).cast::<c_void>()) })
 }
 
 #[cfg(test)]
