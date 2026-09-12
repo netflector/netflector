@@ -78,6 +78,16 @@ pub(crate) fn url_host_ip(url: &[u8]) -> Option<IpAddr> {
         .map(IpAddr::V4)
 }
 
+/// The value of the first header named `name` (ASCII case-insensitive) in a CRLF-delimited
+/// message, without the whitespace after the colon; `None` if the message carries none.
+pub(crate) fn header_value<'a>(message: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    message
+        .split(|&b| b == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+        .find_map(|line| strip_prefix_ignore_ascii_case(line, name)?.strip_prefix(b":"))
+        .map(<[u8]>::trim_ascii_start)
+}
+
 /// `line` with `prefix` removed if it begins with it (ASCII case-insensitive), else `None`.
 pub(crate) fn strip_prefix_ignore_ascii_case<'a>(
     line: &'a [u8],
