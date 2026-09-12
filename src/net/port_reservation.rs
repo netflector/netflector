@@ -7,9 +7,9 @@
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 
-use crate::sys::{open_socket, sockaddr_for, socklen_of};
+use crate::sys::{bind, local_addr, open_socket};
 
 /// A reservation over one OS-assigned ephemeral UDP port on an interface's source address. Owns the
 /// bound socket; `Drop` frees the port.
@@ -31,22 +31,11 @@ impl PortReservation {
             IpAddr::V4(_) => libc::AF_INET,
             IpAddr::V6(_) => libc::AF_INET6,
         };
-        let fd = open_socket(family, libc::SOCK_DGRAM)?;
+        let fd = open_socket(family, libc::SOCK_DGRAM, 0)?;
         #[cfg(target_os = "linux")]
         attach_drop_all_filter(fd.as_raw_fd())?;
-        let (storage, len) = sockaddr_for(addr, 0, ifindex);
-        // SAFETY: `storage` is a valid `sockaddr_in`/`sockaddr_in6` of length `len` for `fd`'s family.
-        let rc = unsafe {
-            libc::bind(
-                fd.as_raw_fd(),
-                (&raw const storage).cast::<libc::sockaddr>(),
-                len,
-            )
-        };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let port = bound_port(fd.as_raw_fd())?;
+        bind(fd.as_raw_fd(), addr, 0, ifindex)?;
+        let port = local_addr(fd.as_raw_fd())?.port();
         Ok(Self {
             _fd: fd,
             source: SocketAddr::new(addr, port),
@@ -64,34 +53,10 @@ impl PortReservation {
     }
 }
 
-/// The port `fd` was bound to, via `getsockname`. The port field sits at the same offset (after the
-/// family) in `sockaddr_in` and `sockaddr_in6`, so one read serves both; it is in network byte order.
-fn bound_port(fd: RawFd) -> io::Result<u16> {
-    // SAFETY: an all-zero `sockaddr_storage` is a valid buffer; `getsockname` fills it and updates
-    // `len` to the bytes written.
-    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-    let mut len = socklen_of::<libc::sockaddr_storage>();
-    // SAFETY: `storage`/`len` are a valid (sockaddr, length) out-pair for `fd`.
-    let rc = unsafe {
-        libc::getsockname(
-            fd,
-            (&raw mut storage).cast::<libc::sockaddr>(),
-            &raw mut len,
-        )
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: `storage` holds a bound `sockaddr_in`/`sockaddr_in6`; `sin_port` aliases the port field
-    // of both (same offset after the family).
-    let port = unsafe { (*(&raw const storage).cast::<libc::sockaddr_in>()).sin_port };
-    Ok(u16::from_be(port))
-}
-
 /// Attach a drop-all classic-BPF filter so the bound socket enqueues nothing: the bind already
 /// suppresses the ICMP port-unreachable, and the raw capture reads the real datagram.
 #[cfg(target_os = "linux")]
-fn attach_drop_all_filter(fd: RawFd) -> io::Result<()> {
+fn attach_drop_all_filter(fd: std::os::fd::RawFd) -> io::Result<()> {
     // A single `BPF_RET | BPF_K` returning 0: accept zero bytes, i.e. drop every packet.
     let drop_all = [libc::sock_filter {
         code: 0x0006,
@@ -103,20 +68,7 @@ fn attach_drop_all_filter(fd: RawFd) -> io::Result<()> {
         len: 1,
         filter: drop_all.as_ptr().cast_mut(),
     };
-    // SAFETY: a `setsockopt` with a `sock_fprog` pointing at `drop_all`, valid for the call.
-    let rc = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_ATTACH_FILTER,
-            (&raw const program).cast::<libc::c_void>(),
-            socklen_of::<libc::sock_fprog>(),
-        )
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    crate::sys::setsockopt(fd, libc::SOL_SOCKET, libc::SO_ATTACH_FILTER, &program)
 }
 
 #[cfg(test)]

@@ -13,7 +13,7 @@ use libc::{c_int, socklen_t};
 use super::{InterfaceAddresses, V6Pick, v6_rank};
 use crate::libcex::nl_align;
 use crate::net::mac::MacAddr;
-use crate::sys::IoStatus;
+use crate::sys::{IoStatus, blocking_socket};
 
 /// `IFA_F_*` bits that disqualify an address as a source.
 const IFA_F_UNUSABLE: u32 = libc::IFA_F_TENTATIVE | libc::IFA_F_DEPRECATED | libc::IFA_F_DADFAILED;
@@ -113,14 +113,7 @@ pub(super) fn resolve(
 }
 
 fn netlink_socket() -> io::Result<OwnedFd> {
-    // SAFETY: `socket` returns a fresh fd or -1.
-    let sock = crate::sys::owned_fd_from(unsafe {
-        libc::socket(
-            libc::AF_NETLINK,
-            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
-            libc::NETLINK_ROUTE,
-        )
-    })?;
+    let sock = blocking_socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_ROUTE)?;
     crate::sys::set_recv_timeout(sock.as_raw_fd(), READ_TIMEOUT)?;
     Ok(sock)
 }

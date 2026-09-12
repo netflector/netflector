@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use super::PollEvent;
 use crate::reactor::{Key, Readiness};
+use crate::sys::check;
 
 // libc's EPOLL* constants are `c_int`; `epoll_event.events` is `u32`, so
 // `cast_unsigned` reinterprets the (positive) flag bits without a sign-loss lint.
@@ -87,20 +88,21 @@ impl Poller {
     /// drops kernel interest before a handler closes its fds, so that would mean the order broke.
     pub(crate) fn remove(&self, fd: RawFd) -> io::Result<()> {
         // SAFETY: poll_fd is our epoll instance; EPOLL_CTL_DEL ignores the event arg.
-        let rc = unsafe {
+        check(unsafe {
             libc::epoll_ctl(
                 self.poll_fd.as_raw_fd(),
                 libc::EPOLL_CTL_DEL,
                 fd,
                 ptr::null_mut(),
             )
-        };
-        if rc < 0 {
-            let err = io::Error::last_os_error();
-            if err.raw_os_error() != Some(libc::ENOENT) {
-                return Err(err);
+        })
+        .or_else(|err| {
+            if err.raw_os_error() == Some(libc::ENOENT) {
+                Ok(())
+            } else {
+                Err(err)
             }
-        }
+        })?;
         log::trace!("epoll: removed fd {fd}");
         Ok(())
     }
@@ -171,11 +173,7 @@ impl Poller {
         event.events = mask;
         event.u64 = key.to_u64();
         // SAFETY: poll_fd is our epoll instance; `event` outlives the call.
-        let rc = unsafe { libc::epoll_ctl(self.poll_fd.as_raw_fd(), op, fd, &raw mut event) };
-        if rc < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        check(unsafe { libc::epoll_ctl(self.poll_fd.as_raw_fd(), op, fd, &raw mut event) })
     }
 }
 

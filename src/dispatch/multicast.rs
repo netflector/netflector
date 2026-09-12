@@ -10,10 +10,8 @@ use std::net::IpAddr;
 use std::num::NonZeroU32;
 use std::os::fd::{AsRawFd, OwnedFd};
 
-use libc::c_void;
-
 use crate::libcex::{GroupReq, MCAST_JOIN_GROUP};
-use crate::sys::{open_socket, sockaddr_for, socklen_of};
+use crate::sys::{open_socket, setsockopt, sockaddr_for};
 
 /// How a [`rejoin`](MulticastJoiner::rejoin) replay landed: `joined` groups are members after the
 /// call (freshly re-joined, or already member), `deferred` groups have no address of their family
@@ -172,7 +170,7 @@ impl MulticastJoiner {
         let fd = match slot {
             Some(sock) => sock.as_raw_fd(),
             None => slot
-                .insert(open_socket(family, libc::SOCK_DGRAM)?)
+                .insert(open_socket(family, libc::SOCK_DGRAM, 0)?)
                 .as_raw_fd(),
         };
         // Zero first: a field-by-field literal would leave the padding after `gr_interface`
@@ -182,24 +180,11 @@ impl MulticastJoiner {
         req.gr_interface = ifindex.get();
         // Interface is selected by `gr_interface`, so the group sockaddr carries no scope id.
         req.gr_group = sockaddr_for(group, 0, 0).0;
-        // SAFETY: `req` is a fully-initialised `group_req` (padding zeroed), passed by address + size.
-        let rc = unsafe {
-            libc::setsockopt(
-                fd,
-                level,
-                MCAST_JOIN_GROUP,
-                (&raw const req).cast::<c_void>(),
-                socklen_of::<GroupReq>(),
-            )
-        };
-        if rc != 0 {
-            let err = io::Error::last_os_error();
+        match setsockopt(fd, level, MCAST_JOIN_GROUP, &req) {
             // Already a member is success: the idempotent re-attempt depends on it.
-            if !already_member(&err) {
-                return Err(err);
-            }
+            Err(e) if !already_member(&e) => Err(e),
+            _ => Ok(()),
         }
-        Ok(())
     }
 }
 

@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use libc::c_int;
 
 use super::{Handler, Reactor, ReadyEvent};
+use crate::sys::check;
 
 /// The signal that requests an on-demand diagnostics dump (the counter summary).
 const DUMP_SIGNAL: c_int = libc::SIGUSR1;
@@ -181,9 +182,7 @@ fn self_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
         unsafe { libc::pipe(fds.as_mut_ptr()) }
     };
 
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
+    check(rc)?;
 
     // SAFETY: `pipe`/`pipe2` succeeded, so both fds are fresh and owned.
     let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
@@ -212,9 +211,9 @@ fn install_handlers() -> io::Result<[libc::sigaction; HANDLED_SIGNALS.len()]> {
     let mut saved: [libc::sigaction; HANDLED_SIGNALS.len()] = unsafe { mem::zeroed() };
     for (i, &signum) in HANDLED_SIGNALS.iter().enumerate() {
         // SAFETY: valid signal number with valid act / oldact pointers.
-        let rc = unsafe { libc::sigaction(signum, &raw const action, &raw mut saved[i]) };
-        if rc != 0 {
-            let err = io::Error::last_os_error();
+        let installed =
+            check(unsafe { libc::sigaction(signum, &raw const action, &raw mut saved[i]) });
+        if let Err(err) = installed {
             restore_handlers(&saved[..i]);
             return Err(err);
         }

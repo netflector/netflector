@@ -18,7 +18,7 @@ use super::filter::{BpfInsn, DROP_OUTGOING_PROLOGUE, ETHERNET_UDP_FILTER, RAW_IP
 use crate::interface::if_index;
 use crate::logging::{WARN_WINDOW, log_rate};
 use crate::net::LinkType;
-use crate::sys::{IoStatus, socklen_of};
+use crate::sys::{IoStatus, check, open_socket, setsockopt, socklen_of};
 
 /// A raw-capture handle on one interface. The socket's bind is the only holder of the
 /// interface's kernel index: sends rely on it, so nothing here goes stale if the index changes.
@@ -41,14 +41,7 @@ impl Capture {
     /// bind fails.
     pub(crate) fn open(if_name: &str) -> io::Result<Self> {
         // Protocol 0: capture nothing until the filter + loop-prevention are in place.
-        // SAFETY: a `socket` call with a valid domain/type/protocol returns a fresh fd or -1.
-        let fd = crate::sys::owned_fd_from(unsafe {
-            libc::socket(
-                libc::AF_PACKET,
-                libc::SOCK_RAW | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-                0,
-            )
-        })?;
+        let fd = open_socket(libc::AF_PACKET, libc::SOCK_RAW, 0)?;
         let link_type = attach(&fd, if_name)?;
         log::debug!(
             "opened AF_PACKET capture on {if_name} (fd {}, {link_type:?})",
@@ -247,9 +240,7 @@ fn link_type_of(fd: &OwnedFd, if_name: &str) -> io::Result<LinkType> {
         libc::Ioctl::try_from(libc::SIOCGIFHWADDR).expect("SIOCGIFHWADDR fits the request type");
     // SAFETY: the ioctl reads the name and writes the hardware address back into the union; any
     // socket serves it.
-    if unsafe { libc::ioctl(fd.as_raw_fd(), request, &raw mut ifr) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    check(unsafe { libc::ioctl(fd.as_raw_fd(), request, &raw mut ifr) })?;
     // SAFETY: a successful ioctl wrote `ifru_hwaddr`, whose family is the hardware type.
     match unsafe { ifr.ifr_ifru.ifru_hwaddr.sa_family } {
         libc::ARPHRD_ETHER | libc::ARPHRD_LOOPBACK => Ok(LinkType::Ethernet),
@@ -317,21 +308,12 @@ fn link_addr(ifindex: c_int) -> libc::sockaddr_ll {
 
 /// Ask the kernel to drop locally-sent frames on this socket (`PACKET_IGNORE_OUTGOING`).
 fn set_ignore_outgoing(fd: &OwnedFd) -> io::Result<()> {
-    let on: c_int = 1;
-    // SAFETY: a `setsockopt` with a `c_int` option value and its matching length.
-    let rc = unsafe {
-        libc::setsockopt(
-            fd.as_raw_fd(),
-            libc::SOL_PACKET,
-            libc::PACKET_IGNORE_OUTGOING,
-            (&raw const on).cast::<c_void>(),
-            socklen_of::<c_int>(),
-        )
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    setsockopt(
+        fd.as_raw_fd(),
+        libc::SOL_PACKET,
+        libc::PACKET_IGNORE_OUTGOING,
+        &1 as &c_int,
+    )
 }
 
 /// Attach a classic-BPF `filter` to the socket via `SO_ATTACH_FILTER`.
@@ -341,21 +323,12 @@ fn attach_filter(fd: &OwnedFd, filter: &[BpfInsn]) -> io::Result<()> {
         // The kernel only reads the program, so the const-to-mut cast is sound.
         filter: filter.as_ptr().cast_mut(),
     };
-    // SAFETY: a `setsockopt` with a `sock_fprog` pointing at `filter`, valid for the
-    // duration of the call.
-    let rc = unsafe {
-        libc::setsockopt(
-            fd.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_ATTACH_FILTER,
-            (&raw const program).cast::<c_void>(),
-            socklen_of::<libc::sock_fprog>(),
-        )
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    setsockopt(
+        fd.as_raw_fd(),
+        libc::SOL_SOCKET,
+        libc::SO_ATTACH_FILTER,
+        &program,
+    )
 }
 
 /// Bind to the interface in `addr`, adding the capture protocol `ETH_P_ALL`.
@@ -364,17 +337,13 @@ fn bind_interface(fd: &OwnedFd, mut addr: libc::sockaddr_ll) -> io::Result<()> {
         .expect("ETH_P_ALL fits u16")
         .to_be();
     // SAFETY: `addr` is a fully-initialized `sockaddr_ll` of the given length.
-    let rc = unsafe {
+    check(unsafe {
         libc::bind(
             fd.as_raw_fd(),
             (&raw const addr).cast::<libc::sockaddr>(),
             socklen_of::<libc::sockaddr_ll>(),
         )
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    })
 }
 
 #[cfg(test)]

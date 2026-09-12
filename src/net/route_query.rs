@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use libc::{c_int, c_void};
 
 use crate::libcex::RtMsgHdr;
-use crate::sys::IoStatus;
+use crate::sys::{IoStatus, blocking_socket};
 
 /// One routing message: a fixed header plus a few small sockaddrs.
 const READ_BUF: usize = 2048;
@@ -74,14 +74,7 @@ pub(crate) fn egress_ifindex(dst: Ipv4Addr) -> io::Result<u32> {
 /// A socket for one query: blocking, like the netlink dump's, since this is a synchronous exchange
 /// rather than something the reactor polls. `AF_INET` narrows the broadcasts it also receives.
 fn open_route_socket() -> io::Result<OwnedFd> {
-    // SAFETY: `socket` returns a fresh fd or -1.
-    let sock = crate::sys::owned_fd_from(unsafe {
-        libc::socket(
-            libc::PF_ROUTE,
-            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
-            libc::AF_INET,
-        )
-    })?;
+    let sock = blocking_socket(libc::PF_ROUTE, libc::SOCK_RAW, libc::AF_INET)?;
     crate::sys::set_recv_timeout(sock.as_raw_fd(), READ_TIMEOUT)?;
     crate::sys::increase_recv_buffer(sock.as_raw_fd(), RECV_BUFFER);
     // A reply the buffer had no room for then reports ENOBUFS rather than looking like silence.

@@ -3,10 +3,11 @@
 //! and the `SOCK_*` type flags, so it applies close-on-exec and non-blocking by `fcntl`.
 
 use std::io;
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 #[cfg(target_os = "macos")]
 use std::os::fd::AsRawFd;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::ptr;
 
 use libc::{c_int, c_void, socklen_t};
 
@@ -21,6 +22,17 @@ pub(crate) fn owned_fd_from(raw: RawFd) -> io::Result<OwnedFd> {
     }
     // SAFETY: a non-negative return from a fd-returning syscall is a fresh fd we exclusively own.
     Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
+/// The result of a syscall that returns 0 on success and -1 on failure.
+///
+/// # Errors
+/// The last OS error when `rc` is negative.
+pub(crate) fn check(rc: c_int) -> io::Result<()> {
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// The status of a non-blocking read/write syscall, from [`from_syscall`](IoStatus::from_syscall).
@@ -71,22 +83,44 @@ pub(crate) fn socklen_of<T>() -> socklen_t {
 /// outcome after its writable edge, or an asynchronous error the kernel parked on the socket
 /// (e.g. `ENETDOWN` on a packet socket whose interface died).
 pub(crate) fn so_error(fd: RawFd) -> io::Result<c_int> {
-    let mut err: c_int = 0;
+    getsockopt_int(fd, libc::SOL_SOCKET, libc::SO_ERROR)
+}
+
+/// `setsockopt` with a plain-data option `value`.
+///
+/// # Errors
+/// The OS error if the option can't be set.
+pub(crate) fn setsockopt<T>(fd: RawFd, level: c_int, name: c_int, value: &T) -> io::Result<()> {
+    // SAFETY: `value` is a live `T` passed with its own size; the kernel only reads it.
+    check(unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            name,
+            (&raw const *value).cast::<c_void>(),
+            socklen_of::<T>(),
+        )
+    })
+}
+
+/// The current value of a `c_int` socket option.
+///
+/// # Errors
+/// The OS error if the option can't be read.
+pub(crate) fn getsockopt_int(fd: RawFd, level: c_int, name: c_int) -> io::Result<c_int> {
+    let mut value: c_int = 0;
     let mut len = socklen_of::<c_int>();
-    // SAFETY: `&err`/`&len` are a valid (value, length) out-pair of `c_int` size for `fd`.
-    let rc = unsafe {
+    // SAFETY: `value`/`len` are a valid (c_int, length) out-pair for `fd`.
+    check(unsafe {
         libc::getsockopt(
             fd,
-            libc::SOL_SOCKET,
-            libc::SO_ERROR,
-            (&raw mut err).cast::<c_void>(),
+            level,
+            name,
+            (&raw mut value).cast::<c_void>(),
             &raw mut len,
         )
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(err)
+    })?;
+    Ok(value)
 }
 
 /// Bound a blocking socket's reads with `SO_RCVTIMEO`: an answer that never arrives then surfaces as
@@ -112,20 +146,7 @@ pub(crate) fn set_recv_timeout(fd: RawFd, timeout: std::time::Duration) -> io::R
             .expect("the timeout's seconds fit tv_sec"),
         tv_usec,
     };
-    // SAFETY: setsockopt reads `tv` (a timeval of the given length) on a valid socket fd.
-    let rc = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_RCVTIMEO,
-            (&raw const tv).cast(),
-            socklen_of::<libc::timeval>(),
-        )
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVTIMEO, &tv)
 }
 
 /// Raise the open-file soft limit to the hard one: a DIAL proxy costs two listener fds plus two per
@@ -186,21 +207,7 @@ fn show_limit(limit: libc::rlim_t) -> String {
 /// Returns the OS error if the option can't be set.
 #[cfg(target_os = "freebsd")]
 pub(crate) fn set_recv_error_reporting(fd: RawFd) -> io::Result<()> {
-    let on: c_int = 1;
-    // SAFETY: setsockopt reads `on` (a c_int of the given length) on a valid socket fd.
-    let rc = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_RERROR,
-            (&raw const on).cast(),
-            socklen_of::<c_int>(),
-        )
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    setsockopt(fd, libc::SOL_SOCKET, libc::SO_RERROR, &1 as &c_int)
 }
 
 /// Best-effort: grow the kernel receive queue to `bytes` so a burst can't overflow it as easily,
@@ -209,28 +216,17 @@ pub(crate) fn set_recv_error_reporting(fd: RawFd) -> io::Result<()> {
 /// netlink already defaults to the system max).
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub(crate) fn increase_recv_buffer(fd: RawFd, bytes: c_int) {
-    let mut current: c_int = 0;
-    let mut len = socklen_of::<c_int>();
-    // SAFETY: `&current`/`&len` are a valid (value, length) out-pair of `c_int` size for `fd`.
-    let rc = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_RCVBUF,
-            (&raw mut current).cast::<c_void>(),
-            &raw mut len,
-        )
-    };
-    if rc != 0 {
-        log::warn!(
-            "could not read the socket receive buffer size, requesting {bytes} bytes anyway: {}",
-            io::Error::last_os_error()
-        );
-    } else if current >= bytes {
-        log::trace!(
-            "socket receive buffer already {current} bytes, at or above the {bytes} wanted; leaving it"
-        );
-        return;
+    match getsockopt_int(fd, libc::SOL_SOCKET, libc::SO_RCVBUF) {
+        Err(e) => log::warn!(
+            "could not read the socket receive buffer size, requesting {bytes} bytes anyway: {e}"
+        ),
+        Ok(current) if current >= bytes => {
+            log::trace!(
+                "socket receive buffer already {current} bytes, at or above the {bytes} wanted; leaving it"
+            );
+            return;
+        }
+        Ok(_) => {}
     }
     set_recv_buffer(fd, bytes);
 }
@@ -239,40 +235,101 @@ pub(crate) fn increase_recv_buffer(fd: RawFd, bytes: c_int) {
 /// logged and ignored (the default buffer still works), so this never fails the caller.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 fn set_recv_buffer(fd: RawFd, bytes: c_int) {
-    // SAFETY: setsockopt reads `bytes` (a c_int of the given length) on a valid socket fd.
-    let rc = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_RCVBUF,
-            (&raw const bytes).cast(),
-            socklen_of::<c_int>(),
-        )
-    };
-    if rc != 0 {
-        log::warn!(
-            "could not set the socket receive buffer to {bytes} bytes: {}",
-            io::Error::last_os_error()
-        );
+    if let Err(e) = setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, &bytes) {
+        log::warn!("could not set the socket receive buffer to {bytes} bytes: {e}");
     }
 }
 
-/// Open a socket of `family` and `base_type` (e.g. `SOCK_DGRAM`/`SOCK_STREAM`), close-on-exec and
-/// non-blocking. Non-blocking keeps a stray read from freezing the single-threaded reactor. Linux and
-/// FreeBSD set both flags in the socket type; macOS lacks them and applies them by `fcntl`.
+/// A socket of `family` and `base_type` (e.g. `SOCK_DGRAM`/`SOCK_STREAM`) for `protocol`,
+/// close-on-exec and non-blocking. Non-blocking keeps a stray read from freezing the single-threaded
+/// reactor. Linux and FreeBSD set both flags in the socket type; macOS lacks them and applies them by
+/// `fcntl`.
 ///
 /// # Errors
 /// Returns the OS error if the socket can't be opened (or, on macOS, the flags can't be set).
-pub(crate) fn open_socket(family: c_int, base_type: c_int) -> io::Result<OwnedFd> {
+pub(crate) fn open_socket(family: c_int, base_type: c_int, protocol: c_int) -> io::Result<OwnedFd> {
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-    let sock_type = base_type | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK;
+    let fd = socket(
+        family,
+        base_type | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+        protocol,
+    )?;
     #[cfg(target_os = "macos")]
-    let sock_type = base_type;
-    // SAFETY: `socket` returns a fresh owned fd or -1; `owned_fd_from` takes ownership or errors.
-    let fd = owned_fd_from(unsafe { libc::socket(family, sock_type, 0) })?;
+    let fd = socket(family, base_type, protocol)?;
     #[cfg(target_os = "macos")]
     set_cloexec_nonblock(fd.as_raw_fd())?;
     Ok(fd)
+}
+
+/// A blocking socket, close-on-exec: for a synchronous request/reply exchange (a netlink dump, a
+/// route query) the reactor never polls.
+///
+/// # Errors
+/// Returns the OS error if the socket can't be opened.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+pub(crate) fn blocking_socket(
+    family: c_int,
+    base_type: c_int,
+    protocol: c_int,
+) -> io::Result<OwnedFd> {
+    socket(family, base_type | libc::SOCK_CLOEXEC, protocol)
+}
+
+fn socket(family: c_int, ty: c_int, protocol: c_int) -> io::Result<OwnedFd> {
+    // SAFETY: `socket` returns a fresh fd or -1.
+    owned_fd_from(unsafe { libc::socket(family, ty, protocol) })
+}
+
+/// `bind` `fd` to `addr`:`port`, with `scope_id` as [`sockaddr_for`] applies it.
+///
+/// # Errors
+/// The OS error if the bind fails.
+pub(crate) fn bind(fd: RawFd, addr: IpAddr, port: u16, scope_id: u32) -> io::Result<()> {
+    let (storage, len) = sockaddr_for(addr, port, scope_id);
+    // SAFETY: `storage` holds a `sockaddr_in`/`sockaddr_in6` of `len` bytes.
+    check(unsafe { libc::bind(fd, (&raw const storage).cast::<libc::sockaddr>(), len) })
+}
+
+/// The address `fd` is bound to, via `getsockname`.
+///
+/// # Errors
+/// The OS error if the name can't be read, or a socket of neither IP family.
+pub(crate) fn local_addr(fd: RawFd) -> io::Result<SocketAddr> {
+    // SAFETY: an all-zero `sockaddr_storage` is a valid out-buffer; `getsockname` fills it.
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = socklen_of::<libc::sockaddr_storage>();
+    // SAFETY: `storage`/`len` are a valid (sockaddr, length) out-pair for `fd`.
+    check(unsafe {
+        libc::getsockname(
+            fd,
+            (&raw mut storage).cast::<libc::sockaddr>(),
+            &raw mut len,
+        )
+    })?;
+    match c_int::from(storage.ss_family) {
+        libc::AF_INET => {
+            // SAFETY: the family says the storage holds a `sockaddr_in`, plain data it is large
+            // enough and aligned for.
+            let sin = unsafe { ptr::read((&raw const storage).cast::<libc::sockaddr_in>()) };
+            Ok(SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes()),
+                u16::from_be(sin.sin_port),
+            )))
+        }
+        libc::AF_INET6 => {
+            // SAFETY: as above, for a `sockaddr_in6`.
+            let sin6 = unsafe { ptr::read((&raw const storage).cast::<libc::sockaddr_in6>()) };
+            Ok(SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::from(sin6.sin6_addr.s6_addr),
+                u16::from_be(sin6.sin6_port),
+                sin6.sin6_flowinfo,
+                sin6.sin6_scope_id,
+            )))
+        }
+        other => Err(io::Error::other(format!(
+            "socket family {other} is neither IPv4 nor IPv6"
+        ))),
+    }
 }
 
 /// Marshal `addr`:`port` into a zeroed `sockaddr_storage` as a `sockaddr_in`/`sockaddr_in6`,
@@ -367,8 +424,8 @@ pub(crate) fn set_cloexec_nonblock(fd: RawFd) -> io::Result<()> {
 ///
 /// # Errors
 /// Returns the failing `fcntl`'s error.
-#[cfg(any(target_os = "macos", target_os = "freebsd"))]
-pub(crate) fn set_nonblock(fd: RawFd) -> io::Result<()> {
+#[cfg(target_os = "macos")]
+fn set_nonblock(fd: RawFd) -> io::Result<()> {
     // SAFETY: `fd` is valid; F_GETFL returns the status flags.
     let status = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if status < 0 {

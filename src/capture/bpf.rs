@@ -21,7 +21,7 @@ use super::filter::{BpfInsn, DLT_NULL_UDP_FILTER, ETHERNET_UDP_FILTER};
 use crate::libcex::bpf_wordalign;
 use crate::logging::{WARN_WINDOW, log_rate};
 use crate::net::LinkType;
-use crate::sys::IoStatus;
+use crate::sys::{IoStatus, check};
 
 /// A raw-capture handle on one interface.
 pub(crate) struct Capture {
@@ -57,8 +57,6 @@ impl Capture {
         // Size the read buffer to the kernel's preferred BPF buffer length.
         let mut blen: c_uint = 0;
         ioctl(&fd, libc::BIOCGBLEN, (&raw mut blen).cast())?;
-
-        crate::sys::set_nonblock(fd.as_raw_fd())?;
 
         log::debug!(
             "opened BPF capture on {if_name} (fd {}, {link_type:?}, {blen}-byte buffer)",
@@ -336,7 +334,12 @@ fn open_bpf_device() -> io::Result<OwnedFd> {
     for n in 0..256 {
         let path = format!("/dev/bpf{n}\0");
         // SAFETY: `path` is NUL-terminated.
-        let raw = unsafe { libc::open(path.as_ptr().cast(), libc::O_RDWR | libc::O_CLOEXEC) };
+        let raw = unsafe {
+            libc::open(
+                path.as_ptr().cast(),
+                libc::O_RDWR | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            )
+        };
         if raw >= 0 {
             // SAFETY: `open` returned a fresh owned fd.
             return Ok(unsafe { OwnedFd::from_raw_fd(raw) });
@@ -352,10 +355,7 @@ fn open_bpf_device() -> io::Result<OwnedFd> {
 /// One `ioctl` with a typed-but-opaque argument pointer, mapping failure to an error.
 fn ioctl(fd: &OwnedFd, request: c_ulong, arg: *mut c_void) -> io::Result<()> {
     // SAFETY: `request` matches `arg`'s type per the BIOC* definitions; `fd` is valid.
-    if unsafe { libc::ioctl(fd.as_raw_fd(), request, arg) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    check(unsafe { libc::ioctl(fd.as_raw_fd(), request, arg) })
 }
 
 #[cfg(test)]
