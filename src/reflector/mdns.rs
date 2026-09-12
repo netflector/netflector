@@ -1,16 +1,9 @@
-//! The mDNS reflector: reflects multicast DNS between the source and target interfaces so service
-//! discovery crosses the link. It registers two directional [`SimpleReflector`]s, each spanning
-//! every in-use family's group: queries flow source → target, responses target → source. Atop the
-//! capture's own-egress drop, this breaks the reflection loop. Each re-emits to the same group at
-//! TTL 255 (RFC 6762 §11), sourced from the egress interface. The dispatcher's filter pins the
-//! group for queries; for responses it also takes an answer sent to the target interface itself,
-//! which a device sends when the query asked for a unicast response (the QU bit, RFC 6762 §5.4)
-//! or arrived as unicast (a copy to a peer, §5.5). Such an answer goes out on the source's group.
+//! The mDNS reflector: queries flow source → target, responses target → source, each re-emitted to
+//! the same group at TTL 255 (RFC 6762 §11) from the egress interface.
 //!
 //! Limitation: a legacy querier asking from an ephemeral port expects its answer there, but the
 //! relayed query is sourced from port 5353, so the device answers on the group, which that
-//! querier does not listen on. (SSDP and WSD instead proxy each searcher's unicast reply through
-//! a per-searcher session; mDNS does not.)
+//! querier does not listen on.
 
 use std::net::SocketAddr;
 
@@ -26,7 +19,6 @@ use super::{
     group_addrs, open_pair,
 };
 
-/// mDNS's classifier kind *is* its message type: `Query`/`Response` map straight across.
 impl From<MdnsKind> for MessageType {
     fn from(kind: MdnsKind) -> Self {
         match kind {
@@ -36,22 +28,14 @@ impl From<MdnsKind> for MessageType {
     }
 }
 
-/// The directional gate for the source → target reflector: reflect queries, skip responses (they
-/// flow the other way), treat a too-short or non-DNS payload on the group as junk. The verdict
-/// carries the packet's message type (via [`From<MdnsKind>`]) for the counters.
 fn query_verdict(payload: &[u8]) -> Verdict {
     directional_verdict(classify(payload), MdnsKind::Query)
 }
 
-/// The directional gate for the target → source reflector: the mirror of [`query_verdict`].
 fn response_verdict(payload: &[u8]) -> Verdict {
     directional_verdict(classify(payload), MdnsKind::Response)
 }
 
-/// Build the mDNS reflector for `reflector` and register its directional handlers on `dispatcher`.
-/// A no-op when mDNS isn't enabled. Joins each in-use family's group on both interfaces, then
-/// registers two handlers spanning them: queries source → target, responses target → source.
-///
 /// # Errors
 /// As [`open_pair`].
 pub(crate) fn build(
@@ -70,7 +54,7 @@ pub(crate) fn build(
     );
     let (source, target) = open_pair(reflector, interfaces, dispatcher, "mDNS", &groups)?;
     let group_ips: IpSet = groups.iter().map(SocketAddr::ip).collect();
-    // source → target: reflect queries (any client on source may ask).
+    // source → target: queries.
     dispatcher.register(
         source,
         Filter {
@@ -87,10 +71,9 @@ pub(crate) fn build(
             Emit::fixed(MDNS_PORT, MDNS_TTL),
         )),
     );
-    // target → source: reflect responses, optionally only from the configured device's MAC. An
-    // answer to a query that asked for a unicast response, or that reached a peer as unicast,
-    // comes to this host rather than the group (RFC 6762 §5.4, §5.5) and is taken in as well. A
-    // response comes from port 5353, and one from elsewhere is ignored by every client (§6).
+    // target → source: responses. `dst_own` takes in an answer sent to this host rather than the
+    // group (a QU query, RFC 6762 §5.4, or one that reached a peer as unicast, §5.5). `src_port`:
+    // a response from anywhere but 5353 is ignored by every client (§6).
     dispatcher.register(
         target,
         Filter {
@@ -112,9 +95,7 @@ pub(crate) fn build(
                 response_verdict,
                 Emit::fixed(MDNS_PORT, MDNS_TTL).unicast_to_group(MDNS_GROUP_V4, MDNS_GROUP_V6),
             )
-            // A response whose A/AAAA records are all link-local or otherwise never a peer
-            // advertises endpoints the source side can never use; queries carry no advertisement,
-            // so only this leg checks.
+            // Queries carry no advertisement, so only this leg checks.
             .with_suppress(advertises_only_unreachable),
         ),
     );

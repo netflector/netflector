@@ -1,9 +1,6 @@
-//! BSD BPF-device batch-record alignment (macOS + FreeBSD): `BPF_WORDALIGN`, which libc does not
-//! provide. The per-frame header is read as `libc::bpf_hdr` (both BSDs have it, with the right
-//! per-OS timestamp).
+//! `BPF_WORDALIGN`, which libc does not provide.
 
-// `BPF_ALIGNMENT` as a usize. libc types it differently per platform (`c_int` on
-// apple, `usize` on FreeBSD), so normalize it once here.
+// libc types `BPF_ALIGNMENT` `c_int` on apple and `usize` on FreeBSD.
 #[cfg(target_os = "macos")]
 pub(crate) const BPF_ALIGN: usize = libc::BPF_ALIGNMENT as usize;
 #[cfg(target_os = "freebsd")]

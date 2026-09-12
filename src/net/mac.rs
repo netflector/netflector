@@ -1,5 +1,5 @@
-//! MAC (link-layer) addressing: the 48-bit address type, its text form, and the
-//! L2 destination MACs derived from multicast / broadcast IP addresses.
+//! MAC (link-layer) addressing: the address type, its text form, and the L2 destinations derived
+//! from multicast IP addresses.
 
 use std::fmt;
 use std::net::IpAddr;
@@ -15,31 +15,27 @@ use crate::unique_list::{ListRule, UniqueList};
 pub(crate) struct MacAddr([u8; 6]);
 
 impl MacAddr {
-    /// The six address bytes, in transmission order.
     #[must_use]
     pub(crate) const fn octets(self) -> [u8; 6] {
         self.0
     }
 
-    /// The L2 broadcast address, `ff:ff:ff:ff:ff:ff`.
     #[must_use]
     pub(crate) const fn broadcast() -> Self {
         MacAddr([0xff; 6])
     }
 
-    /// Whether this is the all-zero address, which names no station: Linux reports it as a
-    /// loopback's hardware address, and loopback frames carry it.
+    /// The all-zero address names no station; Linux reports it as a loopback's hardware address.
     #[must_use]
     pub(crate) fn is_unspecified(self) -> bool {
         self.0 == [0; 6]
     }
 
-    /// The L2 destination MAC for a multicast IP `addr`: IPv4 maps to `01:00:5e`
-    /// plus the low 23 address bits (RFC 1112), IPv6 to `33:33` plus the low 32
-    /// bits (RFC 2464).
+    /// IPv4 maps to `01:00:5e` plus the low 23 address bits (RFC 1112), IPv6 to `33:33` plus the
+    /// low 32 bits (RFC 2464).
     ///
     /// # Panics
-    /// Panics in debug builds if `addr` is not a multicast address.
+    /// In debug builds, if `addr` is not multicast.
     #[must_use]
     pub(crate) fn multicast_for(addr: IpAddr) -> Self {
         debug_assert!(
@@ -59,8 +55,6 @@ impl MacAddr {
     }
 }
 
-/// The six bytes, in transmission order, *are* the address, mirroring `Ipv4Addr`'s
-/// `From<[u8; 4]>`. Used to read a MAC off the wire.
 impl From<[u8; 6]> for MacAddr {
     fn from(octets: [u8; 6]) -> Self {
         MacAddr(octets)
@@ -74,7 +68,6 @@ impl fmt::Display for MacAddr {
     }
 }
 
-/// Error returned when a string is not a valid [`MacAddr`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[error("expected six colon-separated hex octets")]
 pub(crate) struct ParseMacAddrError;
@@ -87,9 +80,8 @@ impl FromStr for MacAddr {
         let mut parts = s.split(':');
         for slot in &mut bytes {
             let part = parts.next().ok_or(ParseMacAddrError)?;
-            // Exactly two hex digits. The is_ascii_hexdigit guard is load-bearing: u8::from_str_radix
-            // accepts a leading '+' (e.g. "+a" parses to 10), so the length check alone would admit a
-            // malformed octet like "+a:+b:+c:+d:+e:+f".
+            // The hex-digit guard is load-bearing: `u8::from_str_radix` accepts a leading '+', so
+            // the length check alone would admit "+a".
             if part.len() != 2 || !part.bytes().all(|b| b.is_ascii_hexdigit()) {
                 return Err(ParseMacAddrError);
             }
@@ -120,11 +112,10 @@ impl ListRule for Macs {
     const NOUN: &'static str = "MAC";
 }
 
-/// A non-empty, duplicate-free set of MAC addresses: a device allow-filter. "Match any device" is
-/// an absent (`None`) filter at the use site, not an empty set.
+/// A device allow-filter. "Match any device" is an absent filter at the use site, never an empty
+/// set.
 pub(crate) type MacSet = UniqueList<Macs>;
 
-/// A single address is a valid one-element set.
 impl From<MacAddr> for MacSet {
     fn from(mac: MacAddr) -> Self {
         Self::try_from(vec![mac]).expect("one address is a valid set")

@@ -1,8 +1,5 @@
-//! Environment-variable configuration (`NETFLECTOR_*`).
-//!
-//! [`parse_env`] produces the same [`RawConfig`] as the TOML path, so downstream
-//! validation is shared. Values parse through their [`FromStr`] type, with failures
-//! tagged by the originating variable name.
+//! Environment-variable configuration (`NETFLECTOR_*`), parsed into the same [`RawConfig`] as
+//! the TOML so validation is shared.
 
 use std::collections::BTreeMap;
 use std::str::FromStr;
@@ -14,8 +11,7 @@ use super::value::{
 };
 use crate::net::mac::MacSet;
 
-/// Accumulates a reflector's fields across its `NETFLECTOR_<tag>_<param>` variables,
-/// then converts to a [`RawReflector`] once all are seen.
+/// A reflector's fields as they arrive, one `NETFLECTOR_<tag>_<param>` variable at a time.
 #[derive(Debug, Default)]
 struct PartialReflector {
     name: Option<ReflectorName>,
@@ -38,7 +34,6 @@ struct PartialReflector {
 }
 
 impl PartialReflector {
-    /// `var` is the full variable name, used only to label errors.
     fn set(&mut self, param: &str, value: &str, var: &str) -> Result<(), ConfigError> {
         // Write-once slots: params fold case-insensitively, so two case-variant variables land in
         // the same slot, and environ order must not pick a silent winner.
@@ -82,7 +77,6 @@ impl PartialReflector {
         }
     }
 
-    /// The two interface fields are required; the rest default.
     fn into_raw(self, name: &str) -> Result<RawReflector, ConfigError> {
         Ok(RawReflector {
             name: self.name,
@@ -112,11 +106,6 @@ impl PartialReflector {
     }
 }
 
-/// Parse `NETFLECTOR_*` variables into the raw configuration they describe.
-///
-/// `NETFLECTOR_LOG_LEVEL`, `NETFLECTOR_DEBUG_MEMORY_INTERVAL_SECS`, and
-/// `NETFLECTOR_COUNTERS_INTERVAL_SECS` set the globals; every other `NETFLECTOR_<tag>_<param>`
-/// contributes to the reflector keyed by the lowercased `tag`. Unprefixed variables are ignored.
 pub(super) fn parse_env(
     vars: impl IntoIterator<Item = (String, String)>,
 ) -> Result<RawConfig, ConfigError> {
@@ -180,10 +169,6 @@ pub(super) fn parse_env(
     })
 }
 
-/// Resolve `NETFLECTOR_LOG_LEVEL` alone, ignoring the rest of the environment.
-///
-/// Raises the logger to the configured verbosity *before* the full parse runs, so
-/// the parse itself (env merge, reflector build) logs at that level.
 pub(super) fn log_level_from_env(
     vars: &[(String, String)],
 ) -> Result<Option<LogLevel>, ConfigError> {
@@ -193,7 +178,6 @@ pub(super) fn log_level_from_env(
         .transpose()
 }
 
-/// Parse through `FromStr`, tagging a failure with the originating variable name.
 fn env_value<T>(value: &str, var: &str) -> Result<T, ConfigError>
 where
     T: FromStr,
@@ -206,7 +190,6 @@ where
     })
 }
 
-/// Parse a boolean environment value (`true`/`false`/`1`/`0`, case-insensitive).
 fn env_bool(value: &str, var: &str) -> Result<bool, ConfigError> {
     let parsed = match value.to_ascii_lowercase().as_str() {
         "true" | "1" => true,

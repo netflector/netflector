@@ -6,37 +6,33 @@ use super::{is_link_local, is_never_a_peer};
 
 /// RFC 6762.
 pub(crate) const MDNS_PORT: u16 = 5353;
-/// mDNS is sent at IP TTL 255: a send-side SHOULD in RFC 6762 §11, kept for old queriers that
-/// checked the TTL on receipt (current receivers check the source address instead). The reflector
-/// re-emits a fresh link-local message, so it sets 255 rather than preserving the captured TTL.
+/// A send-side SHOULD in RFC 6762 §11, kept for old queriers that checked the TTL on receipt. The
+/// reflector re-emits a fresh message, so it sets 255 rather than preserving the captured TTL.
 pub(crate) const MDNS_TTL: u8 = 255;
 pub(crate) const MDNS_GROUP_V4: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
 /// Link-local scope (`ff02::`), not site-local.
 pub(crate) const MDNS_GROUP_V6: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb);
 
-/// An mDNS message is a query or a response, per the QR bit of its DNS header. Unsolicited
-/// announcements count as responses (RFC 6762 §8.3). This split is the reflector's directional
-/// gate: queries reflect source → target, responses target → source.
+/// Per the QR bit; unsolicited announcements are responses (RFC 6762 §8.3). Queries reflect
+/// source → target, responses target → source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MdnsKind {
     Query,
     Response,
 }
 
-/// The fixed DNS header is 12 bytes (RFC 1035 §4.1.1).
+/// RFC 1035 §4.1.1.
 const DNS_HEADER_LEN: usize = 12;
-/// The high byte of the flags field (header offset 2); the QR bit is its top bit.
+/// The high byte of the flags field; the QR bit is its top bit.
 const FLAGS_HIGH: usize = 2;
 const QR_BIT: u8 = 0x80;
-/// The header's four section-count fields, by offset.
 const QDCOUNT_AT: usize = 4;
 const ANCOUNT_AT: usize = 6;
 const NSCOUNT_AT: usize = 8;
 const ARCOUNT_AT: usize = 10;
 
-/// Classify a payload by the QR bit of its fixed 12-byte DNS header. `None` when the payload is too
-/// short to hold that header; that is anomalous on the dedicated mDNS group, so the caller surfaces
-/// it. Header-only: no question or record parsing.
+/// `None` when the payload is too short for a DNS header: anomalous on the mDNS group, so the
+/// caller surfaces it.
 pub(crate) fn classify(payload: &[u8]) -> Option<MdnsKind> {
     if payload.len() < DNS_HEADER_LEN {
         return None;
@@ -52,33 +48,28 @@ pub(crate) fn classify(payload: &[u8]) -> Option<MdnsKind> {
 const TYPE_A: u16 = 1;
 const TYPE_AAAA: u16 = 28;
 
-/// Whether the message carries at least one A/AAAA record and every one is link-local or otherwise
-/// never a peer ([`is_never_a_peer`]). Callers apply it to responses only: a query's records are
-/// known-answer cache state, not an advertisement. No address records, a usable address, or
-/// malformation all read as `false`.
+/// At least one A/AAAA record, and every one link-local or [`is_never_a_peer`]. For responses
+/// only: a query's records are known-answer cache state, not an advertisement. No address records
+/// or a malformed message reads as `false`.
 pub(crate) fn advertises_only_unreachable(payload: &[u8]) -> bool {
     only_unreachable_records(payload).unwrap_or(false)
 }
 
-/// The record walk behind [`advertises_only_unreachable`]: `None` on truncation or an undefined
-/// label type.
+/// `None` on truncation or an undefined label type.
 fn only_unreachable_records(payload: &[u8]) -> Option<bool> {
     if payload.len() < DNS_HEADER_LEN {
         return None;
     }
     let count = |at: usize| usize::from(u16::from_be_bytes([payload[at], payload[at + 1]]));
     let mut at = DNS_HEADER_LEN;
-    // The question section leads and carries no rdata; walk over it to reach the records.
     for _ in 0..count(QDCOUNT_AT) {
         at = skip_name(payload, at)?;
         at += 4; // QTYPE + QCLASS
     }
-    // Answer + authority + additional: address records may sit in any of them.
+    // Address records may sit in any of the three record sections.
     let mut saw_address = false;
     for _ in 0..count(ANCOUNT_AT) + count(NSCOUNT_AT) + count(ARCOUNT_AT) {
-        // A record is its name, 10 fixed bytes - TYPE(2) CLASS(2) TTL(4) RDLENGTH(2) - and then
-        // RDLENGTH bytes of rdata (RFC 1035 §4.1.3). Only TYPE and RDLENGTH are read here; an
-        // A / AAAA rdata is the bare address.
+        // Name, then TYPE(2) CLASS(2) TTL(4) RDLENGTH(2), then rdata (RFC 1035 §4.1.3).
         at = skip_name(payload, at)?;
         let fixed = payload.get(at..at + 10)?;
         let rtype = u16::from_be_bytes([fixed[0], fixed[1]]);
@@ -93,7 +84,6 @@ fn only_unreachable_records(payload: &[u8]) -> Option<bool> {
             (TYPE_AAAA, 16) => {
                 Ipv6Addr::from(<[u8; 16]>::try_from(rdata).expect("length checked")).into()
             }
-            // Any other type, or an A/AAAA whose rdata is not address-sized, holds no address.
             _ => continue,
         };
         if !(is_link_local(ip) || is_never_a_peer(ip)) {
@@ -104,16 +94,13 @@ fn only_unreachable_records(payload: &[u8]) -> Option<bool> {
     Some(saw_address)
 }
 
-/// Advance past the (possibly compressed) domain name at `at`, returning the offset just after it.
-/// `None` on truncation or an undefined label type.
+/// The offset just past the (possibly compressed) name at `at`.
 fn skip_name(payload: &[u8], mut at: usize) -> Option<usize> {
     loop {
         let len = *payload.get(at)?;
-        // A name is a run of labels, and each label's first byte tags its type in the top two bits
-        // (RFC 1035 §3.1 / §4.1.4): 00 = a plain length (1-63) followed by that many bytes, with
-        // length 0 ending the name; 11 = a 2-byte compression pointer, which ends the name in
-        // place (the target holds the rest, so the record's fixed fields follow the 2 bytes, and
-        // skipping never chases it); 01 / 10 = extension types that never shipped.
+        // The top two bits tag the label (RFC 1035 §3.1 / §4.1.4): 00 a plain length, 0 ending
+        // the name; 11 a 2-byte compression pointer, which ends the name in place (the record's
+        // fixed fields follow the 2 bytes, so skipping never chases it); 01 / 10 never shipped.
         match len {
             0 => return Some(at + 1),
             1..=0x3f => at += 1 + usize::from(len),

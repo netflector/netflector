@@ -1,14 +1,7 @@
-//! The shared stateless reflector.
-//!
-//! mDNS (both directions), the WSD Hello/Bye announcements, SSDP's `NOTIFY` advertisements and
-//! Wake-on-LAN are the same operation: classify the payload and, if it's a message for this leg,
-//! re-emit it on the egress interface, verbatim or through an optional [`ReplyRewrite`] (SSDP's
-//! advertisement direction rewrites the DIAL `LOCATION`). What differs per protocol enters as
-//! parameters: the [`Classify`] gate and the [`Emit`] policy (which source and TTL the re-emit
-//! carries, and where a unicast one goes). The destination otherwise follows from the captured one
-//! ([`link_destination`]), except under a fixed unicast [`Delivery`], the reply leg of a search
-//! session, which goes to the one searcher that asked. The search directions themselves are stateful
-//! (per-searcher sessions), so they use the shared `SearchReflector` instead.
+//! The shared stateless reflector: classify the payload and, if it's a message for this leg,
+//! re-emit it on the egress, verbatim or through a [`ReplyRewrite`]. What differs per protocol
+//! enters as the [`Classify`] gate and the [`Emit`] policy. The stateful search directions use
+//! `SearchReflector` instead.
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -20,12 +13,11 @@ use crate::reactor::Reactor;
 
 use super::{Delivery, NoRewrite, ReplyRewrite, Verdict, WARN_WINDOW, egress_sources};
 
-/// A leg's ingress gate: is this packet a message for it? See [`Verdict`].
+/// A leg's ingress gate: is this packet a message for it?
 pub(crate) trait Classify {
     fn classify(&self, packet: &Packet) -> Verdict;
 }
 
-/// A plain function over the payload: the multicast-discovery protocols gate on the message alone.
 impl<F: Fn(&[u8]) -> Verdict> Classify for F {
     fn classify(&self, packet: &Packet) -> Verdict {
         self(packet.payload)
@@ -35,10 +27,9 @@ impl<F: Fn(&[u8]) -> Verdict> Classify for F {
 /// The IP source a re-emit carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Source {
-    /// The egress's own address, at the given port.
     Egress(SourcePort),
-    /// The captured sender's own address and port, kept on the re-emit: the transparent relay,
-    /// whose peers take the sender from the datagram's source.
+    /// The captured sender's own ip:port: the transparent relay, whose peers read the sender off
+    /// the datagram.
     Captured,
 }
 
@@ -53,12 +44,9 @@ impl Source {
     }
 }
 
-/// The UDP source port an egress-sourced re-emit carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SourcePort {
-    /// A protocol's well-known port.
     Fixed(u16),
-    /// The captured packet's own.
     Captured,
 }
 
@@ -71,11 +59,9 @@ impl SourcePort {
     }
 }
 
-/// The TTL / hop limit a re-emit carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Ttl {
     Fixed(u8),
-    /// The captured packet's own.
     Captured,
 }
 
@@ -88,20 +74,20 @@ impl Ttl {
     }
 }
 
-/// Where a re-emit whose captured destination is unicast goes. A group or broadcast destination
-/// keeps its own ([`link_destination`]).
+/// Where a re-emit whose captured destination is unicast goes; a group or broadcast destination
+/// keeps its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UnicastTo {
-    /// Nowhere: the leg's filter pins a group, so a unicast destination is not its traffic.
+    /// The leg's filter pins a group, so a unicast destination is not its traffic.
     Nowhere,
-    /// The egress link's broadcast: a directed broadcast, which reads as unicast without the
-    /// mask, or a wake sent to a sleeping device's own address.
+    /// A directed broadcast (which reads as unicast without the mask) or a wake sent to a sleeping
+    /// device's own address goes to the egress link's broadcast.
     Broadcast,
-    /// The protocol's group of the family: an answer a peer sent to this host's own address.
+    /// An answer a peer sent to this host's own address goes to the protocol's group.
     Group { v4: Ipv4Addr, v6: Ipv6Addr },
 }
 
-/// How a re-emit is stamped: the source and TTL it carries, and where a unicast one goes.
+/// How a re-emit is stamped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Emit {
     pub(crate) source: Source,
@@ -110,7 +96,7 @@ pub(crate) struct Emit {
 }
 
 impl Emit {
-    /// From the egress's address at `port`, at `ttl`: the multicast-discovery protocols.
+    /// The multicast-discovery protocols.
     pub(crate) const fn fixed(port: u16, ttl: u8) -> Self {
         Self {
             source: Source::Egress(SourcePort::Fixed(port)),
@@ -119,7 +105,6 @@ impl Emit {
         }
     }
 
-    /// From the egress's address at the captured source port, at the captured TTL: Wake-on-LAN.
     pub(crate) const fn captured_from_egress() -> Self {
         Self {
             source: Source::Egress(SourcePort::Captured),
@@ -128,8 +113,7 @@ impl Emit {
         }
     }
 
-    /// From the egress's address at the captured source port, at `ttl`: a search reply relayed
-    /// back to its searcher from the responding device's own port.
+    /// A search reply relayed back to its searcher from the responding device's own port.
     pub(crate) const fn reply(ttl: u8) -> Self {
         Self {
             source: Source::Egress(SourcePort::Captured),
@@ -138,7 +122,6 @@ impl Emit {
         }
     }
 
-    /// From the captured sender's own ip:port, at the captured TTL: the transparent UDP relay.
     pub(crate) const fn captured() -> Self {
         Self {
             source: Source::Captured,
@@ -147,7 +130,6 @@ impl Emit {
         }
     }
 
-    /// A unicast destination goes to the egress link's broadcast.
     pub(crate) const fn unicast_to_broadcast(self) -> Self {
         Self {
             unicast: UnicastTo::Broadcast,
@@ -155,7 +137,6 @@ impl Emit {
         }
     }
 
-    /// A unicast destination goes to the protocol's group of its family.
     pub(crate) const fn unicast_to_group(self, v4: Ipv4Addr, v6: Ipv6Addr) -> Self {
         Self {
             unicast: UnicastTo::Group { v4, v6 },
@@ -164,23 +145,19 @@ impl Emit {
     }
 }
 
-/// One stateless leg of one protocol: re-emits each accepted packet captured on its ingress onto
-/// `egress`, stamped per its [`Emit`] policy. `classify` is the directional gate; an optional
-/// [`ReplyRewrite`] transforms the payload before re-emit (default: forward verbatim).
+/// One stateless leg of one protocol: re-emits each packet `classify` accepts onto `egress`,
+/// stamped per `emit`.
 pub(crate) struct SimpleReflector<C> {
     egress: CaptureKey,
-    /// Where the re-emits go on `egress`.
     delivery: Delivery,
-    /// Protocol tag for logs, e.g. `"mDNS"`.
+    /// For logs, e.g. `"mDNS"`.
     name: &'static str,
-    /// The message kind/direction this reflector handles, for logs, e.g. `"query"`.
+    /// For logs, e.g. `"query"`.
     kind: &'static str,
     classify: C,
     emit: Emit,
-    /// Transforms the payload before re-emit; [`NoRewrite`] (the default) forwards verbatim.
     rewrite: Box<dyn ReplyRewrite>,
-    /// The unreachable-advertisement suppression check for payloads `rewrite` left untouched
-    /// (default: none).
+    /// The unreachable-advertisement check, consulted only for payloads `rewrite` left untouched.
     suppress: fn(&[u8]) -> bool,
 }
 
@@ -205,15 +182,11 @@ impl<C: Classify> SimpleReflector<C> {
         }
     }
 
-    /// Apply `rewrite` to the payload before re-emit (e.g. SSDP's DIAL `LOCATION` rewrite); without it
-    /// the payload is forwarded verbatim.
     pub(crate) fn with_rewrite(mut self, rewrite: Box<dyn ReplyRewrite>) -> Self {
         self.rewrite = rewrite;
         self
     }
 
-    /// Drop (rather than re-emit) any payload `suppress` flags: the protocol's
-    /// `advertises_only_unreachable` check.
     pub(crate) fn with_suppress(mut self, suppress: fn(&[u8]) -> bool) -> Self {
         self.suppress = suppress;
         self
@@ -267,8 +240,7 @@ impl<C: Classify> PacketHandler for SimpleReflector<C> {
             return Outcome::Filtered;
         };
 
-        // A family the egress can't currently source is a quiet, transient drop (address
-        // loss): a Stalled, not a genuine send failure.
+        // Address loss is transient: a Stalled, not a send failure.
         if !egress_sources(dispatcher, self.egress, dest) {
             log::debug!(
                 "{}: egress has no source for {dest} yet; dropping {} from {}",
@@ -283,9 +255,9 @@ impl<C: Classify> PacketHandler for SimpleReflector<C> {
             .rewrite
             .rewrite(packet.payload, self.egress, dispatcher, reactor);
 
-        // A rewritten payload is exempt: the rewrite inserts netflector's own egress-side listener,
-        // reachable from the egress link even when that interface's address is itself link-local.
-        // Only an untouched payload still advertises the far link's addresses.
+        // A rewritten payload is exempt: it now names our own egress-side listener, reachable from
+        // that link whatever its address class. Only an untouched payload still advertises the far
+        // link's addresses.
         if rewritten.is_none() && (self.suppress)(packet.payload) {
             log::debug!(
                 "{}: suppressing {} from {}: advertises only unreachable addresses",
@@ -329,16 +301,11 @@ impl<C: Classify> PacketHandler for SimpleReflector<C> {
     }
 }
 
-/// IPv6 link-local all-nodes group (`ff02::1`), the v6 equivalent of the IPv4 limited broadcast.
+/// The v6 stand-in for the IPv4 limited broadcast.
 const V6_ALL_NODES: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
 
-/// Where a re-emit of a packet captured to `dest` goes, at the captured port: a multicast group
-/// (the dispatcher's filter pinned it) and the IPv4 limited broadcast re-emit to themselves; any
-/// other destination goes where `unicast` says. For [`UnicastTo::Broadcast`], a directed broadcast
-/// or a wake sent to a device's own address goes to the egress's own directed broadcast, or the
-/// limited broadcast while its prefix is unknown, and any other IPv6 destination to the all-nodes
-/// group; for [`UnicastTo::Group`], to the group of its family; for [`UnicastTo::Nowhere`],
-/// `None`.
+/// Where a re-emit of a packet captured to `dest` goes, at the captured port: a group or the
+/// limited broadcast keeps it, anything else goes where `unicast` says.
 fn link_destination(
     dest: SocketAddr,
     directed_broadcast: Option<Ipv4Addr>,

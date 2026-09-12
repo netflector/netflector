@@ -1,11 +1,6 @@
-//! Build the link-layer frames we inject on the egress path.
-//!
-//! The public builders write a full frame into a caller-provided buffer (no
-//! data-path allocation) and return the byte count, filling checksums via
-//! [`super::checksum`]. Ethernet builders prefix destination/source MACs and an
-//! ethertype. The BSD `DLT_NULL` builders (macOS/FreeBSD) prefix a 4-byte
-//! host-order address family instead, matching the capture-side framing. A Linux raw
-//! IP link (`WireGuard`, tun) takes the bare datagram that [`ipv4_udp`] / [`ipv6_udp`] write.
+//! Build the link-layer frames injected on the egress path, into a caller-provided buffer with
+//! the checksums filled. A Linux raw IP link (`WireGuard`, tun) takes the bare datagram that
+//! [`ipv4_udp`] / [`ipv6_udp`] write.
 
 use std::net::{SocketAddrV4, SocketAddrV6};
 
@@ -19,28 +14,20 @@ use super::{ETHERNET_HEADER_SIZE, IPV4_HEADER_SIZE, IPV6_HEADER_SIZE, UDP_HEADER
 
 const IPV4_ETHERTYPE: u16 = 0x0800;
 const IPV6_ETHERTYPE: u16 = 0x86dd;
-/// Don't-Fragment, in the IPv4 flags + fragment-offset field. These one-hop
-/// link-local datagrams are never fragmented, so DF is set and a zero IP
-/// identification stays RFC 6864-conformant.
+/// Set on every datagram: these one-hop messages are never fragmented, and with DF a zero IP
+/// identification is RFC 6864-conformant.
 const IPV4_FLAG_DF: u16 = 0x4000;
 
-/// Why building a UDP frame failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub(crate) enum FrameError {
-    /// `out` cannot hold the frame.
     #[error("output buffer too small: need {needed} bytes, have {available}")]
     BufferTooSmall { needed: usize, available: usize },
-    /// The datagram overflows the 16-bit IP/UDP length fields.
     #[error("payload of {payload} bytes is too large for a UDP datagram")]
     PayloadTooLarge { payload: usize },
 }
 
-/// Ethernet frame carrying an IPv4 UDP datagram into `out`: dst/src MAC header and
-/// ethertype, then the IPv4 + UDP datagram with checksums filled.
-///
 /// # Errors
-/// [`FrameError::PayloadTooLarge`] if the datagram overflows the 16-bit length
-/// fields, or [`FrameError::BufferTooSmall`] if `out` cannot hold the frame.
+/// [`FrameError::PayloadTooLarge`] or [`FrameError::BufferTooSmall`].
 pub(crate) fn ethernet_ipv4_udp(
     dst_mac: MacAddr,
     src_mac: MacAddr,
@@ -57,12 +44,8 @@ pub(crate) fn ethernet_ipv4_udp(
     Ok(ETHERNET_HEADER_SIZE + datagram)
 }
 
-/// Ethernet frame carrying an IPv6 UDP datagram into `out`: dst/src MAC header and
-/// ethertype, then the IPv6 + UDP datagram with the UDP checksum filled.
-///
 /// # Errors
-/// [`FrameError::PayloadTooLarge`] if the datagram overflows the 16-bit length
-/// fields, or [`FrameError::BufferTooSmall`] if `out` cannot hold the frame.
+/// [`FrameError::PayloadTooLarge`] or [`FrameError::BufferTooSmall`].
 pub(crate) fn ethernet_ipv6_udp(
     dst_mac: MacAddr,
     src_mac: MacAddr,
@@ -79,13 +62,8 @@ pub(crate) fn ethernet_ipv6_udp(
     Ok(ETHERNET_HEADER_SIZE + datagram)
 }
 
-/// `DLT_NULL` frame carrying an IPv4 UDP datagram into `out` (BSD `lo0`
-/// framing): a 4-byte host-order address family, then the IPv4 + UDP datagram
-/// with checksums filled. Returns the frame length.
-///
 /// # Errors
-/// [`FrameError::PayloadTooLarge`] if the datagram overflows the 16-bit length
-/// fields, or [`FrameError::BufferTooSmall`] if `out` cannot hold the frame.
+/// [`FrameError::PayloadTooLarge`] or [`FrameError::BufferTooSmall`].
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub(crate) fn dlt_null_ipv4_udp(
     src: SocketAddrV4,
@@ -101,13 +79,8 @@ pub(crate) fn dlt_null_ipv4_udp(
     Ok(DLT_NULL_HEADER_SIZE + datagram)
 }
 
-/// `DLT_NULL` frame carrying an IPv6 UDP datagram into `out` (BSD `lo0`
-/// framing): a 4-byte host-order address family, then the IPv6 + UDP datagram
-/// with the UDP checksum filled. Returns the frame length.
-///
 /// # Errors
-/// [`FrameError::PayloadTooLarge`] if the datagram overflows the 16-bit length
-/// fields, or [`FrameError::BufferTooSmall`] if `out` cannot hold the frame.
+/// [`FrameError::PayloadTooLarge`] or [`FrameError::BufferTooSmall`].
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub(crate) fn dlt_null_ipv6_udp(
     src: SocketAddrV6,
@@ -123,12 +96,8 @@ pub(crate) fn dlt_null_ipv6_udp(
     Ok(DLT_NULL_HEADER_SIZE + datagram)
 }
 
-/// Write an IPv4 + UDP datagram (headers and `payload`, with the IPv4-header and
-/// UDP checksums filled) into `out`.
-///
 /// # Errors
-/// [`FrameError::PayloadTooLarge`] if the datagram overflows the 16-bit length
-/// fields, or [`FrameError::BufferTooSmall`] if `out` cannot hold it.
+/// [`FrameError::PayloadTooLarge`] or [`FrameError::BufferTooSmall`].
 pub(crate) fn ipv4_udp(
     src: SocketAddrV4,
     dst: SocketAddrV4,
@@ -138,7 +107,7 @@ pub(crate) fn ipv4_udp(
 ) -> Result<usize, FrameError> {
     let udp_length = datagram_length(payload)?;
     let frame_size = IPV4_HEADER_SIZE + usize::from(udp_length);
-    // The IPv4 total-length field is also 16-bit and spans header + datagram.
+    // The total-length field is 16-bit too and spans header + datagram.
     let total_length = u16::try_from(frame_size).map_err(|_| FrameError::PayloadTooLarge {
         payload: payload.len(),
     })?;
@@ -165,12 +134,10 @@ pub(crate) fn ipv4_udp(
     Ok(frame_size)
 }
 
-/// Write an IPv6 + UDP datagram (headers and `payload`, with the UDP checksum
-/// filled) into `out`. The IPv6 header carries no checksum of its own.
+/// The IPv6 header carries no checksum of its own.
 ///
 /// # Errors
-/// [`FrameError::PayloadTooLarge`] if the datagram overflows the 16-bit length
-/// fields, or [`FrameError::BufferTooSmall`] if `out` cannot hold it.
+/// [`FrameError::PayloadTooLarge`] or [`FrameError::BufferTooSmall`].
 pub(crate) fn ipv6_udp(
     src: SocketAddrV6,
     dst: SocketAddrV6,
@@ -200,15 +167,12 @@ pub(crate) fn ipv6_udp(
     Ok(frame_size)
 }
 
-/// The UDP datagram length (header + `payload`) as a `u16`, or
-/// [`FrameError::PayloadTooLarge`] if it overflows the 16-bit length field.
 fn datagram_length(payload: &[u8]) -> Result<u16, FrameError> {
     u16::try_from(UDP_HEADER_SIZE + payload.len()).map_err(|_| FrameError::PayloadTooLarge {
         payload: payload.len(),
     })
 }
 
-/// Truncate `out` to exactly `frame_size`, or report it as too small.
 fn checked_out(out: &mut [u8], frame_size: usize) -> Result<&mut [u8], FrameError> {
     if out.len() < frame_size {
         return Err(FrameError::BufferTooSmall {
@@ -219,16 +183,13 @@ fn checked_out(out: &mut [u8], frame_size: usize) -> Result<&mut [u8], FrameErro
     Ok(&mut out[..frame_size])
 }
 
-/// Write the UDP source/destination ports and length into `udp` (the datagram,
-/// header first). The checksum field (bytes 6-7) is left for the caller to fill.
+/// Leaves the checksum field (bytes 6-7) for the caller.
 fn write_udp_header(udp: &mut [u8], src_port: u16, dst_port: u16, length: u16) {
     udp[0..2].copy_from_slice(&src_port.to_be_bytes());
     udp[2..4].copy_from_slice(&dst_port.to_be_bytes());
     udp[4..6].copy_from_slice(&length.to_be_bytes());
 }
 
-/// Split `out` into its `l2_size`-byte L2 header and the body that follows, or
-/// report it as too small.
 fn split_l2(out: &mut [u8], l2_size: usize) -> Result<(&mut [u8], &mut [u8]), FrameError> {
     if out.len() < l2_size {
         return Err(FrameError::BufferTooSmall {
@@ -239,8 +200,7 @@ fn split_l2(out: &mut [u8], l2_size: usize) -> Result<(&mut [u8], &mut [u8]), Fr
     Ok(out.split_at_mut(l2_size))
 }
 
-/// Re-base a datagram-relative [`FrameError::BufferTooSmall`] onto the whole
-/// frame, so the reported sizes account for the `l2_size`-byte L2 header.
+/// Re-base a datagram-relative [`FrameError::BufferTooSmall`] onto the whole frame.
 fn with_l2_header(error: FrameError, l2_size: usize) -> FrameError {
     match error {
         FrameError::BufferTooSmall { needed, available } => FrameError::BufferTooSmall {
@@ -251,14 +211,12 @@ fn with_l2_header(error: FrameError, l2_size: usize) -> FrameError {
     }
 }
 
-/// Write the 14-byte Ethernet header: destination MAC, source MAC, ethertype.
 fn write_ethernet_header(out: &mut [u8], dst_mac: MacAddr, src_mac: MacAddr, ethertype: u16) {
     out[0..6].copy_from_slice(&dst_mac.octets());
     out[6..12].copy_from_slice(&src_mac.octets());
     out[12..14].copy_from_slice(&ethertype.to_be_bytes());
 }
 
-/// Write the 4-byte `DLT_NULL` link header: the address family in host byte order.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 fn write_dlt_null_header(out: &mut [u8], family: libc::c_int) {
     out[0..4].copy_from_slice(&family.cast_unsigned().to_ne_bytes());

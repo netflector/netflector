@@ -1,19 +1,12 @@
-//! RFC 1071 Internet checksum, computed only on the egress (raw-inject) path.
-//!
-//! When we build a frame to inject ourselves, the kernel UDP/IP stack is out of
-//! the loop, so the IPv4 header and UDP checksums are filled in by hand. The
-//! capture path never verifies checksums; a re-injected packet gets fresh ones.
+//! RFC 1071 Internet checksum for the egress path: an injected frame bypasses the kernel stack, so
+//! its IPv4 header and UDP checksums are filled by hand. The capture path never verifies checksums.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-/// Internet checksum of an IPv4 header.
-///
-/// `header` is the full IHL-sized header. Its own checksum field (bytes 10-11) is
-/// treated as zero, so its current contents don't affect the result. No need to
-/// pre-zero it; re-checksumming a header that already carries a checksum works.
+/// The checksum field (bytes 10-11) is summed as zero, so it needn't be pre-zeroed.
 ///
 /// # Panics
-/// Panics if `header` is shorter than 12 bytes (no room for the checksum field).
+/// `header` shorter than 12 bytes.
 #[must_use]
 pub(crate) fn ipv4_header(header: &[u8]) -> u16 {
     let sum = sum_words(&header[..10], 0);
@@ -21,14 +14,11 @@ pub(crate) fn ipv4_header(header: &[u8]) -> u16 {
     fold(sum)
 }
 
-/// UDP checksum over the IPv4 pseudo-header and the UDP datagram.
-///
-/// `udp` is the contiguous UDP header plus payload. Its own checksum field
-/// (bytes 6-7) is treated as zero; no need to pre-zero it. A computed `0x0000` is
-/// returned as `0xffff` (RFC 768).
+/// `udp` is the header plus payload; its checksum field (bytes 6-7) is summed as zero. A computed
+/// `0x0000` is returned as `0xffff` (RFC 768).
 ///
 /// # Panics
-/// Panics if `udp` is shorter than the 8-byte UDP header.
+/// `udp` shorter than the 8-byte UDP header.
 #[must_use]
 pub(crate) fn udp_v4(src: Ipv4Addr, dst: Ipv4Addr, udp: &[u8]) -> u16 {
     // Pseudo-header: src(4) dst(4) zero(1) protocol(1) length(2).
@@ -40,14 +30,10 @@ pub(crate) fn udp_v4(src: Ipv4Addr, dst: Ipv4Addr, udp: &[u8]) -> u16 {
     udp_checksum(&pseudo, udp)
 }
 
-/// UDP checksum over the IPv6 pseudo-header and the UDP datagram.
-///
-/// As [`udp_v4`], but with the 40-byte IPv6 pseudo-header. `udp` is the
-/// contiguous UDP header plus payload; its checksum field (bytes 6-7) is treated
-/// as zero, and a computed `0x0000` is returned as `0xffff` (RFC 768).
+/// As [`udp_v4`] with the IPv6 pseudo-header.
 ///
 /// # Panics
-/// Panics if `udp` is shorter than the 8-byte UDP header.
+/// `udp` shorter than the 8-byte UDP header.
 #[must_use]
 pub(crate) fn udp_v6(src: Ipv6Addr, dst: Ipv6Addr, udp: &[u8]) -> u16 {
     // Pseudo-header: src(16) dst(16) length(4) zero(3) next_header(1).
@@ -59,8 +45,6 @@ pub(crate) fn udp_v6(src: Ipv6Addr, dst: Ipv6Addr, udp: &[u8]) -> u16 {
     udp_checksum(&pseudo, udp)
 }
 
-/// Sum the pseudo-header and the datagram with the UDP checksum field (bytes 6-7)
-/// skipped, then fold and apply the RFC 768 zero map.
 fn udp_checksum(pseudo: &[u8], udp: &[u8]) -> u16 {
     let sum = sum_words(pseudo, 0);
     let sum = sum_words(&udp[..6], sum);
@@ -71,9 +55,7 @@ fn udp_checksum(pseudo: &[u8], udp: &[u8]) -> u16 {
     }
 }
 
-/// Sum `data`'s 16-bit big-endian words into a 32-bit accumulator seeded with
-/// `seed`; a trailing odd byte is treated as the high byte of a final word.
-/// `seed` lets callers chain segments (pseudo-header, then datagram).
+/// A trailing odd byte is the high byte of a final word.
 fn sum_words(data: &[u8], seed: u32) -> u32 {
     let (words, tail) = data.as_chunks::<2>();
     let mut sum = seed;
@@ -86,16 +68,13 @@ fn sum_words(data: &[u8], seed: u32) -> u32 {
     sum
 }
 
-/// Fold the carries of a 32-bit accumulator into 16 bits, then take the one's
-/// complement. Two folds always suffice: after the first the high half is at
-/// most 1, which the second carries in.
+/// Two folds suffice: after the first the high half is at most 1.
 fn fold(sum: u32) -> u16 {
     let sum = (sum & 0xffff) + (sum >> 16);
     let sum = (sum & 0xffff) + (sum >> 16);
     !u16::try_from(sum).expect("two folds reduce the accumulator below 2^16")
 }
 
-/// The UDP datagram length, for the pseudo-header's length field.
 fn udp_length(udp: &[u8]) -> u16 {
     u16::try_from(udp.len()).expect("UDP datagram length fits in u16")
 }

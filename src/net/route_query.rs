@@ -1,5 +1,4 @@
-//! Which interface would the kernel route a destination through? A `PF_ROUTE` `RTM_GET` query.
-//!
+//! Which interface the kernel would route a destination through, via a `PF_ROUTE` `RTM_GET`.
 //! FreeBSD has no `SO_BINDTODEVICE`/`IP_BOUND_IF`, so the DIAL proxy checks the route instead of
 //! pinning the connect. Weaker than a pin: it can't hold an established connection in place, and
 //! under multipath the kernel reports the first nexthop while the connect hashes independently.
@@ -14,13 +13,12 @@ use libc::{c_int, c_void};
 use crate::libcex::RtMsgHdr;
 use crate::sys::{IoStatus, blocking_socket};
 
-/// One routing message: a fixed header plus a few small sockaddrs.
+/// Ample for one routing message: a fixed header plus a few small sockaddrs.
 const READ_BUF: usize = 2048;
 
-/// Bound on one blocking read, and on the whole exchange. The kernel hands the reply to a software
-/// interrupt rather than queueing it inline, so some wait is normal; these only cap the cases where
-/// it was dropped (the netisr queue and the receive buffer both discard silently) or where the
-/// socket's own broadcasts keep arriving faster than we step over them.
+/// One blocking read, and the whole exchange. The reply arrives via a software interrupt, so some
+/// wait is normal; these cap a silently dropped reply (netisr queue, receive buffer) or a broadcast
+/// flood.
 const READ_TIMEOUT: Duration = Duration::from_secs(1);
 const REPLY_DEADLINE: Duration = Duration::from_secs(5);
 
@@ -31,9 +29,9 @@ const RECV_BUFFER: c_int = 256 * 1024;
 /// Marks our request in the reply; the kernel's broadcasts carry 0.
 const REQUEST_SEQ: c_int = 1;
 
-/// An `RTM_GET` request: the header followed by the one sockaddr it names. A routing message carries
-/// a variable set of sockaddrs, so `<net/route.h>` declares no struct for one; `route(8)` appends
-/// them to a byte blob through a cursor. Asking for a single `RTA_DST` needs only this.
+/// The header followed by the one sockaddr it names. `<net/route.h>` declares no struct for a
+/// message (the sockaddr set is variable; `route(8)` appends them through a cursor); a single
+/// `RTA_DST` needs only this.
 #[repr(C)]
 struct RouteRequest {
     hdr: RtMsgHdr,
@@ -47,8 +45,8 @@ const _: () = assert!(size_of::<RouteRequest>() == size_of::<RtMsgHdr>() + 16);
 /// The index of the interface the kernel would route `dst` through.
 ///
 /// # Errors
-/// No route, a route that discards traffic, or a routing-socket failure. Anything that leaves the
-/// answer unknown is an error: the caller refuses the connect on one.
+/// No route, a route that discards traffic, or a routing-socket failure; the caller refuses the
+/// connect on any.
 pub(crate) fn egress_ifindex(dst: Ipv4Addr) -> io::Result<u32> {
     let sock = open_route_socket()?;
     let request = build_request(dst);
@@ -71,8 +69,8 @@ pub(crate) fn egress_ifindex(dst: Ipv4Addr) -> io::Result<u32> {
     read_reply(sock.as_raw_fd(), dst)
 }
 
-/// A socket for one query: blocking, like the netlink dump's, since this is a synchronous exchange
-/// rather than something the reactor polls. `AF_INET` narrows the broadcasts it also receives.
+/// Blocking: a synchronous exchange, not something the reactor polls. `AF_INET` narrows the
+/// broadcasts it also receives.
 fn open_route_socket() -> io::Result<OwnedFd> {
     let sock = blocking_socket(libc::PF_ROUTE, libc::SOCK_RAW, libc::AF_INET)?;
     crate::sys::set_recv_timeout(sock.as_raw_fd(), READ_TIMEOUT)?;
@@ -100,7 +98,7 @@ fn build_request(dst: Ipv4Addr) -> RouteRequest {
             sin_len: u8::try_from(size_of::<libc::sockaddr_in>())
                 .expect("sockaddr_in fits a u8 length"),
             sin_family: u8::try_from(libc::AF_INET).expect("AF_INET fits a u8 family"),
-            sin_port: 0, // a route has no port
+            sin_port: 0,
             sin_addr: libc::in_addr {
                 s_addr: u32::from_ne_bytes(dst.octets()),
             },
@@ -109,8 +107,7 @@ fn build_request(dst: Ipv4Addr) -> RouteRequest {
     }
 }
 
-/// Read past the kernel's broadcasts to our own reply. An unanswered query is an error, so the
-/// caller refuses the connect rather than allowing it.
+/// Read past the kernel's broadcasts to our own reply.
 fn read_reply(fd: RawFd, dst: Ipv4Addr) -> io::Result<u32> {
     let mut buf = [0u8; READ_BUF];
     let deadline = Instant::now() + REPLY_DEADLINE;
@@ -153,7 +150,6 @@ fn read_reply(fd: RawFd, dst: Ipv4Addr) -> io::Result<u32> {
     }
 }
 
-/// Whether `hdr` answers our own request rather than being one of the kernel's broadcasts.
 fn is_our_reply(hdr: &RtMsgHdr) -> bool {
     hdr.version == u8::try_from(libc::RTM_VERSION).expect("RTM_VERSION fits a u8")
         && hdr.msg_type == u8::try_from(libc::RTM_GET).expect("RTM_GET fits a u8")

@@ -1,12 +1,9 @@
 //! `AF_PACKET` packet capture (Linux).
 //!
-//! Unlike the BSD BPF backend, one `recv` returns exactly one frame, with no batch to walk.
-//!
-//! Init order matters: the socket opens with protocol 0, capturing nothing, so the
-//! filter and the loop-prevention option install before `bind` sets the real
-//! protocol and starts delivery. No window exists in which unfiltered frames
-//! (e.g. IGMP from a multicast join) queue. The BSD backend instead binds first
-//! and relies on `BIOCSETF` flushing the kernel buffer.
+//! Init order matters: the socket opens with protocol 0 and captures nothing, so the filter
+//! and the loop-prevention option go in before `bind` sets the real protocol and starts
+//! delivery; no unfiltered frame (an IGMP from a multicast join, say) ever queues. The BSD
+//! backend binds first and relies on `BIOCSETF` flushing the kernel buffer.
 
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -20,8 +17,8 @@ use crate::logging::{WARN_WINDOW, log_rate};
 use crate::net::LinkType;
 use crate::sys::{IoStatus, check, open_socket, setsockopt, socklen_of};
 
-/// A raw-capture handle on one interface. The socket's bind is the only holder of the
-/// interface's kernel index: sends rely on it, so nothing here goes stale if the index changes.
+/// A raw-capture handle on one interface. No cached ifindex: the bind holds it, so nothing
+/// here goes stale when the index changes.
 pub(crate) struct Capture {
     fd: OwnedFd,
     buf: Box<[u8]>,
@@ -33,11 +30,10 @@ impl Capture {
     /// Open an `AF_PACKET` capture bound to `if_name`.
     ///
     /// # Errors
-    /// Returns an error if the interface is unknown or of a hardware type that is neither
-    /// Ethernet nor raw IP, the socket can't be created, the filter can't be attached, or the
-    /// bind fails.
+    /// An unknown interface, a hardware type neither Ethernet nor raw IP, or a failed
+    /// socket/filter/bind.
     pub(crate) fn open(if_name: &str) -> io::Result<Self> {
-        // Protocol 0: capture nothing until the filter + loop-prevention are in place.
+        // Protocol 0: nothing is captured until the bind.
         let fd = open_socket(libc::AF_PACKET, libc::SOCK_RAW, 0)?;
         let link_type = attach(&fd, if_name)?;
         log::debug!(
@@ -52,10 +48,8 @@ impl Capture {
         })
     }
 
-    /// Re-attach the socket to the interface currently named at open, re-hooking delivery to
-    /// its (possibly recreated) kernel object. Same fd, so the reactor's watch stays valid;
-    /// [`attach`] re-reads the framing and re-installs the filter ahead of the bind, so the
-    /// init invariant holds with no unfiltered window.
+    /// Re-attach to the interface named at open, after it was recreated. Same fd, so the
+    /// reactor's watch stays valid.
     ///
     /// # Errors
     /// [`io::ErrorKind::NotFound`] while no interface bears the name; otherwise the attach
@@ -71,8 +65,8 @@ impl Capture {
                 self.name,
                 io::Error::from_raw_os_error(errno)
             ),
-            // Can't happen (SO_ERROR is a generic socket option on a live fd); if it somehow
-            // does, the stale error was left unconsumed and the next read will surface it.
+            // Can't fail on a live fd (SO_ERROR is generic); if it does, the next read surfaces
+            // the stale error.
             Err(e) => log::warn!(
                 "could not clear the pending error on the re-bound capture for {}: {e}",
                 self.name
@@ -86,10 +80,9 @@ impl Capture {
         Ok(())
     }
 
-    /// Whether the socket is still hooked to the live interface with kernel index `ifindex`.
-    /// `getsockname` reports the bound index, which the kernel resets to -1 when the bound
-    /// interface is unregistered, so a destroyed (or destroyed-and-recreated) interface
-    /// compares unequal. A `getsockname` failure counts as detached.
+    /// Whether the socket is still bound to the live interface `ifindex`. The kernel resets the
+    /// bound index to -1 when the interface is unregistered, so a destroyed or recreated
+    /// interface compares unequal.
     pub(crate) fn attached(&self, ifindex: u32) -> bool {
         // SAFETY: an all-zero sockaddr_ll is a valid out-param; the kernel fills it up to `len`.
         let mut addr: libc::sockaddr_ll = unsafe { core::mem::zeroed() };
@@ -105,7 +98,6 @@ impl Capture {
         rc == 0 && u32::try_from(addr.sll_ifindex).is_ok_and(|bound| bound == ifindex)
     }
 
-    /// The link framing, from the interface's hardware type.
     pub(crate) fn link_type(&self) -> LinkType {
         self.link_type
     }
@@ -114,20 +106,18 @@ impl Capture {
         &self.name
     }
 
-    /// The next read: a frame, or an oversized one (larger than the receive buffer) dropped
-    /// and counted; `Ok(None)` when a read would block.
+    /// `Ok(None)` when a read would block.
     ///
     /// # Errors
-    /// Returns an error if the `recv` fails for any reason other than would-block.
+    /// A `recv` failure other than would-block.
     pub(crate) fn next_frame(&mut self) -> io::Result<Option<Read<'_>>> {
         let Some(bytes) = self.recv_once()? else {
             return Ok(None);
         };
-        // MSG_TRUNC reports the frame's real length even past the buffer, so an
-        // oversized frame is detectable (and dropped) instead of silently cut.
+        // MSG_TRUNC reports the frame's real length even past the buffer, so an oversized
+        // frame is dropped instead of silently cut.
         if bytes > self.buf.len() {
-            // Rate-limited: this is the per-frame drain loop, and a remote peer can flood
-            // oversized frames.
+            // A remote peer can flood oversized frames.
             log_rate!(
                 log::Level::Warn,
                 WARN_WINDOW,
@@ -141,15 +131,14 @@ impl Capture {
         Ok(Some(Read::Frame(&self.buf[..bytes])))
     }
 
-    /// Whether frames are buffered locally. Never, for `AF_PACKET`: each `recv` is
-    /// one frame, so a level-triggered wait re-fires while the socket has more.
+    /// Never: each `recv` is one frame, so a level-triggered wait re-fires while the socket
+    /// has more.
     #[allow(clippy::unused_self)] // uniform Capture API; the BPF backend reads self
     pub(crate) fn has_buffered(&self) -> bool {
         false
     }
 
-    /// Whether a read error says the interface behind the socket is gone: the kernel parks
-    /// `ENETDOWN` on a packet socket whose interface was unregistered.
+    /// The kernel parks `ENETDOWN` on a packet socket whose interface was unregistered.
     pub(crate) fn lost_interface(err: &io::Error) -> bool {
         err.raw_os_error() == Some(libc::ENETDOWN)
     }
@@ -157,12 +146,10 @@ impl Capture {
     /// Inject a fully-built link-layer `frame` on this interface.
     ///
     /// # Errors
-    /// Returns an error if the send fails or is short.
+    /// A failed or short send.
     pub(crate) fn send(&self, frame: &[u8]) -> io::Result<()> {
-        // SOCK_RAW carries the whole L2 frame and the socket is bound to its interface, so a
-        // plain `send` suffices: the kernel takes the egress from the bind, and the
-        // destination MAC is in the frame. A raw IP link has no header to read the protocol
-        // off; since Linux 5.8 the kernel takes it from the IP version instead.
+        // A plain `send` on the bound SOCK_RAW socket suffices, no `sockaddr_ll`. On a raw IP
+        // link the kernel reads the protocol off the IP version (Linux 5.8+).
         // SAFETY: `frame` is a valid readable slice of `frame.len()` bytes.
         let sent = unsafe {
             libc::send(
@@ -181,9 +168,7 @@ impl Capture {
         Ok(())
     }
 
-    /// One `recv` into the buffer. Returns `Ok(None)` when it would block, or the frame's real
-    /// length. The length may exceed the buffer, since `MSG_TRUNC` is set; the caller treats
-    /// that as an oversized frame.
+    /// One `recv` into the buffer; `Ok(None)` when it would block.
     fn recv_once(&mut self) -> io::Result<Option<usize>> {
         // SAFETY: `recv` writes up to `buf.len()` bytes into our own buffer.
         let n = unsafe {
@@ -207,10 +192,7 @@ impl AsRawFd for Capture {
     }
 }
 
-/// Attach `fd` to `if_name` and normalize the per-attachment state: read the link framing,
-/// install the matching UDP filter with loop prevention, then bind with `ETH_P_ALL` to start
-/// delivery. Shared by [`Capture::open`] and [`Capture::rebind`]; the filter goes in before the
-/// bind, so no frame is ever delivered unfiltered.
+/// The filter goes in before the bind, so no frame is ever delivered unfiltered.
 fn attach(fd: &OwnedFd, if_name: &str) -> io::Result<LinkType> {
     let ifindex = resolve_ifindex(if_name)?;
     let link_type = link_type_of(fd, if_name)?;
@@ -219,9 +201,7 @@ fn attach(fd: &OwnedFd, if_name: &str) -> io::Result<LinkType> {
     Ok(link_type)
 }
 
-/// The link framing of `if_name`, from its hardware type: Ethernet (a loopback is framed the
-/// same), or the bare IP packets of a link with no header (`ARPHRD_NONE`: `WireGuard`, tun).
-/// Anything else is refused rather than read as Ethernet.
+/// Ethernet (a loopback is framed the same) or raw IP (`ARPHRD_NONE`: `WireGuard`, tun).
 fn link_type_of(fd: &OwnedFd, if_name: &str) -> io::Result<LinkType> {
     // SAFETY: an all-zero `ifreq` is valid (a zeroed name and union).
     let mut ifr: libc::ifreq = unsafe { core::mem::zeroed() };
@@ -247,11 +227,10 @@ fn link_type_of(fd: &OwnedFd, if_name: &str) -> io::Result<LinkType> {
     }
 }
 
-/// Install the UDP classifier for `link_type`, with loop prevention: stop the kernel from handing
-/// us our own injected frames. A link that returns them as received frames (a hairpin bridge
-/// port) gets past this; the dispatcher's echo drop catches those. `PACKET_IGNORE_OUTGOING`
-/// (Linux 4.20+) drops them at the socket; if the kernel lacks it (or user-mode QEMU rejects
-/// it), an in-filter drop precedes the classifier instead.
+/// The UDP classifier plus loop prevention. `PACKET_IGNORE_OUTGOING` is Linux 4.20+ and
+/// user-mode QEMU rejects it; without it an in-filter drop precedes the classifier. A hairpin
+/// bridge port returns our frames as received ones and gets past both; the dispatcher's echo
+/// drop catches those.
 fn install_filter(fd: &OwnedFd, link_type: LinkType) -> io::Result<()> {
     let classifier: &[BpfInsn] = match link_type {
         LinkType::Ethernet => &ETHERNET_UDP_FILTER,
@@ -269,8 +248,6 @@ fn install_filter(fd: &OwnedFd, link_type: LinkType) -> io::Result<()> {
     }
 }
 
-/// [`DROP_OUTGOING_PROLOGUE`] followed by `classifier`: the loop-prevention fallback for
-/// kernels without `PACKET_IGNORE_OUTGOING`.
 fn drop_outgoing_filter(classifier: &[BpfInsn]) -> Vec<BpfInsn> {
     DROP_OUTGOING_PROLOGUE
         .iter()
@@ -279,8 +256,6 @@ fn drop_outgoing_filter(classifier: &[BpfInsn]) -> Vec<BpfInsn> {
         .collect()
 }
 
-/// Resolve `if_name` to its kernel index as the `c_int` a `sockaddr_ll` carries, with a clear
-/// error while no interface bears the name.
 fn resolve_ifindex(if_name: &str) -> io::Result<c_int> {
     let ifindex = if_index(if_name).ok_or_else(|| {
         io::Error::new(
@@ -291,8 +266,6 @@ fn resolve_ifindex(if_name: &str) -> io::Result<c_int> {
     c_int::try_from(ifindex).map_err(|_| io::Error::other("interface index too large"))
 }
 
-/// A zeroed `sockaddr_ll` addressed to `ifindex` for the bind (family set, protocol left zero;
-/// [`bind_interface`] adds it).
 fn link_addr(ifindex: c_int) -> libc::sockaddr_ll {
     // SAFETY: all-zero is a valid `sockaddr_ll`: integer and byte-array fields only.
     let mut addr: libc::sockaddr_ll = unsafe { core::mem::zeroed() };
@@ -301,7 +274,6 @@ fn link_addr(ifindex: c_int) -> libc::sockaddr_ll {
     addr
 }
 
-/// Ask the kernel to drop locally-sent frames on this socket (`PACKET_IGNORE_OUTGOING`).
 fn set_ignore_outgoing(fd: &OwnedFd) -> io::Result<()> {
     setsockopt(
         fd.as_raw_fd(),
@@ -311,7 +283,6 @@ fn set_ignore_outgoing(fd: &OwnedFd) -> io::Result<()> {
     )
 }
 
-/// Attach a classic-BPF `filter` to the socket via `SO_ATTACH_FILTER`.
 fn attach_filter(fd: &OwnedFd, filter: &[BpfInsn]) -> io::Result<()> {
     let program = libc::sock_fprog {
         len: u16::try_from(filter.len()).expect("filter length fits u16"),
@@ -326,7 +297,6 @@ fn attach_filter(fd: &OwnedFd, filter: &[BpfInsn]) -> io::Result<()> {
     )
 }
 
-/// Bind to the interface in `addr`, adding the capture protocol `ETH_P_ALL`.
 fn bind_interface(fd: &OwnedFd, mut addr: libc::sockaddr_ll) -> io::Result<()> {
     addr.sll_protocol = u16::try_from(libc::ETH_P_ALL)
         .expect("ETH_P_ALL fits u16")

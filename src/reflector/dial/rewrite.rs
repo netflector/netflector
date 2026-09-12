@@ -1,8 +1,6 @@
-//! The SSDP-side entry to the DIAL proxy: rewrite a discovery message's `LOCATION` to a minted proxy.
-//!
-//! [`rewrite_location`] runs on every advertisement / search response. It rewrites a DIAL message's
-//! `LOCATION` to a source-side description proxy, minting and registering one (via the [`DialContext`]
-//! registry) if none is live for the device, and refreshing its grace either way.
+//! The SSDP-side entry to the DIAL proxy: [`rewrite_location`] rewrites a discovery message's
+//! `LOCATION` to a source-side description proxy, minting and registering one (via the
+//! [`DialContext`] registry) if none is live for the device, and refreshing its grace either way.
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
@@ -20,38 +18,31 @@ use crate::reactor::Reactor;
 
 use super::proxy::{DialDeviceProxy, Listener};
 
-/// Description-listener grace when an advertisement carries no `CACHE-CONTROL: max-age`: the
-/// UDA-recommended minimum device validity (DIAL's own example advertises `max-age=1800`).
+/// The grace without a `CACHE-CONTROL: max-age`: the UDA-recommended minimum (DIAL's own example
+/// advertises `max-age=1800`).
 const DEFAULT_DESC_GRACE: Duration = Duration::from_mins(30);
 
-/// Ceiling on an advertised `max-age`, which sets the proxy's grace-sweep deadline, so clamp it to bound
-/// how long one advertisement (a spoofed burst included) can pin a scarce proxy slot. Well above any real
-/// DIAL device's re-advertise interval, so a live device still refreshes its grace in time.
+/// Bounds how long one (possibly spoofed) advertisement can pin a scarce proxy slot; well above any
+/// real device's re-advertise interval.
 const MAX_DESC_GRACE: Duration = Duration::from_hours(2);
 
-/// Where a minted DIAL description proxy sits across the two interfaces: it binds its source-side
-/// listeners on `source`, egress-pins device connections to `target`/`target_iface`, and is evicted if
-/// either `source_capture`'s or `target_capture`'s IPv4 address later changes. Bundling the two
-/// same-typed capture/address pairs keeps them from being transposed at the call.
+/// Where a minted proxy sits: listeners bind on `source`, device connections egress-pin to
+/// `target`/`target_iface`, and an IPv4 address change on either capture evicts it.
 #[derive(Clone, Copy)]
 pub(crate) struct ProxyPlacement<'a> {
     pub(crate) source_capture: CaptureKey,
     pub(crate) source: Ipv4Addr,
     pub(crate) target_capture: CaptureKey,
     pub(crate) target: Ipv4Addr,
-    /// The target interface's name (the durable identity; `None` skips the egress pin).
+    /// `None` skips the egress pin.
     pub(crate) target_iface: Option<&'a str>,
 }
 
-/// Rewrite a DIAL discovery message's `LOCATION` to a source-side description proxy, minting and
-/// registering the proxy if one isn't already live for this device and refreshing its grace either way.
-/// On a rewrite the datagram is written to `out` and `true` is returned. `false` means forward `payload`
-/// unchanged: it isn't a DIAL message, its `LOCATION` isn't a rewritable IPv4 `http` URL or names an
-/// address that can never be a device's ([`is_never_a_peer`]; the reflector's suppression then drops
-/// the message), the proxy cap was reached / a mint failed (device stays visible but unproxied), or
-/// the rewrite didn't fit `out`.
-/// `out` is the caller's reused sink; a fixed-capacity one makes an over-long rewrite fail rather
-/// than truncate.
+/// Rewrite a DIAL message's `LOCATION` to a source-side description proxy, minting one if none is
+/// live for the device and refreshing its grace either way. `true`: the rewritten datagram is in
+/// `out`. `false`: forward `payload` unchanged (not DIAL, an unrewritable `LOCATION`, the proxy cap,
+/// a mint failure, or a rewrite that didn't fit `out`); a `LOCATION` that can never name a device
+/// ([`is_never_a_peer`]) is also `false`, and the reflector's suppression then drops it.
 pub(crate) fn rewrite_location(
     ctx: &mut DialContext,
     reactor: &mut Reactor,
@@ -63,8 +54,6 @@ pub(crate) fn rewrite_location(
         return false;
     }
     let Some(location) = parse_dial_location_authority(payload) else {
-        // DIAL, but LOCATION isn't a rewritable IPv4 http URL (https, a hostname, an IPv6 literal, a
-        // bad port): the "discovered but never proxied" case. Name the offending URL for debugging.
         log::debug!(
             "dial: LOCATION {} is not a rewritable IPv4 http URL; forwarding the message unproxied",
             dial_location_value(payload).map_or_else(|| "(absent)".into(), String::from_utf8_lossy)
@@ -80,9 +69,6 @@ pub(crate) fn rewrite_location(
         );
         return false;
     }
-    // The grace is refreshed on every advertisement / search response, so a re-advertised device's
-    // cached LOCATION keeps resolving for another max-age. Clamp it (MAX_DESC_GRACE): the value is
-    // attacker-controlled and sets a proxy-slot eviction deadline.
     let max_age = parse_cache_control_max_age(payload).map_or(DEFAULT_DESC_GRACE, |seconds| {
         Duration::from_secs(u64::from(seconds)).min(MAX_DESC_GRACE)
     });
@@ -103,8 +89,7 @@ pub(crate) fn rewrite_location(
     } else {
         return false;
     };
-    // The rewrite can grow the datagram; a fixed-capacity sink then fails the write instead of
-    // truncating.
+    // The rewrite can grow the datagram; a fixed-capacity sink fails rather than truncates.
     let fits = out.write_all(&payload[..location.offset]).is_ok()
         && write!(out, "{desc_addr}").is_ok()
         && out
@@ -119,9 +104,8 @@ pub(crate) fn rewrite_location(
     fits
 }
 
-/// Mint a description proxy for `endpoint`, register it on `reactor`, and record it in `ctx`; returns the
-/// source-side description-listener address to rewrite `LOCATION` to. `None` (logged) at the proxy cap or
-/// on a listen/register failure, leaving `LOCATION` unrewritten.
+/// Returns the description-listener address to rewrite `LOCATION` to; `None` (logged) at the cap or
+/// on a listen/register failure.
 fn mint_proxy(
     ctx: &mut DialContext,
     reactor: &mut Reactor,
@@ -150,7 +134,7 @@ fn mint_proxy(
         Ok(handler) => handler,
         Err(e) => {
             log::warn!("dial: registering the proxy for {endpoint} failed: {e}");
-            return None; // the proxy drops, closing both listeners
+            return None;
         }
     };
     ctx.insert(key, handler, desc_addr, desc_grace);
@@ -161,7 +145,6 @@ fn mint_proxy(
     Some(desc_addr)
 }
 
-/// Bind a source-side listener, logging and yielding `None` on failure; `what` names it for the log.
 fn listen_or_warn(source: Ipv4Addr, what: Listener) -> Option<TcpSocket> {
     match TcpSocket::listen(source) {
         Ok(listener) => Some(listener),

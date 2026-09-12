@@ -1,6 +1,5 @@
-//! A non-blocking IPv4 TCP socket for the DIAL application proxy: listen on the source interface,
-//! accept, connect to a device on the target interface, and stream bytes. The reactor watches its
-//! fd; all operations are non-blocking and the socket is close-on-exec.
+//! A non-blocking, close-on-exec IPv4 TCP socket for the DIAL application proxy; the reactor
+//! watches its fd.
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
@@ -12,27 +11,24 @@ use crate::sys::{
     IoStatus, check, local_addr, open_socket, setsockopt, so_error, sockaddr_for, would_block,
 };
 
-/// Listen backlog. A DIAL listener fields a few short-lived client fetches, so this is ample.
+/// A DIAL listener fields a few short-lived client fetches; 16 is ample.
 const LISTEN_BACKLOG: c_int = 16;
 
-/// A non-blocking IPv4 TCP socket: a listener, an accepted connection, or an outbound connection that
-/// may still be completing its non-blocking `connect`. Owns its fd; `Drop` closes it.
+/// A listener, an accepted connection, or an outbound connection still completing its
+/// non-blocking `connect`.
 pub(crate) struct TcpSocket {
     fd: OwnedFd,
-    /// Captured once at construction (the `bind` fixes it) so [`local_addr`](Self::local_addr) is a
-    /// field read rather than a per-call `getsockname`.
     local_addr: SocketAddrV4,
     connecting: bool,
 }
 
 impl TcpSocket {
-    /// Listen on `addr:0`: an ephemeral port on the source interface's address rather than `0.0.0.0`,
-    /// so the listener is not offered on every interface. Whether anything off that segment can still
-    /// route to the address is a routing and firewall question, not one the bind settles.
-    /// Read the assigned port back with [`local_addr`](Self::local_addr).
+    /// Listen on an ephemeral port at `addr` rather than `0.0.0.0`, so the listener is not offered
+    /// on every interface. That doesn't stop another segment routing to the address; only a
+    /// firewall does.
     ///
     /// # Errors
-    /// Propagates the socket / `setsockopt` / `bind` / `listen` syscall failure.
+    /// The socket / `bind` / `listen` failure.
     pub(crate) fn listen(addr: Ipv4Addr) -> io::Result<Self> {
         let fd = open_socket(libc::AF_INET, libc::SOCK_STREAM, 0)?;
         crate::sys::bind(fd.as_raw_fd(), IpAddr::V4(addr), 0, 0)?;
@@ -46,18 +42,15 @@ impl TcpSocket {
         })
     }
 
-    /// The bound IPv4 address. For a listener, the ephemeral port to advertise.
     pub(crate) fn local_addr(&self) -> SocketAddrV4 {
         self.local_addr
     }
 
-    /// Accept one pending connection, or `None` if there is none to take: either nothing is pending
-    /// (the listener is non-blocking, and a level-triggered reactor re-fires while more wait) or the
-    /// connection that was pending died before we reached it. The accepted socket is connected,
-    /// non-blocking, close-on-exec, and `TCP_NODELAY`.
+    /// `None` when there is nothing to take: nothing pending, or the pending connection died before
+    /// we reached it (see `nothing_to_accept`).
     ///
     /// # Errors
-    /// Propagates an `accept` failure that leaves the connection queued, or the `setsockopt` failure.
+    /// An `accept` failure that leaves the connection queued, or the `setsockopt` failure.
     pub(crate) fn accept(&self) -> io::Result<Option<Self>> {
         let Some(fd) = accept_fd(self.fd.as_raw_fd())? else {
             return Ok(None);
@@ -65,21 +58,18 @@ impl TcpSocket {
         set_nodelay(fd.as_raw_fd())?;
         Ok(Some(Self {
             fd,
-            // inherit the listener's local address rather than re-query it
             local_addr: self.local_addr,
             connecting: false,
         }))
     }
 
-    /// Open a connection to `dst`, sourced from `source` on the target interface. `confine` runs on
-    /// the fresh socket before it binds, for the caller to pin its egress (see the DIAL proxy's
-    /// `egress` module). Non-blocking: the socket is [`is_connecting`](Self::is_connecting) until a
-    /// writable edge and [`finish_connect`](Self::finish_connect). The `source` bind confines
-    /// nothing on its own: `ip_output` picks the interface from the destination alone.
+    /// `confine` runs on the fresh socket before it binds, for the caller to pin its egress: the
+    /// `source` bind alone confines nothing, `ip_output` picks the interface from the destination.
+    /// The socket is [`is_connecting`](Self::is_connecting) until a writable edge and
+    /// [`finish_connect`](Self::finish_connect).
     ///
     /// # Errors
-    /// Propagates the socket / `setsockopt` / `confine` / `bind` / `connect` failure (other than
-    /// the in-progress sentinel).
+    /// The socket / `setsockopt` / `confine` / `bind` / `connect` failure, `EINPROGRESS` excepted.
     pub(crate) fn connect(
         dst: SocketAddrV4,
         source: Ipv4Addr,
@@ -98,11 +88,10 @@ impl TcpSocket {
         })
     }
 
-    /// Complete a non-blocking `connect` after its writable edge: read `SO_ERROR`. Clears
-    /// [`is_connecting`](Self::is_connecting) on success.
+    /// Call after the writable edge.
     ///
     /// # Errors
-    /// The connect's error (e.g. `ECONNREFUSED`) if it failed, or the `getsockopt` failure.
+    /// The connect's own error (e.g. `ECONNREFUSED`), or the `getsockopt` failure.
     pub(crate) fn finish_connect(&mut self) -> io::Result<()> {
         let err = so_error(self.fd.as_raw_fd())?;
         if err != 0 {
@@ -112,18 +101,15 @@ impl TcpSocket {
         Ok(())
     }
 
-    /// Whether an outbound connection is still completing its non-blocking `connect`.
     pub(crate) fn is_connecting(&self) -> bool {
         self.connecting
     }
 
-    /// Read into `buf`: [`IoStatus::Ready(n)`](IoStatus) for `n` bytes, `Ready(0)` for the peer closing
-    /// its write side. `buf` must be non-empty: a `recv` into a zero-length buffer also returns 0,
-    /// aliasing that EOF signal; the splice loop stops reading under backpressure rather than ever
-    /// passing an empty slice.
+    /// `Ready(0)` is the peer closing its write side. `buf` must be non-empty: a zero-length `recv`
+    /// also returns 0 and would alias that EOF.
     ///
     /// # Errors
-    /// Propagates a real read error (other than `EAGAIN`/`EWOULDBLOCK`).
+    /// A read error other than `EAGAIN`/`EWOULDBLOCK`.
     pub(crate) fn recv(&self, buf: &mut [u8]) -> io::Result<IoStatus> {
         debug_assert!(
             !buf.is_empty(),
@@ -141,12 +127,11 @@ impl TcpSocket {
         IoStatus::from_syscall(n)
     }
 
-    /// Send as much of `buf` as the socket takes now: [`IoStatus::Ready(n)`](IoStatus) for `n` bytes
-    /// taken, or `WouldBlock`. A write to a peer that has reset surfaces as an error, not `SIGPIPE`:
-    /// Rust ignores `SIGPIPE` process-wide, so the `send` returns `EPIPE`.
+    /// A write to a reset peer returns `EPIPE` rather than raising `SIGPIPE`: Rust ignores the
+    /// signal process-wide.
     ///
     /// # Errors
-    /// Propagates a real write error (other than `EAGAIN`/`EWOULDBLOCK`).
+    /// A write error other than `EAGAIN`/`EWOULDBLOCK`.
     pub(crate) fn send(&self, buf: &[u8]) -> io::Result<IoStatus> {
         // SAFETY: `buf` is a valid readable region of `buf.len()` bytes.
         let n = unsafe {
@@ -160,13 +145,8 @@ impl TcpSocket {
         IoStatus::from_syscall(n)
     }
 
-    /// Send from several buffers in one `writev` (scatter-gather): [`IoStatus::Ready(n)`](IoStatus)
-    /// for `n` bytes taken, or `WouldBlock`. The proxy forwards a rewritten header and a zero-copy body
-    /// slice in one syscall this way, without coalescing them. Like [`send`](Self::send), a write to a
-    /// reset peer surfaces as `EPIPE`, not a signal.
-    ///
     /// # Errors
-    /// Propagates a real write error (other than `EAGAIN`/`EWOULDBLOCK`).
+    /// A write error other than `EAGAIN`/`EWOULDBLOCK`.
     pub(crate) fn send_vectored(&self, bufs: &[io::IoSlice<'_>]) -> io::Result<IoStatus> {
         let iovcnt = c_int::try_from(bufs.len()).unwrap_or(c_int::MAX);
         // SAFETY: `io::IoSlice` is ABI-compatible with `iovec`; `bufs.as_ptr()`/`iovcnt` describe a
@@ -181,16 +161,13 @@ impl TcpSocket {
         IoStatus::from_syscall(n)
     }
 
-    /// Best-effort `shutdown(SHUT_RDWR)`: FIN both directions now rather than waiting for `Drop`, so a
-    /// proxied peer isn't left hanging. An error (e.g. already disconnected) is ignored.
+    /// Best-effort: FIN both directions now rather than waiting for `Drop`.
     pub(crate) fn shutdown(&self) {
         // SAFETY: `fd` is a valid socket; shutdown of an already-closed peer is a harmless error.
         unsafe { libc::shutdown(self.fd.as_raw_fd(), libc::SHUT_RDWR) };
     }
 
-    /// Best-effort `shutdown(SHUT_WR)`: FIN our write half while leaving the read half open. The DIAL
-    /// proxy uses this to signal one direction's end (a half-close) without tearing down the reverse
-    /// direction, which keeps delivering to the half-closing peer. An error is ignored.
+    /// Best-effort half-close: FIN our write half, the read half stays open.
     pub(crate) fn shutdown_write(&self) {
         // SAFETY: `fd` is a valid socket; shutting an already-closed write half is a harmless error.
         unsafe { libc::shutdown(self.fd.as_raw_fd(), libc::SHUT_WR) };
@@ -203,7 +180,6 @@ impl AsRawFd for TcpSocket {
     }
 }
 
-/// The IPv4 address `fd` is bound to.
 fn local_addr_v4(fd: RawFd) -> io::Result<SocketAddrV4> {
     match local_addr(fd)? {
         std::net::SocketAddr::V4(addr) => Ok(addr),
@@ -211,8 +187,6 @@ fn local_addr_v4(fd: RawFd) -> io::Result<SocketAddrV4> {
     }
 }
 
-/// Accept a pending connection on listener `fd` (close-on-exec + non-blocking), or `None` on
-/// `WouldBlock` (nothing pending).
 fn accept_fd(fd: RawFd) -> io::Result<Option<OwnedFd>> {
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     // SAFETY: null addr/len out-pointers are valid; we don't want the peer address.
@@ -241,15 +215,14 @@ fn accept_fd(fd: RawFd) -> io::Result<Option<OwnedFd>> {
     Ok(Some(fd))
 }
 
-/// Whether a failed `accept` leaves nothing to take rather than reporting a failure to take one.
-/// Either nothing was pending (`EAGAIN`), or the connection that was pending is already gone: the
-/// peer aborted after the handshake (`ECONNABORTED`), or an error queued against that one connection
-/// surfaced here. The kernel drops it either way, so there is nothing to retry and the readiness
-/// clears without us; `accept(2)` says to treat these like `EAGAIN`.
+/// Whether a failed `accept` left nothing to take: nothing was pending (`EAGAIN`), or the pending
+/// connection is already gone (the peer aborted after the handshake, or an error queued against
+/// that connection surfaced here). The kernel has dropped it, so the readiness clears on its own;
+/// `accept(2)` says to treat these like `EAGAIN`.
 ///
-/// Not a catch-all, and the distinction is the point: `EMFILE`/`ENFILE` and friends fail before a
-/// descriptor exists, leaving the connection queued for a level-triggered listener to re-fire on
-/// without end. Those must reach the caller so it can shed the listener instead of spinning on it.
+/// Not a catch-all: `EMFILE`/`ENFILE` fail before a descriptor exists and leave the connection
+/// queued, so a level-triggered listener re-fires on it forever. Those must reach the caller so it
+/// can shed the listener.
 fn nothing_to_accept(err: &io::Error) -> bool {
     would_block(err)
         || matches!(
@@ -267,8 +240,8 @@ fn nothing_to_accept(err: &io::Error) -> bool {
         )
 }
 
-/// Start a non-blocking connect to `dst`. `true` if it is still in progress (`EINPROGRESS`), `false` if
-/// it completed immediately (e.g. a loopback connect).
+/// `true` if the connect is still in progress (`EINPROGRESS`), `false` if it completed at once
+/// (loopback).
 fn connect_v4(fd: RawFd, dst: SocketAddrV4) -> io::Result<bool> {
     let (storage, len) = sockaddr_for(IpAddr::V4(*dst.ip()), dst.port(), 0);
     // SAFETY: `storage` is a valid `sockaddr_in` of length `len` for `fd`.
@@ -284,9 +257,9 @@ fn connect_v4(fd: RawFd, dst: SocketAddrV4) -> io::Result<bool> {
 }
 
 /// Disable Nagle. The proxy forwards at recv granularity and never re-coalesces, so a message
-/// spanning two writes gets its sub-MSS tail held behind the first write's unacked bytes until the
-/// peer's delayed ACK fires (40-100ms), and the peer can't ACK early: it's mid-body with nothing to
-/// send. Writes are already message-shaped, so Nagle has nothing to usefully coalesce here.
+/// spanning two writes would have its sub-MSS tail held behind the first write's unacked bytes
+/// until the peer's delayed ACK (40-100ms); the peer is mid-body with nothing to send, so it can't
+/// ACK early.
 fn set_nodelay(fd: RawFd) -> io::Result<()> {
     setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, &1 as &c_int)
 }

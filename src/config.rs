@@ -1,16 +1,7 @@
 //! Configuration loading and validation.
 //!
-//! TOML is deserialized into a raw form (`RawConfig`/`RawReflector`) and then
-//! validated into the strongly-typed [`Config`]. Typed values make illegal states
-//! unrepresentable ([`Wol::ports`] exists only when `WoL` is enabled;
-//! [`InterfaceName`]/[`PortList`] can't be empty).
-//!
-//! Submodules: value types in `value`, errors in `error`, the serde layer in
-//! `raw`, the environment parser in `env`. Each value type pairs `FromStr` with a
-//! matching `Deserialize`, so one validation serves both the TOML path (serde,
-//! located errors) and the environment path (`FromStr`, variable-named errors).
-//! Cross-field rules live in the `TryFrom` conversions here, the cross-reflector ones in
-//! `conflict`; sources are combined in [`Config::from_sources`].
+//! TOML and the environment both deserialize into the raw form (`RawConfig`/`RawReflector`),
+//! which is then validated into [`Config`].
 //!
 //! Reflectors nest under `[reflectors.<name>]` rather than top-level tables to keep
 //! the deserializer off `#[serde(flatten)]`, which would discard the line/column of
@@ -39,14 +30,11 @@ use self::conflict::check_conflicts;
 use self::raw::{RawConfig, RawReflector};
 use crate::net::mac::MacSet;
 
-/// Wake-on-LAN settings (present only when `WoL` is enabled for the reflector).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Wol {
-    /// UDP destination ports whose magic packets are reflected.
     pub(crate) ports: PortList,
 }
 
-/// The ports a `wol = true` entry relays when `wol_ports` is absent.
 const WOL_DEFAULT_PORTS: [NonZeroU16; 2] =
     [NonZeroU16::new(7).unwrap(), NonZeroU16::new(9).unwrap()];
 
@@ -56,59 +44,43 @@ impl Wol {
     }
 }
 
-/// The transparent UDP relay's settings (present only when `udp_ports` is set).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UdpRelay {
-    /// Destination ports whose datagrams are relayed as sent.
     pub(crate) ports: PortList,
     /// Multicast groups to join and relay on those ports.
     pub(crate) groups: Option<GroupList>,
-    /// Whether broadcasts on those ports are relayed too.
     pub(crate) broadcast: bool,
 }
 
-/// SSDP settings (present only when SSDP is enabled for the reflector).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Ssdp {
-    /// Whether the DIAL HTTP proxy is layered on top of SSDP.
     pub(crate) dial: bool,
 }
 
 /// One reflector: bridges `source_if` → `target_if` for the enabled protocols.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Reflector {
-    /// Display name for logs, from the `[reflectors.<name>]` key or
-    /// `NETFLECTOR_<tag>_NAME`.
     pub(crate) name: ReflectorName,
-    /// Interface to listen on.
     pub(crate) source_if: InterfaceName,
-    /// Interface to emit on (always different from `source_if`).
+    /// Never equal to `source_if`.
     pub(crate) target_if: InterfaceName,
     /// The hosts behind `source_if` / `target_if` when that interface has no broadcast domain:
     /// a group or broadcast re-emitted there goes to each of them as unicast instead.
     pub(crate) source_peers: Option<PeerList>,
     pub(crate) target_peers: Option<PeerList>,
-    /// Optional device allow-filter; `None` matches any device, `Some` a non-empty set.
+    /// Device allow-filter; `None` matches any device.
     pub(crate) macs: Option<MacSet>,
-    /// IP-version policy for this reflector.
     pub(crate) address_family: AddressFamily,
-    /// Wake-on-LAN settings, or `None` when `WoL` is disabled.
     pub(crate) wol: Option<Wol>,
     pub(crate) mdns: bool,
-    /// SSDP settings, or `None` when SSDP is disabled.
     pub(crate) ssdp: Option<Ssdp>,
-    /// Whether WS-Discovery (WSD) is enabled.
     pub(crate) wsd: bool,
-    /// Also relay every enabled protocol target → source: the entry is built a second time with
-    /// its interfaces swapped.
     pub(crate) bidirectional: bool,
-    /// The transparent UDP relay, or `None` when `udp_ports` is unset.
     pub(crate) udp: Option<UdpRelay>,
 }
 
 impl Reflector {
-    /// This entry with its interfaces swapped: the second leg of a bidirectional entry, built
-    /// exactly like the first.
+    /// The second leg of a bidirectional entry.
     pub(crate) fn reversed(&self) -> Reflector {
         Reflector {
             source_if: self.target_if.clone(),
@@ -120,7 +92,6 @@ impl Reflector {
     }
 }
 
-/// The first listed peer of a family the entry's `address_family` does not use, if any.
 fn peer_of_unused_family(raw: &RawReflector) -> Option<IpAddr> {
     [&raw.source_peers, &raw.target_peers]
         .into_iter()
@@ -145,7 +116,6 @@ fn mdns_answers_to_peers(raw: &RawReflector) -> Option<&'static str> {
     }
 }
 
-/// The peers checks: every peer of a family the entry uses, and none where an mDNS answer goes.
 fn check_peers(raw: &RawReflector, name: &ReflectorName) -> Result<(), ConfigError> {
     if let Some(peer) = peer_of_unused_family(raw) {
         return Err(ConfigError::PeerFamily {
@@ -166,8 +136,6 @@ impl TryFrom<(String, RawReflector)> for Reflector {
     type Error = ConfigError;
 
     fn try_from((key, mut raw): (String, RawReflector)) -> Result<Self, ConfigError> {
-        // Env `NAME` override is already validated; the identity key (file table
-        // key / env tag) is validated here.
         let name = match raw.name.take() {
             Some(name) => name,
             None => ReflectorName::from_str(&key)
@@ -267,27 +235,18 @@ impl TryFrom<(String, RawReflector)> for Reflector {
     }
 }
 
-/// A fully-validated configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Config {
-    /// How often to log memory-footprint diagnostics, or `None` to disable them.
     pub(crate) debug_memory_interval: Option<Duration>,
-    /// How often to log per-interface packet counters, or `None` to disable them.
     pub(crate) counter_interval: Option<Duration>,
     pub(crate) reflectors: Vec<Reflector>,
 }
 
 impl Config {
-    /// Build a configuration from optional TOML text plus environment variables.
-    ///
-    /// Environment variables take precedence over the file for the global
-    /// settings; reflectors from the two sources are combined, and a name defined
-    /// by both is rejected. Kept free of I/O so it can be exercised directly.
+    /// Environment globals override the file's; reflectors from both sources are combined.
     ///
     /// # Errors
-    /// Returns [`ConfigError::Parse`] for malformed TOML, an `Env*` variant for a
-    /// malformed or invalid environment variable, [`ConfigError::DuplicateReflector`]
-    /// when a name is defined by both sources, or any cross-field [`ConfigError`].
+    /// Any [`ConfigError`]: malformed TOML, a bad environment variable, or a failed validation rule.
     pub(crate) fn from_sources(
         toml_text: Option<&str>,
         env: impl IntoIterator<Item = (String, String)>,
@@ -335,13 +294,10 @@ impl TryFrom<RawConfig> for Config {
     }
 }
 
-/// One year. A diagnostic cadence beyond this is a config typo, and a value large enough to overflow the
-/// reporter's `Instant + Duration` deadline would panic it at startup; reject it with a clear error.
+/// One year. Beyond this is a typo, and a value large enough to overflow the reporter's
+/// `Instant + Duration` deadline would panic at startup.
 const MAX_INTERVAL_SECS: u64 = 60 * 60 * 24 * 365;
 
-/// A positive-seconds report interval as a `Duration`; `0` or absent disables the report. `field` is the
-/// config key, named in the error for an over-large value.
-///
 /// # Errors
 /// [`ConfigError::IntervalTooLarge`] when `secs` exceeds [`MAX_INTERVAL_SECS`].
 fn interval_from(secs: Option<u64>, field: &'static str) -> Result<Option<Duration>, ConfigError> {
@@ -356,17 +312,16 @@ fn interval_from(secs: Option<u64>, field: &'static str) -> Result<Option<Durati
     }
 }
 
-/// Reads only the top-level `log_level`, ignoring everything else (no
-/// `deny_unknown_fields`), so [`resolve_log_level`] can extract the level without
-/// validating the reflector tables.
+/// Only the top-level `log_level`, and no `deny_unknown_fields` on purpose: [`resolve_log_level`]
+/// must not trip on the reflector tables.
 #[derive(Deserialize)]
 struct LogLevelProbe {
     #[serde(default)]
     log_level: Option<LogLevel>,
 }
 
-/// Read a configuration file, mapping I/O failure to [`ConfigError::ReadFile`]. Takes a `Path` so a
-/// non-UTF-8 path (valid on Unix) reads without loss; only the error message renders it lossily.
+/// Takes a `Path` so a non-UTF-8 path (valid on Unix) still reads; only the error message renders
+/// it lossily.
 pub(crate) fn read_config_file(path: &Path) -> Result<String, ConfigError> {
     std::fs::read_to_string(path).map_err(|source| ConfigError::ReadFile {
         path: path.display().to_string(),
@@ -374,18 +329,14 @@ pub(crate) fn read_config_file(path: &Path) -> Result<String, ConfigError> {
     })
 }
 
-/// Resolve just the log level from the environment and TOML text, before the full
-/// configuration is parsed. Lets the logger be raised to the configured verbosity
-/// so the rest of loading is logged at that level. Environment overrides the file,
-/// which overrides the default.
-///
-/// Deliberately lightweight: it reads only `NETFLECTOR_LOG_LEVEL` and the file's
-/// top-level `log_level`, never touching the reflector tables, so it can't fail
-/// on a reflector error that should instead surface (logged) from the full parse.
+/// The log level alone, resolved before the full parse so the logger can be raised to the
+/// configured verbosity while the rest of loading runs. Environment overrides the file, which
+/// overrides the default. Reads nothing but `NETFLECTOR_LOG_LEVEL` and the file's top-level
+/// `log_level`, so a reflector error surfaces (logged) from the full parse rather than here.
 ///
 /// # Errors
-/// Returns [`ConfigError::Parse`] for malformed TOML, or [`ConfigError::EnvBadValue`]
-/// if `NETFLECTOR_LOG_LEVEL` is not a valid level.
+/// [`ConfigError::Parse`] for malformed TOML, [`ConfigError::EnvBadValue`] for a bad
+/// `NETFLECTOR_LOG_LEVEL`.
 pub(crate) fn resolve_log_level(
     toml_text: Option<&str>,
     env: &[(String, String)],
@@ -402,8 +353,6 @@ pub(crate) fn resolve_log_level(
     Ok(LogLevel::default())
 }
 
-/// The enabled protocols of `reflector` as a comma-separated summary for logging,
-/// with `WoL` ports, the SSDP DIAL flag, and the relay's ports and destinations.
 fn protocol_list(reflector: &Reflector) -> String {
     let mut protocols: Vec<String> = Vec::new();
     if let Some(wol) = &reflector.wol {

@@ -9,8 +9,7 @@ use std::io;
 use std::net::SocketAddrV4;
 use std::os::fd::RawFd;
 
-/// Confine the unconnected socket `fd` to the interface `iface` names before it connects to `dst`;
-/// `None` skips the confinement.
+/// Pin the not-yet-connected `fd` to the interface `iface` names; `None` skips.
 ///
 /// # Errors
 /// An unknown interface, or the pin's `setsockopt` failure.

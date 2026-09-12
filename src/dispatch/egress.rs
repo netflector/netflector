@@ -13,8 +13,7 @@ use super::CaptureKey;
 use super::datagram::{DatagramSource, build_udp, ethernet_dst};
 use super::interface_table::InterfaceTable;
 
-/// A UDP datagram to inject: its destination, IP source, TTL and payload. The L2 destination is
-/// separate, since it is derived from `dst` for a group send and given for a unicast one.
+/// The L2 destination is separate: derived from `dst` for a group send, given for a unicast one.
 #[derive(Clone, Copy)]
 pub(super) struct Datagram<'a> {
     pub(super) dst: SocketAddr,
@@ -23,14 +22,11 @@ pub(super) struct Datagram<'a> {
     pub(super) payload: &'a [u8],
 }
 
-/// The frame-build scratch and the duplicate-send scope of the packet being routed. One scratch
-/// serves every reflector: the single-threaded loop runs one send at a time.
 pub(super) struct Egress {
     scratch: Box<[u8]>,
     /// The number of the packet being routed, from 1.
     packet: u64,
-    /// Whether a packet is being routed; a send outside routing (a timer, a session) is never a
-    /// duplicate of a packet's re-emit.
+    /// A send outside routing (a timer, a session) is never a duplicate.
     routing: bool,
 }
 
@@ -43,7 +39,6 @@ impl Egress {
         }
     }
 
-    /// Open the duplicate-send scope of the next routed packet.
     pub(super) fn begin_packet(&mut self) {
         self.packet += 1;
         self.routing = true;
@@ -53,13 +48,8 @@ impl Egress {
         self.routing = false;
     }
 
-    /// Build `datagram` with `dst_mac` as the L2 destination and inject it on `egress`; the link
-    /// framing follows the egress's link type. An unknown or draining egress is a logged drop.
-    ///
     /// # Errors
-    /// A send failure, or a frame that can't be built from the egress's current state: no source
-    /// address/MAC for the datagram, a source of the other family, or a payload that overflows
-    /// the scratch or the datagram length fields.
+    /// A send failure, or a frame that can't be built from the egress's current state.
     pub(super) fn send_udp(
         &mut self,
         table: &mut InterfaceTable,
@@ -73,12 +63,8 @@ impl Egress {
         Ok(())
     }
 
-    /// Inject a broadcast/multicast `datagram` on `egress`, deriving the L2 destination from its
-    /// address class. A unicast destination has no derivable group MAC and is a
-    /// [`DatagramError::UnicastDestination`](super::datagram::DatagramError::UnicastDestination).
-    ///
     /// # Errors
-    /// As [`send_udp`](Self::send_udp), plus the unicast rejection.
+    /// As [`send_udp`](Self::send_udp), plus a unicast `dst`, whose group MAC can't be derived.
     pub(super) fn send_udp_group(
         &mut self,
         table: &mut InterfaceTable,
@@ -95,13 +81,11 @@ impl Egress {
         self.send_udp(table, egress, dst_mac, datagram)
     }
 
-    /// Deliver a group or broadcast `datagram` to `peers` instead: one unicast copy per peer of
-    /// its family, at its port. Each copy is checked against the packet's earlier sends on its
-    /// own, so two entries whose lists share a peer deliver to it once.
+    /// One unicast copy per peer of `dst`'s family, at its port; a peer already sent to for this
+    /// packet is skipped.
     ///
     /// # Errors
-    /// As [`send_udp`](Self::send_udp) when no copy went out at all. A peer the link cannot reach
-    /// (a `WireGuard` peer without an endpoint) costs only its own copy, logged.
+    /// As [`send_udp`](Self::send_udp), only when no copy went out.
     pub(super) fn send_udp_to_peers(
         &mut self,
         table: &mut InterfaceTable,
@@ -113,8 +97,8 @@ impl Egress {
         let mut failure = None;
         let dst = datagram.dst;
         for &peer in peers.iter().filter(|peer| peer.is_ipv4() == dst.is_ipv4()) {
-            // Nothing here resolves neighbours: on a link with MACs the copy travels in a
-            // broadcast frame, and only the addressed host keeps it.
+            // No neighbour resolution: the copy travels in a broadcast frame and only the
+            // addressed host keeps it.
             let copy = Datagram {
                 dst: SocketAddr::new(peer, dst.port()),
                 ..datagram
@@ -141,8 +125,8 @@ impl Egress {
         }
     }
 
-    /// Assemble `datagram` for `egress` into the scratch. `None` (logged) when the egress is
-    /// unknown or taken out for its drain.
+    /// `None` (logged): the egress is unknown or taken out for its drain. The latter needs
+    /// `egress == ingress`, which no reflector configures (A -> B, never A -> A).
     fn build_frame(
         &mut self,
         table: &InterfaceTable,
@@ -171,11 +155,9 @@ impl Egress {
         .map_err(io::Error::other)
     }
 
-    /// Send the frame in the scratch on `egress`, unless an equal one already went out there for
-    /// the packet being routed: two entries whose legs coincide (per-device entries on one pair,
-    /// whose query legs carry no MAC filter) both relay a packet, and the second's frame equals
-    /// the first's. Noted only once sent, so a failed send leaves the second to try. Returns
-    /// whether the frame went out.
+    /// Skip a frame equal to one already sent for this packet: two entries whose legs coincide
+    /// (per-device entries on one pair) both relay it. Recorded only once sent, so a failed send
+    /// leaves the second to try.
     fn send_built(
         &mut self,
         table: &mut InterfaceTable,
@@ -195,8 +177,7 @@ impl Egress {
     }
 }
 
-/// Inject `frame` on the capture `egress` addresses. A key resolving to a drained (taken-out) or
-/// out-of-range capture is a logged drop, not an error.
+/// A drained or unknown egress is a logged drop, not an error.
 pub(super) fn send(table: &InterfaceTable, egress: CaptureKey, frame: &[u8]) -> io::Result<()> {
     if let Some(capture) = table.capture(egress) {
         capture
@@ -208,7 +189,6 @@ pub(super) fn send(table: &InterfaceTable, egress: CaptureKey, frame: &[u8]) -> 
     }
 }
 
-/// The name of the interface behind `egress`, for a message; `?` for an unknown key.
 fn egress_name(table: &InterfaceTable, egress: CaptureKey) -> &str {
     table
         .interface_of(egress)
@@ -216,9 +196,8 @@ fn egress_name(table: &InterfaceTable, egress: CaptureKey) -> &str {
         .unwrap_or("?")
 }
 
-/// Re-word an `EMSGSIZE` send failure to name the frame, the interface, and its MTU (as of the
-/// interface's last resolution); the bare "Message too long" names none of them. Any other error
-/// passes through.
+/// Re-word `EMSGSIZE` to name the frame, the interface and its MTU; the bare "Message too long"
+/// names none.
 fn oversize_context(e: io::Error, if_name: &str, frame_len: usize, mtu: Option<u32>) -> io::Error {
     if e.raw_os_error() != Some(libc::EMSGSIZE) {
         return e;

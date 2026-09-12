@@ -11,19 +11,13 @@ use super::{
     require_group_join,
 };
 
-/// Every captured datagram is a message for the leg.
 fn relay(_payload: &[u8]) -> Verdict {
     Verdict::Reflect(MessageType::UdpDatagram)
 }
 
-/// Build the UDP relay for `reflector` and register it on `dispatcher`. No-op when `udp_ports`
-/// isn't set. Joins the listed groups on the source interface and registers one handler for the
-/// groups and one for the broadcasts, each spanning every port.
-///
 /// # Errors
-/// [`BuildError::UnknownInterface`] if no capture was opened for the source/target,
-/// [`BuildError::RequiredFamilyUnavailable`] if the target can't currently send a required family,
-/// or [`BuildError::GroupJoin`] if a group can't be joined on the source.
+/// [`BuildError::UnknownInterface`], [`BuildError::RequiredFamilyUnavailable`] or
+/// [`BuildError::GroupJoin`].
 pub(crate) fn build(
     reflector: &Reflector,
     interfaces: &InterfaceMap,

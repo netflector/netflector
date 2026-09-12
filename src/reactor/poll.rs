@@ -1,7 +1,5 @@
-//! Readiness backend: an OS-uniform [`Poller`] over the platform's readiness
-//! syscalls. A wait reports which registered fds are ready, each tagged with the
-//! reactor [`Key`] handed to the kernel, so dispatch needs no fd-to-handler side
-//! table. Backends: kqueue (macOS/FreeBSD) and epoll (Linux).
+//! Readiness backend: one [`Poller`] API over epoll (Linux) and kqueue (macOS/FreeBSD).
+//! Each ready fd comes back tagged with the [`Key`] it was registered under.
 
 use super::{Key, Readiness};
 
@@ -15,17 +13,13 @@ pub(crate) use self::epoll::Poller;
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub(crate) use self::kqueue::Poller;
 
-/// One ready fd from a [`Poller`] wait: the [`Key`] it was registered under and
-/// what it is ready for.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PollEvent {
     pub key: Key,
     pub readiness: Readiness,
 }
 
-// Tests of the uniform `Poller` contract, run against whichever backend compiles
-// (kqueue on macOS/FreeBSD, epoll on Linux). Backend-specific behavior the two
-// can't share, like re-adding an fd, is tested in each backend module instead.
+// Backend-specific behavior (re-adding an fd) is tested in each backend module.
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};

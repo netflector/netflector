@@ -1,13 +1,8 @@
-//! A map over a `Vec` of `(key, value)` pairs, looked up by linear scan.
-//!
-//! The runtime collections here hold a handful of entries (interfaces, sessions, proxies), where
-//! a scan over contiguous pairs beats a `HashMap`'s hashing and heap layout.
+//! A map over a `Vec` of `(key, value)` pairs, scanned linearly: the collections here hold a
+//! handful of entries, where that beats a `HashMap`.
 
 use std::borrow::Borrow;
 
-/// A `Vec<(K, V)>` with a map API. `insert` replaces the value of an existing key, so keys stay
-/// unique. Lookups borrow the key form ([`Borrow`]), so a `LinearMap<String, _>` is queried with
-/// a `&str`.
 #[derive(Debug)]
 pub(crate) struct LinearMap<K, V>(Vec<(K, V)>);
 
@@ -38,7 +33,6 @@ impl<K: PartialEq, V> LinearMap<K, V> {
             .map(|(_, v)| v)
     }
 
-    /// Returns the replaced value when `key` was already present.
     pub(crate) fn insert(&mut self, key: K, value: V) -> Option<V> {
         if let Some(slot) = self.get_mut(&key) {
             return Some(std::mem::replace(slot, value));
@@ -59,8 +53,7 @@ impl<K: PartialEq, V> LinearMap<K, V> {
         self.0.iter().map(|(k, v)| (k, v))
     }
 
-    /// Remove `key`'s entry, returning its value. `swap_remove` underneath, so iteration order is
-    /// not insertion order once anything was removed.
+    /// `swap_remove`: iteration order is not insertion order once anything was removed.
     pub(crate) fn remove<Q>(&mut self, key: &Q) -> Option<V>
     where
         K: Borrow<Q>,

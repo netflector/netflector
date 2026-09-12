@@ -1,25 +1,21 @@
-//! DIAL (Discovery and Launch) discovery detection and `LOCATION`-authority parsing: the SSDP-side
-//! inputs the DIAL proxy hook needs.
+//! DIAL (Discovery and Launch) detection and `LOCATION`-authority parsing for the SSDP-side proxy
+//! hook.
 
 use crate::net::http::{Authority, header_value, parse_authority};
 
 /// The DIAL service-type URN; the trailing `:1` version is dropped so any version matches.
 const DIAL_SERVICE_TYPE: &[u8] = b"urn:dial-multiscreen-org:service:dial";
 
-/// Whether `payload` is a DIAL discovery message: the service-type URN appears anywhere (`ST`,
-/// `NT`, `USN`), ASCII-case-insensitively. Gates a `LOCATION` rewrite.
 pub(crate) fn is_dial_service_message(payload: &[u8]) -> bool {
     contains_ignore_ascii_case(payload, DIAL_SERVICE_TYPE)
 }
 
-/// Parse the device authority from a DIAL discovery message's `LOCATION:` header, the byte span
-/// mapped into the whole `payload` so the SSDP path splices a netflector authority over it. The
-/// `LOCATION` must be a rewritable `http://ipv4[:port]` URL; `None` otherwise (forward unchanged).
+/// The span is relative to the whole `payload`, for the SSDP path to splice over. `None` for a
+/// non-rewritable `LOCATION` (forward unchanged).
 pub(crate) fn parse_dial_location_authority(payload: &[u8]) -> Option<Authority> {
     let url = dial_location_value(payload)?;
     let found = parse_authority(url, false)?;
-    // `url` is a subslice of `payload`, so the distance between their starts is `url`'s offset
-    // within `payload`; add the authority's offset within `url`.
+    // `url` is a subslice of `payload`, so the pointer distance is its offset.
     let url_offset = url.as_ptr().addr() - payload.as_ptr().addr();
     Some(Authority {
         endpoint: found.endpoint,
@@ -28,23 +24,17 @@ pub(crate) fn parse_dial_location_authority(payload: &[u8]) -> Option<Authority>
     })
 }
 
-/// The raw, trimmed value of the first `LOCATION:` header, or `None` if the message carries none or
-/// it is empty. Both the rewrite decision and the debug log that reports a rejection read this, so
-/// the log can't name a header the rewrite never looked at.
+/// The rewrite and the log that reports a rejection both read this, so the log can't name a header
+/// the rewrite never saw.
 pub(crate) fn dial_location_value(payload: &[u8]) -> Option<&[u8]> {
     let url = header_value(payload, b"LOCATION")?;
     (!url.is_empty()).then_some(url)
 }
 
-/// The advertisement's freshness lifetime from a `CACHE-CONTROL: max-age=<seconds>` header: how long
-/// the proxy's description listener may treat the device as present. `max-age` is matched
-/// case-insensitively among comma-separated directives. `None` (caller falls back to its default grace)
-/// if the header or a parseable `max-age` is absent.
 pub(crate) fn parse_cache_control_max_age(payload: &[u8]) -> Option<u32> {
     max_age_seconds(header_value(payload, b"CACHE-CONTROL")?)
 }
 
-/// The `max-age` delta-seconds from a `CACHE-CONTROL` value, scanning its comma-separated directives.
 /// Whitespace around the `=` is tolerated: HTTP's grammar has none, but UDA 1.2.2's example reads
 /// `max-age = 1800` and devices copy it verbatim.
 fn max_age_seconds(value: &[u8]) -> Option<u32> {
@@ -60,7 +50,6 @@ fn max_age_seconds(value: &[u8]) -> Option<u32> {
     None
 }
 
-/// Whether `haystack` contains `needle` as an ASCII-case-insensitive substring.
 fn contains_ignore_ascii_case(haystack: &[u8], needle: &[u8]) -> bool {
     needle.is_empty()
         || haystack

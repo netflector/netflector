@@ -1,14 +1,8 @@
-//! Self-pipe signal handling: graceful shutdown (SIGINT/SIGTERM) and an on-demand
-//! diagnostics dump (SIGUSR1).
+//! Self-pipe signal handling: shutdown on SIGINT/SIGTERM, a diagnostics dump on SIGUSR1.
 //!
-//! A signal arrives at an arbitrary point and its handler may call only
-//! async-signal-safe functions, so it cannot touch the reactor (the arena, the
-//! logger, allocation are all off-limits). The handler records which kind of signal
-//! arrived in an atomic flag and `write`s one byte to a pipe to wake the loop. The
-//! pipe's read end is registered with the reactor like any other fd, so the real
-//! work (a shutdown, or a counter dump) happens later in normal code, when the loop
-//! wakes on it. Needs no per-backend signal support (no `signalfd` / `EVFILT_SIGNAL`);
-//! the pipe is just a readable fd.
+//! The handler may call only async-signal-safe functions, so it sets an atomic flag and
+//! writes one byte to a pipe; the reactor watches the read end and does the work in
+//! normal code.
 
 use std::io;
 use std::mem;
@@ -21,30 +15,21 @@ use libc::c_int;
 use super::{Handler, Reactor, ReadyEvent};
 use crate::sys::check;
 
-/// The signal that requests an on-demand diagnostics dump (the counter summary).
 const DUMP_SIGNAL: c_int = libc::SIGUSR1;
-/// Every signal a [`SignalGuard`] installs a handler for: the two shutdown signals plus the dump one.
 const HANDLED_SIGNALS: [c_int; 3] = [libc::SIGINT, libc::SIGTERM, DUMP_SIGNAL];
 
-/// The write end of the installed self-pipe, or `-1` when none is installed. The
-/// handler reads this and writes a byte; [`SignalGuard`] owns the fd and is the
-/// only thing that sets this cell, and only one can exist at a time (single
-/// reactor, single thread).
+/// The self-pipe's write end, or -1 while none is installed.
 static WRITE_FD: AtomicI32 = AtomicI32::new(-1);
-/// Set by the handler for a shutdown signal (SIGINT/SIGTERM); the pipe reader consumes it.
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
-/// Set by the handler for [`DUMP_SIGNAL`]; the pipe reader consumes it.
 static DUMP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-/// The signal handler: async-signal-safe, so it only records intent and wakes the loop.
 extern "C" fn on_signal(signum: c_int) {
-    // The handler can land between a failed syscall and the `errno` read that reports it, so the
-    // write below must leave no errno of its own behind.
+    // A signal can land between a failed syscall and its errno read; the write below must not
+    // clobber errno.
     let location = errno_location();
     // SAFETY: the calling thread's `errno` cell; reading and writing it is async-signal-safe.
     let saved = unsafe { *location };
 
-    // The pipe byte is a pure wakeup; its value carries nothing, the atomic flags carry the intent.
     if signum == DUMP_SIGNAL {
         DUMP_REQUESTED.store(true, Ordering::Relaxed);
     } else {
@@ -65,9 +50,8 @@ extern "C" fn on_signal(signum: c_int) {
     unsafe { *location = saved };
 }
 
-/// A pointer to the calling thread's `errno` cell (glibc/musl `__errno_location`, BSD `__error`).
-/// Async-signal-safe: the accessor only computes a thread-local address, so the handler above can
-/// save and restore `errno` through it.
+/// The thread's `errno` cell. Async-signal-safe: the accessor only computes a thread-local
+/// address.
 fn errno_location() -> *mut c_int {
     #[cfg(target_os = "linux")]
     // SAFETY: the accessor takes no arguments and always returns the thread's errno cell.
@@ -78,31 +62,22 @@ fn errno_location() -> *mut c_int {
     location
 }
 
-/// An installed self-pipe with the previous signal dispositions saved. Dropping it
-/// restores those dispositions, unpublishes the fd, then closes the write end, in
-/// that order, so no signal can reach a handler that points at a closed fd.
+/// Installed signal handlers plus the previous dispositions; `Drop` restores them.
 pub(crate) struct SignalGuard {
-    /// Held only so its `OwnedFd` `Drop` closes the write end when the guard drops.
     _write_fd: OwnedFd,
     saved_actions: [libc::sigaction; HANDLED_SIGNALS.len()],
 }
 
 impl SignalGuard {
-    /// Create the self-pipe, publish its write end, and install the shutdown and dump handlers.
-    /// Returns the guard plus the [`SignalPipe`] handler (owning the read end) to register with the
-    /// reactor.
-    ///
     /// # Errors
-    /// Returns an error if the pipe cannot be created, a handler cannot be
-    /// installed, or a guard is already installed.
+    /// If the pipe or a handler cannot be set up, or a guard is already installed.
     pub(crate) fn install() -> io::Result<(Self, SignalPipe)> {
         let (read, write) = self_pipe()?;
-        // Publish the write fd for the handler, refusing a second concurrent install.
         WRITE_FD
             .compare_exchange(-1, write.as_raw_fd(), Ordering::SeqCst, Ordering::SeqCst)
             .map_err(|_| io::Error::other("signal handlers already installed"))?;
-        // Clear any flag a signal set during a previous guard's teardown window, so it can't leak into
-        // this run and turn the first wakeup into a spurious shutdown. No handler is installed yet.
+        // A signal in a previous guard's teardown window may have left a flag set; clear it before
+        // the first wakeup can act on it.
         SHUTDOWN_REQUESTED.store(false, Ordering::Relaxed);
         DUMP_REQUESTED.store(false, Ordering::Relaxed);
         let saved = match install_handlers() {
@@ -124,21 +99,19 @@ impl SignalGuard {
 
 impl Drop for SignalGuard {
     fn drop(&mut self) {
-        // Order matters: stop signals reaching our handler, then unpublish the fd;
-        // `self._write_fd` closes last (after this body), when nothing can touch it.
+        // Handlers off, then unpublish; `_write_fd` closes after this body, when no handler can
+        // reach it.
         restore_handlers(&self.saved_actions);
         WRITE_FD.store(-1, Ordering::SeqCst);
     }
 }
 
-/// Reactor handler for the self-pipe read end, which it owns. Drains the pipe and
-/// acts on whichever signal flags are set; the bytes themselves carry nothing.
+/// Reactor handler owning the self-pipe's read end.
 pub(crate) struct SignalPipe {
     read: OwnedFd,
 }
 
 impl SignalPipe {
-    /// The read-end fd to watch, handed to [`Reactor::register_with_fds`] at install.
     pub(crate) fn read_fd(&self) -> RawFd {
         self.read.as_raw_fd()
     }
@@ -146,15 +119,13 @@ impl SignalPipe {
 
 impl Handler for SignalPipe {
     fn on_readable(&mut self, _event: ReadyEvent, reactor: &mut Reactor) {
-        // Drain so a level-triggered wait does not keep re-reporting it.
+        // Drain, or the level-triggered wait re-reports it.
         let mut buf = [0u8; 16];
         let fd = self.read.as_raw_fd();
         // SAFETY: `self.read` is the registered, non-blocking read end; draining
         // stops at EOF (0) or EAGAIN (-1).
         while unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
-        // Shutdown wins if both arrived; a dump on the way out is harmless but pointless.
         if SHUTDOWN_REQUESTED.swap(false, Ordering::Relaxed) {
-            // Tells the operator the daemon stopped on a signal, not a crash or self-termination.
             log::info!("received shutdown signal; stopping");
             reactor.request_shutdown();
         }
@@ -196,8 +167,6 @@ fn self_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
     Ok((read, write))
 }
 
-/// Install [`on_signal`] for every handled signal, returning the previous
-/// dispositions to restore later. Rolls back on partial failure.
 fn install_handlers() -> io::Result<[libc::sigaction; HANDLED_SIGNALS.len()]> {
     // SAFETY: an all-zero `sigaction` is a valid SIG_DFL disposition we overwrite.
     let mut action: libc::sigaction = unsafe { mem::zeroed() };
@@ -221,7 +190,6 @@ fn install_handlers() -> io::Result<[libc::sigaction; HANDLED_SIGNALS.len()]> {
     Ok(saved)
 }
 
-/// Restore previously-saved signal dispositions (best effort, errors ignored).
 fn restore_handlers(saved: &[libc::sigaction]) {
     for (&signum, action) in HANDLED_SIGNALS.iter().zip(saved) {
         // SAFETY: `action` is a disposition a prior `sigaction` produced.

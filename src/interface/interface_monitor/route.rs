@@ -1,8 +1,5 @@
-//! macOS/FreeBSD: a `PF_ROUTE` socket delivers routing messages; the address and link ones
-//! carry the affected interface's index. We read only that index, at its fixed offset in the
-//! message. Same "trust the offset, not the whole libc struct" approach as
-//! [`super::super::getifaddrs`]'s MAC read: the `ifa_msghdr`/`if_msghdr` tails diverge across
-//! the BSDs.
+//! macOS/FreeBSD: a `PF_ROUTE` socket. Only the interface index is read, at its fixed header
+//! offset: the `ifa_msghdr`/`if_msghdr` tails diverge across the BSDs.
 
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -11,64 +8,50 @@ use libc::c_int;
 
 use super::InterfaceEvent;
 
-/// Holds one routing message: a fixed header plus a few small sockaddrs (the `RTAX_*` slots),
-/// a few hundred bytes. No rtnetlink-style attribute lists, so smaller than the `rtnetlink`
-/// backend's 8 KiB suffices.
+/// A routing message is a fixed header plus a few small sockaddrs, a few hundred bytes.
 pub(super) const READ_BUF: usize = 2048;
 
-/// See [`InterfaceMonitor::INDEXES_MONOTONIC`](super::InterfaceMonitor::INDEXES_MONOTONIC):
-/// the BSDs reuse indexes (FreeBSD hands out the lowest free one; macOS recycles the whole
-/// ifnet for stable-uniqueid drivers), so index ordering carries no creation signal.
+/// See [`InterfaceMonitor::INDEXES_MONOTONIC`](super::InterfaceMonitor::INDEXES_MONOTONIC).
 pub(super) const INDEXES_MONOTONIC: bool = false;
 
 /// See [`InterfaceMonitor::LIFECYCLE_EVENTS`](super::InterfaceMonitor::LIFECYCLE_EVENTS):
 /// FreeBSD announces arrival/departure via `RTM_IFANNOUNCE`; macOS has no lifecycle message.
 pub(super) const LIFECYCLE_EVENTS: bool = cfg!(target_os = "freebsd");
 
-/// Requested `SO_RCVBUF` for the route socket, whose default receive queue is only ~8 KiB. Enlarge it so
-/// a burst of routing messages is far less likely to overflow it and drop changes. Best-effort and
-/// kernel-clamped; FreeBSD's `SO_RERROR` still recovers from an overflow, and macOS (no `SO_RERROR`)
-/// relies on this alone. Linux's netlink monitor already defaults to the system max, so it isn't grown.
+/// The route socket's default receive queue is ~8 KiB. Best-effort and kernel-clamped;
+/// FreeBSD's `SO_RERROR` still recovers from an overflow, macOS (no `SO_RERROR`) relies on this
+/// alone.
 const RECV_BUFFER: c_int = 256 * 1024;
 
-/// `ifam_index` (in `ifa_msghdr`) and `ifm_index` (in `if_msghdr`) are both a `u16` at this
-/// offset; the asserts pin it against the libc layout.
+/// `ifam_index` (`ifa_msghdr`) and `ifm_index` (`if_msghdr`) are both a `u16` at this offset.
 const INDEX_OFFSET: usize = 12;
 const _: () = assert!(std::mem::offset_of!(libc::ifa_msghdr, ifam_index) == INDEX_OFFSET);
 const _: () = assert!(std::mem::offset_of!(libc::if_msghdr, ifm_index) == INDEX_OFFSET);
 
-/// `ifan_index` (in `if_announcemsghdr`) sits earlier than the shared offset above: the announce
-/// header has no `ifam_addrs`/`ifm_data` before it. FreeBSD only; macOS has no `RTM_IFANNOUNCE`.
+/// `ifan_index` sits earlier: the announce header has no `ifam_addrs`/`ifm_data` before it.
 #[cfg(target_os = "freebsd")]
 const ANNOUNCE_INDEX_OFFSET: usize = 4;
 #[cfg(target_os = "freebsd")]
 const _: () =
     assert!(std::mem::offset_of!(libc::if_announcemsghdr, ifan_index) == ANNOUNCE_INDEX_OFFSET);
 
-/// Open a `PF_ROUTE` socket, non-blocking + close-on-exec.
 pub(super) fn open() -> io::Result<OwnedFd> {
     let sock = crate::sys::open_socket(libc::PF_ROUTE, libc::SOCK_RAW, 0)?;
     crate::sys::increase_recv_buffer(sock.as_raw_fd(), RECV_BUFFER);
-    // Without it the drain's ENOBUFS re-resolve-all recovery never fires and address changes are lost
-    // under pressure. macOS has the same silent drop and no equivalent, so the gap is unfixable there.
+    // Without SO_RERROR the drain's ENOBUFS recovery never fires; macOS has no equivalent.
     #[cfg(target_os = "freebsd")]
     crate::sys::set_recv_error_reporting(sock.as_raw_fd())?;
     Ok(sock)
 }
 
-/// Walk every routing message in `buf`; report the interface index and event kind of each
-/// `RTM_NEWADDR` / `RTM_DELADDR` (address change) and `RTM_IFINFO` (link-state/MAC change --
-/// [`InterfaceEvent::Address`] too: a flap refreshes addresses, it isn't a lifecycle event),
-/// plus, on FreeBSD, `RTM_IFANNOUNCE` (interface arrival/departure, [`InterfaceEvent::Link`]).
-/// Every routing message begins with `u16 msglen; u8 version; u8 type`.
+/// Every routing message begins with `u16 msglen; u8 version; u8 type`. `RTM_IFINFO` (a flap
+/// or MAC change) maps to [`InterfaceEvent::Address`], not a lifecycle event.
 pub(super) fn for_each_change(buf: &[u8], on_change: &mut impl FnMut(InterfaceEvent)) {
     let mut offset = 0;
     while offset + 4 <= buf.len() {
         let msglen = usize::from(u16::from_ne_bytes([buf[offset], buf[offset + 1]]));
         let msg_type = c_int::from(buf[offset + 3]);
         if msglen < 4 || offset + msglen > buf.len() {
-            // Not the normal end (the `while` running out): a message claims an impossible
-            // length, so a change may be dropped.
             log::warn!(
                 "routing message walk stopped at offset {offset}: msglen {msglen}, buffer {} B \
                  (truncated or malformed); a change may be missed",
@@ -76,8 +59,6 @@ pub(super) fn for_each_change(buf: &[u8], on_change: &mut impl FnMut(InterfaceEv
             );
             break;
         }
-        // Each subscribed type's index sits at its own fixed offset in the message header;
-        // `event` is the matching variant constructor.
         let hit = match msg_type {
             libc::RTM_NEWADDR | libc::RTM_DELADDR | libc::RTM_IFINFO => Some((
                 INDEX_OFFSET,
@@ -89,8 +70,7 @@ pub(super) fn for_each_change(buf: &[u8], on_change: &mut impl FnMut(InterfaceEv
                 InterfaceEvent::Link as fn(u32) -> InterfaceEvent,
             )),
             _ => {
-                // PF_ROUTE is unfiltered, so every routing message on the system lands here;
-                // this is the only trail of what a drain actually saw.
+                // PF_ROUTE is unfiltered; this trace is the only trail of what a drain saw.
                 log::trace!("interface monitor: ignoring routing message type {msg_type}");
                 None
             }
@@ -101,7 +81,7 @@ pub(super) fn for_each_change(buf: &[u8], on_change: &mut impl FnMut(InterfaceEv
             let index =
                 u16::from_ne_bytes([buf[offset + index_offset], buf[offset + index_offset + 1]]);
             if index == 0 {
-                // Kernel indices are >= 1, so a 0 is a malformed message; never forward it.
+                // Kernel indices are >= 1.
                 log::warn!("interface monitor: dropping a change with no valid interface index");
             } else {
                 let event = event(u32::from(index));
@@ -113,11 +93,9 @@ pub(super) fn for_each_change(buf: &[u8], on_change: &mut impl FnMut(InterfaceEv
     }
 }
 
-/// `PF_ROUTE` carries no per-message sender identity, and not every message is the kernel's: the
-/// stack echoes a local process's own request to every listener (hence `route monitor` showing other
-/// processes' traffic). Accept all anyway. An injected message only picks which interface to
-/// re-resolve, and the re-resolve reads the kernel, so it buys wasted work and nothing else.
-/// (The netlink backend's `sender_ok` rejects spoofed datagrams; `PF_ROUTE` offers nothing to check.)
+/// `PF_ROUTE` carries no sender identity and echoes local processes' requests to every listener.
+/// Accept all: an injected message only picks which interface to re-resolve, and the re-resolve
+/// reads the kernel.
 pub(super) fn sender_ok(_src: &libc::sockaddr_storage, _len: libc::socklen_t) -> bool {
     true
 }

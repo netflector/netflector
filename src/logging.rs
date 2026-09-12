@@ -1,13 +1,5 @@
-//! Process-wide logging built on the [`log`] facade.
-//!
-//! Subsystems log through the `log` macros, which capture the call site's module
-//! path as the record's target. [`init`] installs [`StderrLogger`] as the global
-//! logger and sets the severity threshold from the configured [`LogLevel`]. The
-//! macros apply that threshold before a record reaches us, so below-threshold
-//! calls cost only a level comparison.
-//!
-//! Records go to stderr (stdout is left for program output) as
-//! `<utc> <LEVEL> <target>: <message>` with a UTC ISO-8601 timestamp.
+//! Process-wide logging on the [`log`] facade: one line per record on stderr (stdout is
+//! program output), as `<utc> <LEVEL> <target>: <message>`.
 
 use std::cell::RefCell;
 use std::fmt::{self, Write as _};
@@ -20,8 +12,6 @@ use log::{LevelFilter, Log, Metadata, Record};
 
 use crate::config::LogLevel;
 
-/// The installed logger. The only mutable state is `log`'s global max level, set
-/// once by [`init`].
 struct StderrLogger;
 
 static LOGGER: StderrLogger = StderrLogger;
@@ -32,13 +22,12 @@ impl Log for StderrLogger {
     }
 
     fn log(&self, record: &Record) {
-        // The trait doesn't guarantee `enabled` runs first, so filter here too.
+        // The trait doesn't guarantee `enabled` runs first.
         if !self.enabled(record.metadata()) {
             return;
         }
-        // Build the line first and write it whole. Stderr is unbuffered and its write_fmt issues
-        // one write(2) per formatting fragment (20-30 for a typical record), which matters once
-        // debug/trace logs per frame. The buffer is reused, so no per-record allocation either.
+        // Format into a reused buffer and write once: stderr is unbuffered, so `write_fmt` would
+        // issue a write(2) per fragment.
         thread_local! {
             static LINE: RefCell<String> = const { RefCell::new(String::new()) };
         }
@@ -55,10 +44,7 @@ impl Log for StderrLogger {
     }
 }
 
-/// Format `record`, stamped `now`, as the one-line stderr entry, newline included. The caller
-/// reads the clock, so the formatting is exercisable against a fixed timestamp.
 fn format_record(line: &mut String, now: Utc, record: &Record) {
-    // Formatting into a String is infallible.
     let _ = writeln!(
         line,
         "{now} {:>5} {}: {}",
@@ -68,7 +54,7 @@ fn format_record(line: &mut String, now: Utc, record: &Record) {
     );
 }
 
-/// A civil UTC date-time, rendered as ISO 8601 (e.g. `2026-06-19T18:49:58Z`).
+/// A civil UTC date-time; `Display` renders ISO 8601.
 #[derive(Clone, Copy)]
 struct Utc {
     year: u64,
@@ -80,8 +66,6 @@ struct Utc {
 }
 
 impl Utc {
-    /// The current wall-clock instant as UTC. A clock set before the Unix epoch
-    /// renders as the epoch rather than failing.
     fn now() -> Self {
         let secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -89,16 +73,14 @@ impl Utc {
         Self::from_unix(secs)
     }
 
-    /// Convert Unix seconds to civil UTC via Howard Hinnant's `civil_from_days`.
-    /// All arithmetic stays unsigned: seconds since the epoch are non-negative, so
-    /// the algorithm's negative-day branch can't be reached and is omitted.
+    /// Howard Hinnant's `civil_from_days`, unsigned only: the negative-day branch is unreachable
+    /// for post-epoch seconds.
     fn from_unix(secs: u64) -> Self {
         let hour = secs % 86_400 / 3_600;
         let minute = secs % 3_600 / 60;
         let second = secs % 60;
 
-        // Shift the epoch to 0000-03-01 so a 400-year era ends on a leap day, then
-        // unwind era → year-of-era → day-of-year. Bracketed ranges aid verification.
+        // Epoch shifted to 0000-03-01 so a 400-year era ends on a leap day.
         let z = secs / 86_400 + 719_468;
         let era = z / 146_097;
         let doe = z - era * 146_097; // [0, 146096]
@@ -130,29 +112,22 @@ impl fmt::Display for Utc {
     }
 }
 
-/// Install the global logger backend with the default severity threshold.
-///
-/// A process-global logger is the binary's responsibility, so this is called once
-/// from `main`. `set_level` then applies the configured threshold after the
-/// configuration is loaded.
+/// Install the global logger with the default threshold; `set_level` applies the configured
+/// one once the configuration is loaded.
 ///
 /// # Panics
-/// Panics if called more than once: a second call would try to replace the
-/// already-installed global logger.
+/// If called more than once.
 pub fn init() {
     log::set_logger(&LOGGER).expect("logging::init called more than once");
     log::set_max_level(LevelFilter::from(LogLevel::default()));
 }
 
-/// Set the minimum severity that will be logged, once the configured level is
-/// known. Cheap and idempotent.
 pub(crate) fn set_level(level: LogLevel) {
     log::set_max_level(LevelFilter::from(level));
 }
 
-/// Like [`log::log!`], but emits at most once per `window` (a `Duration`) per call site; a call
-/// landing inside a closed window is counted instead, and the next emitted line discloses the
-/// count as ` (N suppressed)`. The window is per call site, not per entry or interface.
+/// Like [`log::log!`], but at most once per `window` per call site (not per entry or
+/// interface); suppressed calls are counted and disclosed on the next line as ` (N suppressed)`.
 macro_rules! log_rate {
     ($level:expr, $window:expr, $($arg:tt)+) => {{
         static LAST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -176,26 +151,22 @@ macro_rules! log_rate {
 }
 pub(crate) use log_rate;
 
-/// The default window for [`log_rate!`] emissions.
 pub(crate) const WARN_WINDOW: Duration = Duration::from_mins(1);
 
-/// The decision behind [`log_rate!`]: emit now, returning how many were suppressed since the
-/// last emission, or count this one (`None`). The caller reads the clock (as [`format_record`]
-/// does), so the window arithmetic is exercisable against fixed times. Whole-second granularity:
-/// a sub-second window truncates to 0 and every call emits. `u32`, not `u64`, because armv5te (a
-/// shipped target) has no 64-bit atomics; atomics at all only because `static`s demand `Sync` -
-/// the process is single-threaded, hence `Relaxed`.
+/// The decision behind [`log_rate!`]: `Some(n)` to emit, with `n` suppressed since the last
+/// emission; `None` to count this one. Whole-second granularity: a sub-second window emits every
+/// call. `u32` because armv5te has no 64-bit atomics; atomics at all only because `static`s
+/// demand `Sync`, hence `Relaxed`.
 pub(crate) fn rate_gate(
     last: &AtomicU32,
     suppressed: &AtomicU32,
     now_secs: u32,
     window: Duration,
 ) -> Option<u32> {
-    // Duration is unsigned, so try_from fails only past u32::MAX s (136 years); read that as never.
     let window_secs = u32::try_from(window.as_secs()).unwrap_or(u32::MAX);
     let last_emit = last.load(Ordering::Relaxed);
     if last_emit == 0 || now_secs.saturating_sub(last_emit) >= window_secs {
-        // max(1): the first call lands at elapsed 0 s, which must not read as "never".
+        // max(1): elapsed 0 s must not read as "never".
         last.store(now_secs.max(1), Ordering::Relaxed);
         Some(suppressed.swap(0, Ordering::Relaxed))
     } else {
@@ -204,10 +175,8 @@ pub(crate) fn rate_gate(
     }
 }
 
-/// Seconds since the first call, from the monotonic clock; saturates after 136 years.
+/// Seconds since the first call.
 pub(crate) fn monotonic_secs() -> u32 {
-    // A static can't hold a bare `Instant` (no const construction), so the anchor initializes
-    // lazily on first use.
     static START: LazyLock<Instant> = LazyLock::new(Instant::now);
     u32::try_from(START.elapsed().as_secs()).unwrap_or(u32::MAX)
 }

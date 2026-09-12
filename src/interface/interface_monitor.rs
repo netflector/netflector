@@ -1,10 +1,7 @@
-//! Interface change monitoring: a routing socket whose readiness means some interface's
-//! addresses (or MAC) changed, or an interface itself came or went, so the dispatcher should
-//! react. `NETLINK_ROUTE` on Linux, `PF_ROUTE` on the BSDs. One [`InterfaceMonitor`] over a
-//! per-platform backend, mirroring the resolver's rtnetlink/getifaddrs split.
-//!
-//! Best-effort: only keeps already-resolved addresses fresh. A failed open (or a read error)
-//! degrades to the startup-resolved addresses; it never aborts the daemon.
+//! Interface change monitoring: a routing socket whose readiness means an interface's
+//! addresses (or MAC) changed, or an interface came or went. `NETLINK_ROUTE` on Linux,
+//! `PF_ROUTE` on the BSDs. Best-effort: a failed open or a read error degrades to the
+//! startup-resolved addresses, never aborts the daemon.
 
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -21,58 +18,48 @@ use self::route as backend;
 #[cfg(target_os = "linux")]
 use self::rtnetlink as backend;
 
-/// Bound on consecutive `ENOBUFS` overflows in a single drain. The kernel clears the overflow
-/// flag on the next recv, so an unbroken run of them means the socket is wedged. Stop rather
-/// than spin the single-threaded loop forever; a level-triggered wait re-fires to try later.
+/// The kernel clears the overflow flag on the next recv, so an unbroken run of `ENOBUFS` means
+/// the socket is wedged: stop rather than spin; a level-triggered wait re-fires later.
 const MAX_CONSECUTIVE_OVERFLOWS: u32 = 16;
 
-/// What one routing-socket notification reported. The kind drives the dispatcher's trigger
-/// policy; the monitor itself attaches no meaning beyond the message-type mapping.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum InterfaceEvent {
-    /// An address-level change on the interface with this kernel index (also BSD `RTM_IFINFO`
-    /// link-state/MAC updates: a flap refreshes addresses, it doesn't signal a lifecycle change).
+    /// An address-level change on this kernel index. BSD `RTM_IFINFO` (link state, MAC) maps
+    /// here too: a flap refreshes addresses, it is not a lifecycle change.
     Address(u32),
-    /// A link lifecycle event on the interface with this kernel index: Linux
-    /// `RTM_{NEW,DEL}LINK` (creation, deletion, or any link change -- netlink doesn't
-    /// distinguish), FreeBSD `RTM_IFANNOUNCE` (arrival/departure). macOS has no lifecycle
-    /// message, so this variant is never constructed there.
+    /// A link lifecycle event on this kernel index: Linux `RTM_{NEW,DEL}LINK` (creation,
+    /// deletion or any link change, netlink doesn't distinguish), FreeBSD `RTM_IFANNOUNCE`.
+    /// macOS has no lifecycle message, so this is never constructed there.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     Link(u32),
-    /// The socket overflowed and notifications were dropped: every interface may be stale.
+    /// Notifications were dropped: every interface may be stale.
     Overflow,
 }
 
-/// A routing-socket monitor for interface address and link changes. The dispatcher watches
-/// its fd and calls [`drain`](Self::drain) on readiness.
+/// The dispatcher watches the fd and calls [`drain`](Self::drain) on readiness.
 pub(crate) struct InterfaceMonitor {
     sock: OwnedFd,
-    /// Reused across drains, sized once at open and never grown. Each notification is a single
-    /// bounded message (not a coalesced dump), so a fixed buffer fits with headroom. No
-    /// data-path allocation.
+    /// Sized once: each notification is one bounded message, never a coalesced dump.
     buf: Box<[u8]>,
 }
 
 impl InterfaceMonitor {
-    /// Whether this platform allocates interface indexes monotonically (Linux: 31-bit cyclic
-    /// per netns), so a newly-created interface always carries an index above every
-    /// previously-seen one. The dispatcher gates unknown-index [`InterfaceEvent::Link`]
-    /// events on that; the BSDs reuse indexes (FreeBSD hands out the lowest free, macOS
-    /// recycles the whole ifnet), so no such gate is sound there. Two Linux corners slip the
-    /// gate -- a device moved between netns keeps its (possibly low) index when free, and the
-    /// 31-bit wrap -- both backstopped by the reconcile tick.
+    /// Whether the platform allocates interface indexes monotonically, so a new interface
+    /// carries an index above every one seen before (Linux: 31-bit cyclic per netns). The
+    /// BSDs reuse indexes (FreeBSD hands out the lowest free, macOS recycles the whole ifnet),
+    /// so the dispatcher's unknown-index [`InterfaceEvent::Link`] gate is unsound there. Two
+    /// Linux corners slip the gate, a device moved between netns keeping a low index and the
+    /// 31-bit wrap; the reconcile tick backstops both.
     pub(crate) const INDEXES_MONOTONIC: bool = backend::INDEXES_MONOTONIC;
 
-    /// Whether this backend delivers [`InterfaceEvent::Link`] lifecycle events at all. Where
-    /// it does not (macOS: no `RTM_IFANNOUNCE`), an unknown-index address event is the only
-    /// signal a recreated interface ever sends, and must stand in as the recreation trigger.
+    /// Whether the backend delivers [`InterfaceEvent::Link`] at all. Where it does not (macOS:
+    /// no `RTM_IFANNOUNCE`), an unknown-index address event is the only signal a recreated
+    /// interface ever sends and must stand in as the recreation trigger.
     pub(crate) const LIFECYCLE_EVENTS: bool = backend::LIFECYCLE_EVENTS;
 
-    /// Open and subscribe a routing socket, non-blocking and close-on-exec.
-    ///
     /// # Errors
-    /// Returns an error if the socket can't be opened or subscribed. A failure is the
-    /// caller's cue to run without live updates, not to abort.
+    /// The socket could not be opened or subscribed: the caller's cue to run without live
+    /// updates, not to abort.
     pub(crate) fn open() -> io::Result<Self> {
         Ok(Self {
             sock: backend::open()?,
@@ -80,19 +67,15 @@ impl InterfaceMonitor {
         })
     }
 
-    /// The fd to watch for readiness.
     pub(crate) fn as_raw_fd(&self) -> RawFd {
         self.sock.as_raw_fd()
     }
 
-    /// Drain every queued notification, calling `on_change(event)` per affected interface;
-    /// the per-interface events carry the kernel index. After an overflow it reports
-    /// [`InterfaceEvent::Overflow`] once per burst. Reads to `EAGAIN` so a level-triggered
-    /// wait won't immediately re-fire.
+    /// Drain every queued notification. After an overflow, [`InterfaceEvent::Overflow`] once
+    /// per burst. Reads to `EAGAIN` so a level-triggered wait won't immediately re-fire.
     ///
     /// # Errors
-    /// The first non-recoverable recv failure. Recoverable: `EAGAIN`/`EWOULDBLOCK` end the
-    /// drain, `ENOBUFS` reports the overflow and continues (bailing if it never clears).
+    /// The first non-recoverable recv failure; `ENOBUFS` reports the overflow and continues.
     pub(crate) fn drain(&mut self, mut on_change: impl FnMut(InterfaceEvent)) -> io::Result<()> {
         let mut overflows = 0u32;
         loop {
@@ -112,15 +95,12 @@ impl InterfaceMonitor {
                     &raw mut addrlen,
                 )
             };
-            // ENOBUFS is the drain's own signal (a dropped-notification overflow → re-resolve
-            // everything), so handle it before the generic classifier.
+            // ENOBUFS is the drain's own signal; handle it before the generic classifier.
             if n < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ENOBUFS) {
                 overflows += 1;
+                // Abnormal (buffer pressure or an event storm), so a warn of its own, not just the
+                // dispatcher's debug. Once per burst: the dispatcher re-resolves everything on it.
                 if overflows == 1 {
-                    // A dropped-notification overflow is abnormal (kernel buffer pressure or an
-                    // event storm): warn here, not just the dispatcher's debug. Emit Overflow once
-                    // per burst; the dispatcher re-resolves everything on it, so repeating it per
-                    // ENOBUFS is redundant.
                     log::warn!(
                         "interface monitor overflowed; notifications were dropped, re-resolving every interface"
                     );
@@ -133,10 +113,9 @@ impl InterfaceMonitor {
                 }
                 continue;
             }
-            overflows = 0; // a successful recv breaks the overflow streak
+            overflows = 0;
             match IoStatus::from_syscall(n)? {
-                // No more queued notifications (or a defensive empty read; routing sockets
-                // don't EOF).
+                // Routing sockets don't EOF; a 0 read is treated as drained.
                 IoStatus::WouldBlock | IoStatus::Ready(0) => return Ok(()),
                 IoStatus::Ready(len) => {
                     if backend::sender_ok(&src, addrlen) {

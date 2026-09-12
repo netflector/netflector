@@ -1,10 +1,6 @@
-//! Parse a captured frame into a [`Packet`]: strip the link header, then the IP and
-//! UDP headers, yielding the endpoints, TTL, and a borrowed payload.
-//!
-//! The parse is zero-copy: a [`Packet`] borrows the capture buffer, valid only until
-//! the next read. The kernel filter already restricts capture to IP/UDP, so the
-//! validation here is defense in depth: a malformed frame yields a [`ParseError`] to
-//! log and skip, never a panic or partial packet.
+//! Parse a captured frame into a [`Packet`]: link header, then IP and UDP, borrowing the payload
+//! from the capture buffer. The kernel filter already restricts capture to IP/UDP; the validation
+//! here is defense in depth, so a malformed frame is a [`ParseError`] to log and skip.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -18,24 +14,22 @@ use super::{
     UDP_HEADER_SIZE,
 };
 
-/// A parsed UDP datagram: the endpoints, the captured TTL/hop-limit, the L2 addresses
-/// (for filtering), and the payload borrowed from the capture buffer.
+/// A parsed UDP datagram, its payload borrowed from the capture buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Packet<'a> {
     pub(crate) source: SocketAddr,
     pub(crate) dest: SocketAddr,
     /// IPv4 TTL or IPv6 hop limit, as captured.
     pub(crate) ttl: u8,
-    /// Ethernet destination/source MAC, or `None` on a link without them (`DLT_NULL`, raw IP).
+    /// `None` on a link without MACs (`DLT_NULL`, raw IP).
     pub(crate) dst_mac: Option<MacAddr>,
     pub(crate) src_mac: Option<MacAddr>,
     pub(crate) payload: &'a [u8],
 }
 
 impl Packet<'_> {
-    /// Whether the datagram is an IPv4 broadcast. On a link with MACs the frame says: it went to
-    /// the all-ones MAC, which carries a directed broadcast of any subnet on the link as well as the
-    /// limited one. A link without MACs (`DLT_NULL`, a tunnel or a loopback) leaves the address:
+    /// On a link with MACs the all-ones destination is decisive: it carries a directed broadcast
+    /// of any subnet on the link as well as the limited one. Without MACs only the address is left:
     /// the limited broadcast, or `directed_broadcast`, the link's own subnet's.
     pub(crate) fn is_broadcast(&self, directed_broadcast: Option<Ipv4Addr>) -> bool {
         match (self.dest.ip(), self.dst_mac) {
@@ -46,36 +40,27 @@ impl Packet<'_> {
     }
 }
 
-/// Why a captured frame could not be parsed into a [`Packet`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub(crate) enum ParseError {
-    /// The frame is shorter than a header it must contain.
     #[error("frame is truncated")]
     Truncated,
-    /// The IP version nibble is neither 4 nor 6.
     #[error("unsupported IP version {0}")]
     BadIpVersion(u8),
-    /// An IPv4 fragment (we reflect only whole datagrams).
     #[error("IPv4 fragment")]
     Fragmented,
-    /// The L4 protocol (IPv4) or next header (IPv6) is not UDP.
     #[error("not a UDP datagram (IP protocol {0})")]
     NotUdp(u8),
-    /// A declared length field is inconsistent with the captured bytes.
     #[error("inconsistent length field")]
     BadLength,
 }
 
 impl<'a> Packet<'a> {
-    /// Parse one captured `frame` (framed as `link_type`) into a [`Packet`].
-    ///
     /// # Errors
-    /// Returns a [`ParseError`] if the frame is truncated, not IPv4/IPv6 UDP, an IPv4
-    /// fragment, or carries an inconsistent length field.
+    /// The frame is truncated, not IPv4/IPv6 UDP, an IPv4 fragment, or carries an inconsistent
+    /// length field.
     pub(crate) fn parse(link_type: LinkType, frame: &'a [u8]) -> Result<Self, ParseError> {
         let link = parse_link_header(link_type, frame)?;
-        // Dispatch on the IP version nibble, not the link-layer ethertype or address
-        // family: the nibble governs the header layout we parse.
+        // The version nibble, not the ethertype or `DLT_NULL` family, governs the header layout.
         let &first = link.l3.first().ok_or(ParseError::Truncated)?;
         match first >> 4 {
             4 => parse_ipv4(link),
@@ -85,8 +70,6 @@ impl<'a> Packet<'a> {
     }
 }
 
-/// A frame's link header: its L2 addresses (absent on a MAC-less link) and the L3 bytes
-/// that follow.
 #[derive(Clone, Copy)]
 struct LinkHeader<'a> {
     dst_mac: Option<MacAddr>,
@@ -94,15 +77,13 @@ struct LinkHeader<'a> {
     l3: &'a [u8],
 }
 
-/// Parse the `link_type` link header into its L2 addresses and the L3 bytes that follow.
 fn parse_link_header(link_type: LinkType, frame: &[u8]) -> Result<LinkHeader<'_>, ParseError> {
     match link_type {
         LinkType::Ethernet => {
             let l3 = frame
                 .get(ETHERNET_HEADER_SIZE..)
                 .ok_or(ParseError::Truncated)?;
-            // The Ethernet header is dst MAC(6) + src MAC(6) + ethertype(2); the L3
-            // slice above proves the frame holds all 14, so the MAC reads are in range.
+            // The `get` above proved all 14 header bytes are present: the MAC slices can't panic.
             Ok(LinkHeader {
                 dst_mac: Some(read_mac(&frame[0..6])?),
                 src_mac: Some(read_mac(&frame[6..12])?),
@@ -126,15 +107,13 @@ fn parse_link_header(link_type: LinkType, frame: &[u8]) -> Result<LinkHeader<'_>
     }
 }
 
-/// Parse an IPv4 datagram (header, options, then UDP) from `link`'s L3 bytes, carrying
-/// its L2 addresses onto the [`Packet`].
 fn parse_ipv4(link: LinkHeader<'_>) -> Result<Packet<'_>, ParseError> {
     let l3 = link.l3;
     if l3.len() < IPV4_HEADER_SIZE {
         return Err(ParseError::Truncated);
     }
 
-    // IHL counts 32-bit words and covers any options; it bounds where L4 begins.
+    // IHL is in 32-bit words and covers the options.
     let header_len = usize::from(l3[0] & 0x0f) * 4;
     if header_len < IPV4_HEADER_SIZE || header_len > l3.len() {
         return Err(ParseError::BadLength);
@@ -150,8 +129,8 @@ fn parse_ipv4(link: LinkHeader<'_>) -> Result<Packet<'_>, ParseError> {
         return Err(ParseError::NotUdp(l3[9]));
     }
 
-    // The total length spans the IP header + datagram; trust it over the captured slice
-    // so trailing link padding (Ethernet min-frame, capture slack) is trimmed off.
+    // Trust the total length over the captured slice: it trims trailing link padding (Ethernet
+    // min-frame, capture slack).
     let total_len = usize::from(u16::from_be_bytes([l3[2], l3[3]]));
     if total_len < header_len || total_len > l3.len() {
         return Err(ParseError::BadLength);
@@ -172,9 +151,7 @@ fn parse_ipv4(link: LinkHeader<'_>) -> Result<Packet<'_>, ParseError> {
     })
 }
 
-/// Parse an IPv6 datagram (fixed base header, then UDP) from `link`'s L3 bytes, carrying
-/// its L2 addresses onto the [`Packet`]. Extension headers are unsupported: a next
-/// header other than UDP is rejected.
+/// Extension headers are unsupported: a next header other than UDP is rejected.
 fn parse_ipv6(link: LinkHeader<'_>) -> Result<Packet<'_>, ParseError> {
     let l3 = link.l3;
     if l3.len() < IPV6_HEADER_SIZE {
@@ -206,8 +183,6 @@ fn parse_ipv6(link: LinkHeader<'_>) -> Result<Packet<'_>, ParseError> {
     })
 }
 
-/// Parse a UDP header from `l4`, returning the ports and the payload trimmed to the
-/// datagram's declared length.
 fn parse_udp(l4: &[u8]) -> Result<(u16, u16, &[u8]), ParseError> {
     if l4.len() < UDP_HEADER_SIZE {
         return Err(ParseError::Truncated);
@@ -221,22 +196,18 @@ fn parse_udp(l4: &[u8]) -> Result<(u16, u16, &[u8]), ParseError> {
     Ok((src_port, dst_port, &l4[UDP_HEADER_SIZE..udp_len]))
 }
 
-/// `bytes` is a length-checked header slice, so the conversion never fails; mapping a
-/// mismatch to `Truncated` keeps it panic-free regardless.
 fn ipv4_addr(bytes: &[u8]) -> Result<Ipv4Addr, ParseError> {
     <[u8; 4]>::try_from(bytes)
         .map(Ipv4Addr::from)
         .map_err(|_| ParseError::Truncated)
 }
 
-/// Read a 16-byte IPv6 address field, the [`ipv4_addr`] counterpart.
 fn ipv6_addr(bytes: &[u8]) -> Result<Ipv6Addr, ParseError> {
     <[u8; 16]>::try_from(bytes)
         .map(Ipv6Addr::from)
         .map_err(|_| ParseError::Truncated)
 }
 
-/// Read a 6-byte MAC field.
 fn read_mac(bytes: &[u8]) -> Result<MacAddr, ParseError> {
     <[u8; 6]>::try_from(bytes)
         .map(MacAddr::from)

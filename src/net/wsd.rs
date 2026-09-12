@@ -1,8 +1,6 @@
-//! WS-Discovery (WSD) wire helpers: the multicast group / port / TTL and a classifier that sorts a
-//! SOAP-over-UDP datagram into an announcement (`Hello` / `Bye`) or a search (`Probe` / `Resolve`) by
-//! its WS-Addressing `Action` URI. WSD is structurally SSDP-without-DIAL: announcements reflect device
-//! → client, searches client → device with unicast `ProbeMatches` / `ResolveMatches` replies routed
-//! back through a per-searcher session.
+//! WS-Discovery wire helpers: the group / port / TTL and a classifier sorting a SOAP-over-UDP
+//! datagram into an announcement (`Hello` / `Bye`) or a search (`Probe` / `Resolve`) by its
+//! WS-Addressing `Action`.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -10,29 +8,24 @@ use crate::net::http::url_host_ip;
 
 use super::{is_link_local, is_never_a_peer};
 
-/// WSD runs SOAP-over-UDP on port 3702, re-emitted at TTL 1. The re-emit is a single hop onto the
-/// egress link, matching the link scope of the groups it serves.
 pub(crate) const WSD_PORT: u16 = 3702;
+/// A single hop onto the egress link, matching the link scope of the groups.
 pub(crate) const WSD_TTL: u8 = 1;
-/// The WS-Discovery multicast groups: IPv4 `239.255.255.250` (shared with SSDP) and IPv6 `ff02::c`.
-/// Unlike SSDP, WSD uses only the link-local IPv6 scope (no site-local `ff05::c`).
+/// Shared with SSDP, but WSD uses only the link-local IPv6 scope (no site-local `ff05::c`).
 pub(crate) const WSD_GROUP_V4: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
 pub(crate) const WSD_GROUP_V6: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0x0c);
 
-/// What a WSD datagram on the group is, by its `Action` message type. The unicast reply types
-/// (`ProbeMatches` / `ResolveMatches`) never reach the group, so they classify as neither.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WsdKind {
-    /// A device presence announcement: `Hello` or `Bye`.
+    /// `Hello` or `Bye`.
     Announcement,
-    /// A client discovery request: `Probe` or `Resolve`.
+    /// `Probe` or `Resolve`.
     Search,
 }
 
-/// Classify a WSD SOAP-over-UDP datagram by the final path segment of its WS-Addressing `Action` URI
-/// (namespace-agnostic: the 2005/04 and 2009/01 discovery namespaces differ only in the URI prefix).
-/// `None` for a reply type (`ProbeMatches` / `ResolveMatches`, unicast and not expected on the group), a
-/// missing `Action`, or non-WSD junk.
+/// By the final path segment of the `Action` URI: the 2005/04 and 2009/01 namespaces differ only
+/// in the prefix. `None` for a reply type (`ProbeMatches` / `ResolveMatches`, unicast and never on
+/// the group), a missing `Action`, or junk.
 pub(crate) fn classify(payload: &[u8]) -> Option<WsdKind> {
     match action_segment(payload)? {
         b"Hello" | b"Bye" => Some(WsdKind::Announcement),
@@ -41,16 +34,13 @@ pub(crate) fn classify(payload: &[u8]) -> Option<WsdKind> {
     }
 }
 
-/// The final `/`-delimited segment of the first `Action` element's URI (the WS-Addressing message
-/// type), or `None` when there is no such element.
 fn action_segment(payload: &[u8]) -> Option<&[u8]> {
     let (uri, _) = element_text(payload, b"Action")?;
     uri.rsplit(|&b| b == b'/').next().filter(|s| !s.is_empty())
 }
 
-/// Whether the message's `XAddrs` (the device's transport addresses) hold at least one IP-literal
-/// URI and every one is link-local or otherwise never a peer ([`is_never_a_peer`]). A hostname or
-/// unparseable URI, a usable literal, or no `XAddrs` at all reads as `false`.
+/// At least one `XAddrs` URI, and every one a link-local or [`is_never_a_peer`] literal. A hostname
+/// or unparseable URI reads as `false`: not provably dead.
 pub(crate) fn advertises_only_unreachable(payload: &[u8]) -> bool {
     // Every XAddrs element counts: a ProbeMatches carries one per ProbeMatch.
     let mut saw_ip = false;
@@ -62,7 +52,6 @@ pub(crate) fn advertises_only_unreachable(payload: &[u8]) -> bool {
             }
             match url_host_ip(uri) {
                 Some(ip) if is_link_local(ip) || is_never_a_peer(ip) => saw_ip = true,
-                // A routable literal, a hostname, or an unparseable URI: not provably dead.
                 _ => return false,
             }
         }
@@ -71,28 +60,24 @@ pub(crate) fn advertises_only_unreachable(payload: &[u8]) -> bool {
     saw_ip
 }
 
-/// The trimmed text content of the first element named `local_name` (ASCII-case-insensitive, any
-/// namespace prefix), with the remainder after that content, or `None` when no such element opens.
-/// Walks the payload element by element so a match is scoped to the tag: tolerant of the prefix
-/// (`a:` / `wsa:` / none) and of tag attributes (ONVIF sends `mustUnderstand`), and never fooled by
-/// the token appearing in body text.
+/// The trimmed text of the first element with local name `local_name` (any prefix, any attributes;
+/// ONVIF sends `mustUnderstand`), and the remainder after it. Scoped to tags, so the token in body
+/// text can't match.
 fn element_text<'a>(payload: &'a [u8], local_name: &[u8]) -> Option<(&'a [u8], &'a [u8])> {
     let mut rest = payload;
     while let Some(open) = rest.iter().position(|&b| b == b'<') {
         rest = &rest[open + 1..];
         let close = rest.iter().position(|&b| b == b'>')?;
         let (tag, after) = rest.split_at(close);
-        rest = &after[1..]; // past the '>'
-        // A closing tag (`</…>`), the XML declaration (`<?…`), or a comment/doctype (`<!…`) is not an
-        // opening element.
+        rest = &after[1..];
+        // closing tag, XML declaration, comment/doctype
         if matches!(tag.first().copied(), Some(b'/' | b'?' | b'!')) {
             continue;
         }
-        // A self-closed element (`<a:Action/>`) has no text content.
+        // self-closed: no text content
         if tag.last() == Some(&b'/') {
             continue;
         }
-        // The element name runs up to the first whitespace or self-close '/'; drop any `prefix:`.
         let name = tag
             .split(|&b| b.is_ascii_whitespace() || b == b'/')
             .next()

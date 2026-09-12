@@ -1,9 +1,5 @@
-//! Strongly-typed configuration values.
-//!
-//! Each type parses from a string via `FromStr` (used by the environment layer,
-//! with variable-named errors) and deserializes via a matching `Deserialize` that
-//! delegates to the same `FromStr` (used by the TOML layer, with located errors).
-//! The newtypes make illegal values unrepresentable.
+//! Strongly-typed configuration values. Each type pairs `FromStr` (the environment path) with a
+//! `Deserialize` that delegates to it (the TOML path), so one validation serves both.
 
 use std::fmt;
 use std::net::IpAddr;
@@ -15,8 +11,6 @@ use thiserror::Error;
 
 use crate::unique_list::{ListRule, UniqueList};
 
-/// Minimum severity a record must have to be logged; `Off` disables logging
-/// entirely. Ordered most-restrictive to most-verbose, mirroring `log`'s filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum LogLevel {
     Off,
@@ -56,7 +50,6 @@ impl<'de> Deserialize<'de> for LogLevel {
     }
 }
 
-/// Which IP versions a reflector operates on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum AddressFamily {
     #[default]
@@ -77,7 +70,6 @@ impl AddressFamily {
         matches!(self, Self::Default | Self::Dual | Self::Ipv6)
     }
 
-    /// Whether the policy handles `ip`'s IP version.
     pub(crate) fn uses(self, ip: IpAddr) -> bool {
         match ip {
             IpAddr::V4(_) => self.uses_ipv4(),
@@ -85,16 +77,15 @@ impl AddressFamily {
         }
     }
 
-    /// A v4 source must be present at startup, else the reflector fails to build. Same set as
-    /// `uses_ipv4`, but distinct in meaning: `Default` requires v4 while treating v6 as
-    /// best-effort.
+    /// The reflector fails to build without a v4 source. Same set as `uses_ipv4`, kept distinct:
+    /// `Default` requires v4 but treats v6 as best-effort.
     #[must_use]
     pub(crate) fn requires_ipv4(self) -> bool {
         matches!(self, Self::Default | Self::Dual | Self::Ipv4)
     }
 
-    /// A v6 source must be present at startup, else the reflector fails to build: only `Dual`
-    /// and `Ipv6`. Unlike `uses_ipv6`, `Default` reflects v6 when available but starts without it.
+    /// The reflector fails to build without a v6 source: `Default` reflects v6 when available but
+    /// starts without it.
     #[must_use]
     pub(crate) fn requires_ipv6(self) -> bool {
         matches!(self, Self::Dual | Self::Ipv6)
@@ -127,9 +118,8 @@ impl<'de> Deserialize<'de> for AddressFamily {
     }
 }
 
-/// A network interface name: non-empty and whitespace-free. OS interface names never contain
-/// whitespace; a padded one would miss the interface (a confusing capture error) and slip past the
-/// `source_if`/`target_if` equality check, so reject it here rather than downstream.
+/// Non-empty and whitespace-free: a padded name would miss the interface with a confusing capture
+/// error and slip past the `source_if`/`target_if` equality check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InterfaceName(String);
 
@@ -169,9 +159,8 @@ impl<'de> Deserialize<'de> for InterfaceName {
     }
 }
 
-/// A reflector's name: surrounding whitespace trimmed and ASCII-lowercased (names are the reflector's
-/// case-insensitive identity), never empty. The canonical form makes `Eq` the identity check, so no
-/// caller has to fold case itself.
+/// Trimmed and ASCII-lowercased, never empty: names are a case-insensitive identity, and the
+/// canonical form makes `Eq` the identity check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReflectorName(String);
 
@@ -204,7 +193,7 @@ impl FromStr for ReflectorName {
     }
 }
 
-/// The rule for [`PortList`]: any UDP port; `NonZeroU16` keeps 0 out.
+/// The rule for [`PortList`]: any UDP port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Ports;
 
@@ -252,8 +241,8 @@ impl ListRule for Peers {
     }
 }
 
-/// A non-empty, duplicate-free list of unicast addresses, of either family: the hosts behind an
-/// interface that has no broadcast domain.
+/// A non-empty, duplicate-free list of unicast addresses: the hosts behind an interface without a
+/// broadcast domain.
 pub(crate) type PeerList = UniqueList<Peers>;
 
 #[cfg(test)]

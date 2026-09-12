@@ -1,16 +1,7 @@
-//! A generational-index arena.
-//!
-//! [`insert`](Arena::insert) returns a `Copy` [`Key`] carrying the slot's `index`
-//! and `generation`. [`remove`](Arena::remove) bumps the generation, so a key to
-//! the old occupant resolves to `None` rather than dangling.
-//!
-//! Lets the reactor hand out copyable handles to registrations instead of
-//! pointers, avoiding the aliasing that cross-references would create.
+//! A generational-index arena. [`remove`](Arena::remove) bumps the slot's generation,
+//! so a key to the old occupant resolves to `None` instead of aliasing the next one.
 
-/// A `Copy` handle into an [`Arena`].
-///
-/// Valid only for the value it was returned for; once that value is removed the
-/// key is stale and every lookup with it returns `None`.
+/// A handle into an [`Arena`]; stale once its value is removed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct Key {
     index: u32,
@@ -18,15 +9,12 @@ pub(crate) struct Key {
 }
 
 impl Key {
-    /// Pack the key into a `u64`, recoverable via [`from_u64`](Key::from_u64). The
-    /// two `u32` halves fit exactly, so the key can ride in an opaque 64-bit slot
-    /// (such as a kernel readiness token).
+    /// Pack into a `u64` (a kernel token); [`from_u64`](Key::from_u64) reverses it.
     #[must_use]
     pub(crate) fn to_u64(self) -> u64 {
         (u64::from(self.index) << 32) | u64::from(self.generation)
     }
 
-    /// Reconstruct a key packed by [`to_u64`](Key::to_u64).
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
     pub(crate) fn from_u64(packed: u64) -> Self {
@@ -37,15 +25,11 @@ impl Key {
     }
 }
 
-/// One arena slot: occupied (`Some`) or free (`None`), plus the generation a key
-/// must match to address the current occupant.
 struct Slot<T> {
     generation: u32,
     value: Option<T>,
 }
 
-/// A slab of slots addressed by generational [`Key`]s, with a free list so freed
-/// slots are reused without invalidating live keys to other slots.
 pub(crate) struct Arena<T> {
     slots: Vec<Slot<T>>,
     free: Vec<u32>,
@@ -60,22 +44,16 @@ impl<T> Arena<T> {
         }
     }
 
-    /// Store `value`, returning a key that addresses it.
-    ///
     /// # Panics
-    /// Panics if more than `u32::MAX` slots have ever been allocated (the index
-    /// space is exhausted). Unreachable for the reactor's handful of descriptors.
+    /// If the `u32` index space is exhausted.
     pub(crate) fn insert(&mut self, value: T) -> Key {
         self.insert_from(|_| value)
     }
 
-    /// Store a value built from the key that will address it. Used when the value
-    /// must know its own key: a reactor handler that later watches fds under, or
-    /// unregisters, its own key. The arena resolves the key first, then hands it
-    /// to `make`.
+    /// Store the value `make` builds from the key it will get.
     ///
     /// # Panics
-    /// As [`insert`](Self::insert): if the `u32` index space is exhausted.
+    /// As [`insert`](Self::insert).
     pub(crate) fn insert_from<F>(&mut self, make: F) -> Key
     where
         F: FnOnce(Key) -> T,
@@ -99,36 +77,29 @@ impl<T> Arena<T> {
         }
     }
 
-    /// A shared reference to the value `key` addresses, or `None` if stale.
     #[must_use]
     pub(crate) fn get(&self, key: Key) -> Option<&T> {
         self.slot(key)?.value.as_ref()
     }
 
-    /// A mutable reference to the value `key` addresses, or `None` if stale.
     pub(crate) fn get_mut(&mut self, key: Key) -> Option<&mut T> {
         self.slot_mut(key)?.value.as_mut()
     }
 
-    /// Remove and return the value `key` addresses, freeing the slot. A stale key
-    /// removes nothing and returns `None`.
     pub(crate) fn remove(&mut self, key: Key) -> Option<T> {
         let slot = self.slot_mut(key)?;
         let value = slot.value.take()?;
-        // Bumping strands every existing key to this slot; wrapping stays panic-free
-        // (a collision would need 2^32 reuses of one slot).
+        // wrapping: a collision needs 2^32 reuses of one slot
         slot.generation = slot.generation.wrapping_add(1);
         self.free.push(key.index);
         Some(value)
     }
 
-    /// Whether `key` still addresses a live value.
     #[must_use]
     pub(crate) fn contains(&self, key: Key) -> bool {
         self.get(key).is_some()
     }
 
-    /// Iterate every live `(key, &value)`, in slot order; freed slots are skipped.
     pub(crate) fn iter(&self) -> impl Iterator<Item = (Key, &T)> + '_ {
         self.slots.iter().enumerate().filter_map(|(index, slot)| {
             let value = slot.value.as_ref()?;
@@ -143,7 +114,6 @@ impl<T> Arena<T> {
         })
     }
 
-    /// The slot `key` names, only if its generation still matches.
     fn slot(&self, key: Key) -> Option<&Slot<T>> {
         self.slots
             .get(key.index as usize)
@@ -163,8 +133,7 @@ impl<T> Default for Arena<T> {
     }
 }
 
-/// A slot value holding its handler in an `Option`: the handler is taken out for its call, so the
-/// arena's owner is free to hand itself to it, and put back after. `None` marks "out mid-call".
+/// A slot value whose handler is taken out (`None`) for the duration of a call.
 pub(crate) trait HandlerSlot {
     type Handler: ?Sized;
 
@@ -180,20 +149,16 @@ pub(crate) trait HandlerSlot {
 }
 
 impl<T: HandlerSlot> Arena<T> {
-    /// Take `key`'s handler out for a call: `None` if the slot is gone or the handler is already
-    /// out.
     pub(crate) fn take_handler(&mut self, key: Key) -> Option<Box<T::Handler>> {
         self.get_mut(key)?.slot_mut().take()
     }
 
-    /// Put a handler back after its call. A slot removed during the call drops it.
     pub(crate) fn restore_handler(&mut self, key: Key, handler: Box<T::Handler>) {
         if let Some(slot) = self.get_mut(key) {
             *slot.slot_mut() = Some(handler);
         }
     }
 
-    /// Every present handler with its key, in slot order.
     pub(crate) fn handlers(&self) -> impl Iterator<Item = (Key, &T::Handler)> + '_ {
         self.iter()
             .filter_map(|(key, slot)| Some((key, slot.handler()?)))

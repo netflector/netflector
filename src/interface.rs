@@ -1,13 +1,7 @@
 //! Interface address resolution: the source MAC / IPv4 / IPv6 an interface currently has.
-//! A reflector re-emits from these, so they must be read fresh (the interface monitor keeps
-//! them current). Any may be absent: a loopback / `DLT_NULL` link has no MAC, and a link
-//! may be v4-only or v6-only.
-//!
-//! Resolution lives on [`Interface`] (built by [`open`](Interface::open), kept current by
-//! [`refresh`](Interface::refresh)), dispatching to one backend per platform: pure rtnetlink
-//! on Linux (one `RTM_GETADDR` dump for the addresses, one `RTM_GETLINK` for the MAC),
-//! `getifaddrs` plus `SIOCGIFAFLAG_IN6` on the BSDs. Each yields the same
-//! [`InterfaceAddresses`].
+//! Read fresh, since a reflector re-emits from them; any may be absent (a loopback /
+//! `DLT_NULL` link has no MAC, a link may be single-family). Backends: rtnetlink on Linux,
+//! `getifaddrs` plus `SIOCGIFAFLAG_IN6` on the BSDs.
 
 use std::fmt;
 use std::io;
@@ -23,10 +17,8 @@ mod rtnetlink;
 
 pub(crate) use self::interface_monitor::{InterfaceEvent, InterfaceMonitor};
 
-/// An interface's current source addresses; any may be absent. The fields are private so a sender
-/// reaches a v6 source only through [`v6`](Self::v6), naming the destination's scope: the stored
-/// best-overall source (link-local preferred) and best-non-link-local one (ULA or global) can't be
-/// grabbed directly and mismatched against the destination.
+/// An interface's current source addresses; any may be absent. The v6 fields stay private so a
+/// sender reaches a v6 source only through [`v6`](Self::v6), naming the destination's scope.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct InterfaceAddresses {
     mac: Option<MacAddr>,
@@ -37,19 +29,15 @@ pub(crate) struct InterfaceAddresses {
 }
 
 impl InterfaceAddresses {
-    /// The source MAC, if the link has one (a `DLT_NULL` / loopback link has none).
     pub(crate) fn mac(&self) -> Option<MacAddr> {
         self.mac
     }
 
-    /// The IPv4 source address, if any. IPv4 is scopeless, so unlike
-    /// [`v6`](Self::v6) it needs no destination argument.
     pub(crate) fn v4(&self) -> Option<Ipv4Addr> {
         self.v4
     }
 
-    /// The directed broadcast of the v4 address's subnet, when the prefix is known and the subnet
-    /// has one (a /31 or /32 do not).
+    /// The directed broadcast of the v4 subnet; a /31 or /32 has none.
     pub(crate) fn v4_directed_broadcast(&self) -> Option<Ipv4Addr> {
         let (addr, prefix) = (self.v4?, self.v4_prefix?);
         if prefix > 30 {
@@ -58,9 +46,8 @@ impl InterfaceAddresses {
         Some(Ipv4Addr::from(u32::from(addr) | (u32::MAX >> prefix)))
     }
 
-    /// The best v6 source for a destination of `dest_scope`: a link-local source for a link-local
-    /// destination, a routable (ULA/global) source for a wider one. Falls back to the other scope's
-    /// address when the matching one is absent: a scope mismatch, but better than dropping the send.
+    /// The v6 source for a destination of `dest_scope`, falling back to the other scope's address
+    /// when the matching one is absent: a scope mismatch beats dropping the send.
     pub(crate) fn v6(&self, dest_scope: Ipv6Scope) -> Option<Ipv6Addr> {
         match dest_scope {
             Ipv6Scope::LinkLocal => self.v6,
@@ -68,7 +55,6 @@ impl InterfaceAddresses {
         }
     }
 
-    /// Whether `ip` is one of the interface's own addresses.
     pub(crate) fn has(&self, ip: IpAddr) -> bool {
         match ip {
             IpAddr::V4(v4) => self.v4 == Some(v4),
@@ -76,13 +62,11 @@ impl InterfaceAddresses {
         }
     }
 
-    /// Whether the interface can currently source IPv4. The per-family availability gate.
     pub(crate) fn has_v4(&self) -> bool {
         self.v4.is_some()
     }
 
-    /// Whether the interface can currently source IPv6, in any scope. The best-overall source is set
-    /// whenever any usable v6 address exists, so this answers "is there a v6 source at all".
+    /// `v6` is set whenever any usable v6 exists, so this covers both scopes.
     pub(crate) fn has_v6(&self) -> bool {
         self.v6.is_some()
     }
@@ -114,9 +98,8 @@ impl fmt::Display for InterfaceAddresses {
     }
 }
 
-/// Which source fields a [`refresh`](Interface::refresh) found changed: one flag per
-/// [`InterfaceAddresses`] field, so a caller reacts only to the family it depends on (the DIAL proxies
-/// bind IPv4, so they re-mint only when `v4` moves, not on a routine v6 or MAC change).
+/// Which source fields a [`refresh`](Interface::refresh) changed, so a caller reacts only to the
+/// family it depends on (the DIAL proxies re-mint only when `v4` moves).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct AddressChange {
     pub(crate) mac: bool,
@@ -124,20 +107,15 @@ pub(crate) struct AddressChange {
     pub(crate) v6: bool,
 }
 
-/// An IPv6 destination's scope, coarsened to what matters for source selection: a link-local
-/// destination (`fe80::/10`, or a link-local-scoped multicast group like `ff02::`) wants a link-local
-/// source; anything wider wants a routable one.
+/// An IPv6 destination's scope, coarsened to what source selection needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Ipv6Scope {
     LinkLocal,
-    /// Site-local, ULA, or global: anything routed beyond the local link (not necessarily a GUA).
+    /// Anything beyond the link: site-local, ULA or global.
     Routable,
 }
 
 impl Ipv6Scope {
-    /// The scope of `addr`: link-local if it's a link-local-scoped multicast group or a link-local
-    /// unicast address ([`Ipv6Addr::is_unicast_link_local`]), else routable. Only the multicast side is
-    /// hand-rolled, because `Ipv6Addr::multicast_scope` is unstable (feature `ip`).
     pub(crate) fn of(addr: Ipv6Addr) -> Self {
         if is_multicast_link_local(addr) || addr.is_unicast_link_local() {
             Self::LinkLocal
@@ -147,27 +125,21 @@ impl Ipv6Scope {
     }
 }
 
-/// One configured interface: its name (the durable identity, kept for re-resolution), kernel
-/// ifindex (the interface monitor's lookup key), and current source addresses. Built by
-/// [`open`](Self::open); the monitor later refreshes `addrs` in place.
-///
-/// The `ifindex` is a cache of what the name resolves to -- the process's only persistent copy
-/// of an interface index. If the OS destroys and recreates the interface (a fresh kernel
-/// identity, e.g. a `PPPoE` reconnect or a bridge/VLAN rebuild), the dispatcher's reconcile
-/// re-points it (0 while the name resolves to nothing) and re-binds the captures.
+/// One configured interface. `ifindex` caches what `name` resolves to, the process's only
+/// persistent copy of an interface index: when the OS destroys and recreates the interface (a
+/// `PPPoE` reconnect, a bridge/VLAN rebuild), the dispatcher's reconcile re-points it (0 while
+/// the name resolves to nothing) and re-binds the captures.
 pub(crate) struct Interface {
     pub(crate) name: String,
     pub(crate) ifindex: u32,
     pub(crate) addrs: InterfaceAddresses,
-    /// The MTU as of the last [`refresh`](Self::refresh), `None` when unreadable. Deliberately
-    /// outside [`InterfaceAddresses`]: that struct's equality drives the refresh diffing, and a
-    /// bare MTU change must not read as an address change (which clears sessions).
+    /// Outside [`InterfaceAddresses`] on purpose: that struct's equality drives the refresh
+    /// diffing, and a bare MTU change must not read as an address change (which clears sessions).
     pub(crate) mtu: Option<u32>,
 }
 
 impl Interface {
-    /// Build an interface record: cache `name`'s kernel ifindex (0 if unknown, never matching
-    /// a real event), then [`refresh`](Self::refresh) its current source addresses.
+    /// `ifindex` is 0 while the name resolves to nothing; no real event carries 0.
     ///
     /// # Errors
     /// Propagates a resolution syscall failure.
@@ -186,12 +158,7 @@ impl Interface {
         Ok(iface)
     }
 
-    /// Re-resolve this interface's addresses in place (at open, and after an address-change
-    /// notification) via the platform backend. The cached `ifindex`, a stable identity for
-    /// the interface's lifetime, keys the Linux dump; the BSD `getifaddrs` walk matches by
-    /// name. The backend logs each address (and every v6's flag status) at `trace`. Returns which
-    /// source fields changed from the previous resolution, so a caller can react to exactly the
-    /// family it depends on.
+    /// Re-resolve the addresses in place and report which source fields changed.
     ///
     /// # Errors
     /// Propagates a resolution syscall failure.
@@ -205,8 +172,7 @@ impl Interface {
             Some(mtu) => log::debug!("{}: resolved {addrs}, mtu {mtu}", self.name),
             None => log::debug!("{}: resolved {addrs}, mtu unreadable", self.name),
         }
-        // Both v6 transitions are logged (the `let`s run before the `||`), and either folds into the
-        // single `v6` change bit, since no caller distinguishes the two v6 sources.
+        // Separate `let`s so both v6 transitions log; `||` would short-circuit the second.
         let v6 = log_field_change(&self.name, "IPv6", self.addrs.v6, addrs.v6);
         let v6_routable = log_field_change(
             &self.name,
@@ -224,21 +190,18 @@ impl Interface {
     }
 }
 
-/// The kernel ifindex of `name`, or `None` if it names no interface *or* the lookup itself
-/// failed. Address-change events report an ifindex; an [`Interface`] caches its own so a
-/// notification maps back to it. A caller that acts destructively on absence wants
-/// [`if_index_checked`] instead.
+/// `None` if `name` names no interface or the lookup itself failed. A caller that acts
+/// destructively on absence wants [`if_index_checked`] instead.
 pub(crate) fn if_index(name: &str) -> Option<u32> {
     if_index_checked(name).ok().flatten()
 }
 
-/// The kernel ifindex of `name`, telling "no such interface" apart from a lookup that could not
-/// run. `if_nametoindex` is not a pure lookup: glibc and musl open a socket inside it, so under fd
-/// pressure it reports 0 for a perfectly live interface.
+/// Tells "no such interface" apart from a lookup that could not run: glibc and musl open a
+/// socket inside `if_nametoindex`, so under fd pressure it reports 0 for a live interface.
 ///
 /// # Errors
-/// Only the resource errnos yield `Err`. Any other failure still reads as absent, so an errno this
-/// list happens to miss can't mask a genuinely removed interface.
+/// Only the resource errnos. Anything else still reads as absent, so an unlisted errno can't
+/// mask a removed interface.
 pub(crate) fn if_index_checked(name: &str) -> io::Result<Option<u32>> {
     let Ok(cname) = std::ffi::CString::new(name) else {
         return Ok(None); // an interior NUL names no interface
@@ -255,8 +218,6 @@ pub(crate) fn if_index_checked(name: &str) -> io::Result<Option<u32>> {
     }
 }
 
-/// The name of interface `index`, or `None` if it names no interface. The reverse of [`if_index`],
-/// so a diagnostic can say `em0` rather than `3`.
 #[cfg(target_os = "freebsd")]
 pub(crate) fn if_name(index: u32) -> Option<String> {
     let mut buf = [0u8; libc::IF_NAMESIZE];
@@ -270,9 +231,7 @@ pub(crate) fn if_name(index: u32) -> Option<String> {
     std::str::from_utf8(&buf[..end]).ok().map(str::to_owned)
 }
 
-/// Log a single source field's transition at `info`, so the address churn is visible to an operator
-/// and the address-change e2e. Returns whether it changed at all, so the caller acts on exactly the
-/// families that moved. Nothing is logged when the field is unchanged.
+/// Logged at `info`: the address-change e2e greps these lines. Returns whether the field changed.
 fn log_field_change<A: PartialEq + fmt::Display>(
     iface: &str,
     family: &str,
@@ -290,10 +249,8 @@ fn log_field_change<A: PartialEq + fmt::Display>(
     true
 }
 
-/// An IPv6 source candidate's rank, ordered worst-to-best so a higher variant outranks a lower one
-/// (the derived `Ord` follows declaration order). netflector reflects link-local service traffic, so
-/// a link-local source is preferred, then ULA, then global; a multicast / `::` / `::1` address is never
-/// a source.
+/// Worst to best; the derived `Ord` follows declaration order. Link-local is preferred because
+/// netflector reflects link-local service traffic.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Debug)]
 enum V6Rank {
     #[default]
@@ -303,7 +260,6 @@ enum V6Rank {
     LinkLocal,
 }
 
-/// Rank an IPv6 source candidate by how good a source it is (see [`V6Rank`]).
 fn v6_rank(addr: Ipv6Addr) -> V6Rank {
     if addr.is_multicast() || addr.is_unspecified() || addr.is_loopback() {
         V6Rank::NotASource
@@ -316,18 +272,14 @@ fn v6_rank(addr: Ipv6Addr) -> V6Rank {
     }
 }
 
-/// Whether `addr` is a link-local-scoped multicast group (`ff02::`): a multicast address (`ff00::/8`)
-/// whose scope nibble is `2`. Hand-rolled because `Ipv6Addr::multicast_scope`, the natural fit, is
-/// unstable (feature `ip`), unlike the unicast/ULA classifiers we take from std. The `is_multicast`
-/// check isn't a redundant guard: the scope nibble alone also matches unicasts like `fd02::` or `2012::`.
+/// `Ipv6Addr::multicast_scope` is unstable (feature `ip`). The `is_multicast` check is not
+/// redundant: the scope nibble alone also matches unicasts like `fd02::` or `2012::`.
 fn is_multicast_link_local(addr: Ipv6Addr) -> bool {
     addr.is_multicast() && (addr.octets()[1] & 0x0f) == 0x02
 }
 
-/// Picks the best v6 source addresses while a backend scans an interface's usable addresses: the
-/// highest-ranked overall ([`v6`](InterfaceAddresses::v6), link-local preferred) and the highest-ranked
-/// non-link-local ([`v6_routable`](InterfaceAddresses::v6_routable), for site-local/global sends). Both
-/// platform backends feed it their usable candidates, so the per-scope pick lives in one place.
+/// Picks the best-overall v6 source (link-local preferred) and the best non-link-local one while
+/// a backend scans an interface's usable addresses.
 #[derive(Default)]
 pub(super) struct V6Pick {
     best_rank: V6Rank,
@@ -335,7 +287,6 @@ pub(super) struct V6Pick {
 }
 
 impl V6Pick {
-    /// Consider a usable v6 source `addr`, updating `addrs` if it outranks the current pick(s).
     pub(super) fn consider(&mut self, addrs: &mut InterfaceAddresses, addr: Ipv6Addr) {
         let rank = v6_rank(addr);
         if rank == V6Rank::NotASource {
@@ -345,7 +296,6 @@ impl V6Pick {
             addrs.v6 = Some(addr);
             self.best_rank = rank;
         }
-        // The best non-link-local source (ranked below LinkLocal), for site-local/global destinations.
         if rank < V6Rank::LinkLocal
             && (addrs.v6_routable.is_none() || rank > self.best_routable_rank)
         {
@@ -355,8 +305,7 @@ impl V6Pick {
     }
 }
 
-// The loopback interface for tests: `lo` on Linux, `lo0` on the BSDs. An unhandled target
-// fails to compile rather than silently guess (`any(macos, freebsd)`, not the looser `not(linux)`).
+// `any(macos, freebsd)` rather than `not(linux)`: an unhandled target must fail to compile.
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) const LOOPBACK_IFACE: &str = "lo";
 #[cfg(all(test, any(target_os = "macos", target_os = "freebsd")))]

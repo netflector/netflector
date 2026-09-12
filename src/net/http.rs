@@ -1,24 +1,20 @@
-//! HTTP/1.1 message helpers: the IPv4 authority parser shared by the DIAL proxy's
-//! `Host` / `Application-URL` / `Location` rewrites and the SSDP `LOCATION` rewrite (SSDP is
-//! HTTP-over-UDP), plus the case-insensitive header-prefix match. Streaming framer in [`framing`].
+//! HTTP/1.1 message helpers shared by the DIAL proxy's header rewrites and the SSDP `LOCATION`
+//! rewrite (SSDP is HTTP-over-UDP). Streaming framer in [`framing`].
 
 pub(crate) mod framing;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4};
 
-/// A parsed HTTP authority plus the byte span (`offset`/`len`) of its `host[:port]` text within the
-/// source value, so a caller splices a replacement over exactly that span. HTTP/DIAL rewrites are
-/// IPv4-only, hence [`SocketAddrV4`].
+/// A parsed authority and the byte span of its `host[:port]` text within the source value, for a
+/// caller to splice a replacement over.
 pub(crate) struct Authority {
     pub(crate) endpoint: SocketAddrV4,
     pub(crate) offset: usize,
     pub(crate) len: usize,
 }
 
-/// Parse an authority from `value`. `bare` (a `Host` header) treats the whole value as the authority;
-/// else `value` must be an `http://host[:port]...` URL (no `https`). Host must be an IPv4 literal;
-/// hostname and IPv6 are rejected (DIAL is IPv4-only). Port defaults to 80, else must parse in
-/// `1..=65535`. `offset`/`len` are relative to `value`.
+/// `bare` (a `Host` header) takes the whole value as the authority; otherwise `value` must be an
+/// `http://` URL. Hostnames and IPv6 are rejected: DIAL is IPv4-only.
 pub(crate) fn parse_authority(value: &[u8], bare: bool) -> Option<Authority> {
     let (rest, auth_offset) = if bare {
         (value, 0)
@@ -52,9 +48,9 @@ pub(crate) fn parse_authority(value: &[u8], bare: bool) -> Option<Authority> {
     })
 }
 
-/// The host of an `http://` / `https://` URL as an IP address, or `None` for a hostname or a
-/// non-URL value. Unlike [`parse_authority`] it reads both schemes and both families; a bracketed
-/// IPv6 host may carry a zone suffix (`%` or URL-encoded `%25`), cut before the parse.
+/// The IP-literal host of an `http://` / `https://` URL; `None` for a hostname. A bracketed IPv6
+/// host may carry a zone suffix (`%` or URL-encoded `%25`, as WSDAPI advertises), cut before the
+/// parse.
 pub(crate) fn url_host_ip(url: &[u8]) -> Option<IpAddr> {
     let rest = strip_prefix_ignore_ascii_case(url, b"http://")
         .or_else(|| strip_prefix_ignore_ascii_case(url, b"https://"))?;
@@ -78,8 +74,7 @@ pub(crate) fn url_host_ip(url: &[u8]) -> Option<IpAddr> {
         .map(IpAddr::V4)
 }
 
-/// The value of the first header named `name` (ASCII case-insensitive) in a CRLF-delimited
-/// message, without the whitespace after the colon; `None` if the message carries none.
+/// The value of the first header named `name`, case-insensitively.
 pub(crate) fn header_value<'a>(message: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
     message
         .split(|&b| b == b'\n')
@@ -88,7 +83,6 @@ pub(crate) fn header_value<'a>(message: &'a [u8], name: &[u8]) -> Option<&'a [u8
         .map(<[u8]>::trim_ascii_start)
 }
 
-/// `line` with `prefix` removed if it begins with it (ASCII case-insensitive), else `None`.
 pub(crate) fn strip_prefix_ignore_ascii_case<'a>(
     line: &'a [u8],
     prefix: &[u8],

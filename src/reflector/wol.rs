@@ -1,12 +1,6 @@
 //! Wake-on-LAN reflector: re-broadcasts magic packets seen on the source interface onto the
-//! target interface, so a wake sent on one link reaches a sleeping device on another.
-//!
-//! A magic packet is 6 bytes of `0xFF` followed by the target device's MAC repeated 16 times
-//! (102 bytes). A trailing `SecureOn` password, if present, is forwarded verbatim. The
-//! [`WakeClassifier`] validates the payload and applies the optional device allow-set and the
-//! family policy; the shared [`SimpleReflector`] re-emits on the target interface link-wide (a v4
-//! limited broadcast or v6 all-nodes multicast), sourced from that interface's own address at the
-//! captured source port and TTL ([`Emit::captured_from_egress`]).
+//! target interface. A magic packet is 6 bytes of `0xFF` followed by the target MAC repeated 16
+//! times; a trailing `SecureOn` password is forwarded verbatim.
 
 use crate::config::{AddressFamily, Reflector};
 use crate::dispatch::{Filter, MessageType, PacketDispatcher, PortSet};
@@ -21,14 +15,10 @@ use super::{
 const PREFIX_LEN: usize = 6;
 const MAC_LEN: usize = 6;
 const MAC_REPS: usize = 16;
-/// Smallest valid magic packet: prefix plus the 16 MAC repetitions.
 const MAGIC_LEN: usize = PREFIX_LEN + MAC_REPS * MAC_LEN;
 
-/// The Wake-on-LAN gate: a magic packet whose target MAC the optional allow-set admits, in a
-/// family the policy handles. The family is gated here because the filter pins only the port, so
-/// both families arrive.
+/// The family is gated here because the filter pins only the port, so both families arrive.
 struct WakeClassifier {
-    /// Optional device allow-set; `None` admits a wake for any device.
     target_macs: Option<MacSet>,
     family: AddressFamily,
 }
@@ -56,16 +46,14 @@ impl Classify for WakeClassifier {
     }
 }
 
-/// The target MAC of the Wake-on-LAN magic packet opening `payload`: the `6×0xFF` prefix followed
-/// by one MAC repeated 16 times. `None` when the structure doesn't match. Only the leading
-/// [`MAGIC_LEN`] bytes are inspected; trailing bytes (a `SecureOn` password) are ignored here and
-/// forwarded as-is by the caller.
+/// The target MAC of the magic packet opening `payload`; trailing bytes (a `SecureOn` password)
+/// are not inspected.
 fn magic_packet_mac(payload: &[u8]) -> Option<MacAddr> {
     let magic = payload.get(..MAGIC_LEN)?;
     if magic[..PREFIX_LEN] != [0xff; PREFIX_LEN] {
         return None;
     }
-    // The other 15 repetitions must all equal the first; the prefix length leaves no remainder.
+    // Exactly 16 chunks, so the remainder is `[]`.
     let ([mac, repeats @ ..], []) = magic[PREFIX_LEN..].as_chunks::<MAC_LEN>() else {
         return None;
     };
@@ -75,18 +63,12 @@ fn magic_packet_mac(payload: &[u8]) -> Option<MacAddr> {
     Some(MacAddr::from(*mac))
 }
 
-/// Whether the optional `targets` allow-set admits a wake for `mac`.
 fn wake_allowed(mac: MacAddr, targets: Option<&MacSet>) -> bool {
     targets.is_none_or(|targets| targets.contains(&mac))
 }
 
-/// Build the Wake-on-LAN reflector for `reflector` and register it on `dispatcher`. No-op when
-/// Wake-on-LAN isn't enabled. Registers a single handler covering all configured ports, re-emitting
-/// on the target interface.
-///
 /// # Errors
-/// [`BuildError::UnknownInterface`] if no capture was opened for the source/target, or
-/// [`BuildError::RequiredFamilyUnavailable`] if the target can't currently send a required family.
+/// [`BuildError::UnknownInterface`] or [`BuildError::RequiredFamilyUnavailable`].
 pub(crate) fn build(
     reflector: &Reflector,
     interfaces: &InterfaceMap,
@@ -105,8 +87,7 @@ pub(crate) fn build(
         reflector.address_family,
     )?;
 
-    // One handler spans every configured port via its filter. The re-emit uses the captured
-    // destination port, so a single reflector serves them all.
+    // The re-emit keeps the captured destination port, so one handler serves every configured port.
     let ports: PortSet = wol.ports.iter().map(|port| port.get()).collect();
     dispatcher.register(
         ingress,

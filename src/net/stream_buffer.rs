@@ -1,28 +1,22 @@
-//! A fixed-capacity byte buffer with a FIFO cursor pair: appended (or written through [`io::Write`])
-//! at the back, consumed from the front. It holds one direction of a proxied TCP stream, and the
-//! reused scratch a rewritten SSDP datagram is built in. The backing store is allocated on first use,
-//! so a buffer that never fills never allocates. Capacity is fixed: an [`append`](StreamBuffer::append)
-//! past it is an [`Overflow`] (the proxy drops-and-closes rather than let a stuck peer pin unbounded
-//! memory), a [`write`](io::Write::write) past it is a short write, so `write_all` reports `WriteZero`.
+//! A fixed-capacity FIFO byte buffer: one direction of a proxied TCP stream, or the scratch a
+//! rewritten SSDP datagram is built in. The backing store is allocated on first use. An
+//! [`append`](StreamBuffer::append) past capacity is an [`Overflow`]; a [`write`](io::Write::write)
+//! past it is a short write, so `write_all` reports `WriteZero`.
 
 use std::io;
 
-/// From [`StreamBuffer::append`] when the data won't fit even after reclaiming the consumed prefix.
 #[derive(Debug)]
 pub(crate) struct Overflow;
 
-/// A bounded FIFO byte buffer: append at `filled`, consume from `consumed`, live bytes in between.
+/// Live bytes are `storage[consumed..filled]`.
 pub(crate) struct StreamBuffer {
-    /// `None` until the first write; `capacity` bytes once set.
     storage: Option<Box<[u8]>>,
     capacity: usize,
     filled: usize,
-    /// The live region is `storage[consumed..filled]`.
     consumed: usize,
 }
 
 impl StreamBuffer {
-    /// Holds at most `cap` live bytes.
     pub(crate) fn with_capacity(cap: usize) -> Self {
         Self {
             storage: None,
@@ -32,7 +26,6 @@ impl StreamBuffer {
         }
     }
 
-    /// The live bytes: written, not yet consumed.
     pub(crate) fn pending(&self) -> &[u8] {
         self.storage
             .as_deref()
@@ -47,8 +40,7 @@ impl StreamBuffer {
         self.filled == self.consumed
     }
 
-    /// Append `data` whole, reclaiming the consumed prefix first if the tail can't hold it. `Err`
-    /// (buffer unchanged) if the live bytes plus `data` would exceed capacity.
+    /// All or nothing: on `Overflow` the buffer is unchanged.
     pub(crate) fn append(&mut self, data: &[u8]) -> Result<(), Overflow> {
         if self.len() + data.len() > self.capacity {
             return Err(Overflow);
@@ -57,10 +49,8 @@ impl StreamBuffer {
         Ok(())
     }
 
-    /// The free space at the back, to receive into in place; [`commit`](Self::commit) marks how many
-    /// bytes landed. Reclaims the consumed prefix first when the tail is exhausted, so the whole spare
-    /// capacity is offered as one slice. Empty only when full of live bytes: the caller then holds an
-    /// unframable, over-long message.
+    /// Receive into this, then [`commit`](Self::commit). Empty only when full of live bytes: the
+    /// caller then holds an unframable, over-long message.
     pub(crate) fn free_tail_mut(&mut self) -> &mut [u8] {
         if self.filled == self.capacity && self.consumed > 0 {
             self.compact();
@@ -75,32 +65,29 @@ impl StreamBuffer {
         self.filled += n;
     }
 
-    /// Drop the first `n` live bytes. Both cursors reset to the front once the buffer empties, so a
-    /// fully-drained buffer offers its whole capacity again.
     pub(crate) fn consume(&mut self, n: usize) {
         debug_assert!(
             self.consumed + n <= self.filled,
             "consume past the filled bytes"
         );
         self.consumed += n;
-        // `>=`, not `==`: the assert is compiled out in release, so an over-consume must still reset
-        // cleanly rather than leave `consumed > filled`, which would underflow `len`.
+        // `>=`, not `==`: the assert is compiled out in release, and `consumed > filled` would
+        // underflow `len`.
         if self.consumed >= self.filled {
             self.consumed = 0;
             self.filled = 0;
         }
     }
 
-    /// Drop every byte (keeping the allocation), to build the next message from the front.
     pub(crate) fn clear(&mut self) {
         self.filled = 0;
         self.consumed = 0;
     }
 
-    /// Copy `data`, which the caller has checked fits, to the back.
+    /// The caller has checked `data` fits.
     fn push(&mut self, data: &[u8]) {
         if data.is_empty() {
-            return; // avoid forcing the lazy allocation for a no-op
+            return; // don't force the lazy allocation for a no-op
         }
         if self.filled + data.len() > self.capacity {
             self.compact();
@@ -117,7 +104,6 @@ impl StreamBuffer {
             .get_or_insert_with(|| vec![0u8; capacity].into_boxed_slice())[..]
     }
 
-    /// Slide the live bytes to the front, dropping the consumed prefix.
     fn compact(&mut self) {
         if let Some(storage) = &mut self.storage {
             storage.copy_within(self.consumed..self.filled, 0);

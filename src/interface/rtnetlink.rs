@@ -1,6 +1,5 @@
-//! Linux address resolution over rtnetlink (`NETLINK_ROUTE`): one `RTM_GETADDR` dump for the
-//! v4/v6 addresses (each carrying its `IFA_FLAGS`, so tentative/deprecated/dadfailed are
-//! filtered inline) and one `RTM_GETLINK` dump for the MAC.
+//! Linux address resolution over rtnetlink: one `RTM_GETADDR` dump for the v4/v6 addresses
+//! (filtered by their `IFA_FLAGS`) and one `RTM_GETLINK` dump for the MAC and MTU.
 
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -18,21 +17,19 @@ use crate::sys::{IoStatus, blocking_socket};
 /// `IFA_F_*` bits that disqualify an address as a source.
 const IFA_F_UNUSABLE: u32 = libc::IFA_F_TENTATIVE | libc::IFA_F_DEPRECATED | libc::IFA_F_DADFAILED;
 
-/// Bound on one blocking read, and on a whole dump. The kernel builds every chunk inside our own
-/// `sendmsg`/`recvmsg`, so neither is a normal wait: they cap the cases where a reply is dropped
-/// (the socket's `ENOBUFS` state) or another local process feeds us datagrams we discard, either of
-/// which would otherwise park the single-threaded reactor for good.
+/// The kernel answers inside our own `sendmsg`/`recvmsg`, so these are not normal waits: they cap
+/// a reply dropped in the socket's `ENOBUFS` state, or a local process feeding us datagrams we
+/// discard, either of which would park the reactor for good.
 const READ_TIMEOUT: Duration = Duration::from_secs(1);
 const DUMP_DEADLINE: Duration = Duration::from_secs(5);
 
-/// Iterator over the `rtattr` TLVs of a message: yields `(attr_type, value)`, stopping at the
-/// first malformed length (as the kernel's own walk does).
+/// The `rtattr` TLVs of a message, stopping at the first malformed length as the kernel's own
+/// walk does.
 struct RtAttrs<'a> {
     msg: &'a [u8],
     at: usize,
 }
 
-/// The `rtattr` TLVs of `msg` starting at byte offset `from`.
 fn rtattrs(msg: &[u8], from: usize) -> RtAttrs<'_> {
     RtAttrs { msg, at: from }
 }
@@ -52,7 +49,7 @@ impl<'a> Iterator for RtAttrs<'a> {
     }
 }
 
-/// A netlink wire struct [`read_at`] may copy out of a byte buffer.
+/// A wire struct [`read_at`] may copy out of a byte buffer.
 ///
 /// # Safety
 /// Every bit pattern must be a valid value of the type: all-integer `repr(C)` fields, no `Drop`.
@@ -73,8 +70,7 @@ unsafe impl Pod for u32 {}
 // SAFETY: an integer.
 unsafe impl Pod for u16 {}
 
-/// Read a `T` at `off` in `buf`, or `None` if `buf` is too short (or `off` overflows). Tolerates
-/// any alignment.
+/// `None` if `buf` is too short. Any alignment.
 pub(super) fn read_at<T: Pod>(buf: &[u8], off: usize) -> Option<T> {
     if off.checked_add(size_of::<T>())? > buf.len() {
         return None;
@@ -84,13 +80,10 @@ pub(super) fn read_at<T: Pod>(buf: &[u8], off: usize) -> Option<T> {
     Some(unsafe { ptr::read_unaligned(buf.as_ptr().add(off).cast::<T>()) })
 }
 
-/// Resolve interface `ifindex`'s current source addresses with two netlink dumps:
-/// `RTM_GETADDR` for v4/v6 (flag-filtered, link-local > ULA > global) and `RTM_GETLINK` for
-/// the MAC and MTU. `if_name` is for tracing only; the dumps are filtered by `ifindex`. A `0`
-/// `ifindex` (the caller's "unknown interface" sentinel) skips the dumps.
+/// `if_name` is for tracing only; the dumps filter by `ifindex`. A 0 `ifindex` skips the dumps.
 ///
 /// # Errors
-/// Returns an error if a netlink socket, request, or reply fails.
+/// A failed netlink socket, request or reply.
 pub(super) fn resolve(
     if_name: &str,
     ifindex: u32,
@@ -175,8 +168,6 @@ fn dump<B>(
         return Err(io::Error::last_os_error());
     }
 
-    // Grows to whatever the largest datagram needs (see the peek below); reused across
-    // datagrams, so it reallocates at most a few times over a dump.
     let mut buf: Vec<u8> = Vec::new();
     let deadline = Instant::now() + DUMP_DEADLINE;
     loop {
@@ -185,9 +176,8 @@ fn dump<B>(
                 "the netlink dump did not finish within its deadline",
             ));
         }
-        // Size the next datagram before reading it: MSG_PEEK leaves it queued while MSG_TRUNC
-        // reports its true length. Reading into a zero-length buffer learns the size; an
-        // oversized message then grows `buf` rather than being silently truncated.
+        // MSG_PEEK|MSG_TRUNC on a zero-length read reports the queued datagram's true length
+        // without consuming it.
         // SAFETY: a zero-length read dereferences nothing, so the null pointer is never read.
         let size = unsafe {
             libc::recv(
@@ -223,8 +213,8 @@ fn dump<B>(
         let IoStatus::Ready(received) = IoStatus::from_syscall(received)? else {
             return Err(io::Error::other("the netlink dump went unanswered"));
         };
-        // Only the kernel (nl_pid == 0) may answer the dump; a local process could unicast a spoofed
-        // reply to inject a bogus address. Discard anything else and read the next datagram.
+        // Only the kernel (nl_pid 0) may answer: a local process could unicast a spoofed reply to
+        // inject a bogus address.
         if src.nl_pid != 0 {
             log::debug!(
                 "netlink dump: ignoring a reply from a non-kernel sender (pid {})",
@@ -236,24 +226,22 @@ fn dump<B>(
         match walk_dump(&buf[..received], reply_type, &mut on_msg) {
             DumpStep::Done => return Ok(()),
             DumpStep::Failed(e) => return Err(e),
-            DumpStep::More => {} // read the next datagram
+            DumpStep::More => {}
         }
     }
 }
 
-/// One dump datagram's outcome from [`walk_dump`].
 enum DumpStep {
-    /// `NLMSG_DONE`: the dump is complete.
+    /// `NLMSG_DONE`.
     Done,
-    /// `NLMSG_ERROR`: the kernel reported a dump error (carrying its errno).
+    /// `NLMSG_ERROR`, carrying its errno.
     Failed(io::Error),
     /// The datagram was fully walked; read the next one.
     More,
 }
 
-/// A `c_int`-typed netlink header value as the `u16` the wire header carries. libc types the
-/// `NLMSG_*` kinds and `NLM_F_*` flags `c_int`; `nlmsg_type`/`nlmsg_flags` are `u16`, and a path
-/// const of a different type can't even pattern-match `nlmsg_type`.
+/// libc types the `NLMSG_*` kinds and `NLM_F_*` flags `c_int`, but the wire fields are `u16` and
+/// a const of another type can't pattern-match `nlmsg_type`.
 // guarded: the assert rejects any negative or truncating value
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 const fn nl_u16(value: libc::c_int) -> u16 {
@@ -264,21 +252,17 @@ const fn nl_u16(value: libc::c_int) -> u16 {
 const NLMSG_DONE: u16 = nl_u16(libc::NLMSG_DONE);
 const NLMSG_ERROR: u16 = nl_u16(libc::NLMSG_ERROR);
 
-/// Walk one dump datagram, feeding each `reply_type` message to `on_msg`, and report whether the dump is
-/// done, failed, or needs another datagram. Split from [`dump`]'s socket loop so the message walk (and
-/// its bounds handling) is unit-testable.
+/// Walk one dump datagram, feeding each `reply_type` message to `on_msg`.
 fn walk_dump(buf: &[u8], reply_type: u16, on_msg: &mut impl FnMut(&[u8])) -> DumpStep {
     let mut offset = 0;
     while let Some(hdr) = read_at::<libc::nlmsghdr>(buf, offset) {
         let len = hdr.nlmsg_len as usize;
-        // checked_add: a crafted len must not wrap `offset + len` past the bound on a 32-bit usize,
-        // which would then panic the `&buf[offset..offset + len]` slice (start > end) below.
+        // checked_add: a crafted len must not wrap `offset + len` on a 32-bit usize; the slice
+        // below would then panic.
         if len < size_of::<libc::nlmsghdr>()
             || offset.checked_add(len).is_none_or(|end| end > buf.len())
         {
-            // Not a normal end (that's the `while` running out): a message claims an impossible
-            // length, so the datagram's remaining addresses are lost. The monitor twins warn on
-            // this; here the next refresh re-reads everything, so debug suffices.
+            // Debug, not warn: the next refresh re-reads everything.
             log::debug!(
                 "netlink dump walk stopped at offset {offset}: len {len}, buffer {} B \
                  (truncated or malformed); remaining messages skipped",
@@ -297,8 +281,8 @@ fn walk_dump(buf: &[u8], reply_type: u16, on_msg: &mut impl FnMut(&[u8])) -> Dum
     DumpStep::More
 }
 
-/// The error for an `NLMSG_ERROR` reply at `offset`. Its payload is `struct nlmsgerr { int error; ... }`
-/// where `error` is a negative errno, or 0 for an ACK (which our dumps never request).
+/// The payload is `struct nlmsgerr { int error; ... }`: a negative errno, or 0 for an ACK (which
+/// our dumps never request).
 fn nlmsg_error(buf: &[u8], offset: usize) -> io::Error {
     match read_at::<c_int>(buf, offset + nl_align(size_of::<libc::nlmsghdr>())) {
         Some(errno) if errno != 0 => io::Error::from_raw_os_error(errno.saturating_neg()),
@@ -306,8 +290,8 @@ fn nlmsg_error(buf: &[u8], offset: usize) -> io::Error {
     }
 }
 
-/// Parse one `RTM_NEWADDR` message; if it carries a usable address of `ifindex`, record it
-/// (v4: first wins; v6: highest-ranked usable wins). `msg` spans one netlink message.
+/// Record a usable address of `ifindex` from one `RTM_NEWADDR` (v4: first wins; v6: highest
+/// rank wins).
 fn scan_addr(
     msg: &[u8],
     if_name: &str,
@@ -335,7 +319,6 @@ fn scan_addr(
             libc::IFA_ADDRESS => address = Some(data),
             libc::IFA_LOCAL => local = Some(data),
             libc::IFA_FLAGS => {
-                // `IFA_FLAGS` is a `u32`; ignore a malformed attribute of any other length.
                 if let Ok(bytes) = <[u8; 4]>::try_from(data) {
                     flags = u32::from_ne_bytes(bytes);
                 }
@@ -352,8 +335,6 @@ fn scan_addr(
             return;
         };
         let v4 = Ipv4Addr::from(octets);
-        // First usable address wins: skip a tentative/deprecated/DAD-failed v4 (the same
-        // IFA_F_UNUSABLE mask the v6 branch applies) so it is never chosen as the reflection source.
         if flags & IFA_F_UNUSABLE != 0 {
             log::trace!("{if_name}: v4 {v4} flags {flags:#06x} -> filtered");
         } else if addrs.v4.is_some() {
@@ -377,8 +358,7 @@ fn scan_addr(
     }
 }
 
-/// Parse one `RTM_NEWLINK` message; if it is `ifindex`, record its 6-byte `IFLA_ADDRESS` as the
-/// MAC and its `IFLA_MTU`. `msg` spans one netlink message.
+/// Record the MAC (`IFLA_ADDRESS`) and MTU of `ifindex` from one `RTM_NEWLINK`.
 fn scan_link(
     msg: &[u8],
     if_name: &str,
