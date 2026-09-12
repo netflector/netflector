@@ -1,33 +1,28 @@
-//! A fixed-capacity byte buffer for one direction of a proxied TCP stream: appended at the back (from
-//! a recv, possibly after a header rewrite), consumed from the front as a send drains them. Backed by a
-//! `Box<[MaybeUninit<u8>]>` allocated on first use, so a send-side buffer that never backpressures never
-//! allocates. Never zero-filled: only the written `storage[consumed..filled]` region is ever read.
-//! Capacity is fixed. An append past it returns [`Overflow`] and the proxy drops-and-closes rather than
-//! let a stuck peer pin unbounded memory. Two cursors bound the live bytes: `storage[consumed..filled]`.
+//! A fixed-capacity byte buffer with a FIFO cursor pair: appended (or written through [`io::Write`])
+//! at the back, consumed from the front. It holds one direction of a proxied TCP stream, and the
+//! reused scratch a rewritten SSDP datagram is built in. The backing store is allocated on first use,
+//! so a buffer that never fills never allocates. Capacity is fixed: an [`append`](StreamBuffer::append)
+//! past it is an [`Overflow`] (the proxy drops-and-closes rather than let a stuck peer pin unbounded
+//! memory), a [`write`](io::Write::write) past it is a short write, so `write_all` reports `WriteZero`.
 
-use std::mem::MaybeUninit;
-use std::{ptr, slice};
+use std::io;
 
-/// From [`StreamBuffer::append`] when the data won't fit even after reclaiming the consumed prefix. The
-/// caller drops and closes the connection.
+/// From [`StreamBuffer::append`] when the data won't fit even after reclaiming the consumed prefix.
 #[derive(Debug)]
 pub(crate) struct Overflow;
 
-/// A bounded FIFO byte buffer: append at `filled`, consume from `consumed`, unsent bytes in between.
-/// The backing box is allocated (uninitialized) on first use, sized to `capacity`, and never reallocates.
+/// A bounded FIFO byte buffer: append at `filled`, consume from `consumed`, live bytes in between.
 pub(crate) struct StreamBuffer {
-    /// The backing store, `None` until the first append or `free_tail_mut`; `capacity` bytes once set.
-    storage: Option<Box<[MaybeUninit<u8>]>>,
+    /// `None` until the first write; `capacity` bytes once set.
+    storage: Option<Box<[u8]>>,
     capacity: usize,
-    /// Bytes written; the initialized region is `storage[..filled]`.
     filled: usize,
-    /// Bytes drained from the front; the live (unsent) region is `storage[consumed..filled]`.
+    /// The live region is `storage[consumed..filled]`.
     consumed: usize,
 }
 
 impl StreamBuffer {
-    /// Holds at most `cap` live bytes. The backing store is allocated (uninitialized, never zero-filled)
-    /// on the first `append`/`free_tail_mut`, so an idle buffer costs nothing.
+    /// Holds at most `cap` live bytes.
     pub(crate) fn with_capacity(cap: usize) -> Self {
         Self {
             storage: None,
@@ -37,89 +32,51 @@ impl StreamBuffer {
         }
     }
 
-    /// The unsent bytes, for one `send`.
+    /// The live bytes: written, not yet consumed.
     pub(crate) fn pending(&self) -> &[u8] {
-        match &self.storage {
-            // SAFETY: bytes enter `[..filled]` only via `append` (which writes them) or `commit`
-            // (whose contract is that `free_tail_mut`'s region was written and that nothing moved
-            // `filled` in between), so `[consumed..filled]` is initialized. `MaybeUninit<u8>` and
-            // `u8` share layout.
-            Some(storage) => unsafe {
-                let live = &storage[self.consumed..self.filled];
-                slice::from_raw_parts(live.as_ptr().cast::<u8>(), live.len())
-            },
-            None => &[],
-        }
+        self.storage
+            .as_deref()
+            .map_or(&[], |storage| &storage[self.consumed..self.filled])
     }
 
     pub(crate) fn len(&self) -> usize {
         self.filled - self.consumed
     }
 
-    /// Nothing waiting to be sent: the cue to disarm write interest.
     pub(crate) fn is_empty(&self) -> bool {
         self.filled == self.consumed
     }
 
-    /// Append `data`, reclaiming the consumed prefix first if the tail can't hold it. `Err` (buffer
-    /// unchanged) if the live bytes plus `data` would exceed capacity. The caller drops-and-closes.
+    /// Append `data` whole, reclaiming the consumed prefix first if the tail can't hold it. `Err`
+    /// (buffer unchanged) if the live bytes plus `data` would exceed capacity.
     pub(crate) fn append(&mut self, data: &[u8]) -> Result<(), Overflow> {
         if self.len() + data.len() > self.capacity {
             return Err(Overflow);
         }
-        if data.is_empty() {
-            return Ok(()); // avoid forcing the lazy allocation for a no-op
-        }
-        // Fits overall, but maybe not in the tail. Slide the live bytes down to reclaim the consumed gap.
-        if self.filled + data.len() > self.capacity {
-            self.compact();
-        }
-        let filled = self.filled;
-        let storage = self.ensure_alloc();
-        // SAFETY: `filled + data.len() <= capacity` (checked above, and `compact` reclaimed the consumed
-        // prefix if the tail was short), so the destination stays in bounds. Source and destination can't
-        // overlap: `data` is a shared borrow, `storage` lives behind `&mut self`, so `data` aliasing it
-        // would be a shared+exclusive borrow of the same bytes, which the borrow checker rejects.
-        // `MaybeUninit<u8>` and `u8` share layout.
-        unsafe {
-            ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                storage.as_mut_ptr().add(filled).cast::<u8>(),
-                data.len(),
-            );
-        }
-        self.filled = filled + data.len();
+        self.push(data);
         Ok(())
     }
 
-    /// The free space at the back, to receive into in place. Reclaims the consumed prefix first when
-    /// the tail is exhausted, so the whole spare capacity is offered as one slice; pair with
-    /// [`commit`](Self::commit) to mark how many bytes landed. Empty only when full of live bytes: the
-    /// caller then holds an unframable, over-long message and drops-and-closes. The bytes are
-    /// uninitialized: write, don't read, until they are committed.
-    pub(crate) fn free_tail_mut(&mut self) -> &mut [MaybeUninit<u8>] {
+    /// The free space at the back, to receive into in place; [`commit`](Self::commit) marks how many
+    /// bytes landed. Reclaims the consumed prefix first when the tail is exhausted, so the whole spare
+    /// capacity is offered as one slice. Empty only when full of live bytes: the caller then holds an
+    /// unframable, over-long message.
+    pub(crate) fn free_tail_mut(&mut self) -> &mut [u8] {
         if self.filled == self.capacity && self.consumed > 0 {
             self.compact();
         }
         let filled = self.filled;
-        &mut self.ensure_alloc()[filled..]
+        &mut self.storage_mut()[filled..]
     }
 
-    /// Mark `n` bytes received into [`free_tail_mut`](Self::free_tail_mut) as filled.
-    ///
-    /// # Safety
-    /// The first `n` bytes of the most recent [`free_tail_mut`](Self::free_tail_mut) must have been
-    /// initialized (written), and no other `&mut self` method may have run in between: `commit` adds
-    /// `n` to whatever `filled` is now, and `append` or a compaction inside `free_tail_mut` moves it,
-    /// so an interleaved call marks bytes nobody wrote. [`pending`](Self::pending) then reads
-    /// `[consumed..filled]` as initialized `u8`, which is undefined behavior.
-    pub(crate) unsafe fn commit(&mut self, n: usize) {
+    /// Mark `n` bytes received into [`free_tail_mut`](Self::free_tail_mut) as live.
+    pub(crate) fn commit(&mut self, n: usize) {
         debug_assert!(self.filled + n <= self.capacity, "commit past the capacity");
         self.filled += n;
     }
 
-    /// Drop the first `n` bytes after a send wrote them. Resets both cursors to the front once the
-    /// buffer empties, so a fully-drained buffer offers its whole capacity again.
+    /// Drop the first `n` live bytes. Both cursors reset to the front once the buffer empties, so a
+    /// fully-drained buffer offers its whole capacity again.
     pub(crate) fn consume(&mut self, n: usize) {
         debug_assert!(
             self.consumed + n <= self.filled,
@@ -127,20 +84,37 @@ impl StreamBuffer {
         );
         self.consumed += n;
         // `>=`, not `==`: the assert is compiled out in release, so an over-consume must still reset
-        // cleanly rather than leave `consumed > filled`, which would underflow `len` and panic
-        // `pending`'s slice next call.
+        // cleanly rather than leave `consumed > filled`, which would underflow `len`.
         if self.consumed >= self.filled {
             self.consumed = 0;
             self.filled = 0;
         }
     }
 
-    /// The backing store, allocating it (uninitialized) on first call.
-    fn ensure_alloc(&mut self) -> &mut [MaybeUninit<u8>] {
+    /// Drop every byte (keeping the allocation), to build the next message from the front.
+    pub(crate) fn clear(&mut self) {
+        self.filled = 0;
+        self.consumed = 0;
+    }
+
+    /// Copy `data`, which the caller has checked fits, to the back.
+    fn push(&mut self, data: &[u8]) {
+        if data.is_empty() {
+            return; // avoid forcing the lazy allocation for a no-op
+        }
+        if self.filled + data.len() > self.capacity {
+            self.compact();
+        }
+        let filled = self.filled;
+        self.storage_mut()[filled..filled + data.len()].copy_from_slice(data);
+        self.filled = filled + data.len();
+    }
+
+    fn storage_mut(&mut self) -> &mut [u8] {
         let capacity = self.capacity;
         &mut self
             .storage
-            .get_or_insert_with(|| Box::new_uninit_slice(capacity))[..]
+            .get_or_insert_with(|| vec![0u8; capacity].into_boxed_slice())[..]
     }
 
     /// Slide the live bytes to the front, dropping the consumed prefix.
@@ -153,16 +127,23 @@ impl StreamBuffer {
     }
 }
 
+impl io::Write for StreamBuffer {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        let n = data.len().min(self.capacity - self.len());
+        self.push(&data[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::io::Write;
 
-    /// Write `data` into the front of an uninitialized tail slice, for tests.
-    fn fill(tail: &mut [MaybeUninit<u8>], data: &[u8]) {
-        for (slot, &byte) in tail.iter_mut().zip(data) {
-            slot.write(byte);
-        }
-    }
+    use super::*;
 
     #[test]
     fn new_buffer_is_empty() {
@@ -246,9 +227,8 @@ mod tests {
         b.append(b"ab").unwrap();
         let tail = b.free_tail_mut();
         assert_eq!(tail.len(), 6);
-        fill(tail, b"xyz");
-        // SAFETY: `fill` wrote 3 bytes into the free_tail_mut region above.
-        unsafe { b.commit(3) };
+        tail[..3].copy_from_slice(b"xyz");
+        b.commit(3);
         assert_eq!(b.pending(), b"abxyz");
     }
 
@@ -259,9 +239,8 @@ mod tests {
         b.consume(2); // live "cd"; tail exhausted but 2 bytes reclaimable
         let tail = b.free_tail_mut(); // compacts: "cd" slides to the front
         assert_eq!(tail.len(), 2);
-        fill(tail, b"ef");
-        // SAFETY: `fill` wrote 2 bytes into the free_tail_mut region above.
-        unsafe { b.commit(2) };
+        tail.copy_from_slice(b"ef");
+        b.commit(2);
         assert_eq!(b.pending(), b"cdef");
     }
 
@@ -282,5 +261,41 @@ mod tests {
         let mut b = StreamBuffer::with_capacity(4);
         b.append(b"ab").unwrap();
         b.consume(3); // only 2 are filled
+    }
+
+    #[test]
+    fn writes_then_reads_the_written_prefix() {
+        let mut b = StreamBuffer::with_capacity(8);
+        b.write_all(b"abc").unwrap();
+        assert_eq!(b.pending(), b"abc");
+        write!(b, "{}", 42).unwrap();
+        assert_eq!(b.pending(), b"abc42");
+    }
+
+    #[test]
+    fn clear_resets_but_keeps_writing_from_the_front() {
+        let mut b = StreamBuffer::with_capacity(8);
+        b.write_all(b"abc").unwrap();
+        b.clear();
+        assert_eq!(b.pending(), b"");
+        b.write_all(b"xy").unwrap();
+        assert_eq!(b.pending(), b"xy");
+    }
+
+    #[test]
+    fn write_past_capacity_is_a_short_write() {
+        let mut b = StreamBuffer::with_capacity(4);
+        // The 4 fit-able bytes are written even though the overflow makes `write_all` fail.
+        assert!(b.write_all(b"abcde").is_err());
+        assert_eq!(b.pending(), b"abcd");
+    }
+
+    #[test]
+    fn writing_to_a_full_buffer_makes_no_progress() {
+        let mut b = StreamBuffer::with_capacity(3);
+        b.write_all(b"abc").unwrap();
+        assert_eq!(b.write(b"d").unwrap(), 0);
+        assert!(b.write_all(b"d").is_err());
+        assert_eq!(b.pending(), b"abc");
     }
 }

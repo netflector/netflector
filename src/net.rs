@@ -15,7 +15,6 @@ mod route_query;
 pub(crate) mod ssdp;
 pub(crate) mod stream_buffer;
 pub(crate) mod tcp;
-pub(crate) mod uninit_buf;
 pub(crate) mod wsd;
 
 /// Link-layer framing of a captured or injected frame. The capture layer reports

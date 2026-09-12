@@ -52,7 +52,7 @@ fn drive_forward(
                 "forward should stay open on a clean message"
             );
         }
-        match peer_out.recv_bytes(&mut buf).expect("recv on the peer") {
+        match peer_out.recv(&mut buf).expect("recv on the peer") {
             IoStatus::Ready(0) => panic!("unexpected EOF before the forwarded bytes"),
             IoStatus::Ready(n) => return (buf[..n].to_vec(), learned_rest),
             IoStatus::WouldBlock => sleep(Duration::from_millis(1)),
@@ -286,7 +286,7 @@ fn drain_to_eof(sock: &TcpSocket) -> Vec<u8> {
     let mut out = Vec::new();
     let mut buf = [0u8; 256];
     for _ in 0..2000 {
-        match sock.recv_bytes(&mut buf).expect("recv") {
+        match sock.recv(&mut buf).expect("recv") {
             IoStatus::Ready(0) => return out,
             IoStatus::Ready(n) => out.extend_from_slice(&buf[..n]),
             IoStatus::WouldBlock => sleep(Duration::from_millis(1)),
