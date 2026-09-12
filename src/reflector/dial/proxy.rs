@@ -18,6 +18,7 @@ use crate::net::tcp::TcpSocket;
 use crate::reactor::{Arena, Handler, HandlerKey, Key, Reactor, ReadyEvent};
 
 use super::connection::{Connection, Outcome};
+use super::egress;
 
 /// Cap on concurrent proxied connections (drop-new past it).
 const MAX_CONNECTIONS: usize = 64;
@@ -188,14 +189,14 @@ impl DialDeviceProxy {
     ) {
         let key = self.own_key();
         let rest_listener = self.rest.local_addr();
-        let device =
-            match TcpSocket::connect(device_endpoint, self.target, self.target_iface.as_deref()) {
-                Ok(device) => device,
-                Err(e) => {
-                    log::warn!("dial: connect to {device_endpoint} failed: {e}");
-                    return;
-                }
-            };
+        let confine = |fd| egress::confine(fd, device_endpoint, self.target_iface.as_deref());
+        let device = match TcpSocket::connect(device_endpoint, self.target, confine) {
+            Ok(device) => device,
+            Err(e) => {
+                log::warn!("dial: connect to {device_endpoint} failed: {e}");
+                return;
+            }
+        };
         let client_fd = client.as_raw_fd();
         let device_fd = device.as_raw_fd();
         // Insert first so the connection's arena key can tag both fds' `user_data`; the regs are
@@ -424,7 +425,7 @@ mod tests {
 
         // A client reaches the REST listener; drive accept until the loopback handshake lands.
         let _client =
-            TcpSocket::connect(rest_addr, Ipv4Addr::LOCALHOST, None).expect("client connect");
+            TcpSocket::connect(rest_addr, Ipv4Addr::LOCALHOST, |_| Ok(())).expect("client connect");
         for _ in 0..2000 {
             proxy.accept_rest(&mut reactor);
             if proxy.conns.iter().count() == 1 {
@@ -457,7 +458,7 @@ mod tests {
         // cannot drain. Either way it must not stay registered and re-firing on a readiness it
         // will never consume.
         proxy.rest =
-            TcpSocket::connect(rest_addr, Ipv4Addr::LOCALHOST, None).expect("client connect");
+            TcpSocket::connect(rest_addr, Ipv4Addr::LOCALHOST, |_| Ok(())).expect("client connect");
         assert!(proxy.accept_client(Listener::Rest, &mut reactor).is_none());
         assert!(
             !reactor.is_registered(key),
@@ -471,7 +472,7 @@ mod tests {
         let mut reactor = Reactor::new().expect("reactor");
         let (mut proxy, rest_addr) = watched_proxy(&mut reactor); // rest_endpoint stays None
         let client =
-            TcpSocket::connect(rest_addr, Ipv4Addr::LOCALHOST, None).expect("client connect");
+            TcpSocket::connect(rest_addr, Ipv4Addr::LOCALHOST, |_| Ok(())).expect("client connect");
 
         // accept_rest accepts the client (draining the listener) but, with no learned endpoint, drops
         // it. The client observes EOF and no connection is recorded.

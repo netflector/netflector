@@ -18,8 +18,10 @@ fn spin<T>(mut op: impl FnMut() -> io::Result<Option<T>>) -> T {
 fn connected_pair() -> (TcpSocket, TcpSocket) {
     let listener = TcpSocket::listen(std::net::Ipv4Addr::LOCALHOST).expect("listen on loopback");
     let mut initiator =
-        TcpSocket::connect(listener.local_addr(), std::net::Ipv4Addr::LOCALHOST, None)
-            .expect("connect");
+        TcpSocket::connect(listener.local_addr(), std::net::Ipv4Addr::LOCALHOST, |_| {
+            Ok(())
+        })
+        .expect("connect");
     let accepted = spin(|| listener.accept());
     initiator.finish_connect().expect("the connect completed");
     (initiator, accepted)

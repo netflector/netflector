@@ -1,7 +1,6 @@
 //! A non-blocking IPv4 TCP socket for the DIAL application proxy: listen on the source interface,
 //! accept, connect to a device on the target interface, and stream bytes. The reactor watches its
-//! fd; all operations are non-blocking and the socket is close-on-exec. Outbound connections are
-//! confined to the target interface: see [`TcpSocket::connect`].
+//! fd; all operations are non-blocking and the socket is close-on-exec.
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
@@ -72,28 +71,23 @@ impl TcpSocket {
         }))
     }
 
-    /// Open a connection to `dst`, confined to the target interface (`source` address + the `iface`
-    /// name) so the route can't leak onto the wrong segment. Non-blocking: the socket is
-    /// [`is_connecting`](Self::is_connecting) until a writable edge and [`finish_connect`](Self::finish_connect).
-    ///
-    /// Linux and macOS pin the interface; FreeBSD has no such primitive and checks the route
-    /// instead. The `source` bind confines nothing on its own: `ip_output` picks the interface from
-    /// the destination alone.
+    /// Open a connection to `dst`, sourced from `source` on the target interface. `confine` runs on
+    /// the fresh socket before it binds, for the caller to pin its egress (see the DIAL proxy's
+    /// `egress` module). Non-blocking: the socket is [`is_connecting`](Self::is_connecting) until a
+    /// writable edge and [`finish_connect`](Self::finish_connect). The `source` bind confines
+    /// nothing on its own: `ip_output` picks the interface from the destination alone.
     ///
     /// # Errors
-    /// Propagates the socket / `setsockopt` / pin / `bind` / `connect` failure (other than the
-    /// in-progress sentinel), or, on FreeBSD, a destination that does not route via `iface`.
+    /// Propagates the socket / `setsockopt` / `confine` / `bind` / `connect` failure (other than
+    /// the in-progress sentinel).
     pub(crate) fn connect(
         dst: SocketAddrV4,
         source: Ipv4Addr,
-        iface: Option<&str>,
+        confine: impl FnOnce(RawFd) -> io::Result<()>,
     ) -> io::Result<Self> {
-        #[cfg(target_os = "freebsd")]
-        verify_egress(dst, iface)?;
         let fd = open_socket(libc::AF_INET, libc::SOCK_STREAM, 0)?;
         set_nodelay(fd.as_raw_fd())?;
-        #[cfg(not(target_os = "freebsd"))]
-        pin_egress(fd.as_raw_fd(), iface)?;
+        confine(fd.as_raw_fd())?;
         crate::sys::bind(fd.as_raw_fd(), IpAddr::V4(source), 0, 0)?;
         let local_addr = local_addr_v4(fd.as_raw_fd())?;
         let connecting = connect_v4(fd.as_raw_fd(), dst)?;
@@ -297,76 +291,6 @@ fn set_nodelay(fd: RawFd) -> io::Result<()> {
     setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, &1 as &c_int)
 }
 
-/// Constrain `fd`'s egress to the interface named `iface` so a route lookup can't leak the connect
-/// onto the wrong segment; `None` skips the pin. Linux uses `SO_BINDTODEVICE` (needs `CAP_NET_RAW`),
-/// which takes the name directly; macOS resolves the name to its current ifindex for `IP_BOUND_IF`,
-/// so the pin follows the name across an interface recreation. FreeBSD has no equivalent and checks
-/// the route instead.
-#[cfg(not(target_os = "freebsd"))]
-fn pin_egress(fd: RawFd, iface: Option<&str>) -> io::Result<()> {
-    let Some(name) = iface else {
-        return Ok(());
-    };
-    #[cfg(target_os = "linux")]
-    {
-        if name.len() >= libc::IF_NAMESIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "interface name too long",
-            ));
-        }
-        // SAFETY: `name` points at `name.len()` valid bytes; the kernel NUL-terminates its copy.
-        check(unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_BINDTODEVICE,
-                name.as_ptr().cast::<c_void>(),
-                libc::socklen_t::try_from(name.len())
-                    .expect("interface name length fits socklen_t"),
-            )
-        })?;
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let index = crate::interface::if_index(name).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("interface {name} not found"),
-            )
-        })?;
-        let index = c_int::try_from(index).map_err(|_| io::Error::other("ifindex too large"))?;
-        setsockopt(fd, libc::IPPROTO_IP, libc::IP_BOUND_IF, &index)?;
-    }
-    log::trace!("connect egress pinned to {name}");
-    Ok(())
-}
-
-/// Refuse a connect whose route would leave by an interface other than `iface`; `None` skips the
-/// check.
-#[cfg(target_os = "freebsd")]
-fn verify_egress(dst: SocketAddrV4, iface: Option<&str>) -> io::Result<()> {
-    let Some(name) = iface else {
-        return Ok(());
-    };
-    let want = crate::interface::if_index(name).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("interface {name} not found"),
-        )
-    })?;
-    let got = super::route_query::egress_ifindex(*dst.ip())?;
-    if got == want {
-        log::trace!("{} is reachable via {name}", dst.ip());
-        return Ok(());
-    }
-    let via = crate::interface::if_name(got).unwrap_or_else(|| format!("interface {got}"));
-    let ip = dst.ip();
-    Err(io::Error::other(format!(
-        "{ip} routes via {via}, not {name}"
-    )))
-}
-
 #[cfg(test)]
 mod tests {
     use std::thread::sleep;
@@ -399,7 +323,7 @@ mod tests {
         let server_addr = listener.local_addr();
         assert_ne!(server_addr.port(), 0, "an ephemeral port is assigned");
 
-        let mut client = TcpSocket::connect(server_addr, Ipv4Addr::LOCALHOST, None)
+        let mut client = TcpSocket::connect(server_addr, Ipv4Addr::LOCALHOST, |_| Ok(()))
             .expect("connect to loopback");
         let server = spin(|| listener.accept()); // completes the handshake
         client.finish_connect().expect("the connect completed");
@@ -422,7 +346,7 @@ mod tests {
     #[cfg_attr(miri, ignore = "needs a real socket")]
     fn loopback_send_vectored_concatenates_the_slices() {
         let listener = TcpSocket::listen(Ipv4Addr::LOCALHOST).expect("listen on loopback");
-        let mut client = TcpSocket::connect(listener.local_addr(), Ipv4Addr::LOCALHOST, None)
+        let mut client = TcpSocket::connect(listener.local_addr(), Ipv4Addr::LOCALHOST, |_| Ok(()))
             .expect("connect to loopback");
         let server = spin(|| listener.accept());
         client.finish_connect().expect("the connect completed");
@@ -445,8 +369,8 @@ mod tests {
     #[cfg_attr(miri, ignore = "needs a real socket")]
     fn accepted_and_outbound_sockets_disable_nagle() {
         let listener = TcpSocket::listen(Ipv4Addr::LOCALHOST).expect("listen on loopback");
-        let client =
-            TcpSocket::connect(listener.local_addr(), Ipv4Addr::LOCALHOST, None).expect("connect");
+        let client = TcpSocket::connect(listener.local_addr(), Ipv4Addr::LOCALHOST, |_| Ok(()))
+            .expect("connect");
         let server = spin(|| listener.accept());
         assert!(nodelay(&client), "the outbound socket sets TCP_NODELAY");
         assert!(nodelay(&server), "the accepted socket sets TCP_NODELAY");
@@ -490,8 +414,8 @@ mod tests {
     #[cfg_attr(miri, ignore = "needs a real socket")]
     fn shutdown_write_half_closes_keeping_the_read_half() {
         let listener = TcpSocket::listen(Ipv4Addr::LOCALHOST).expect("listen on loopback");
-        let mut client =
-            TcpSocket::connect(listener.local_addr(), Ipv4Addr::LOCALHOST, None).expect("connect");
+        let mut client = TcpSocket::connect(listener.local_addr(), Ipv4Addr::LOCALHOST, |_| Ok(()))
+            .expect("connect");
         let server = spin(|| listener.accept());
         client.finish_connect().expect("the connect completed");
 

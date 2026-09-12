@@ -11,7 +11,7 @@ pub(crate) mod mdns;
 pub(crate) mod packet;
 pub(crate) mod port_reservation;
 #[cfg(target_os = "freebsd")]
-mod route_query;
+pub(crate) mod route_query;
 pub(crate) mod ssdp;
 pub(crate) mod stream_buffer;
 pub(crate) mod tcp;
