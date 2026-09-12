@@ -209,7 +209,7 @@ impl InterfaceTable {
             .mtu
     }
 
-    /// A shared borrow of a present capture, for [`send`](super::PacketDispatcher::send).
+    /// A shared borrow of a present capture, for the egress path's send.
     pub(super) fn capture(&self, capture: CaptureKey) -> Option<&Capture> {
         self.captures.get(capture.0 as usize)?.capture.as_ref()
     }
