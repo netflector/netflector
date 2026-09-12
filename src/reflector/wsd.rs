@@ -1,24 +1,19 @@
 //! The WSD (WS-Discovery) reflector: reflects WS-Discovery between the source and target interfaces so
 //! ONVIF-camera / Windows-device discovery crosses the link. Structurally SSDP-without-DIAL: `Hello` /
-//! `Bye` announcements reflect device → client as a stateless multicast re-emit (a [`SimpleReflector`],
+//! `Bye` announcements reflect device → client as a stateless multicast re-emit (a [`SimpleReflector`](super::SimpleReflector),
 //! like mDNS), and `Probe` / `Resolve` searches reflect client → device with their unicast
 //! `ProbeMatches` / `ResolveMatches` replies routed back through a per-searcher session (the shared
-//! [`SearchReflector`]). Re-emits go to the same group at TTL 1, sourced from the egress interface.
+//! [`SearchReflector`](super::search::SearchReflector)). Re-emits go to the same group at TTL 1, sourced from the egress interface.
 
-use std::net::SocketAddr;
 use std::time::Duration;
 
-use crate::config::{AddressFamily, Reflector};
-use crate::dispatch::{Filter, IpSet, MessageType, PacketDispatcher};
+use crate::config::Reflector;
+use crate::dispatch::{MessageType, PacketDispatcher};
 use crate::net::wsd::{
     WSD_GROUP_V4, WSD_GROUP_V6, WSD_PORT, WSD_TTL, WsdKind, advertises_only_unreachable, classify,
 };
 
-use super::{
-    BuildError, Delivery, Emit, InterfaceMap, NoRewrite, ReplyRewrite, SearchReflector,
-    SimpleReflector, Verdict, directional_verdict, require_bidirectional_families,
-    require_group_join, require_macs_matchable,
-};
+use super::{BuildError, InterfaceMap, SearchProtocol, Verdict, build_pair, directional_verdict};
 
 /// WSD's classifier kind maps to its group message types. The `ProbeMatches`/`ResolveMatches` unicast
 /// replies are a separate leg ([`MessageType::WsdResponse`]), carried by the response reflector.
@@ -50,15 +45,26 @@ fn window(_: &[u8]) -> Duration {
     SESSION_WINDOW
 }
 
-/// Build the WSD reflector for `reflector` and register both directions on `dispatcher`. A no-op when
-/// WSD isn't enabled. It joins each in-use family's group on BOTH interfaces, then registers two
-/// handlers spanning them: `Hello` / `Bye` announcements target → source (a [`SimpleReflector`]), and
-/// `Probe` / `Resolve` searches source → target with their unicast replies (the shared
-/// [`SearchReflector`]). A required family must be sendable on BOTH interfaces, since both re-emit.
+/// WSD as a search-style protocol: the IPv4 group and, unlike SSDP, only the link-local IPv6 scope.
+const WSD: SearchProtocol = SearchProtocol {
+    name: "WSD",
+    announcement_kind: "announcement",
+    port: WSD_PORT,
+    ttl: WSD_TTL,
+    group_v4: WSD_GROUP_V4,
+    groups_v6: &[WSD_GROUP_V6],
+    response_type: MessageType::WsdResponse,
+    announcement_verdict,
+    search_verdict,
+    window,
+    suppress: advertises_only_unreachable,
+};
+
+/// Build the WSD reflector for `reflector` and register both directions on `dispatcher`: the
+/// announcement and search legs of [`build_pair`]. A no-op when WSD isn't enabled.
 ///
 /// # Errors
-/// [`BuildError::UnknownInterface`] for an unopened source/target, or
-/// [`BuildError::RequiredFamilyUnavailable`] if either interface can't send a required family.
+/// As [`build_pair`].
 pub(crate) fn build(
     reflector: &Reflector,
     interfaces: &InterfaceMap,
@@ -67,132 +73,19 @@ pub(crate) fn build(
     if !reflector.wsd {
         return Ok(());
     }
-    let source = interfaces.require(reflector.source_if.as_str())?;
-    let target = interfaces.require(reflector.target_if.as_str())?;
-
-    // Announcements re-emit on source, searches and their replies on target, so a required family must
-    // be sendable on BOTH.
-    require_bidirectional_families(
+    build_pair(
+        reflector,
+        interfaces,
         dispatcher,
-        reflector.address_family,
-        source,
-        reflector.source_if.as_str(),
-        target,
-        reflector.target_if.as_str(),
-    )?;
-    require_macs_matchable(
-        dispatcher,
-        reflector.macs.as_ref(),
-        target,
-        reflector.target_if.as_str(),
-    )?;
-
-    // Announcements are captured on target, searches on source, so join the group on both. A family with
-    // no address yet is recorded and re-attempted on the next address change.
-    let groups = used_groups(reflector.address_family);
-    for group in &groups {
-        require_group_join(
-            dispatcher,
-            target,
-            group.ip(),
-            "WSD",
-            reflector.target_if.as_str(),
-        )?;
-        require_group_join(
-            dispatcher,
-            source,
-            group.ip(),
-            "WSD",
-            reflector.source_if.as_str(),
-        )?;
-    }
-    // One handler per direction spans every group; its filter matches the group set at the WSD port.
-    let group_ips: IpSet = groups.iter().map(SocketAddr::ip).collect();
-    // target -> source: Hello/Bye announcements, optionally filtered to the configured device's MAC.
-    dispatcher.register(
-        target,
-        Filter {
-            dst_ip: Some(group_ips.clone()),
-            dst_port: Some(WSD_PORT.into()),
-            src_mac: reflector.macs.clone(),
-            ..Filter::default()
-        },
-        Box::new(
-            SimpleReflector::new(
-                source,
-                Delivery::new(reflector.source_peers.as_ref()),
-                "WSD",
-                "announcement",
-                announcement_verdict,
-                Emit::fixed(WSD_PORT, WSD_TTL),
-            )
-            // A Hello whose XAddrs are all link-local or otherwise never a peer advertises
-            // endpoints the source side can never use.
-            .with_suppress(advertises_only_unreachable),
-        ),
-    );
-    // source -> target: Probe/Resolve searches (unfiltered, any source client may search); each
-    // searcher's unicast matches route back through a per-searcher session. As with SSDP, the
-    // filter deliberately pins only the group and port; a src constraint would silently break
-    // chained (router-to-router) deployments.
-    dispatcher.register(
-        source,
-        Filter {
-            dst_ip: Some(group_ips),
-            dst_port: Some(WSD_PORT.into()),
-            ..Filter::default()
-        },
-        Box::new(SearchReflector::new(
-            source,
-            target,
-            Delivery::new(reflector.target_peers.as_ref()),
-            reflector.macs.clone(),
-            "WSD",
-            MessageType::WsdResponse,
-            WSD_TTL,
-            search_verdict,
-            window,
-            Box::new(|| Box::new(NoRewrite) as Box<dyn ReplyRewrite>),
-            // Each session's ProbeMatches / ResolveMatches reply is gated the same way.
-            advertises_only_unreachable,
-        )),
-    );
-    log::info!(
-        "WSD reflector \"{}\": {} <-> {} (announcements + searches)",
-        reflector.name.as_str(),
-        reflector.source_if.as_str(),
-        reflector.target_if.as_str()
-    );
-    Ok(())
-}
-
-/// The WSD group socket addresses `family` reflects to: the IPv4 group and the IPv6 link-local group
-/// (WSD, unlike SSDP, uses only the link-local IPv6 scope).
-fn used_groups(family: AddressFamily) -> Vec<SocketAddr> {
-    let mut groups = Vec::with_capacity(2);
-    if family.uses_ipv4() {
-        groups.push(SocketAddr::from((WSD_GROUP_V4, WSD_PORT)));
-    }
-    if family.uses_ipv6() {
-        groups.push(SocketAddr::from((WSD_GROUP_V6, WSD_PORT)));
-    }
-    groups
+        WSD,
+        None,
+        "announcements + searches",
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn used_groups_follows_the_address_family() {
-        let v4 = SocketAddr::from((WSD_GROUP_V4, WSD_PORT));
-        let v6 = SocketAddr::from((WSD_GROUP_V6, WSD_PORT));
-        // Default and Dual reflect both families; the single-family policies, only their own.
-        assert_eq!(used_groups(AddressFamily::Default), vec![v4, v6]);
-        assert_eq!(used_groups(AddressFamily::Dual), vec![v4, v6]);
-        assert_eq!(used_groups(AddressFamily::Ipv4), vec![v4]);
-        assert_eq!(used_groups(AddressFamily::Ipv6), vec![v6]);
-    }
 
     #[test]
     fn verdicts_gate_by_direction() {

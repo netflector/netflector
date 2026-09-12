@@ -14,7 +14,7 @@
 
 use std::net::SocketAddr;
 
-use crate::config::{AddressFamily, Reflector};
+use crate::config::Reflector;
 use crate::dispatch::{Filter, IpSet, MessageType, PacketDispatcher};
 use crate::net::mdns::{
     MDNS_GROUP_V4, MDNS_GROUP_V6, MDNS_PORT, MDNS_TTL, MdnsKind, advertises_only_unreachable,
@@ -23,7 +23,7 @@ use crate::net::mdns::{
 
 use super::{
     BuildError, Delivery, Emit, InterfaceMap, SimpleReflector, Verdict, directional_verdict,
-    require_bidirectional_families, require_group_join, require_macs_matchable,
+    group_addrs, open_pair,
 };
 
 /// mDNS's classifier kind *is* its message type: `Query`/`Response` map straight across.
@@ -49,14 +49,11 @@ fn response_verdict(payload: &[u8]) -> Verdict {
 }
 
 /// Build the mDNS reflector for `reflector` and register its directional handlers on `dispatcher`.
-/// A no-op when mDNS isn't enabled. It joins each in-use family's group on both interfaces (so each
-/// capture is admitted the group's frames), then registers two handlers spanning them: queries
-/// source → target, responses target → source. A required family must be sendable on BOTH
-/// interfaces, since both re-emit.
+/// A no-op when mDNS isn't enabled. Joins each in-use family's group on both interfaces, then
+/// registers two handlers spanning them: queries source → target, responses target → source.
 ///
 /// # Errors
-/// [`BuildError::UnknownInterface`] for an unopened source/target, or
-/// [`BuildError::RequiredFamilyUnavailable`] if either interface can't send a required family.
+/// As [`open_pair`].
 pub(crate) fn build(
     reflector: &Reflector,
     interfaces: &InterfaceMap,
@@ -65,38 +62,13 @@ pub(crate) fn build(
     if !reflector.mdns {
         return Ok(());
     }
-    let source = interfaces.require(reflector.source_if.as_str())?;
-    let target = interfaces.require(reflector.target_if.as_str())?;
-
-    // Both interfaces re-emit (queries on target, responses on source), so a required family must
-    // be sendable on BOTH.
-    require_bidirectional_families(
-        dispatcher,
+    let groups = group_addrs(
         reflector.address_family,
-        source,
-        reflector.source_if.as_str(),
-        target,
-        reflector.target_if.as_str(),
-    )?;
-    require_macs_matchable(
-        dispatcher,
-        reflector.macs.as_ref(),
-        target,
-        reflector.target_if.as_str(),
-    )?;
-
-    // Join every group on both interfaces. A family with no address yet is recorded and re-attempted
-    // on the next address change, so a deferred join logs rather than fails the build.
-    let groups = used_groups(reflector.address_family);
-    for group in &groups {
-        for (capture, interface) in [
-            (source, &reflector.source_if),
-            (target, &reflector.target_if),
-        ] {
-            require_group_join(dispatcher, capture, group.ip(), "mDNS", interface.as_str())?;
-        }
-    }
-    // One handler per direction spans every group; its filter matches the group set at the mDNS port.
+        MDNS_PORT,
+        MDNS_GROUP_V4,
+        &[MDNS_GROUP_V6],
+    );
+    let (source, target) = open_pair(reflector, interfaces, dispatcher, "mDNS", &groups)?;
     let group_ips: IpSet = groups.iter().map(SocketAddr::ip).collect();
     // source → target: reflect queries (any client on source may ask).
     dispatcher.register(
@@ -155,32 +127,9 @@ pub(crate) fn build(
     Ok(())
 }
 
-/// The mDNS group socket addresses `family` reflects to.
-fn used_groups(family: AddressFamily) -> Vec<SocketAddr> {
-    let mut groups = Vec::with_capacity(2);
-    if family.uses_ipv4() {
-        groups.push(SocketAddr::from((MDNS_GROUP_V4, MDNS_PORT)));
-    }
-    if family.uses_ipv6() {
-        groups.push(SocketAddr::from((MDNS_GROUP_V6, MDNS_PORT)));
-    }
-    groups
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn used_groups_follows_the_address_family() {
-        let v4 = SocketAddr::from((MDNS_GROUP_V4, MDNS_PORT));
-        let v6 = SocketAddr::from((MDNS_GROUP_V6, MDNS_PORT));
-        // Default and Dual reflect both families; the single-family policies, only their own.
-        assert_eq!(used_groups(AddressFamily::Default), vec![v4, v6]);
-        assert_eq!(used_groups(AddressFamily::Dual), vec![v4, v6]);
-        assert_eq!(used_groups(AddressFamily::Ipv4), vec![v4]);
-        assert_eq!(used_groups(AddressFamily::Ipv6), vec![v6]);
-    }
 
     #[test]
     fn verdicts_gate_by_direction() {

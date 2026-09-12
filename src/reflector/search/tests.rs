@@ -21,19 +21,36 @@ fn fixed_window(_: &[u8]) -> Duration {
     Duration::from_secs(2)
 }
 
+fn never(_: &[u8]) -> bool {
+    false
+}
+
+const TEST_PROTOCOL: SearchProtocol = SearchProtocol {
+    name: "TEST",
+    announcement_kind: "announcement",
+    port: 1900,
+    ttl: TEST_TTL,
+    group_v4: Ipv4Addr::new(239, 255, 255, 250),
+    groups_v6: &[],
+    response_type: MessageType::SsdpResponse,
+    announcement_verdict: always_reflect,
+    search_verdict: always_reflect,
+    window: fixed_window,
+    suppress: never,
+};
+
+fn no_rewrite() -> Box<dyn Fn() -> Box<dyn ReplyRewrite>> {
+    Box::new(|| Box::new(NoRewrite) as Box<dyn ReplyRewrite>)
+}
+
 fn test_reflector() -> SearchReflector {
     SearchReflector::new(
         CaptureKey::from_u64(1),
         CaptureKey::from_u64(0),
         Delivery::Link,
         None,
-        "TEST",
-        MessageType::SsdpResponse,
-        TEST_TTL,
-        always_reflect,
-        fixed_window,
-        Box::new(|| Box::new(NoRewrite) as Box<dyn ReplyRewrite>),
-        |_| false,
+        TEST_PROTOCOL,
+        no_rewrite(),
     )
 }
 
@@ -386,13 +403,8 @@ fn a_search_without_a_source_mac_opens_a_session() {
         target,
         Delivery::Link,
         None,
-        "TEST",
-        MessageType::SsdpResponse,
-        TEST_TTL,
-        always_reflect,
-        fixed_window,
-        Box::new(|| Box::new(NoRewrite) as Box<dyn ReplyRewrite>),
-        |_| false,
+        TEST_PROTOCOL,
+        no_rewrite(),
     );
     let packet = Packet {
         source: "10.0.0.1:5".parse().unwrap(),
@@ -427,13 +439,8 @@ fn a_session_listens_where_its_search_copies_come_from() -> std::io::Result<()> 
         target,
         Delivery::Peers(Box::new([peer])),
         None,
-        "TEST",
-        MessageType::SsdpResponse,
-        TEST_TTL,
-        always_reflect,
-        fixed_window,
-        Box::new(|| Box::new(NoRewrite) as Box<dyn ReplyRewrite>),
-        |_| false,
+        TEST_PROTOCOL,
+        no_rewrite(),
     );
     let packet = Packet {
         source: "[fe80::a]:1900".parse().unwrap(),
@@ -488,13 +495,8 @@ fn a_failed_reflect_rolls_back_the_session_registration() {
         target,
         Delivery::Link,
         None,
-        "TEST",
-        MessageType::SsdpResponse,
-        TEST_TTL,
-        always_reflect,
-        fixed_window,
-        Box::new(|| Box::new(NoRewrite) as Box<dyn ReplyRewrite>),
-        |_| false,
+        TEST_PROTOCOL,
+        no_rewrite(),
     );
     let before = dispatcher.registration_count();
     let packet = Packet {
