@@ -1,17 +1,16 @@
 //! The SSDP reflector reflects Simple Service Discovery Protocol (`UPnP`) between the source and
 //! target interfaces so service discovery crosses the link. Advertisements (`NOTIFY`) reflect
-//! target → source as a plain multicast re-emit (a [`SimpleReflector`]). Searches (`M-SEARCH`)
+//! target → source as a plain multicast re-emit (a [`SimpleReflector`](super::SimpleReflector)). Searches (`M-SEARCH`)
 //! reflect source → target and each searcher's unicast `200 OK` replies route back through a
-//! per-searcher session (the shared [`SearchReflector`]). Re-emits go to the same group at TTL 2,
+//! per-searcher session (the shared [`SearchReflector`](super::search::SearchReflector)). Re-emits go to the same group at TTL 2,
 //! sourced from the egress interface. With `dial`, a target→source datagram's DIAL `LOCATION` is
 //! rewritten to a source-side proxy: [`DialRewrite`] is the SSDP [`ReplyRewrite`], used by both the
 //! advertisement direction and each search session's response.
 
-use std::net::SocketAddr;
 use std::time::Duration;
 
-use crate::config::{AddressFamily, Reflector};
-use crate::dispatch::{CaptureKey, Filter, IpSet, MessageType, PacketDispatcher};
+use crate::config::Reflector;
+use crate::dispatch::{CaptureKey, MessageType, PacketDispatcher};
 use crate::interface::InterfaceAddresses;
 use crate::net::MAX_UDP_PAYLOAD_LEN;
 use crate::net::ssdp::{
@@ -23,9 +22,8 @@ use crate::reactor::Reactor;
 
 use super::dial::{ProxyPlacement, rewrite_location};
 use super::{
-    BuildError, Delivery, Emit, InterfaceMap, NoRewrite, ReplyRewrite, SearchReflector,
-    SimpleReflector, Verdict, directional_verdict, require_bidirectional_families,
-    require_group_join, require_macs_matchable,
+    BuildError, InterfaceMap, ReplyRewrite, SearchProtocol, Verdict, build_pair,
+    directional_verdict,
 };
 
 /// What a DIAL-enabled SSDP reflector needs to rewrite a device's `LOCATION` to a source-side proxy: the
@@ -129,16 +127,27 @@ fn search_window(payload: &[u8]) -> Duration {
     Duration::from_secs(u64::from(mx)) + SESSION_GRACE
 }
 
-/// Build the SSDP reflector for `reflector` and register both directions on `dispatcher`. A no-op
-/// when SSDP isn't enabled. It joins every in-use family's group on BOTH interfaces, then registers
-/// two handlers spanning them: advertisements target → source (a [`SimpleReflector`]), and searches
-/// source → target with their unicast 200-OK replies (the shared [`SearchReflector`]). One
-/// [`SearchReflector`] for every group means its sessions share one table and one cap. A
-/// required family must be sendable on BOTH interfaces, since the reflector re-emits on both.
+/// SSDP as a search-style protocol: one IPv4 group and, unlike mDNS and WSD, BOTH IPv6 scopes.
+const SSDP: SearchProtocol = SearchProtocol {
+    name: "SSDP",
+    announcement_kind: "advertisement",
+    port: SSDP_PORT,
+    ttl: SSDP_TTL,
+    group_v4: SSDP_GROUP_V4,
+    groups_v6: &[SSDP_GROUP_V6_LINK_LOCAL, SSDP_GROUP_V6_SITE_LOCAL],
+    response_type: MessageType::SsdpResponse,
+    announcement_verdict: advertisement_verdict,
+    search_verdict,
+    window: search_window,
+    suppress: advertises_only_unreachable,
+};
+
+/// Build the SSDP reflector for `reflector` and register both directions on `dispatcher`: the
+/// advertisement and search legs of [`build_pair`], with `dial` adding the DIAL `LOCATION` rewrite
+/// to both. A no-op when SSDP isn't enabled.
 ///
 /// # Errors
-/// [`BuildError::UnknownInterface`] for an unopened source/target, or
-/// [`BuildError::RequiredFamilyUnavailable`] if either interface can't send a required family.
+/// As [`build_pair`].
 pub(crate) fn build(
     reflector: &Reflector,
     interfaces: &InterfaceMap,
@@ -147,130 +156,20 @@ pub(crate) fn build(
     let Some(ssdp) = &reflector.ssdp else {
         return Ok(());
     };
-    let source = interfaces.require(reflector.source_if.as_str())?;
-    let target = interfaces.require(reflector.target_if.as_str())?;
-
-    // Re-emits on both interfaces (advertisements on source, searches and their responses on target),
-    // so a required family must be sendable on BOTH.
-    require_bidirectional_families(
-        dispatcher,
-        reflector.address_family,
-        source,
-        reflector.source_if.as_str(),
-        target,
-        reflector.target_if.as_str(),
-    )?;
-    require_macs_matchable(
-        dispatcher,
-        reflector.macs.as_ref(),
-        target,
-        reflector.target_if.as_str(),
-    )?;
-
-    // Advertisements are captured on target, searches on source; join every group on both. A family
-    // with no address yet is recorded and re-attempted on the next address change.
-    let groups = used_groups(reflector.address_family);
-    for group in &groups {
-        require_group_join(
-            dispatcher,
-            target,
-            group.ip(),
-            "SSDP",
-            reflector.target_if.as_str(),
-        )?;
-        require_group_join(
-            dispatcher,
-            source,
-            group.ip(),
-            "SSDP",
-            reflector.source_if.as_str(),
-        )?;
-    }
-    // One handler per direction spans every group; its filter matches the group set at the SSDP port.
-    let group_ips: IpSet = groups.iter().map(SocketAddr::ip).collect();
-    // target -> source: advertisements (a stateless re-emit), optionally filtered to the configured
-    // device's MAC. With `dial`, the reflected `LOCATION` is rewritten to a source-side proxy.
-    // A NOTIFY whose LOCATION names a link-local or never-a-peer address advertises an endpoint
-    // the source side can never use.
-    let advertisement = SimpleReflector::new(
-        source,
-        Delivery::new(reflector.source_peers.as_ref()),
-        "SSDP",
-        "advertisement",
-        advertisement_verdict,
-        Emit::fixed(SSDP_PORT, SSDP_TTL),
-    )
-    .with_suppress(advertises_only_unreachable);
-    let advertisement = if ssdp.dial {
-        advertisement.with_rewrite(Box::new(DialRewrite::new(target)))
+    let (rewrite, summary) = if ssdp.dial {
+        (
+            Some(dial_rewrite as fn(CaptureKey) -> Box<dyn ReplyRewrite>),
+            "advertisements + searches + DIAL",
+        )
     } else {
-        advertisement
+        (None, "advertisements + searches")
     };
-    dispatcher.register(
-        target,
-        Filter {
-            dst_ip: Some(group_ips.clone()),
-            dst_port: Some(SSDP_PORT.into()),
-            src_mac: reflector.macs.clone(),
-            ..Filter::default()
-        },
-        Box::new(advertisement),
-    );
-    // source -> target: searches (unfiltered, any source client may search); each searcher's unicast
-    // 200-OK replies route back through a per-searcher session. The filter deliberately pins only
-    // the group and port: a search relayed by another netflector arrives from its reserved
-    // ephemeral source port, so a src_port or src_mac pin would silently break chained
-    // (router-to-router) deployments. With `dial`, each session's reply
-    // rewrites the device's DIAL `LOCATION` (a fresh DialRewrite per session); else it passes through.
-    let make_reply: Box<dyn Fn() -> Box<dyn ReplyRewrite>> = if ssdp.dial {
-        Box::new(move || Box::new(DialRewrite::new(target)) as Box<dyn ReplyRewrite>)
-    } else {
-        Box::new(|| Box::new(NoRewrite) as Box<dyn ReplyRewrite>)
-    };
-    dispatcher.register(
-        source,
-        Filter {
-            dst_ip: Some(group_ips),
-            dst_port: Some(SSDP_PORT.into()),
-            ..Filter::default()
-        },
-        Box::new(SearchReflector::new(
-            source,
-            target,
-            Delivery::new(reflector.target_peers.as_ref()),
-            reflector.macs.clone(),
-            "SSDP",
-            MessageType::SsdpResponse,
-            SSDP_TTL,
-            search_verdict,
-            search_window,
-            make_reply,
-            // Each session's 200 OK reply is gated the same way as the NOTIFY leg.
-            advertises_only_unreachable,
-        )),
-    );
-    log::info!(
-        "SSDP reflector \"{}\": {} <-> {} (advertisements + searches{})",
-        reflector.name.as_str(),
-        reflector.source_if.as_str(),
-        reflector.target_if.as_str(),
-        if ssdp.dial { " + DIAL" } else { "" }
-    );
-    Ok(())
+    build_pair(reflector, interfaces, dispatcher, SSDP, rewrite, summary)
 }
 
-/// The SSDP groups `family` re-emits to: one IPv4 group, and (unlike mDNS) BOTH IPv6 scopes,
-/// link-local `ff02::c` and site-local `ff05::c`.
-fn used_groups(family: AddressFamily) -> Vec<SocketAddr> {
-    let mut groups = Vec::with_capacity(3);
-    if family.uses_ipv4() {
-        groups.push(SocketAddr::from((SSDP_GROUP_V4, SSDP_PORT)));
-    }
-    if family.uses_ipv6() {
-        groups.push(SocketAddr::from((SSDP_GROUP_V6_LINK_LOCAL, SSDP_PORT)));
-        groups.push(SocketAddr::from((SSDP_GROUP_V6_SITE_LOCAL, SSDP_PORT)));
-    }
-    groups
+/// The DIAL rewrite for the device behind `target`.
+fn dial_rewrite(target: CaptureKey) -> Box<dyn ReplyRewrite> {
+    Box::new(DialRewrite::new(target))
 }
 
 #[cfg(test)]
@@ -278,23 +177,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn used_groups_follows_the_address_family() {
-        let v4 = SocketAddr::from((SSDP_GROUP_V4, SSDP_PORT));
-        let link_local = SocketAddr::from((SSDP_GROUP_V6_LINK_LOCAL, SSDP_PORT));
-        let site_local = SocketAddr::from((SSDP_GROUP_V6_SITE_LOCAL, SSDP_PORT));
-        // Default and Dual reflect both families; IPv6 uses both scopes (link-local + site-local).
+    fn ssdp_reflects_both_ipv6_scopes() {
+        let groups = SSDP.groups(crate::config::AddressFamily::Ipv6);
         assert_eq!(
-            used_groups(AddressFamily::Default),
-            vec![v4, link_local, site_local]
-        );
-        assert_eq!(
-            used_groups(AddressFamily::Dual),
-            vec![v4, link_local, site_local]
-        );
-        assert_eq!(used_groups(AddressFamily::Ipv4), vec![v4]);
-        assert_eq!(
-            used_groups(AddressFamily::Ipv6),
-            vec![link_local, site_local]
+            groups,
+            [
+                std::net::SocketAddr::from((SSDP_GROUP_V6_LINK_LOCAL, SSDP_PORT)),
+                std::net::SocketAddr::from((SSDP_GROUP_V6_SITE_LOCAL, SSDP_PORT)),
+            ]
         );
     }
 

@@ -12,16 +12,16 @@ pub(crate) mod wsd;
 mod search;
 mod simple;
 
-pub(crate) use search::SearchReflector;
+pub(crate) use search::{SearchProtocol, build_pair};
 pub(crate) use simple::{Classify, Emit, SimpleReflector};
 
 use std::fmt;
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use thiserror::Error;
 
-use crate::config::{AddressFamily, PeerList};
+use crate::config::{AddressFamily, PeerList, Reflector};
 use crate::dispatch::{
     CaptureKey, DatagramSource, MessageType, PacketDispatcher, join_capped, join_deferrable,
 };
@@ -290,15 +290,14 @@ fn require_egress_family(
     }
 }
 
-/// Enforce that a bidirectional reflector can source every required family on BOTH interfaces.
-/// mDNS, SSDP and WSD re-emit on the source *and* the target, so a family required by `address_family`
-/// must be sendable on each. Checks each required family on both interfaces (v4 before v6, the
+/// Enforce that a protocol re-emitting on both interfaces (mDNS, SSDP, WSD) can source every
+/// required family on BOTH. Checks each required family on both interfaces (v4 before v6, the
 /// single-interface policy order) and blames the side that actually lacks it: the source when it's
 /// the one missing, otherwise the target.
 ///
 /// # Errors
 /// [`BuildError::RequiredFamilyUnavailable`] naming the interface and the family it can't send.
-fn require_bidirectional_families(
+fn require_both_sides_family(
     dispatcher: &PacketDispatcher,
     address_family: AddressFamily,
     source: CaptureKey,
@@ -324,6 +323,68 @@ fn require_bidirectional_families(
         return Err(unavailable(IpFamily::V6, !src.has_v6()));
     }
     Ok(())
+}
+
+/// The build steps mDNS, SSDP and WSD share: resolve both captures, require the families both
+/// sides re-emit and a matchable `macs` filter on the target, and join every group on both
+/// interfaces. Returns the captures.
+///
+/// # Errors
+/// [`BuildError::UnknownInterface`] for an unopened source/target,
+/// [`BuildError::RequiredFamilyUnavailable`], [`BuildError::MacsUnmatchable`], or
+/// [`BuildError::GroupJoin`] for a join no later event clears.
+fn open_pair(
+    reflector: &Reflector,
+    interfaces: &InterfaceMap,
+    dispatcher: &mut PacketDispatcher,
+    protocol: &str,
+    groups: &[SocketAddr],
+) -> Result<(CaptureKey, CaptureKey), BuildError> {
+    let source = interfaces.require(reflector.source_if.as_str())?;
+    let target = interfaces.require(reflector.target_if.as_str())?;
+    require_both_sides_family(
+        dispatcher,
+        reflector.address_family,
+        source,
+        reflector.source_if.as_str(),
+        target,
+        reflector.target_if.as_str(),
+    )?;
+    require_macs_matchable(
+        dispatcher,
+        reflector.macs.as_ref(),
+        target,
+        reflector.target_if.as_str(),
+    )?;
+    // A family with no address yet is recorded and re-attempted on the next address change, so a
+    // deferred join logs rather than fails the build.
+    for group in groups {
+        for (capture, interface) in [
+            (source, &reflector.source_if),
+            (target, &reflector.target_if),
+        ] {
+            require_group_join(
+                dispatcher,
+                capture,
+                group.ip(),
+                protocol,
+                interface.as_str(),
+            )?;
+        }
+    }
+    Ok((source, target))
+}
+
+/// The group socket addresses `family` reflects to: `v4` if it uses IPv4, each of `v6` if IPv6.
+fn group_addrs(family: AddressFamily, port: u16, v4: Ipv4Addr, v6: &[Ipv6Addr]) -> Vec<SocketAddr> {
+    let mut groups = Vec::with_capacity(1 + v6.len());
+    if family.uses_ipv4() {
+        groups.push(SocketAddr::from((v4, port)));
+    }
+    if family.uses_ipv6() {
+        groups.extend(v6.iter().map(|group| SocketAddr::from((*group, port))));
+    }
+    groups
 }
 
 /// Join `group` on `capture`, the capture of `interface`, for `protocol`. A
@@ -373,6 +434,28 @@ mod tests {
     use crate::interface::LOOPBACK_IFACE;
     use crate::net::mac::MacAddr;
     use crate::test_support::{loopback_lock, open_loopback_or_skip};
+
+    #[test]
+    fn group_addrs_follows_the_address_family() {
+        let v4 = Ipv4Addr::new(239, 255, 255, 250);
+        let (link_local, site_local) = (
+            Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xc),
+            Ipv6Addr::new(0xff05, 0, 0, 0, 0, 0, 0, 0xc),
+        );
+        let groups = |family| group_addrs(family, 1900, v4, &[link_local, site_local]);
+        let at = |ip: IpAddr| SocketAddr::new(ip, 1900);
+        // Default and Dual reflect both families; the single-family policies, only their own.
+        assert_eq!(
+            groups(AddressFamily::Default),
+            [at(v4.into()), at(link_local.into()), at(site_local.into())]
+        );
+        assert_eq!(groups(AddressFamily::Dual), groups(AddressFamily::Default));
+        assert_eq!(groups(AddressFamily::Ipv4), [at(v4.into())]);
+        assert_eq!(
+            groups(AddressFamily::Ipv6),
+            [at(link_local.into()), at(site_local.into())]
+        );
+    }
 
     #[test]
     fn delivery_follows_the_entrys_peers() {
