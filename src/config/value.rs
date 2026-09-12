@@ -8,11 +8,12 @@
 use std::fmt;
 use std::net::IpAddr;
 use std::num::NonZeroU16;
-use std::ops::Deref;
 use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer};
 use thiserror::Error;
+
+use crate::unique_list::{ListRule, UniqueList};
 
 /// Minimum severity a record must have to be logged; `Off` disables logging
 /// entirely. Ordered most-restrictive to most-verbose, mirroring `log`'s filter.
@@ -203,216 +204,62 @@ impl FromStr for ReflectorName {
     }
 }
 
+/// The rule for [`PortList`]: any UDP port; `NonZeroU16` keeps 0 out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Ports;
+
+impl ListRule for Ports {
+    type Item = NonZeroU16;
+
+    const NOUN: &'static str = "port";
+}
+
 /// A non-empty, duplicate-free list of UDP ports.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PortList(Vec<NonZeroU16>);
+pub(crate) type PortList = UniqueList<Ports>;
 
-impl Deref for PortList {
-    type Target = [NonZeroU16];
+/// The rule for [`GroupList`]: multicast addresses of either family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Groups;
 
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
+impl ListRule for Groups {
+    type Item = IpAddr;
 
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub(crate) enum PortListError {
-    #[error("port list must not be empty")]
-    Empty,
-    #[error("duplicate port {0}")]
-    Duplicate(u16),
-    /// A comma-separated token was not a port in 1..=65535.
-    #[error("invalid port \"{0}\"")]
-    BadPort(String),
-}
+    const NOUN: &'static str = "group";
 
-impl TryFrom<Vec<NonZeroU16>> for PortList {
-    type Error = PortListError;
-
-    fn try_from(ports: Vec<NonZeroU16>) -> Result<Self, Self::Error> {
-        if ports.is_empty() {
-            return Err(PortListError::Empty);
-        }
-        for (i, port) in ports.iter().enumerate() {
-            if ports[..i].contains(port) {
-                return Err(PortListError::Duplicate(port.get()));
-            }
-        }
-        Ok(Self(ports))
-    }
-}
-
-impl FromStr for PortList {
-    type Err = PortListError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let ports = s
-            .split(',')
-            .map(|token| {
-                let token = token.trim();
-                token
-                    .parse::<NonZeroU16>()
-                    .map_err(|_| PortListError::BadPort(token.to_owned()))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        PortList::try_from(ports)
-    }
-}
-
-impl<'de> Deserialize<'de> for PortList {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Vec::<NonZeroU16>::deserialize(deserializer)?
-            .try_into()
-            .map_err(serde::de::Error::custom)
+    fn refuse(group: &IpAddr) -> Option<&'static str> {
+        (!group.is_multicast()).then_some("is not a multicast address")
     }
 }
 
 /// A non-empty, duplicate-free list of multicast groups, of either family.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct GroupList(Vec<IpAddr>);
+pub(crate) type GroupList = UniqueList<Groups>;
 
-impl Deref for GroupList {
-    type Target = [IpAddr];
+/// The rule for [`PeerList`]: unicast addresses of either family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Peers;
 
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
+impl ListRule for Peers {
+    type Item = IpAddr;
 
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub(crate) enum GroupListError {
-    #[error("group list must not be empty")]
-    Empty,
-    #[error("duplicate group {0}")]
-    Duplicate(IpAddr),
-    #[error("{0} is not a multicast address")]
-    NotMulticast(IpAddr),
-    /// A comma-separated token was not an IP address.
-    #[error("invalid group \"{0}\"")]
-    BadAddress(String),
-}
+    const NOUN: &'static str = "peer";
 
-impl TryFrom<Vec<IpAddr>> for GroupList {
-    type Error = GroupListError;
-
-    fn try_from(groups: Vec<IpAddr>) -> Result<Self, Self::Error> {
-        if groups.is_empty() {
-            return Err(GroupListError::Empty);
-        }
-        for (i, group) in groups.iter().enumerate() {
-            if !group.is_multicast() {
-                return Err(GroupListError::NotMulticast(*group));
-            }
-            if groups[..i].contains(group) {
-                return Err(GroupListError::Duplicate(*group));
-            }
-        }
-        Ok(Self(groups))
-    }
-}
-
-impl FromStr for GroupList {
-    type Err = GroupListError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let groups = s
-            .split(',')
-            .map(|token| {
-                let token = token.trim();
-                token
-                    .parse::<IpAddr>()
-                    .map_err(|_| GroupListError::BadAddress(token.to_owned()))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        GroupList::try_from(groups)
-    }
-}
-
-impl<'de> Deserialize<'de> for GroupList {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Vec::<IpAddr>::deserialize(deserializer)?
-            .try_into()
-            .map_err(serde::de::Error::custom)
+    fn refuse(peer: &IpAddr) -> Option<&'static str> {
+        let unicast = match peer {
+            IpAddr::V4(v4) => !v4.is_multicast() && !v4.is_broadcast() && !v4.is_unspecified(),
+            IpAddr::V6(v6) => !v6.is_multicast() && !v6.is_unspecified(),
+        };
+        (!unicast).then_some("is not a unicast address")
     }
 }
 
 /// A non-empty, duplicate-free list of unicast addresses, of either family: the hosts behind an
 /// interface that has no broadcast domain.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PeerList(Vec<IpAddr>);
-
-impl Deref for PeerList {
-    type Target = [IpAddr];
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub(crate) enum PeerListError {
-    #[error("peer list must not be empty")]
-    Empty,
-    #[error("duplicate peer {0}")]
-    Duplicate(IpAddr),
-    #[error("{0} is not a unicast address")]
-    NotUnicast(IpAddr),
-    /// A comma-separated token was not an IP address.
-    #[error("invalid peer \"{0}\"")]
-    BadAddress(String),
-}
-
-impl TryFrom<Vec<IpAddr>> for PeerList {
-    type Error = PeerListError;
-
-    fn try_from(peers: Vec<IpAddr>) -> Result<Self, Self::Error> {
-        if peers.is_empty() {
-            return Err(PeerListError::Empty);
-        }
-        for (i, peer) in peers.iter().enumerate() {
-            let unicast = match peer {
-                IpAddr::V4(v4) => !v4.is_multicast() && !v4.is_broadcast() && !v4.is_unspecified(),
-                IpAddr::V6(v6) => !v6.is_multicast() && !v6.is_unspecified(),
-            };
-            if !unicast {
-                return Err(PeerListError::NotUnicast(*peer));
-            }
-            if peers[..i].contains(peer) {
-                return Err(PeerListError::Duplicate(*peer));
-            }
-        }
-        Ok(Self(peers))
-    }
-}
-
-impl FromStr for PeerList {
-    type Err = PeerListError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let peers = s
-            .split(',')
-            .map(|token| {
-                let token = token.trim();
-                token
-                    .parse::<IpAddr>()
-                    .map_err(|_| PeerListError::BadAddress(token.to_owned()))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        PeerList::try_from(peers)
-    }
-}
-
-impl<'de> Deserialize<'de> for PeerList {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Vec::<IpAddr>::deserialize(deserializer)?
-            .try_into()
-            .map_err(serde::de::Error::custom)
-    }
-}
+pub(crate) type PeerList = UniqueList<Peers>;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::unique_list::ListError;
 
     #[test]
     fn peer_list_takes_unicast_addresses_only() {
@@ -427,20 +274,20 @@ mod tests {
         ] {
             assert!(matches!(
                 bad.parse::<PeerList>(),
-                Err(PeerListError::NotUnicast(_))
+                Err(ListError::Refused { .. })
             ));
         }
         assert!(matches!(
             "10.10.10.2,10.10.10.2".parse::<PeerList>(),
-            Err(PeerListError::Duplicate(_))
+            Err(ListError::Duplicate { .. })
         ));
         assert!(matches!(
             "".parse::<PeerList>(),
-            Err(PeerListError::BadAddress(_))
+            Err(ListError::Invalid { .. })
         ));
         assert!(matches!(
             PeerList::try_from(Vec::new()),
-            Err(PeerListError::Empty)
+            Err(ListError::Empty { .. })
         ));
     }
 
@@ -518,15 +365,15 @@ mod tests {
         );
         assert!(matches!(
             "7,7".parse::<PortList>(),
-            Err(PortListError::Duplicate(7))
+            Err(ListError::Duplicate { item, .. }) if item.get() == 7
         ));
         assert!(matches!(
             "0".parse::<PortList>(),
-            Err(PortListError::BadPort(_))
+            Err(ListError::Invalid { .. })
         ));
         assert!(matches!(
             "abc".parse::<PortList>(),
-            Err(PortListError::BadPort(_))
+            Err(ListError::Invalid { .. })
         ));
     }
 
@@ -538,23 +385,23 @@ mod tests {
             ["239.255.90.90", "ff12::8384"]
         );
         let unicast: IpAddr = "192.0.2.1".parse().unwrap();
-        assert_eq!(
+        assert!(matches!(
             "192.0.2.1".parse::<GroupList>(),
-            Err(GroupListError::NotMulticast(unicast))
-        );
+            Err(ListError::Refused { item, .. }) if item == unicast
+        ));
         let group: IpAddr = "239.255.90.90".parse().unwrap();
-        assert_eq!(
+        assert!(matches!(
             "239.255.90.90,239.255.90.90".parse::<GroupList>(),
-            Err(GroupListError::Duplicate(group))
-        );
+            Err(ListError::Duplicate { item, .. }) if item == group
+        ));
         assert!(matches!(
             "roon".parse::<GroupList>(),
-            Err(GroupListError::BadAddress(_))
+            Err(ListError::Invalid { .. })
         ));
-        assert_eq!(
+        assert!(matches!(
             GroupList::try_from(Vec::<IpAddr>::new()),
-            Err(GroupListError::Empty)
-        );
+            Err(ListError::Empty { .. })
+        ));
     }
 
     #[test]
@@ -572,7 +419,7 @@ mod tests {
         // FromStr can't yield an empty list, so Empty is reachable only via the TryFrom path.
         assert!(matches!(
             PortList::try_from(Vec::<NonZeroU16>::new()),
-            Err(PortListError::Empty)
+            Err(ListError::Empty { .. })
         ));
     }
 }
