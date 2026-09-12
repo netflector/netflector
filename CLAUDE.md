@@ -37,6 +37,8 @@
   depended-on first, each immediately followed by its inherent impl, then its
   trait impls) → free fns (after the types they serve) → `#[cfg(test)] mod tests`
   last.
+- Unit tests stay inline in `#[cfg(test)] mod tests` until the module carries
+  ~500 lines of them; then `#[cfg(test)] mod tests;` in `<module>/tests.rs`.
 - A const/static bound to a single item lives beside it, not in the top block: a
   private const used by one fn, or a `const _: () = assert!(...)` layout check
   beside the type it guards. A const built from a local type/builder likewise
