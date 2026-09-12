@@ -5,7 +5,7 @@
 //! registrations. When an interface's fd is readable, [`drain_and_route`] takes that
 //! capture *out* of the table, drains it, parses each frame into a [`Packet`], and
 //! offers it to every registration whose [`Filter`] matches. A matching reflector
-//! re-emits on the opposite interface via [`send`], keyed.
+//! re-emits on the opposite interface via [`send_udp`], keyed.
 //!
 //! Taking the ingress capture out is load-bearing: the parsed `Packet` then borrows a
 //! local, not `self`, so `&mut PacketDispatcher` is free to hand to a reflector, which
@@ -15,12 +15,14 @@
 //! key resolves to the taken-out `None` slot and the send is a logged drop, not UB.
 //!
 //! [`drain_and_route`]: PacketDispatcher::drain_and_route
-//! [`send`]: PacketDispatcher::send
+//! [`send_udp`]: PacketDispatcher::send_udp
 
 mod counters;
 mod datagram;
 mod dial_context;
+mod egress;
 mod interface_table;
+mod lifecycle;
 mod multicast;
 
 #[cfg(test)]
@@ -39,17 +41,16 @@ use std::time::{Duration, Instant};
 
 use crate::capture::{Capture, Read};
 use crate::config::AddressFamily;
-use crate::interface::{InterfaceAddresses, InterfaceEvent, InterfaceMonitor};
-use crate::linear_map::LinearMap;
-use crate::logging::{WARN_WINDOW, log_rate};
+use crate::interface::InterfaceAddresses;
 use crate::net::LinkType;
 use crate::net::mac::{MacAddr, MacSet};
 use crate::net::packet::Packet;
 use crate::reactor::{Arena, ControlEvent, Handler, Key, Reactor, ReadyEvent};
 
 use self::counters::log_counters;
-use self::datagram::{build_udp, ethernet_dst};
+use self::egress::{Datagram, Egress};
 use self::interface_table::InterfaceTable;
+use self::lifecycle::InterfaceLifecycle;
 
 /// The most frames drained per readable event before yielding, so a flooded interface
 /// can't starve the others. `AF_PACKET` stops here and the level-triggered wait
@@ -60,15 +61,6 @@ const MAX_FRAMES_PER_EVENT: u32 = 64;
 /// The reactor `user_data` for the interface monitor's fd. A [`CaptureKey`] packs a `u32`
 /// (via [`to_u64`](CaptureKey::to_u64)), so `u64::MAX` never collides with a real capture.
 const MONITOR_TAG: u64 = u64::MAX;
-
-/// The reconcile's periodic floor: the guarantee that an interface recreation whose every
-/// event was lost (macOS's silent route-socket overflow) is still detected. Cheap while
-/// healthy -- one name lookup per watched interface plus one kernel probe per capture.
-const RECONCILE_TICK: Duration = Duration::from_secs(30);
-
-/// The reconcile cadence while an interface is parked absent or a rebuild step failed: the
-/// retry driver that picks up the interface's return and re-attempts failed re-binds.
-const RECONCILE_RETRY: Duration = Duration::from_secs(1);
 
 /// A `Copy` handle to a capture the dispatcher owns: an index into the interface table's
 /// captures. A newtype, not a bare alias, so it can't be passed where an [`InterfaceKey`](interface_table::InterfaceKey)
@@ -249,7 +241,7 @@ struct CounterReport {
 }
 
 /// Owns the interface table and the routing registrations. The sole owner of capture fds:
-/// egress goes through [`send`](Self::send), keyed.
+/// egress goes through [`send_udp`](Self::send_udp), keyed.
 pub(crate) struct PacketDispatcher {
     table: InterfaceTable,
     registrations: Arena<Registration>,
@@ -257,38 +249,19 @@ pub(crate) struct PacketDispatcher {
     /// keys, taken once at the start of a route so a mid-route registration isn't fed the
     /// in-flight frame, and kept allocated across calls so the data path doesn't allocate per packet.
     route_keys: Vec<RegistrationKey>,
-    /// The address-change monitor, opened best-effort in [`new`](Self::new). `None` is a
-    /// degraded mode: addresses stay at their startup-resolved values.
-    monitor: Option<InterfaceMonitor>,
+    /// The address-change monitor and the recreation reconcile.
+    lifecycle: InterfaceLifecycle,
     /// The DIAL proxy registry, shared across the SSDP advertisement/response reflectors. Empty unless a
     /// DIAL reflector is configured; the dispatcher evicts its past-grace proxies on the deadline sweep.
     dial: DialContext,
-    /// The reused frame-build buffer shared by every reflector's send. One buffer serves them all:
-    /// the single-threaded loop runs one `send_udp_group` at a time.
-    scratch: Box<[u8]>,
+    /// The frame-build scratch and the duplicate-send scope of the packet being routed.
+    egress: Egress,
     /// The periodic counter-summary schedule, or `None` when the summary is disabled.
     report: Option<CounterReport>,
-    /// The largest kernel ifindex seen: the watched interfaces' own, raised by every drained
-    /// notification. On monotonic platforms ([`InterfaceMonitor::INDEXES_MONOTONIC`]) an
-    /// unknown-index Link event at or below this ceiling is churn on an existing unwatched
-    /// interface, not a creation, so it doesn't trigger the reconcile.
-    max_seen_ifindex: u32,
-    /// When the next reconcile pass is due: the [`RECONCILE_TICK`] floor when healthy,
-    /// [`RECONCILE_RETRY`] while an interface is parked absent or a rebuild step failed, `now`
-    /// when a capture read error pulls it forward.
-    next_reconcile: Instant,
-    /// The number of the packet being routed, from 1: the scope of the duplicate-send check in
-    /// [`send_udp`](Self::send_udp).
-    packet: u64,
-    /// Whether [`route`](Self::route) is running; a send outside it (a timer, a session) is
-    /// never a duplicate of a packet's re-emit.
-    routing: bool,
 }
 
 impl PacketDispatcher {
-    /// A dispatcher with no captures yet. Opens the interface monitor up front, before the
-    /// first [`add_capture`](Self::add_capture) resolve, so a change during startup is
-    /// already queued rather than missed.
+    /// A dispatcher with no captures yet.
     pub(crate) fn new() -> Self {
         Self::with_table(InterfaceTable::new())
     }
@@ -303,14 +276,10 @@ impl PacketDispatcher {
             table,
             registrations: Arena::new(),
             route_keys: Vec::new(),
-            monitor: Self::open_monitor(),
+            lifecycle: InterfaceLifecycle::new(),
             dial: DialContext::new(),
-            scratch: vec![0u8; crate::net::MAX_FRAME_LEN].into_boxed_slice(),
+            egress: Egress::new(),
             report: None,
-            max_seen_ifindex: 0,
-            next_reconcile: Instant::now() + RECONCILE_TICK,
-            packet: 0,
-            routing: false,
         }
     }
 
@@ -324,21 +293,6 @@ impl PacketDispatcher {
         });
     }
 
-    /// Open the address-change monitor. Best-effort: a failure logs and yields `None`, and the
-    /// daemon then runs on its startup-resolved addresses (no live updates), never aborting.
-    fn open_monitor() -> Option<InterfaceMonitor> {
-        match InterfaceMonitor::open() {
-            Ok(monitor) => {
-                log::debug!("interface monitor installed");
-                Some(monitor)
-            }
-            Err(e) => {
-                log::warn!("interface monitor unavailable; addresses won't refresh on change: {e}");
-                None
-            }
-        }
-    }
-
     /// Hand a capture to the dispatcher; the returned key is how reflectors send on it. The
     /// capture's interface is found-or-created from its [`if_name`](Capture::if_name), so
     /// captures on the same interface share one [`Interface`](crate::interface::Interface) record.
@@ -348,10 +302,8 @@ impl PacketDispatcher {
     pub(crate) fn add_capture(&mut self, capture: Capture) -> io::Result<CaptureKey> {
         let interface = self.table.find_or_add_interface(capture.if_name())?;
         let key = self.table.add_capture(capture, interface);
-        // Seed the seen-index ceiling with the watched interfaces' own identities.
-        self.max_seen_ifindex = self
-            .max_seen_ifindex
-            .max(self.table.interface_index(interface).unwrap_or(0));
+        self.lifecycle
+            .saw_interface(self.table.interface_index(interface).unwrap_or(0));
         if let Some(name) = self.table.interface_name(interface) {
             log::debug!("watching {name} as capture {key:?}");
         }
@@ -364,8 +316,8 @@ impl PacketDispatcher {
     /// monitor's fd, when it opened, rides along under [`MONITOR_TAG`].
     pub(crate) fn capture_watches(&self) -> Vec<(RawFd, u64)> {
         let mut watches = self.table.capture_watches();
-        if let Some(monitor) = &self.monitor {
-            watches.push((monitor.as_raw_fd(), MONITOR_TAG));
+        if let Some(fd) = self.lifecycle.monitor_fd() {
+            watches.push((fd, MONITOR_TAG));
         }
         watches
     }
@@ -405,22 +357,6 @@ impl PacketDispatcher {
             return Ok(());
         };
         self.table.join_on(interface, group)
-    }
-
-    /// Inject `frame` on the capture `egress` addresses.
-    ///
-    /// # Errors
-    /// Returns an error if the underlying send fails. A key resolving to a drained
-    /// (taken-out) or out-of-range capture is a logged drop, not an error and never UB.
-    pub(crate) fn send(&self, egress: CaptureKey, frame: &[u8]) -> io::Result<()> {
-        if let Some(capture) = self.table.capture(egress) {
-            capture.send(frame).map_err(|e| {
-                oversize_context(e, capture.if_name(), frame.len(), self.table.mtu_of(egress))
-            })
-        } else {
-            log::warn!("egress {egress:?} unavailable (drained or unknown); frame dropped");
-            Ok(())
-        }
     }
 
     /// The MTU of the interface behind `capture`, as of its last resolution.
@@ -467,8 +403,7 @@ impl PacketDispatcher {
     /// `egress`. The caller supplies the L2 MAC, so this serves unicast, multicast, and broadcast
     /// alike; the link framing (Ethernet vs `DLT_NULL`) follows the egress's link type, and `ttl`
     /// and `payload` are carried verbatim. Builds into the dispatcher's reused scratch buffer, so
-    /// the data path never allocates. An unknown or draining egress is a logged drop, like
-    /// [`send`](Self::send).
+    /// the data path never allocates. An unknown or draining egress is a logged drop.
     ///
     /// # Errors
     /// Propagates a send failure, and reports a frame that can't be built from the egress's
@@ -483,10 +418,14 @@ impl PacketDispatcher {
         ttl: u8,
         payload: &[u8],
     ) -> io::Result<()> {
-        if let Some(len) = self.build_frame(egress, dst, dst_mac, source, ttl, payload)? {
-            self.send_built(egress, len)?;
-        }
-        Ok(())
+        let datagram = Datagram {
+            dst,
+            source,
+            ttl,
+            payload,
+        };
+        self.egress
+            .send_udp(&mut self.table, egress, dst_mac, datagram)
     }
 
     /// Inject a broadcast/multicast UDP datagram on `egress`, deriving the L2 destination MAC from
@@ -505,8 +444,14 @@ impl PacketDispatcher {
         ttl: u8,
         payload: &[u8],
     ) -> io::Result<()> {
-        let dst_mac = self.group_mac(egress, dst)?;
-        self.send_udp(egress, dst, dst_mac, source, ttl, payload)
+        let datagram = Datagram {
+            dst,
+            source,
+            ttl,
+            payload,
+        };
+        self.egress
+            .send_udp_group(&mut self.table, egress, datagram)
     }
 
     /// Deliver a group or broadcast datagram to `peers` instead: one unicast copy per peer of
@@ -525,108 +470,14 @@ impl PacketDispatcher {
         ttl: u8,
         payload: &[u8],
     ) -> io::Result<()> {
-        let mut delivered = false;
-        let mut failure = None;
-        for &peer in peers.iter().filter(|peer| peer.is_ipv4() == dst.is_ipv4()) {
-            // Nothing here resolves neighbours: on a link with MACs the copy travels in a
-            // broadcast frame, and only the addressed host keeps it.
-            let to = SocketAddr::new(peer, dst.port());
-            let Some(len) =
-                self.build_frame(egress, to, MacAddr::broadcast(), source, ttl, payload)?
-            else {
-                return Ok(());
-            };
-            match self.send_built(egress, len) {
-                Ok(_) => delivered = true,
-                Err(e) => {
-                    log_rate!(
-                        log::Level::Warn,
-                        WARN_WINDOW,
-                        "{}: cannot send to peer {peer}: {e}",
-                        self.egress_name(egress)
-                    );
-                    failure = Some(e);
-                }
-            }
-        }
-        match failure {
-            Some(e) if !delivered => Err(e),
-            _ => Ok(()),
-        }
-    }
-
-    /// The name of the interface behind `egress`, for a message; `?` for an unknown key.
-    fn egress_name(&self, egress: CaptureKey) -> &str {
-        self.table
-            .interface_of(egress)
-            .and_then(|interface| self.table.interface_name(interface))
-            .unwrap_or("?")
-    }
-
-    /// Assemble the datagram for `egress` into the scratch buffer. `None` (logged) when the
-    /// egress is unknown or taken out for its drain.
-    fn build_frame(
-        &mut self,
-        egress: CaptureKey,
-        dst: SocketAddr,
-        dst_mac: MacAddr,
-        source: DatagramSource,
-        ttl: u8,
-        payload: &[u8],
-    ) -> io::Result<Option<usize>> {
-        // Copy the addresses out (they're `Copy`) so the borrow of the table ends before the
-        // mutable borrow of `self.scratch`.
-        let (Some(addrs), Some(link)) =
-            (self.egress_addrs(egress).copied(), self.link_type(egress))
-        else {
-            log::warn!("egress {egress:?} unavailable (drained or unknown); datagram dropped");
-            return Ok(None);
-        };
-        build_udp(
-            &addrs,
-            link,
+        let datagram = Datagram {
             dst,
-            dst_mac,
             source,
             ttl,
             payload,
-            &mut self.scratch,
-        )
-        .map(Some)
-        .map_err(io::Error::other)
-    }
-
-    /// Send the frame in the scratch buffer on `egress`, unless an equal one already went out
-    /// there for the packet being routed: two entries whose legs coincide (per-device entries
-    /// on one pair, whose query legs carry no MAC filter) both relay a packet, and the second's
-    /// frame equals the first's. Noted only once sent, so a failed send leaves the second to
-    /// try. Returns whether the frame went out.
-    fn send_built(&mut self, egress: CaptureKey, len: usize) -> io::Result<bool> {
-        if self.routing
-            && self
-                .table
-                .was_sent(egress, self.packet, &self.scratch[..len])
-        {
-            log::trace!("egress {egress:?}: an equal frame already went out for this packet");
-            return Ok(false);
-        }
-        self.send(egress, &self.scratch[..len])?;
-        if self.routing {
-            self.table
-                .record_sent(egress, self.packet, &self.scratch[..len]);
-        }
-        Ok(true)
-    }
-
-    /// The L2 destination for a broadcast/multicast `dst` on `egress`: its own directed broadcast
-    /// counts as broadcast there.
-    fn group_mac(&self, egress: CaptureKey, dst: SocketAddr) -> io::Result<MacAddr> {
-        ethernet_dst(
-            dst.ip(),
-            self.egress_addrs(egress)
-                .and_then(InterfaceAddresses::v4_directed_broadcast),
-        )
-        .map_err(io::Error::other)
+        };
+        self.egress
+            .send_udp_to_peers(&mut self.table, egress, peers, datagram)
     }
 
     /// Drain the capture `ingress` addresses and route each parsed packet. Makes up to
@@ -671,7 +522,7 @@ impl PacketDispatcher {
                     // are left to the tick.
                     if Capture::lost_interface(&e) {
                         log::info!("fd {fd}: capture lost its interface ({e}); reconciling");
-                        self.next_reconcile = Instant::now();
+                        self.lifecycle.reconcile_now();
                     } else {
                         log::error!("fd {fd}: capture read failed, abandoning batch: {e}");
                     }
@@ -748,8 +599,7 @@ impl PacketDispatcher {
                 .map(|(key, _)| RegistrationKey(key)),
         );
         let ingress_addrs = self.table.egress_addrs(ingress).copied();
-        self.packet += 1;
-        self.routing = true;
+        self.egress.begin_packet();
         let mut final_outcome: Option<Outcome> = None;
         for i in 0..self.route_keys.len() {
             let key = self.route_keys[i];
@@ -790,7 +640,7 @@ impl PacketDispatcher {
                 }
             });
         }
-        self.routing = false;
+        self.egress.end_packet();
         // One packet, one count: record the folded outcome on the ingress capture's row. The row
         // always exists: `route` is reached only via the drain, whose take-out guard admits only a
         // real, in-range ingress key.
@@ -807,163 +657,20 @@ impl PacketDispatcher {
         }
     }
 
-    /// Drain the interface monitor and re-resolve each interface a notification names,
-    /// coalescing duplicates so one interface re-resolves at most once per wakeup. An
-    /// [`InterfaceEvent::Overflow`] re-resolves every interface. Best-effort: a read or
-    /// resolution failure logs and is dropped, and the daemon keeps its last-known addresses.
-    ///
-    /// Doubles as the recreation detector: events that can announce a destroyed or recreated
-    /// interface run the reconcile afterwards. A `Link` event on a watched interface, or one
-    /// carrying an index above everything seen (a creation, on platforms whose indexes are
-    /// monotonic), or any unknown-index event where no lifecycle messages exist (macOS), or an
-    /// overflow (the announcement may be among the drops) -- and, for a recreation that reused
-    /// the watched index, a per-capture kernel probe on every matched refresh.
+    /// Drain the interface monitor, then act on what moved: evict the DIAL proxies whose interface
+    /// lost the v4 address they bound, drop the search sessions whose reserved port was bound to a
+    /// re-addressed interface, and reconcile when an event may announce a recreation.
     fn refresh_changed_interfaces(&mut self, reactor: &mut Reactor) {
-        let Some(monitor) = self.monitor.as_mut() else {
-            return;
-        };
-        // Coalesce to one ifindex -> saw-a-Link-event entry per interface.
-        let mut changed: LinearMap<u32, bool> = LinearMap::new();
-        let mut overflow = false;
-        if let Err(e) = monitor.drain(|event| match event {
-            InterfaceEvent::Overflow => overflow = true,
-            InterfaceEvent::Address(ifindex) | InterfaceEvent::Link(ifindex) => {
-                let is_link = matches!(event, InterfaceEvent::Link(_));
-                match changed.get_mut(&ifindex) {
-                    Some(link) => *link |= is_link,
-                    None => {
-                        changed.insert(ifindex, is_link);
-                    }
-                }
-            }
-        }) {
-            // The drain already consumed and collected these notifications before failing, so refresh
-            // what we have rather than discard it; the socket's unread remainder stays readable and the
-            // level-triggered wait re-drains it.
-            log::warn!(
-                "interface monitor read failed mid-drain; refreshing what was collected: {e}"
-            );
-        }
-        if changed.is_empty() && !overflow {
-            return; // nothing collected (a spurious wakeup, or a drain error before the first read)
-        }
-        // The creation gate compares against the ceiling from BEFORE this batch: the creation's
-        // own Link event would otherwise raise the ceiling past itself and slip through.
-        let prior_ceiling = self.max_seen_ifindex;
-        for (ifindex, _) in changed.iter() {
-            self.max_seen_ifindex = self.max_seen_ifindex.max(*ifindex);
-        }
-        let mut want_reconcile = overflow;
-        // The DIAL proxies bind IPv4 only, so collect the interfaces whose v4 address actually moved. A
-        // routine v6 or MAC change must not churn a proxy whose v4 (and cached LOCATION) is unchanged.
-        let mut v4_moved: Vec<u32> = Vec::new();
-        // Interfaces whose addresses actually moved this cycle, for the session notification below:
-        // search reflectors drop sessions whose reserved port was bound to a re-addressed interface.
-        // Only a real address delta (either family) qualifies, not a benign Link / no-op-Address event,
-        // so a healthy session survives a carrier flap or an unrelated interface's churn. (DIAL is
-        // v4-only via v4_moved; sessions can be either family. Recreations are handled by the reconcile,
-        // keyed by capture, so they need no entry here.)
-        let mut touched: Vec<u32> = Vec::new();
-        if overflow {
-            // Notifications were dropped, so re-resolve every interface.
-            log::debug!("interface monitor overflow; re-resolving all interfaces");
-            for (ifindex, result) in self.table.refresh_all() {
-                match result {
-                    Ok(change) => {
-                        if change.v4 {
-                            v4_moved.push(ifindex);
-                        }
-                        if change.v4 || change.v6 {
-                            touched.push(ifindex);
-                        }
-                    }
-                    Err(e) => {
-                        // The overflow already means notifications were dropped, so this is the one
-                        // chance to catch a move whose event was lost, and we can't confirm the address
-                        // survived. Treat it as moved so any DIAL proxy re-mints and any session drops
-                        // rather than keeping a listener bound to a possibly-vanished address.
-                        log::warn!(
-                            "re-resolving ifindex {ifindex} failed: {e}; evicting its proxies"
-                        );
-                        v4_moved.push(ifindex);
-                        touched.push(ifindex);
-                    }
-                }
-            }
-        } else {
-            for (ifindex, is_link) in changed.iter() {
-                match self.table.refresh_by_ifindex(*ifindex) {
-                    Ok(Some(change)) => {
-                        log::debug!("re-resolved interface (ifindex {ifindex}) after a change");
-                        if change.v4 {
-                            v4_moved.push(*ifindex);
-                        }
-                        // Only a real address delta invalidates a session's reserved reply address; a
-                        // bare Link event (carrier / MTU / flag) with no delta must not clear sessions.
-                        if change.v4 || change.v6 {
-                            touched.push(*ifindex);
-                        }
-                        // A lifecycle event on a watched interface, or a capture whose kernel
-                        // binding died behind this (possibly reused) index: reconcile.
-                        if *is_link || !self.table.probe_by_ifindex(*ifindex) {
-                            want_reconcile = true;
-                        }
-                    }
-                    Ok(None) => {
-                        // An interface we don't watch -- unless it is one of ours, recreated
-                        // under a new index. A Link event above every index seen so far is a
-                        // creation where indexes are monotonic; where they aren't (FreeBSD),
-                        // any Link announcement reconciles; where lifecycle events don't
-                        // exist at all (macOS), any unknown-index event has to.
-                        let creation = if InterfaceMonitor::INDEXES_MONOTONIC {
-                            *is_link && *ifindex > prior_ceiling
-                        } else {
-                            *is_link
-                        };
-                        if creation || !InterfaceMonitor::LIFECYCLE_EVENTS {
-                            want_reconcile = true;
-                        }
-                    }
-                    Err(e) => {
-                        // Same conservative stance as the overflow branch: a failed re-resolve can't
-                        // confirm the bound v4 survived (a notification arrived, so something changed),
-                        // so evict any proxy on it rather than risk a stale, silently-dead listener.
-                        // Reconcile, since it can't confirm the interface survived either.
-                        log::warn!(
-                            "re-resolving ifindex {ifindex} failed: {e}; evicting its proxies"
-                        );
-                        v4_moved.push(*ifindex);
-                        touched.push(*ifindex);
-                        want_reconcile = true;
-                    }
-                }
-            }
-        }
-        // Evict proxies whose source or target interface lost the v4 address they bound, and drop
-        // search sessions whose reserved port was bound to a re-addressed interface. Both keyed by
-        // capture, materialized before the reconcile rewrites the table's caches so the ifindexes here
-        // still map to the pre-change identities. A recreation under a new index resolves to no capture
-        // here and is handled by the reconcile below.
-        let v4_captures = self.captures_for(&v4_moved);
+        let changes = self.lifecycle.drain(&mut self.table);
         self.dial.evict_on_interface_change(
             reactor,
-            &v4_captures,
+            &changes.v4_moved,
             "after its interface's address changed",
         );
-        let touched_captures = self.captures_for(&touched);
-        self.notify_iface_change(&touched_captures, reactor);
-        if want_reconcile {
+        self.notify_iface_change(&changes.touched, reactor);
+        if changes.reconcile {
             self.reconcile_interfaces(reactor);
         }
-    }
-
-    /// The captures on the interfaces currently at `ifindexes`, mapping the refresh path's kernel
-    /// indexes to the stable [`CaptureKey`]s the eviction and session notification are keyed by.
-    fn captures_for(&self, ifindexes: &[u32]) -> Vec<CaptureKey> {
-        ifindexes
-            .iter()
-            .flat_map(|ifindex| self.table.captures_at_ifindex(*ifindex))
-            .collect()
     }
 
     /// Broadcast [`PacketHandler::on_iface_change`] to every registered handler for the interfaces
@@ -1002,105 +709,20 @@ impl PacketDispatcher {
         }
     }
 
-    /// Detect and repair interfaces whose kernel identity moved out from under the table: the
-    /// recreation recovery. Each stale entry is re-pointed at its name's current interface (or
-    /// parked absent), its captures re-bound in place behind their stable keys, and its DIAL
-    /// proxies evicted -- their mint-time snapshots (listener binds, target address, egress
-    /// pin) died with the old interface, whatever the new one's values. Re-arms the next pass:
-    /// the [`RECONCILE_TICK`] floor when healthy, [`RECONCILE_RETRY`] while an interface is
-    /// absent or a rebuild step failed (the probe keeps re-flagging a half-rebuilt entry).
+    /// Run the recreation reconcile, then evict the DIAL proxies and drop the search sessions on
+    /// every rebuilt interface's captures: their mint-time snapshots and reserved ports belonged
+    /// to the interface that was removed or recreated, whatever the new one resolves to.
     fn reconcile_interfaces(&mut self, reactor: &mut Reactor) {
-        let mut pending = false;
-        for stale in self.table.stale_interfaces() {
-            let name = self
-                .table
-                .interface_name(stale.key)
-                .expect("stale keys come from this table's own scan")
-                .to_owned();
-            let captures = self.table.captures_of(stale.key);
-            let mut failed = false;
-            match (stale.cached, stale.cur) {
-                (was, 0) => {
-                    log::info!(
-                        "interface {name} is gone (was ifindex {was}); parking until it returns"
-                    );
-                }
-                (0, now) => {
-                    log::info!("interface {name}: returned as ifindex {now}; re-binding");
-                }
-                (was, now) => {
-                    log::info!("interface {name}: recreated (ifindex {was} -> {now}); re-binding");
-                }
-            }
-            match self.table.rebind_interface(stale.key, stale.cur) {
-                // Both kinds are retried on every later address event, but only a deferral has a
-                // trigger that will resolve it, so only that one may promise a retry.
-                Ok(counts) => {
-                    if counts.failed > 0 {
-                        log::warn!(
-                            "{} group membership(s) on {name} did not re-join; that traffic is \
-                             not reflected until they do",
-                            counts.failed
-                        );
-                    }
-                    if counts.deferred > 0 {
-                        log::warn!(
-                            "{} group membership(s) on {name} not re-joined yet; retrying \
-                             on its next address event",
-                            counts.deferred
-                        );
-                    }
-                }
-                Err(e) => {
-                    log::warn!("re-resolving {name} failed: {e}; will retry");
-                    failed = true;
-                }
-            }
-            if stale.cur != 0 {
-                for capture in &captures {
-                    match self.table.rebind_capture(*capture) {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            log::warn!("capture {capture:?} missing during {name}'s rebuild");
-                        }
-                        Err(e) => {
-                            log::warn!("re-binding a capture on {name} failed: {e}; will retry");
-                            failed = true;
-                        }
-                    }
-                }
-            }
-            // The proxies' snapshots reference the dead interface regardless of what the
-            // replacement resolves to, so the eviction is keyed by capture, not by address
-            // deltas (and not through v4_moved, whose indexes predate the rebuild).
-            let reason = if stale.cur == 0 {
+        for rebuilt in self.lifecycle.reconcile(&mut self.table) {
+            let reason = if rebuilt.removed {
                 "after its interface was removed"
             } else {
                 "after its interface was recreated"
             };
             self.dial
-                .evict_on_interface_change(reactor, &captures, reason);
-            // Drop search sessions on the interface's captures: their reserved port and response
-            // registration belonged to the interface that was removed or recreated (even one that
-            // returned on the same index, which the reconcile reached via the attached() probe).
-            self.notify_iface_change(&captures, reactor);
-            if stale.cur != 0 && !failed {
-                for capture in &captures {
-                    self.table.record_recovery(*capture);
-                }
-                log::info!("interface {name}: recovery complete");
-            }
-            pending |= failed;
+                .evict_on_interface_change(reactor, &rebuilt.captures, reason);
+            self.notify_iface_change(&rebuilt.captures, reactor);
         }
-        // The fast cadence also covers parked interfaces (quiescent, so not in the stale list):
-        // their return must be picked up promptly even if every event for it is lost.
-        let retry = pending || self.table.any_absent();
-        self.next_reconcile = Instant::now()
-            + if retry {
-                RECONCILE_RETRY
-            } else {
-                RECONCILE_TICK
-            };
     }
 }
 
@@ -1129,7 +751,7 @@ impl Handler for PacketDispatcher {
             .filter_map(|(_, reg)| reg.handler.as_ref().and_then(|h| h.next_deadline()))
             .chain(self.dial.next_grace()) // and the soonest DIAL proxy grace, for its eviction sweep
             .chain(self.report.as_ref().map(|r| r.next)) // and the next counter summary, if enabled
-            .chain(Some(self.next_reconcile)) // and the interface reconcile tick
+            .chain(Some(self.lifecycle.next_reconcile())) // and the interface reconcile tick
             .min()
     }
 
@@ -1176,7 +798,7 @@ impl Handler for PacketDispatcher {
 
         // The interface reconcile tick (it re-arms itself): the detection floor for
         // recreations whose events were lost, and the retry driver while one is mid-recovery.
-        if now >= self.next_reconcile {
+        if now >= self.lifecycle.next_reconcile() {
             self.reconcile_interfaces(reactor);
         }
     }
@@ -1198,20 +820,6 @@ fn is_own_echo(src_mac: Option<MacAddr>, own_mac: Option<MacAddr>) -> bool {
         (Some(src), Some(own)) => src == own && !own.is_unspecified(),
         _ => false,
     }
-}
-
-/// Re-word an `EMSGSIZE` send failure to name the frame, the interface, and its MTU (as of the
-/// interface's last resolution); the bare "Message too long" names none of them. Any other error
-/// passes through.
-fn oversize_context(e: io::Error, if_name: &str, frame_len: usize, mtu: Option<u32>) -> io::Error {
-    if e.raw_os_error() != Some(libc::EMSGSIZE) {
-        return e;
-    }
-    let mtu = mtu.map_or_else(String::new, |mtu| format!(" (MTU {mtu})"));
-    io::Error::new(
-        e.kind(),
-        format!("a frame of {frame_len} bytes exceeds what {if_name}{mtu} can carry"),
-    )
 }
 
 #[cfg(test)]

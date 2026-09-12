@@ -1,3 +1,4 @@
+use super::lifecycle::RECONCILE_RETRY;
 use super::*;
 use crate::interface::LOOPBACK_IFACE;
 use crate::test_support::{loopback_lock, open_or_skip};
@@ -10,6 +11,11 @@ impl PacketDispatcher {
     /// The number of live routing registrations, a seam for the SSDP session lifecycle tests.
     pub(crate) fn registration_count(&self) -> usize {
         self.registrations.iter().count()
+    }
+
+    /// Inject a raw frame on `egress`, skipping the frame build.
+    fn send(&self, egress: CaptureKey, frame: &[u8]) -> io::Result<()> {
+        super::egress::send(&self.table, egress, frame)
     }
 }
 
@@ -33,7 +39,7 @@ fn reconcile_repairs_a_moved_identity_and_arms_the_slow_tick() -> io::Result<()>
         "the moved identity is repaired"
     );
     assert!(
-        dispatcher.next_reconcile > Instant::now() + RECONCILE_RETRY,
+        dispatcher.lifecycle.next_reconcile() > Instant::now() + RECONCILE_RETRY,
         "a healthy table re-arms the slow tick, not the retry"
     );
     Ok(())
@@ -57,7 +63,7 @@ fn reconcile_parks_a_vanished_interface_and_keeps_the_fast_retry() -> io::Result
     );
     assert!(dispatcher.table.any_absent());
     assert!(
-        dispatcher.next_reconcile <= Instant::now() + RECONCILE_RETRY,
+        dispatcher.lifecycle.next_reconcile() <= Instant::now() + RECONCILE_RETRY,
         "an absent interface keeps the fast retry cadence"
     );
     // The interface "returns" (the name resolves again): the next pass rebuilds it.
@@ -68,7 +74,7 @@ fn reconcile_parks_a_vanished_interface_and_keeps_the_fast_retry() -> io::Result
         "the returned interface is re-pointed"
     );
     assert!(
-        dispatcher.next_reconcile > Instant::now() + RECONCILE_RETRY,
+        dispatcher.lifecycle.next_reconcile() > Instant::now() + RECONCILE_RETRY,
         "recovery re-arms the slow tick"
     );
     Ok(())
@@ -529,8 +535,7 @@ fn group_sends_fan_out_to_the_peers_of_a_raw_ip_link() -> io::Result<()> {
     let group: SocketAddr = "239.255.90.90:9003".parse().unwrap();
     let source: SocketAddr = "192.0.2.7:40001".parse().unwrap();
     // Two handlers relaying one routed packet: the second fan-out duplicates the first.
-    dispatcher.packet = 1;
-    dispatcher.routing = true;
+    dispatcher.egress.begin_packet();
     for _ in 0..2 {
         dispatcher.send_udp_to_peers(
             egress,
@@ -568,8 +573,7 @@ fn overlapping_peer_lists_deliver_to_each_peer_once() -> io::Result<()> {
     let (x, y, z) = (peer(2), peer(3), peer(4));
     let group: SocketAddr = "239.255.90.90:9003".parse().unwrap();
     let source: SocketAddr = "192.0.2.7:40001".parse().unwrap();
-    dispatcher.packet = 1;
-    dispatcher.routing = true;
+    dispatcher.egress.begin_packet();
     for list in [[x, y], [y, z]] {
         dispatcher.send_udp_to_peers(
             egress,
@@ -603,8 +607,7 @@ fn peers_whose_frames_share_a_checksum_each_get_a_copy() -> io::Result<()> {
     let peers: [IpAddr; 2] = ["10.0.1.2".parse().unwrap(), "10.1.1.1".parse().unwrap()];
     let group: SocketAddr = "239.255.90.90:9003".parse().unwrap();
     let source: SocketAddr = "192.0.2.7:40001".parse().unwrap();
-    dispatcher.packet = 1;
-    dispatcher.routing = true;
+    dispatcher.egress.begin_packet();
     dispatcher.send_udp_to_peers(
         egress,
         &peers,
@@ -1029,7 +1032,7 @@ fn counter_report_fires_on_its_interval() -> io::Result<()> {
     let now = Instant::now();
     assert_eq!(
         dispatcher.next_deadline(),
-        Some(dispatcher.next_reconcile),
+        Some(dispatcher.lifecycle.next_reconcile()),
         "until enabled, the only standing deadline is the reconcile tick"
     );
 
@@ -1491,33 +1494,4 @@ fn join_group_ignores_an_unknown_capture() {
     let mut dispatcher = PacketDispatcher::new();
     let group = IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251));
     assert!(dispatcher.join_group(CaptureKey(9999), group).is_ok());
-}
-
-#[test]
-fn oversize_context_rewords_only_emsgsize() {
-    // The reworded message is the feature: it must name the frame length, the interface, and
-    // the MTU when known.
-    let e = oversize_context(
-        io::Error::from_raw_os_error(libc::EMSGSIZE),
-        "vxlan0",
-        1500,
-        Some(1370),
-    );
-    let text = e.to_string();
-    assert!(
-        text.contains("1500") && text.contains("vxlan0") && text.contains("1370"),
-        "{text}"
-    );
-    // The custom message costs the errno representation (std's `io::Error` carries one or the
-    // other, never both). Deliberate: nothing matches on EMSGSIZE downstream, and the message
-    // is the only surface an operator sees.
-    assert_eq!(e.raw_os_error(), None);
-    // Any other error passes through untouched: its message is the plain strerror text, and
-    // it keeps its errno (rewording builds a custom error, whose `raw_os_error` is `None`).
-    let other = oversize_context(io::Error::from_raw_os_error(libc::ENETDOWN), "x0", 9, None);
-    assert_eq!(
-        other.to_string(),
-        io::Error::from_raw_os_error(libc::ENETDOWN).to_string()
-    );
-    assert_eq!(other.raw_os_error(), Some(libc::ENETDOWN));
 }
