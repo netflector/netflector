@@ -20,6 +20,7 @@ mod reflector;
 mod sys;
 #[cfg(test)]
 mod test_support;
+mod unique_list;
 
 pub use self::error::{Error, Result};
 pub use self::logging::init as init_logging;

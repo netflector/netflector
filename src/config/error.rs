@@ -6,14 +6,16 @@
 
 use std::fmt;
 use std::net::IpAddr;
+use std::num::NonZeroU16;
 
 use thiserror::Error;
 
 use super::value::{
-    GroupListError, InterfaceName, ParseAddressFamilyError, ParseInterfaceNameError,
-    ParseLogLevelError, ParseReflectorNameError, PeerListError, PortListError, ReflectorName,
+    InterfaceName, ParseAddressFamilyError, ParseInterfaceNameError, ParseLogLevelError,
+    ParseReflectorNameError, ReflectorName,
 };
-use crate::net::mac::MacSetError;
+use crate::net::mac::MacAddr;
+use crate::unique_list::ListError;
 
 /// Everything that can make a configuration invalid.
 ///
@@ -213,18 +215,16 @@ pub(crate) enum ParseValueError {
     AddressFamily(#[from] ParseAddressFamilyError),
     /// `MACS`.
     #[error(transparent)]
-    Macs(#[from] MacSetError),
+    Macs(#[from] ListError<MacAddr>),
     /// `SOURCE_IF`/`TARGET_IF`.
     #[error(transparent)]
     Interface(#[from] ParseInterfaceNameError),
     /// `WOL_PORTS` / `UDP_PORTS`.
     #[error(transparent)]
-    PortList(#[from] PortListError),
-    /// `UDP_GROUPS`.
+    Ports(#[from] ListError<NonZeroU16>),
+    /// `UDP_GROUPS`, `SOURCE_PEERS` / `TARGET_PEERS`.
     #[error(transparent)]
-    GroupList(#[from] GroupListError),
-    #[error(transparent)]
-    PeerList(#[from] PeerListError),
+    Addresses(#[from] ListError<IpAddr>),
     /// `NAME`.
     #[error(transparent)]
     ReflectorName(#[from] ParseReflectorNameError),
