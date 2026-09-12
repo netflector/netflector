@@ -1,5 +1,4 @@
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::*;
 #[cfg(target_os = "linux")]
@@ -7,7 +6,7 @@ use crate::capture::Capture;
 #[cfg(target_os = "linux")]
 use crate::net::LinkType;
 use crate::reflector::NoRewrite;
-use crate::test_support::{ReplaceRewrite, loopback_lock, open_loopback_or_skip};
+use crate::test_support::{loopback_lock, open_loopback_or_skip};
 
 const TEST_TTL: u8 = 2;
 
@@ -56,16 +55,17 @@ fn push_session(
     let response_key = dispatcher.register(
         target,
         Filter::default(),
-        Box::new(ResponseReflector {
-            searcher,
-            searcher_mac: MacAddr::from([0; 6]),
-            egress: source,
-            name: "TEST",
-            message_type: MessageType::SsdpResponse,
-            ttl: TEST_TTL,
-            reply: Box::new(NoRewrite),
-            suppress: |_| false,
-        }),
+        Box::new(SimpleReflector::new(
+            source,
+            Delivery::Unicast {
+                to: searcher,
+                mac: MacAddr::from([0; 6]),
+            },
+            "TEST",
+            "response",
+            always_reflect,
+            Emit::reply(TEST_TTL),
+        )),
     );
     reflector.sessions.insert(
         SessionKey { searcher, dest },
@@ -365,85 +365,6 @@ fn make_session_drops_at_the_session_cap() {
         outcome,
         Err(Outcome::Dropped(MessageType::SsdpSearch))
     ));
-}
-
-/// A reply for a `ResponseReflector` with the given transform and suppression check, plus the
-/// dispatcher/reactor it runs against, over a real loopback egress (`None` = skip, no
-/// `CAP_NET_RAW`).
-fn reply_over_loopback(
-    reply: Box<dyn ReplyRewrite>,
-    suppress: fn(&[u8]) -> bool,
-) -> Option<(ResponseReflector, PacketDispatcher, Reactor)> {
-    let cap = open_loopback_or_skip()?;
-    let mut dispatcher = PacketDispatcher::new();
-    let egress = dispatcher
-        .add_capture(cap)
-        .expect("add the loopback capture");
-    let reactor = Reactor::new().expect("reactor");
-    let reflector = ResponseReflector {
-        searcher: "127.0.0.1:4000".parse().unwrap(),
-        searcher_mac: MacAddr::from([0x02, 0, 0, 0, 0, 1]),
-        egress,
-        name: "TEST",
-        message_type: MessageType::SsdpResponse,
-        ttl: TEST_TTL,
-        reply,
-        suppress,
-    };
-    Some((reflector, dispatcher, reactor))
-}
-
-fn reply_packet() -> Packet<'static> {
-    Packet {
-        source: "127.0.0.1:1900".parse().unwrap(),
-        dest: "127.0.0.1:4000".parse().unwrap(),
-        ttl: TEST_TTL,
-        dst_mac: None,
-        src_mac: None,
-        payload: b"HTTP/1.1 200 OK\r\n\r\n",
-    }
-}
-
-#[test]
-#[cfg_attr(miri, ignore = "needs a real capture device")]
-fn suppression_drops_an_untouched_reply() {
-    let _serial = loopback_lock();
-    // The Dropped outcome proves the early return: a completed loopback send would be Reflected.
-    let Some((mut reflector, mut dispatcher, mut reactor)) =
-        reply_over_loopback(Box::new(NoRewrite), |_| true)
-    else {
-        return;
-    };
-    assert_eq!(
-        reflector.on_packet(&reply_packet(), &mut dispatcher, &mut reactor),
-        Outcome::Dropped(MessageType::SsdpResponse)
-    );
-}
-
-#[test]
-#[cfg_attr(miri, ignore = "needs a real capture device")]
-fn a_rewritten_reply_is_exempt_from_suppression() {
-    // The rewrite spliced in our own egress-side listener, reachable from that link whatever
-    // its address class, so the gate must not even be consulted. The tracking fn (would-be
-    // suppressing) proves it: a fn pointer can't capture, hence the static.
-    static SUPPRESS_CONSULTED: AtomicBool = AtomicBool::new(false);
-    fn tracking_suppress(_: &[u8]) -> bool {
-        SUPPRESS_CONSULTED.store(true, Ordering::Relaxed);
-        true
-    }
-    let _serial = loopback_lock();
-    let Some((mut reflector, mut dispatcher, mut reactor)) =
-        reply_over_loopback(Box::new(ReplaceRewrite), tracking_suppress)
-    else {
-        return;
-    };
-    let outcome = reflector.on_packet(&reply_packet(), &mut dispatcher, &mut reactor);
-    assert!(
-        !SUPPRESS_CONSULTED.load(Ordering::Relaxed),
-        "the gate ran on a rewritten reply"
-    );
-    // And the exempt reply completed the reflect: it was sent, not merely spared the gate.
-    assert_eq!(outcome, Outcome::Reflected(MessageType::SsdpResponse));
 }
 
 // A search off a link without MACs (a tunnel) carries no source MAC; the reply needs none

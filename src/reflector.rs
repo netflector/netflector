@@ -29,7 +29,7 @@ use crate::interface::InterfaceAddresses;
 use crate::linear_map::LinearMap;
 use crate::logging::WARN_WINDOW;
 use crate::net::LinkType;
-use crate::net::mac::MacSet;
+use crate::net::mac::{MacAddr, MacSet};
 use crate::reactor::Reactor;
 
 /// A reflector's verdict on a captured payload, from its protocol's classifier. `Reflect`/`Skip` carry
@@ -51,12 +51,14 @@ pub(crate) enum Verdict {
     Junk,
 }
 
-/// Where a leg's group and broadcast re-emits go: onto the link, or, behind a link without a
-/// broadcast domain, to each of the entry's peers as unicast.
+/// Where a leg's re-emits go: group and broadcast ones onto the link, or, behind a link without a
+/// broadcast domain, to each of the entry's peers as unicast; a reply leg's to the one searcher
+/// that asked, at its captured frame MAC (no ARP/ND).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Delivery {
     Link,
     Peers(Box<[IpAddr]>),
+    Unicast { to: SocketAddr, mac: MacAddr },
 }
 
 impl Delivery {
@@ -68,8 +70,9 @@ impl Delivery {
         }
     }
 
-    /// The address a datagram to `dst` reaches under this delivery: `dst` on the link, or the
-    /// first peer of its family. A reply to it must be listened for on a source of that scope.
+    /// The address a datagram to `dst` reaches under this delivery: `dst` on the link, the first
+    /// peer of its family, or the fixed unicast target. A reply to it must be listened for on a
+    /// source of that scope.
     pub(crate) fn destination(&self, dst: IpAddr) -> IpAddr {
         match self {
             Self::Link => dst,
@@ -78,15 +81,17 @@ impl Delivery {
                 .copied()
                 .find(|peer| peer.is_ipv4() == dst.is_ipv4())
                 .unwrap_or(dst),
+            Self::Unicast { to, .. } => to.ip(),
         }
     }
 
-    /// Send a group or broadcast datagram on `egress` where the delivery says.
+    /// Send a datagram to `dst` on `egress` where the delivery says; a fixed unicast delivery
+    /// ignores `dst`.
     ///
     /// # Errors
-    /// As the dispatcher's [`send_udp_group`](PacketDispatcher::send_udp_group) and
-    /// [`send_udp_to_peers`](PacketDispatcher::send_udp_to_peers): for peers, only when no copy
-    /// went out.
+    /// As the dispatcher's [`send_udp_group`](PacketDispatcher::send_udp_group),
+    /// [`send_udp_to_peers`](PacketDispatcher::send_udp_to_peers) (only when no copy went out)
+    /// and [`send_udp`](PacketDispatcher::send_udp).
     pub(crate) fn send(
         &self,
         dispatcher: &mut PacketDispatcher,
@@ -100,6 +105,9 @@ impl Delivery {
             Self::Link => dispatcher.send_udp_group(egress, dst, source, ttl, payload),
             Self::Peers(peers) => {
                 dispatcher.send_udp_to_peers(egress, peers, dst, source, ttl, payload)
+            }
+            Self::Unicast { to, mac } => {
+                dispatcher.send_udp(egress, *to, *mac, source, ttl, payload)
             }
         }
     }

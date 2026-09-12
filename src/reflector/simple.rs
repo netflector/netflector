@@ -6,8 +6,9 @@
 //! advertisement direction rewrites the DIAL `LOCATION`). What differs per protocol enters as
 //! parameters: the [`Classify`] gate and the [`Emit`] policy (which source and TTL the re-emit
 //! carries, and where a unicast one goes). The destination otherwise follows from the captured one
-//! ([`link_destination`]). The search directions are stateful (per-searcher sessions), so they use
-//! the shared `SearchReflector` instead.
+//! ([`link_destination`]), except under a fixed unicast [`Delivery`], the reply leg of a search
+//! session, which goes to the one searcher that asked. The search directions themselves are stateful
+//! (per-searcher sessions), so they use the shared `SearchReflector` instead.
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -127,6 +128,16 @@ impl Emit {
         }
     }
 
+    /// From the egress's address at the captured source port, at `ttl`: a search reply relayed
+    /// back to its searcher from the responding device's own port.
+    pub(crate) const fn reply(ttl: u8) -> Self {
+        Self {
+            source: Source::Egress(SourcePort::Captured),
+            ttl: Ttl::Fixed(ttl),
+            unicast: UnicastTo::Nowhere,
+        }
+    }
+
     /// From the captured sender's own ip:port, at the captured TTL: the transparent UDP relay.
     pub(crate) const fn captured() -> Self {
         Self {
@@ -207,6 +218,19 @@ impl<C: Classify> SimpleReflector<C> {
         self.suppress = suppress;
         self
     }
+
+    fn destination(&self, packet: &Packet, dispatcher: &PacketDispatcher) -> Option<SocketAddr> {
+        match &self.delivery {
+            Delivery::Unicast { to, .. } => Some(*to),
+            Delivery::Link | Delivery::Peers(_) => link_destination(
+                packet.dest,
+                dispatcher
+                    .egress_addrs(self.egress)
+                    .and_then(InterfaceAddresses::v4_directed_broadcast),
+                self.emit.unicast,
+            ),
+        }
+    }
 }
 
 impl<C: Classify> PacketHandler for SimpleReflector<C> {
@@ -232,13 +256,7 @@ impl<C: Classify> PacketHandler for SimpleReflector<C> {
             }
         };
 
-        let Some(dest) = link_destination(
-            packet.dest,
-            dispatcher
-                .egress_addrs(self.egress)
-                .and_then(InterfaceAddresses::v4_directed_broadcast),
-            self.emit.unicast,
-        ) else {
+        let Some(dest) = self.destination(packet, dispatcher) else {
             log::debug!(
                 "{}: dropping {} to {} from {}: not for this leg",
                 self.name,
@@ -509,6 +527,35 @@ mod tests {
             by_length.classify(&group_packet()),
             Verdict::Reflect(MessageType::MdnsQuery)
         );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "needs a real capture device")]
+    fn a_fixed_unicast_delivery_ignores_the_captured_destination() {
+        let _serial = loopback_lock();
+        let Some(cap) = open_loopback_or_skip() else {
+            return;
+        };
+        let mut dispatcher = PacketDispatcher::new();
+        let egress = dispatcher
+            .add_capture(cap)
+            .expect("add the loopback capture");
+        let mut reactor = Reactor::new().expect("reactor");
+        let mut reflector = SimpleReflector::new(
+            egress,
+            Delivery::Unicast {
+                to: "127.0.0.1:4000".parse().unwrap(),
+                mac: crate::net::mac::MacAddr::from([0x02, 0, 0, 0, 0, 1]),
+            },
+            "TEST",
+            "response",
+            reflect_all as fn(&[u8]) -> Verdict,
+            Emit::reply(2),
+        );
+        // A unicast captured destination is dropped under the link deliveries; the fixed
+        // delivery relays regardless of it.
+        let outcome = reflector.on_packet(&packet_to("127.0.0.1:9"), &mut dispatcher, &mut reactor);
+        assert_eq!(outcome, Outcome::Reflected(MessageType::MdnsResponse));
     }
 
     #[test]
