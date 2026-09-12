@@ -4,7 +4,8 @@
 //! searcher's *unicast* reply (SSDP `200 OK`, WSD `ProbeMatches` / `ResolveMatches`) is routed back
 //! through a per-searcher session: a reserved ephemeral port on the target with a dedicated response
 //! registration, so a reply reaches only the searcher that asked. [`SearchReflector`] owns the sessions and
-//! reflects searches; a per-session [`ResponseReflector`] routes each reply back.
+//! reflects searches; a per-session [`SimpleReflector`] under a fixed unicast [`Delivery`] routes each
+//! reply back.
 //!
 //! Protocol specifics enter as parameters: the [`Verdict`] classifier (is this payload a search?), the
 //! session-window policy, the re-emit TTL, and a [`ReplyRewrite`] factory. SSDP injects its DIAL
@@ -25,7 +26,7 @@ use crate::net::packet::Packet;
 use crate::net::port_reservation::PortReservation;
 use crate::reactor::Reactor;
 
-use super::{Delivery, ReplyRewrite, Verdict, WARN_WINDOW, egress_sources};
+use super::{Delivery, Emit, ReplyRewrite, SimpleReflector, Verdict, WARN_WINDOW};
 
 /// In-flight session cap, so a burst of searchers can't exhaust ephemeral ports or registrations. At
 /// the cap a new search is dropped (no live session is evicted early).
@@ -52,98 +53,11 @@ struct Session {
     response_key: RegistrationKey,
 }
 
-/// One search session's reply path: a standalone leaf that re-emits each unicast reply (captured at
-/// the session's reserved port on the target) onto `egress` (the source), back to the single
-/// `searcher` that searched. It carries everything a reply needs, so no session lookup is required: the
-/// reply goes to the searcher's captured frame MAC (no ARP/ND) and is sourced from the responding
-/// device's own reply port. [`SearchReflector`] creates one per session and drops it on expiry.
-struct ResponseReflector {
-    searcher: SocketAddr,
-    searcher_mac: MacAddr,
-    egress: CaptureKey,
-    /// Protocol label for logs, e.g. `"SSDP"`.
-    name: &'static str,
-    /// This reply leg's message type, for the counters (e.g. [`MessageType::SsdpResponse`]).
-    message_type: MessageType,
-    ttl: u8,
-    reply: Box<dyn ReplyRewrite>,
-    /// The unreachable-advertisement suppression check for untouched replies (see
-    /// [`SearchReflector::suppress`]).
-    suppress: fn(&[u8]) -> bool,
-}
-
-impl PacketHandler for ResponseReflector {
-    fn on_packet(
-        &mut self,
-        packet: &Packet,
-        dispatcher: &mut PacketDispatcher,
-        reactor: &mut Reactor,
-    ) -> Outcome {
-        // The dispatcher's filter already pinned this capture to the reserved port, so every packet
-        // here is a unicast reply for this searcher; nothing to classify. A family the source can't
-        // currently send is a transient drop (address loss), returned as Stalled rather than a failure.
-        if !egress_sources(dispatcher, self.egress, self.searcher) {
-            log::debug!(
-                "{}: egress has no source for searcher {} yet; dropping response from {}",
-                self.name,
-                self.searcher,
-                packet.source
-            );
-            return Outcome::Stalled(self.message_type);
-        }
-        let rewritten = self
-            .reply
-            .rewrite(packet.payload, self.egress, dispatcher, reactor);
-        // A rewritten reply is exempt; the why lives at `SimpleReflector::on_packet`'s gate.
-        if rewritten.is_none() && (self.suppress)(packet.payload) {
-            log::debug!(
-                "{}: suppressing response from {} to searcher {}: advertises only unreachable \
-                 addresses",
-                self.name,
-                packet.source,
-                self.searcher
-            );
-            return Outcome::Dropped(self.message_type);
-        }
-        let payload = rewritten.unwrap_or(packet.payload);
-        match dispatcher.send_udp(
-            self.egress,
-            self.searcher,
-            self.searcher_mac,
-            DatagramSource::Egress {
-                port: packet.source.port(),
-            },
-            self.ttl,
-            payload,
-        ) {
-            Ok(()) => {
-                log::debug!(
-                    "reflected {} response from {} to searcher {}",
-                    self.name,
-                    packet.source,
-                    self.searcher
-                );
-                Outcome::Reflected(self.message_type)
-            }
-            Err(e) => {
-                log_rate!(
-                    log::Level::Warn,
-                    WARN_WINDOW,
-                    "{}: cannot reflect response to searcher {}: {e}",
-                    self.name,
-                    self.searcher
-                );
-                Outcome::Dropped(self.message_type)
-            }
-        }
-    }
-}
-
 /// Reflects searches source → target and routes each unicast reply back to its searcher. Registered
 /// per group on the source and owns the sessions for searches to that group. On a search it dedups
 /// against live sessions (a retransmit refreshes the window and re-reflects from the same reserved
 /// port), else opens a session (reserve an ephemeral port on the target, register a
-/// [`ResponseReflector`] for its replies) and reflects the search from that port. The deadline timer
+/// reply reflector for its replies) and reflects the search from that port. The deadline timer
 /// sweeps expired sessions.
 ///
 /// Protocol-specific behaviour is injected: `classify` gates the ingress ([`Verdict::Reflect`] = a
@@ -160,7 +74,7 @@ pub(crate) struct SearchReflector {
     device_macs: Option<MacSet>,
     /// Protocol label for logs, e.g. `"SSDP"`.
     name: &'static str,
-    /// The reply leg's message type, handed to each session's [`ResponseReflector`] for the counters.
+    /// The reply leg's message type, for the counters.
     response_type: MessageType,
     /// The TTL each reflected search and reply is re-emitted at.
     ttl: u8,
@@ -170,8 +84,8 @@ pub(crate) struct SearchReflector {
     window: fn(&[u8]) -> Duration,
     /// Mints a fresh reply transform per session (its own scratch, for a rewriting protocol).
     make_reply: Box<dyn Fn() -> Box<dyn ReplyRewrite>>,
-    /// The protocol's `advertises_only_unreachable` check, handed to each session's
-    /// [`ResponseReflector`]: an untouched reply it flags is dropped rather than reflected.
+    /// The protocol's `advertises_only_unreachable` check for each session's replies: an untouched
+    /// reply it flags is dropped rather than reflected.
     suppress: fn(&[u8]) -> bool,
     sessions: LinearMap<SessionKey, Session>,
 }
@@ -266,6 +180,9 @@ impl SearchReflector {
             packet.source
         );
         // Register before the reflect so a fast responder's reply is captured, not ICMP-rejected.
+        // The filter pins the reserved port, so every packet the reply leg sees is a reply: it
+        // admits them all, sourced from the responding device's own port.
+        let response_type = self.response_type;
         let response_key = dispatcher.register(
             self.target,
             Filter {
@@ -274,16 +191,21 @@ impl SearchReflector {
                 src_mac: self.device_macs.clone(),
                 ..Filter::default()
             },
-            Box::new(ResponseReflector {
-                searcher: packet.source,
-                searcher_mac,
-                egress: self.source,
-                name: self.name,
-                message_type: self.response_type,
-                ttl: self.ttl,
-                reply: (self.make_reply)(),
-                suppress: self.suppress,
-            }),
+            Box::new(
+                SimpleReflector::new(
+                    self.source,
+                    Delivery::Unicast {
+                        to: packet.source,
+                        mac: searcher_mac,
+                    },
+                    self.name,
+                    "response",
+                    move |_: &[u8]| Verdict::Reflect(response_type),
+                    Emit::reply(self.ttl),
+                )
+                .with_rewrite((self.make_reply)())
+                .with_suppress(self.suppress),
+            ),
         );
         Ok(Session {
             expiry,
