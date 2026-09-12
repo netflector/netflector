@@ -1,7 +1,7 @@
 //! DIAL (Discovery and Launch) discovery detection and `LOCATION`-authority parsing: the SSDP-side
 //! inputs the DIAL proxy hook needs.
 
-use crate::net::http::{Authority, parse_authority, strip_prefix_ignore_ascii_case};
+use crate::net::http::{Authority, header_value, parse_authority};
 
 /// The DIAL service-type URN; the trailing `:1` version is dropped so any version matches.
 const DIAL_SERVICE_TYPE: &[u8] = b"urn:dial-multiscreen-org:service:dial";
@@ -32,11 +32,7 @@ pub(crate) fn parse_dial_location_authority(payload: &[u8]) -> Option<Authority>
 /// it is empty. Both the rewrite decision and the debug log that reports a rejection read this, so
 /// the log can't name a header the rewrite never looked at.
 pub(crate) fn dial_location_value(payload: &[u8]) -> Option<&[u8]> {
-    let url = payload
-        .split(|&b| b == b'\n')
-        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
-        .find_map(|line| strip_prefix_ignore_ascii_case(line, b"LOCATION:"))?
-        .trim_ascii_start();
+    let url = header_value(payload, b"LOCATION")?;
     (!url.is_empty()).then_some(url)
 }
 
@@ -45,13 +41,7 @@ pub(crate) fn dial_location_value(payload: &[u8]) -> Option<&[u8]> {
 /// case-insensitively among comma-separated directives. `None` (caller falls back to its default grace)
 /// if the header or a parseable `max-age` is absent.
 pub(crate) fn parse_cache_control_max_age(payload: &[u8]) -> Option<u32> {
-    for line in payload.split(|&b| b == b'\n') {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if let Some(value) = strip_prefix_ignore_ascii_case(line, b"CACHE-CONTROL:") {
-            return max_age_seconds(value);
-        }
-    }
-    None
+    max_age_seconds(header_value(payload, b"CACHE-CONTROL")?)
 }
 
 /// The `max-age` delta-seconds from a `CACHE-CONTROL` value, scanning its comma-separated directives.

@@ -4,7 +4,7 @@ pub(crate) mod dial;
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use crate::net::http::{strip_prefix_ignore_ascii_case, url_host_ip};
+use crate::net::http::{header_value, url_host_ip};
 
 use super::{is_link_local, is_never_a_peer};
 
@@ -70,28 +70,18 @@ const MX_MAX: u8 = 5;
 /// leading integer. The first `MX:` line is decisive. Returns `None` when MX is absent or its value
 /// isn't a number; the caller substitutes [`MSEARCH_MX_DEFAULT`] and logs the non-conformance.
 pub(crate) fn parse_msearch_mx(payload: &[u8]) -> Option<u8> {
-    for line in payload.split(|&b| b == b'\n') {
-        // Lines are CRLF-delimited; drop the trailing CR left by splitting on LF.
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        let Some(value) = strip_prefix_ignore_ascii_case(line, b"MX:") else {
-            continue;
-        };
-        // Skip leading spaces, then take the leading run of digits. A trailing non-digit doesn't
-        // void a valid leading number. Empty or out-of-`u32`-range reads as "present but unparseable".
-        let value = value.trim_ascii_start();
-        let end = value
-            .iter()
-            .position(|b| !b.is_ascii_digit())
-            .unwrap_or(value.len());
-        let mx = std::str::from_utf8(&value[..end])
-            .ok()?
-            .parse::<u32>()
-            .ok()?;
-        return Some(
-            u8::try_from(mx.clamp(u32::from(MX_MIN), u32::from(MX_MAX))).unwrap_or(MX_MAX),
-        );
-    }
-    None
+    let value = header_value(payload, b"MX")?;
+    // The leading run of digits: a trailing non-digit doesn't void a valid leading number. Empty or
+    // out-of-`u32`-range reads as "present but unparseable".
+    let end = value
+        .iter()
+        .position(|b| !b.is_ascii_digit())
+        .unwrap_or(value.len());
+    let mx = std::str::from_utf8(&value[..end])
+        .ok()?
+        .parse::<u32>()
+        .ok()?;
+    Some(u8::try_from(mx.clamp(u32::from(MX_MIN), u32::from(MX_MAX))).unwrap_or(MX_MAX))
 }
 
 #[cfg(test)]
