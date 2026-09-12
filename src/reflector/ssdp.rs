@@ -18,7 +18,7 @@ use crate::net::ssdp::{
     MSEARCH_MX_DEFAULT, SSDP_GROUP_V4, SSDP_GROUP_V6_LINK_LOCAL, SSDP_GROUP_V6_SITE_LOCAL,
     SSDP_PORT, SSDP_TTL, SsdpKind, advertises_only_unreachable, classify, parse_msearch_mx,
 };
-use crate::net::uninit_buf::UninitBuf;
+use crate::net::stream_buffer::StreamBuffer;
 use crate::reactor::Reactor;
 
 use super::dial::{ProxyPlacement, rewrite_location};
@@ -37,7 +37,7 @@ struct DialRewrite {
     /// Reused sink for the rewritten datagram; see the [`ReplyRewrite`] impl. Bounded by the
     /// payload that still frames within [`MAX_FRAME_LEN`](crate::net::MAX_FRAME_LEN), so a rewrite
     /// that fits is always sendable.
-    scratch: UninitBuf,
+    scratch: StreamBuffer,
 }
 
 impl DialRewrite {
@@ -45,7 +45,7 @@ impl DialRewrite {
     fn new(target: CaptureKey) -> Self {
         Self {
             target,
-            scratch: UninitBuf::with_capacity(MAX_UDP_PAYLOAD_LEN),
+            scratch: StreamBuffer::with_capacity(MAX_UDP_PAYLOAD_LEN),
         }
     }
 }
@@ -83,7 +83,7 @@ impl ReplyRewrite for DialRewrite {
         };
         self.scratch.clear();
         if rewrite_location(ctx, reactor, payload, placement, &mut self.scratch) {
-            Some(self.scratch.filled())
+            Some(self.scratch.pending())
         } else {
             None
         }

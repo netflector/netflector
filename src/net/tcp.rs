@@ -4,7 +4,6 @@
 //! confined to the target interface: see [`TcpSocket::connect`].
 
 use std::io;
-use std::mem::MaybeUninit;
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
@@ -124,22 +123,19 @@ impl TcpSocket {
         self.connecting
     }
 
-    /// Read into `buf`, which may be uninitialized. `recv` only ever writes the bytes it returns, so on
-    /// [`IoStatus::Ready(n)`](IoStatus) the first `n` bytes of `buf` are now initialized. `buf` must be
-    /// non-empty: a `recv` into a zero-length buffer also returns 0, aliasing the `Ready(0)` clean-EOF
-    /// signal (the `std::io::Read::read` caveat). The peer closing its write side is then the only
-    /// legitimate `Ready(0)`; the splice loop stops reading under backpressure rather than ever passing an
-    /// empty slice.
+    /// Read into `buf`: [`IoStatus::Ready(n)`](IoStatus) for `n` bytes, `Ready(0)` for the peer closing
+    /// its write side. `buf` must be non-empty: a `recv` into a zero-length buffer also returns 0,
+    /// aliasing that EOF signal; the splice loop stops reading under backpressure rather than ever
+    /// passing an empty slice.
     ///
     /// # Errors
     /// Propagates a real read error (other than `EAGAIN`/`EWOULDBLOCK`).
-    pub(crate) fn recv(&self, buf: &mut [MaybeUninit<u8>]) -> io::Result<IoStatus> {
+    pub(crate) fn recv(&self, buf: &mut [u8]) -> io::Result<IoStatus> {
         debug_assert!(
             !buf.is_empty(),
             "recv into an empty buffer returns 0, aliasing EOF"
         );
-        // SAFETY: `buf` is a valid writable region of `buf.len()` bytes; `recv` writes only the `n` it
-        // returns, leaving the rest untouched (still uninitialized).
+        // SAFETY: `buf` is a valid writable region of `buf.len()` bytes.
         let n = unsafe {
             libc::recv(
                 self.fd.as_raw_fd(),
@@ -378,22 +374,6 @@ mod tests {
 
     use super::*;
 
-    impl TcpSocket {
-        /// recv into an initialized `[u8]` buffer: a thin wrapper over
-        /// [`recv`](TcpSocket::recv) for tests reading into plain byte buffers.
-        pub(crate) fn recv_bytes(&self, buf: &mut [u8]) -> io::Result<IoStatus> {
-            // SAFETY: a `&mut [u8]` is a valid `&mut [MaybeUninit<u8>]` (an initialized byte is a valid
-            // `MaybeUninit`, same layout); `recv` only writes into it.
-            let buf = unsafe {
-                std::slice::from_raw_parts_mut(
-                    buf.as_mut_ptr().cast::<MaybeUninit<u8>>(),
-                    buf.len(),
-                )
-            };
-            self.recv(buf)
-        }
-    }
-
     /// Read back the `TCP_NODELAY` flag via `getsockopt`.
     fn nodelay(socket: &TcpSocket) -> bool {
         crate::sys::getsockopt_int(socket.as_raw_fd(), libc::IPPROTO_TCP, libc::TCP_NODELAY)
@@ -430,7 +410,7 @@ mod tests {
             IoStatus::Ready(4)
         ));
         let mut buf = [0u8; 16];
-        let n = spin(|| match server.recv_bytes(&mut buf)? {
+        let n = spin(|| match server.recv(&mut buf)? {
             IoStatus::Ready(0) => panic!("unexpected EOF before the payload"),
             IoStatus::Ready(n) => Ok(Some(n)),
             IoStatus::WouldBlock => Ok(None),
@@ -453,7 +433,7 @@ mod tests {
             .expect("send_vectored");
         assert!(matches!(sent, IoStatus::Ready(8)));
         let mut buf = [0u8; 16];
-        let n = spin(|| match server.recv_bytes(&mut buf)? {
+        let n = spin(|| match server.recv(&mut buf)? {
             IoStatus::Ready(0) => panic!("unexpected EOF before the payload"),
             IoStatus::Ready(n) => Ok(Some(n)),
             IoStatus::WouldBlock => Ok(None),
@@ -518,7 +498,7 @@ mod tests {
         // The client shuts down its write half: the server reads EOF.
         client.shutdown_write();
         let mut buf = [0u8; 16];
-        let eof = spin(|| match server.recv_bytes(&mut buf)? {
+        let eof = spin(|| match server.recv(&mut buf)? {
             IoStatus::Ready(n) => Ok(Some(n)),
             IoStatus::WouldBlock => Ok(None),
         });
@@ -532,7 +512,7 @@ mod tests {
             server.send(b"pong").expect("send"),
             IoStatus::Ready(4)
         ));
-        let n = spin(|| match client.recv_bytes(&mut buf)? {
+        let n = spin(|| match client.recv(&mut buf)? {
             IoStatus::Ready(0) => panic!("the client's read half closed unexpectedly"),
             IoStatus::Ready(n) => Ok(Some(n)),
             IoStatus::WouldBlock => Ok(None),

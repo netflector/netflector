@@ -124,10 +124,7 @@ impl DirectionContext<'_> {
                 return Forwarded::Failed;
             }
         };
-        // SAFETY: `recv` wrote `n` bytes into the `free_tail_mut` region above, initializing them.
-        unsafe {
-            self.flow.recv.commit(n);
-        }
+        self.flow.recv.commit(n);
         loop {
             let framed = match self.flow.framer.feed(self.flow.recv.pending()) {
                 Ok(framed) => framed,
