@@ -159,6 +159,12 @@ impl Capture {
         std::mem::take(&mut self.oversized)
     }
 
+    /// Whether a read error says the interface behind the socket is gone: the kernel parks
+    /// `ENETDOWN` on a packet socket whose interface was unregistered.
+    pub(crate) fn lost_interface(err: &io::Error) -> bool {
+        err.raw_os_error() == Some(libc::ENETDOWN)
+    }
+
     /// Inject a fully-built link-layer `frame` on this interface.
     ///
     /// # Errors
