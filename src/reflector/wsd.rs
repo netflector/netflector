@@ -16,8 +16,8 @@ use crate::net::wsd::{
 
 use super::{
     BuildError, Delivery, Emit, InterfaceMap, NoRewrite, ReplyRewrite, SearchReflector,
-    SimpleReflector, Verdict, require_bidirectional_families, require_group_join,
-    require_macs_matchable,
+    SimpleReflector, Verdict, directional_verdict, require_bidirectional_families,
+    require_group_join, require_macs_matchable,
 };
 
 /// WSD's classifier kind maps to its group message types. The `ProbeMatches`/`ResolveMatches` unicast
@@ -34,20 +34,12 @@ impl From<WsdKind> for MessageType {
 /// The directional gate for the announcement direction: reflect `Hello` / `Bye`, skip a search (it
 /// flows the other way), and treat anything else on the group as junk.
 fn announcement_verdict(payload: &[u8]) -> Verdict {
-    match classify(payload) {
-        Some(kind @ WsdKind::Announcement) => Verdict::Reflect(kind.into()),
-        Some(kind @ WsdKind::Search) => Verdict::Skip(kind.into()),
-        None => Verdict::Junk,
-    }
+    directional_verdict(classify(payload), WsdKind::Announcement)
 }
 
 /// The directional gate for the search direction: the mirror of [`announcement_verdict`].
 fn search_verdict(payload: &[u8]) -> Verdict {
-    match classify(payload) {
-        Some(kind @ WsdKind::Search) => Verdict::Reflect(kind.into()),
-        Some(kind @ WsdKind::Announcement) => Verdict::Skip(kind.into()),
-        None => Verdict::Junk,
-    }
+    directional_verdict(classify(payload), WsdKind::Search)
 }
 
 /// A `Probe` / `Resolve` carries no MX field, so the reply window is fixed: long enough for a

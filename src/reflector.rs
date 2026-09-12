@@ -215,6 +215,19 @@ pub(crate) enum BuildError {
     },
 }
 
+/// The verdict of a two-kind classifier for the leg that reflects `reflect`: a message of that kind
+/// is reflected, one of the other kind belongs to the other leg, and no kind is junk.
+fn directional_verdict<K: PartialEq + Copy + Into<MessageType>>(
+    kind: Option<K>,
+    reflect: K,
+) -> Verdict {
+    match kind {
+        Some(kind) if kind == reflect => Verdict::Reflect(kind.into()),
+        Some(kind) => Verdict::Skip(kind.into()),
+        None => Verdict::Junk,
+    }
+}
+
 /// Refuse a `macs` filter on a target whose link framing carries no MAC addresses:
 /// [`Filter`](crate::dispatch::Filter)'s MAC fields never match a `DLT_NULL` frame. `WoL` never
 /// calls this: it matches the MAC inside the magic packet's payload, not the frame's.
@@ -253,6 +266,27 @@ fn missing_required_family(family: AddressFamily, addrs: &InterfaceAddresses) ->
         Some(IpFamily::V6)
     } else {
         None
+    }
+}
+
+/// Enforce that `egress` can source every family `address_family` requires: the one-sided check
+/// of a protocol that re-emits on the target alone.
+///
+/// # Errors
+/// [`BuildError::RequiredFamilyUnavailable`] naming the interface and the family it can't send.
+fn require_egress_family(
+    dispatcher: &PacketDispatcher,
+    egress: CaptureKey,
+    egress_if: &str,
+    address_family: AddressFamily,
+) -> Result<(), BuildError> {
+    let addrs = dispatcher.egress_addrs(egress).copied().unwrap_or_default();
+    match missing_required_family(address_family, &addrs) {
+        Some(family) => Err(BuildError::RequiredFamilyUnavailable {
+            interface: egress_if.to_owned(),
+            family,
+        }),
+        None => Ok(()),
     }
 }
 

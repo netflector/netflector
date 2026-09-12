@@ -24,8 +24,8 @@ use crate::reactor::Reactor;
 use super::dial::{ProxyPlacement, rewrite_location};
 use super::{
     BuildError, Delivery, Emit, InterfaceMap, NoRewrite, ReplyRewrite, SearchReflector,
-    SimpleReflector, Verdict, require_bidirectional_families, require_group_join,
-    require_macs_matchable,
+    SimpleReflector, Verdict, directional_verdict, require_bidirectional_families,
+    require_group_join, require_macs_matchable,
 };
 
 /// What a DIAL-enabled SSDP reflector needs to rewrite a device's `LOCATION` to a source-side proxy: the
@@ -104,21 +104,13 @@ impl From<SsdpKind> for MessageType {
 /// The directional gate for the advertisement leg: a `NOTIFY` is an advertisement to reflect, an
 /// `M-SEARCH` belongs to the search direction, and anything else on the group is junk.
 fn advertisement_verdict(payload: &[u8]) -> Verdict {
-    match classify(payload) {
-        Some(kind @ SsdpKind::Advertisement) => Verdict::Reflect(kind.into()),
-        Some(kind @ SsdpKind::Search) => Verdict::Skip(kind.into()),
-        None => Verdict::Junk,
-    }
+    directional_verdict(classify(payload), SsdpKind::Advertisement)
 }
 
 /// The directional gate for the search leg: an `M-SEARCH` is a search to reflect, a `NOTIFY` belongs to
 /// the advertisement direction, and anything else on the group is junk.
 fn search_verdict(payload: &[u8]) -> Verdict {
-    match classify(payload) {
-        Some(kind @ SsdpKind::Search) => Verdict::Reflect(kind.into()),
-        Some(kind @ SsdpKind::Advertisement) => Verdict::Skip(kind.into()),
-        None => Verdict::Junk,
-    }
+    directional_verdict(classify(payload), SsdpKind::Search)
 }
 
 /// A session outlives the searcher's MX window by this grace, since a device's 200-OK may lag the

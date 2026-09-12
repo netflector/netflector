@@ -8,8 +8,6 @@
 //! limited broadcast or v6 all-nodes multicast), sourced from that interface's own address at the
 //! captured source port and TTL ([`Emit::captured_from_egress`]).
 
-use std::net::SocketAddr;
-
 use crate::config::{AddressFamily, Reflector};
 use crate::dispatch::{Filter, MessageType, PacketDispatcher, PortSet};
 use crate::net::mac::{MacAddr, MacSet};
@@ -17,7 +15,7 @@ use crate::net::packet::Packet;
 
 use super::{
     BuildError, Classify, Delivery, Emit, InterfaceMap, SimpleReflector, Verdict,
-    missing_required_family,
+    require_egress_family,
 };
 
 const PREFIX_LEN: usize = 6;
@@ -47,11 +45,7 @@ impl Classify for WakeClassifier {
             );
             return Verdict::Excluded;
         }
-        let handled = match packet.dest {
-            SocketAddr::V4(_) => self.family.uses_ipv4(),
-            SocketAddr::V6(_) => self.family.uses_ipv6(),
-        };
-        if !handled {
+        if !self.family.uses(packet.dest.ip()) {
             log::debug!(
                 "WoL: {} is not a handled address family; ignoring",
                 packet.source
@@ -104,13 +98,12 @@ pub(crate) fn build(
     let ingress = interfaces.require(reflector.source_if.as_str())?;
     let egress = interfaces.require(reflector.target_if.as_str())?;
 
-    let addrs = dispatcher.egress_addrs(egress).copied().unwrap_or_default();
-    if let Some(family) = missing_required_family(reflector.address_family, &addrs) {
-        return Err(BuildError::RequiredFamilyUnavailable {
-            interface: reflector.target_if.as_str().to_owned(),
-            family,
-        });
-    }
+    require_egress_family(
+        dispatcher,
+        egress,
+        reflector.target_if.as_str(),
+        reflector.address_family,
+    )?;
 
     // One handler spans every configured port via its filter. The re-emit uses the captured
     // destination port, so a single reflector serves them all.
