@@ -10,6 +10,7 @@ use std::num::NonZeroU16;
 
 use thiserror::Error;
 
+use super::conflict::Protocol;
 use super::value::{
     InterfaceName, ParseAddressFamilyError, ParseInterfaceNameError, ParseLogLevelError,
     ParseReflectorNameError, ReflectorName,
@@ -175,28 +176,6 @@ impl fmt::Display for RequiredField {
         f.write_str(match self {
             Self::SourceIf => "source_if",
             Self::TargetIf => "target_if",
-        })
-    }
-}
-
-/// A reflected discovery protocol, named in [`ConfigError::ConflictingReflectors`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Protocol {
-    Wol,
-    Mdns,
-    Ssdp,
-    Wsd,
-    Udp,
-}
-
-impl fmt::Display for Protocol {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Wol => "WoL",
-            Self::Mdns => "mDNS",
-            Self::Ssdp => "SSDP",
-            Self::Wsd => "WSD",
-            Self::Udp => "UDP relay",
         })
     }
 }

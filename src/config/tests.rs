@@ -1,3 +1,4 @@
+use super::conflict::Protocol;
 use super::*;
 
 fn from_toml(text: &str) -> Result<Config, ConfigError> {
