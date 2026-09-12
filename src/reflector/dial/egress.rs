@@ -26,17 +26,8 @@ pub(super) fn confine(fd: RawFd, _dst: SocketAddrV4, iface: Option<&str>) -> io:
                 "interface name too long",
             ));
         }
-        // SAFETY: `name` points at `name.len()` valid bytes; the kernel NUL-terminates its copy.
-        crate::sys::check(unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_BINDTODEVICE,
-                name.as_ptr().cast::<libc::c_void>(),
-                libc::socklen_t::try_from(name.len())
-                    .expect("interface name length fits socklen_t"),
-            )
-        })?;
+        // The kernel NUL-terminates its copy, so the name goes without one.
+        crate::sys::setsockopt_bytes(fd, libc::SOL_SOCKET, libc::SO_BINDTODEVICE, name.as_bytes())?;
     }
     #[cfg(target_os = "macos")]
     {
