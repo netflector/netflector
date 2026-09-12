@@ -27,9 +27,6 @@ pub(crate) struct Capture {
     buf: Box<[u8]>,
     link_type: LinkType,
     name: String,
-    /// Frames dropped for exceeding the receive buffer since the last
-    /// [`take_oversized`](Self::take_oversized) drain.
-    oversized: u64,
 }
 
 impl Capture {
@@ -52,7 +49,6 @@ impl Capture {
             buf: vec![0u8; crate::net::MAX_FRAME_LEN].into_boxed_slice(),
             link_type,
             name: if_name.into(),
-            oversized: 0,
         })
     }
 
@@ -140,7 +136,6 @@ impl Capture {
                 self.name,
                 self.buf.len()
             );
-            self.oversized += 1;
             return Ok(Some(Read::Oversized));
         }
         Ok(Some(Read::Frame(&self.buf[..bytes])))
@@ -151,12 +146,6 @@ impl Capture {
     #[allow(clippy::unused_self)] // uniform Capture API; the BPF backend reads self
     pub(crate) fn has_buffered(&self) -> bool {
         false
-    }
-
-    /// The oversized-frame drops since the last call, resetting the count: the dispatcher folds
-    /// them into the interface's counter row after each drain.
-    pub(crate) fn take_oversized(&mut self) -> u64 {
-        std::mem::take(&mut self.oversized)
     }
 
     /// Whether a read error says the interface behind the socket is gone: the kernel parks
@@ -537,7 +526,6 @@ mod tests {
                 None => panic!("did not capture the oversized datagram on lo"),
             }
         }
-        assert!(capture.take_oversized() >= 1);
         Ok(())
     }
 
