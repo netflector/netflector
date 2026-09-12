@@ -663,13 +663,11 @@ impl PacketDispatcher {
                 }
                 Ok(None) => break,
                 Err(e) => {
-                    // A dead capture's read error (Linux parks ENETDOWN on the unregistered
-                    // packet socket; a detached BPF descriptor reads ENXIO) is the expected
-                    // first sign of an interface destruction: pull the reconcile forward --
-                    // it must not run from here, mid-drain, with this capture taken out of
-                    // its slot. Other read errors are real failures and are left to the tick;
-                    // they say nothing about the interface.
-                    if matches!(e.raw_os_error(), Some(libc::ENETDOWN | libc::ENXIO)) {
+                    // The expected first sign of an interface destruction: pull the reconcile
+                    // forward. It must not run from here, mid-drain, with this capture taken
+                    // out of its slot. Other read errors say nothing about the interface and
+                    // are left to the tick.
+                    if Capture::lost_interface(&e) {
                         log::info!("fd {fd}: capture lost its interface ({e}); reconciling");
                         self.next_reconcile = Instant::now();
                     } else {
