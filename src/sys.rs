@@ -78,19 +78,48 @@ pub(crate) fn so_error(fd: RawFd) -> io::Result<c_int> {
     getsockopt_int(fd, libc::SOL_SOCKET, libc::SO_ERROR)
 }
 
+/// # Safety
+/// `value` must point at `len` readable bytes.
+unsafe fn setsockopt_raw(
+    fd: RawFd,
+    level: c_int,
+    name: c_int,
+    value: *const c_void,
+    len: socklen_t,
+) -> io::Result<()> {
+    // SAFETY: the caller's contract; the kernel only reads the bytes.
+    check(unsafe { libc::setsockopt(fd, level, name, value, len) })
+}
+
 /// # Errors
 /// The OS error if the option can't be set.
 pub(crate) fn setsockopt<T>(fd: RawFd, level: c_int, name: c_int, value: &T) -> io::Result<()> {
-    // SAFETY: `value` is a live `T` passed with its own size; the kernel only reads it.
-    check(unsafe {
-        libc::setsockopt(
+    // SAFETY: `value` is a live `T` passed with its own size.
+    unsafe {
+        setsockopt_raw(
             fd,
             level,
             name,
-            (&raw const *value).cast::<c_void>(),
+            (&raw const *value).cast(),
             socklen_of::<T>(),
         )
-    })
+    }
+}
+
+/// A byte-string option: `SO_BINDTODEVICE` takes an interface name.
+///
+/// # Errors
+/// The OS error if the option can't be set.
+#[cfg(target_os = "linux")]
+pub(crate) fn setsockopt_bytes(
+    fd: RawFd,
+    level: c_int,
+    name: c_int,
+    value: &[u8],
+) -> io::Result<()> {
+    let len = socklen_t::try_from(value.len()).expect("option length fits socklen_t");
+    // SAFETY: `value` is a live slice passed with its own length.
+    unsafe { setsockopt_raw(fd, level, name, value.as_ptr().cast(), len) }
 }
 
 /// # Errors

@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use crate::capture::{Capture, Read};
 use crate::interface::{Interface, InterfaceAddresses, Ipv6Scope, if_index};
 use crate::net::packet::Packet;
-use crate::sys::socklen_of;
+use crate::sys::setsockopt;
 #[cfg(target_os = "linux")]
 use crate::{
     libcex::{GroupReq, MCAST_JOIN_GROUP},
@@ -777,21 +777,7 @@ fn subscribe(fd: &OwnedFd, group: IpAddr, ifindex: u32) -> io::Result<()> {
     let mut request: GroupReq = unsafe { std::mem::zeroed() };
     request.gr_interface = ifindex;
     request.gr_group = sockaddr_for(group, 0, 0).0;
-    // SAFETY: `request` is a fully-initialised `group_req`, passed by address and size.
-    let rc = unsafe {
-        libc::setsockopt(
-            fd.as_raw_fd(),
-            level,
-            MCAST_JOIN_GROUP,
-            (&raw const request).cast::<libc::c_void>(),
-            socklen_of::<GroupReq>(),
-        )
-    };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+    setsockopt(fd.as_raw_fd(), level, MCAST_JOIN_GROUP, &request)
 }
 
 /// A raw socket observing every `protocol` packet the stack accepts, with a short read timeout
@@ -810,19 +796,12 @@ fn raw_observer(family: libc::c_int, protocol: libc::c_int) -> io::Result<OwnedF
         tv_sec: 0,
         tv_usec: 100_000,
     };
-    // SAFETY: `timeout` is a valid timeval, passed by address and size.
-    let rc = unsafe {
-        libc::setsockopt(
-            fd.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_RCVTIMEO,
-            (&raw const timeout).cast::<libc::c_void>(),
-            socklen_of::<libc::timeval>(),
-        )
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
+    setsockopt(
+        fd.as_raw_fd(),
+        libc::SOL_SOCKET,
+        libc::SO_RCVTIMEO,
+        &timeout,
+    )?;
     Ok(fd)
 }
 
