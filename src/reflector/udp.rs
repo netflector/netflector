@@ -7,7 +7,7 @@ use crate::config::Reflector;
 use crate::dispatch::{Filter, MessageType, PacketDispatcher, PortSet};
 
 use super::{
-    BuildError, Delivery, Emit, InterfaceMap, SimpleReflector, Verdict, missing_required_family,
+    BuildError, Delivery, Emit, InterfaceMap, SimpleReflector, Verdict, require_egress_family,
     require_group_join,
 };
 
@@ -35,13 +35,12 @@ pub(crate) fn build(
     let ingress = interfaces.require(reflector.source_if.as_str())?;
     let egress = interfaces.require(reflector.target_if.as_str())?;
 
-    let addrs = dispatcher.egress_addrs(egress).copied().unwrap_or_default();
-    if let Some(family) = missing_required_family(reflector.address_family, &addrs) {
-        return Err(BuildError::RequiredFamilyUnavailable {
-            interface: reflector.target_if.as_str().to_owned(),
-            family,
-        });
-    }
+    require_egress_family(
+        dispatcher,
+        egress,
+        reflector.target_if.as_str(),
+        reflector.address_family,
+    )?;
 
     let groups = udp.groups.as_deref().unwrap_or(&[]);
     for group in groups {

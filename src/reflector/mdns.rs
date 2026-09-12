@@ -22,7 +22,7 @@ use crate::net::mdns::{
 };
 
 use super::{
-    BuildError, Delivery, Emit, InterfaceMap, SimpleReflector, Verdict,
+    BuildError, Delivery, Emit, InterfaceMap, SimpleReflector, Verdict, directional_verdict,
     require_bidirectional_families, require_group_join, require_macs_matchable,
 };
 
@@ -40,20 +40,12 @@ impl From<MdnsKind> for MessageType {
 /// flow the other way), treat a too-short or non-DNS payload on the group as junk. The verdict
 /// carries the packet's message type (via [`From<MdnsKind>`]) for the counters.
 fn query_verdict(payload: &[u8]) -> Verdict {
-    match classify(payload) {
-        Some(kind @ MdnsKind::Query) => Verdict::Reflect(kind.into()),
-        Some(kind @ MdnsKind::Response) => Verdict::Skip(kind.into()),
-        None => Verdict::Junk,
-    }
+    directional_verdict(classify(payload), MdnsKind::Query)
 }
 
 /// The directional gate for the target → source reflector: the mirror of [`query_verdict`].
 fn response_verdict(payload: &[u8]) -> Verdict {
-    match classify(payload) {
-        Some(kind @ MdnsKind::Query) => Verdict::Skip(kind.into()),
-        Some(kind @ MdnsKind::Response) => Verdict::Reflect(kind.into()),
-        None => Verdict::Junk,
-    }
+    directional_verdict(classify(payload), MdnsKind::Response)
 }
 
 /// Build the mDNS reflector for `reflector` and register its directional handlers on `dispatcher`.
