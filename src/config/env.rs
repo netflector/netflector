@@ -120,7 +120,6 @@ impl PartialReflector {
 pub(super) fn parse_env(
     vars: impl IntoIterator<Item = (String, String)>,
 ) -> Result<RawConfig, ConfigError> {
-    let mut log_level = None;
     let mut debug_memory_interval_secs = None;
     let mut counters_interval_secs = None;
     let mut partials: BTreeMap<String, PartialReflector> = BTreeMap::new();
@@ -132,7 +131,9 @@ pub(super) fn parse_env(
         match rest {
             "LOG_LEVEL" => {
                 log::trace!("env {key} = {value}");
-                log_level = Some(env_value(&value, &key)?);
+                // Validated here so `--check-config` rejects a bad level; the value itself is
+                // read by `log_level_from_env` before the full parse.
+                env_value::<LogLevel>(&value, &key)?;
                 continue;
             }
             "DEBUG_MEMORY_INTERVAL_SECS" => {
@@ -172,7 +173,7 @@ pub(super) fn parse_env(
         reflectors.insert(name, raw);
     }
     Ok(RawConfig {
-        log_level,
+        _log_level: None,
         debug_memory_interval_secs,
         counters_interval_secs,
         reflectors,
@@ -281,7 +282,6 @@ mod tests {
             ("NETFLECTOR_TV_MDNS", "false"),
         ])
         .unwrap();
-        assert_eq!(cfg.log_level, LogLevel::Debug);
         assert_eq!(
             cfg.debug_memory_interval,
             Some(std::time::Duration::from_secs(30))
@@ -429,14 +429,25 @@ mod tests {
     fn env_overrides_file_globals() {
         let toml = r#"
             log_level = "info"
+            debug_memory_interval_secs = 10
             [reflectors.tv]
             source_if = "a"
             target_if = "b"
             mdns = true
         "#;
-        let cfg =
-            Config::from_sources(Some(toml), env(&[("NETFLECTOR_LOG_LEVEL", "error")])).unwrap();
-        assert_eq!(cfg.log_level, LogLevel::Error);
+        let vars = env(&[
+            ("NETFLECTOR_LOG_LEVEL", "error"),
+            ("NETFLECTOR_DEBUG_MEMORY_INTERVAL_SECS", "20"),
+        ]);
+        assert_eq!(
+            super::super::resolve_log_level(Some(toml), &vars).unwrap(),
+            LogLevel::Error
+        );
+        let cfg = Config::from_sources(Some(toml), vars).unwrap();
+        assert_eq!(
+            cfg.debug_memory_interval,
+            Some(std::time::Duration::from_secs(20))
+        );
     }
 
     #[test]
