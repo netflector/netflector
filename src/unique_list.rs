@@ -1,6 +1,5 @@
-//! A non-empty, duplicate-free list with a per-element admission rule: the shape of every
-//! configured list (ports, multicast groups, peers, MAC addresses). One comma-separated `FromStr`
-//! and one array `Deserialize` serve them all.
+//! A non-empty, duplicate-free list with a per-element admission rule, parsed from a
+//! comma-separated string or a TOML array.
 
 use std::fmt;
 use std::ops::Deref;
@@ -9,7 +8,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Deserializer};
 use thiserror::Error;
 
-/// What a list admits: the element noun for its error messages, and the per-element rule.
+/// The element type, the element noun for error messages, and the per-element rule.
 pub(crate) trait ListRule {
     type Item;
 
@@ -22,17 +21,15 @@ pub(crate) trait ListRule {
     }
 }
 
-/// Why a list was rejected. `noun` is the rule's element noun.
+/// Why a list was rejected.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub(crate) enum ListError<T: fmt::Display> {
     #[error("{noun} list must not be empty")]
     Empty { noun: &'static str },
     #[error("duplicate {noun} {item}")]
     Duplicate { noun: &'static str, item: T },
-    /// The rule refused an element, for the given reason.
     #[error("{item} {reason}")]
     Refused { item: T, reason: &'static str },
-    /// A comma-separated token did not parse as an element.
     #[error("invalid {noun} \"{token}\"")]
     Invalid { noun: &'static str, token: String },
 }

@@ -1,8 +1,6 @@
-//! Raw L2 packet capture: a per-interface handle the reactor can poll.
-//!
-//! One backend per platform behind a uniform `Capture`: BPF on macOS/FreeBSD,
-//! `AF_PACKET` on Linux. The handle owns a pollable fd, reads link-layer frames
-//! into a reused buffer (no per-frame allocation), and injects built frames.
+//! Raw L2 packet capture: a per-interface handle the reactor can poll. BPF on
+//! macOS/FreeBSD, `AF_PACKET` on Linux; frames are read into a reused buffer,
+//! no per-frame allocation.
 
 mod filter;
 
@@ -11,7 +9,6 @@ mod af_packet;
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 mod bpf;
 
-/// The platform `Capture` under one name, so consumers and tests need not name the backend.
 #[cfg(target_os = "linux")]
 pub(crate) use self::af_packet::Capture;
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]

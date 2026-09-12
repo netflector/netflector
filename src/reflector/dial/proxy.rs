@@ -1,11 +1,8 @@
 //! The per-device DIAL proxy: a reactor [`Handler`] fronting one device's HTTP endpoints.
 //!
-//! [`DialDeviceProxy`] owns a source-side description listener and a REST listener plus a pool of live
-//! [`Connection`]s. It accepts on either listener, opens an egress-pinned connection to the device on
-//! the target subnet, and dispatches each readable/writable edge to the matching connection. Its own
-//! eviction (once the device's advertisement grace lapses) belongs to the
-//! [`DialContext`](crate::dispatch::DialContext) registry. The proxy never sees advertisements; it only
-//! sweeps its own connections past their connect/idle deadlines.
+//! [`DialDeviceProxy`] owns a description listener, a REST listener and a pool of live
+//! [`Connection`]s. Its own eviction belongs to the [`DialContext`](crate::dispatch::DialContext)
+//! registry; it only sweeps its connections past their connect/idle deadlines.
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
@@ -20,32 +17,28 @@ use crate::reactor::{Arena, Handler, HandlerKey, Key, Reactor, ReadyEvent};
 use super::connection::{Connection, Outcome};
 use super::egress;
 
-/// Cap on concurrent proxied connections (drop-new past it).
+/// Past it, new clients are dropped.
 const MAX_CONNECTIONS: usize = 64;
 
-/// How often saturation is reported while it lasts. A source-side host can reach the cap on its own,
-/// so a line per rejected client would hand it the log; silence would hide an outage in progress.
+/// A source-side host can reach the cap on its own, so a line per rejected client would hand it
+/// the log.
 const CAP_WARN_INTERVAL: Duration = Duration::from_mins(1);
 
-/// A `Copy` handle into the proxy's connection [`Arena`]: a newtype over the arena [`Key`] so it
-/// can't be confused with the reactor's keys. Round-trips through a watched fd's `user_data`: the
-/// reactor echoes it back on every event, and dispatch decodes it to find the flow.
+/// A handle into the proxy's connection [`Arena`]. Round-trips through a watched fd's `user_data`:
+/// the reactor echoes it back on every event.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct ConnectionKey(Key);
 
 impl ConnectionKey {
-    /// Pack into a watch's `user_data`.
     fn to_u64(self) -> u64 {
         self.0.to_u64()
     }
 
-    /// Unpack from a dispatched event's `user_data`.
     fn from_u64(packed: u64) -> Self {
         Self(Key::from_u64(packed))
     }
 }
 
-/// Which of a proxy's two source-side listeners. Names it in a log message.
 #[derive(Clone, Copy)]
 pub(super) enum Listener {
     Description,
@@ -61,35 +54,27 @@ impl fmt::Display for Listener {
     }
 }
 
-/// A per-device DIAL proxy: a reactor `Handler` owning a description listener and its connections.
 pub(super) struct DialDeviceProxy {
-    /// This handler's own key, learned via [`adopt_key`](Handler::adopt_key); used to watch fds it
-    /// opens.
+    /// Set by [`adopt_key`](Handler::adopt_key) at registration.
     key: Option<HandlerKey>,
-    /// The target-interface address device connections bind, so the device sees a same-segment peer
-    /// and replies via the target interface. The bind picks the source address only; what keeps the
-    /// connection on that segment is `target_iface`.
+    /// The target-interface address device connections bind, so the device sees a same-segment
+    /// peer. The bind picks the source address only; `target_iface` keeps the connection on that
+    /// segment.
     target: Ipv4Addr,
-    /// The target interface's name, confining device connections to that segment (`None` skips the
-    /// confinement). The name, not an ifindex: `SO_BINDTODEVICE` wants it directly, and a name stays
-    /// valid across an interface recreation where a cached index would not.
+    /// The name, not an ifindex: it stays valid across an interface recreation. `None` skips the
+    /// confinement.
     target_iface: Option<String>,
-    /// The description listener (source side); its connections proxy to `desc_endpoint`.
     desc: TcpSocket,
-    /// The proxy's identity: the device's description endpoint (`device-ip:desc_port`).
     desc_endpoint: SocketAddrV4,
-    /// The REST listener (source side); its connections proxy to the device's REST endpoint. Eager-minted
-    /// so its address is fixed and available to rewrite a description response's `Application-URL` to.
+    /// Minted eagerly so its address exists to rewrite a description response's `Application-URL`
+    /// to.
     rest: TcpSocket,
-    /// The device's REST endpoint, learned (and re-learned) from a description response's `Application-URL`;
-    /// `None` until the first description fetch reveals it. REST connections proxy here.
+    /// Learned from a description response's `Application-URL`; `None` until the first fetch.
     rest_endpoint: Option<SocketAddrV4>,
     conns: Arena<Connection>,
 }
 
 impl DialDeviceProxy {
-    /// A proxy fronting `desc_endpoint` via the source-side `desc` listener (already bound by the caller).
-    /// Device connections bind the target-interface `target` and egress-pin `target_iface`.
     pub(super) fn new(
         target: Ipv4Addr,
         target_iface: Option<String>,
@@ -109,22 +94,15 @@ impl DialDeviceProxy {
         }
     }
 
-    /// This handler's own key. `adopt_key` sets it at registration, before any dispatch; its absence
-    /// would be a reactor-contract violation.
     fn own_key(&self) -> HandlerKey {
         self.key
             .expect("adopt_key sets the proxy's key before any dispatch")
     }
 
-    /// Accept one pending client on `listener` if there is connection capacity, else `None`. An accept
-    /// is always taken (draining the readiness) even at the shared connection cap, where the client is
-    /// then dropped.
-    ///
-    /// A failed accept tears the proxy down. `accept` fails only once the connection is stuck in the
-    /// queue -- a client that dies before we reach it arrives as `None` instead -- so under `EMFILE` it
-    /// stays queued and this level-triggered listener re-fires on it without end; shedding the proxy
-    /// stops that and hands its fds back. The device re-mints on its next advertisement, as it would
-    /// after any eviction.
+    /// Always accepts, draining the readiness, and drops the client at the connection cap. A failed
+    /// accept sheds the whole proxy: under `EMFILE` the connection stays queued and this
+    /// level-triggered listener would re-fire on it without end. The device re-mints on its next
+    /// advertisement.
     fn accept_client(&mut self, what: Listener, reactor: &mut Reactor) -> Option<TcpSocket> {
         let listener = match what {
             Listener::Description => &self.desc,
@@ -132,7 +110,7 @@ impl DialDeviceProxy {
         };
         let client = match listener.accept() {
             Ok(Some(client)) => client,
-            Ok(None) => return None, // the client died before we reached it, or a spurious readiness
+            Ok(None) => return None,
             Err(e) => {
                 log::error!(
                     "dial: accept on the {what} listener failed: {e}; tearing the proxy down, \
@@ -150,21 +128,19 @@ impl DialDeviceProxy {
                 "dial: connection cap ({MAX_CONNECTIONS}) reached for {}; dropping new clients",
                 self.desc_endpoint
             );
-            return None; // `client` drops here, closing it
+            return None;
         }
         Some(client)
     }
 
-    /// Accept a client on the description listener and proxy it to the device's description endpoint.
     fn accept_desc(&mut self, reactor: &mut Reactor) {
         if let Some(client) = self.accept_client(Listener::Description, reactor) {
             self.start_connection(client, self.desc_endpoint, self.desc.local_addr(), reactor);
         }
     }
 
-    /// Accept a client on the REST listener and proxy it to the REST endpoint learned from a prior
-    /// description fetch. A client reaching here before that fetch is dropped (the proxy minted the
-    /// listener's address into the description's `Application-URL`, so this is unexpected).
+    /// A client before the REST endpoint is learned is unexpected: only a description response the
+    /// proxy rewrote names this listener.
     fn accept_rest(&mut self, reactor: &mut Reactor) {
         let Some(client) = self.accept_client(Listener::Rest, reactor) else {
             return;
@@ -173,13 +149,11 @@ impl DialDeviceProxy {
             log::warn!(
                 "dial: REST request before the device's REST endpoint is known; dropping it"
             );
-            return; // `client` drops here, closing it
+            return;
         };
         self.start_connection(client, device, self.rest.local_addr(), reactor);
     }
 
-    /// Open an egress-pinned connection to `device_endpoint`, register both fds, and record the
-    /// connection. Best-effort: a connect or watch failure drops the half-built connection.
     fn start_connection(
         &mut self,
         client: TcpSocket,
@@ -199,8 +173,7 @@ impl DialDeviceProxy {
         };
         let client_fd = client.as_raw_fd();
         let device_fd = device.as_raw_fd();
-        // Insert first so the connection's arena key can tag both fds' `user_data`; the regs are
-        // patched in once watching succeeds.
+        // Insert first: the arena key tags both fds' `user_data`.
         let conn_key = ConnectionKey(self.conns.insert(Connection::new(
             client,
             device,
@@ -236,8 +209,6 @@ impl DialDeviceProxy {
         log::debug!("dial: accepted a client; connecting to {device_endpoint}");
     }
 
-    /// A connection socket is readable: forward one edge in the matching direction; close on EOF or a
-    /// fatal error.
     fn on_connection_readable(
         &mut self,
         conn_key: ConnectionKey,
@@ -252,7 +223,6 @@ impl DialDeviceProxy {
             let outcome = conn.readable(fd, reactor);
             (outcome, conn.take_learned_rest())
         };
-        // A description response just revealed (or moved) the device's REST endpoint.
         if let Some(endpoint) = learned {
             self.adopt_rest_endpoint(endpoint);
         }
@@ -261,9 +231,9 @@ impl DialDeviceProxy {
         }
     }
 
-    /// Adopt a REST endpoint a description response revealed, unless it can never name a device
-    /// ([`is_never_a_peer`]): dialing such an address would reach a local service, not the device.
-    /// A link-local endpoint is fine, deliberately: the dial goes out the target interface, on-link.
+    /// Refuses an endpoint that can never name a device ([`is_never_a_peer`]): dialing it would reach
+    /// a local service. Link-local is fine on purpose: the dial goes out the target interface,
+    /// on-link.
     fn adopt_rest_endpoint(&mut self, endpoint: SocketAddrV4) {
         if is_never_a_peer(IpAddr::V4(*endpoint.ip())) {
             log::debug!(
@@ -281,7 +251,6 @@ impl DialDeviceProxy {
         self.rest_endpoint = Some(endpoint);
     }
 
-    /// A connection socket is writable: complete the connect / drain its send backlog; close on error.
     fn on_connection_writable(
         &mut self,
         conn_key: ConnectionKey,
@@ -290,8 +259,6 @@ impl DialDeviceProxy {
     ) {
         let outcome = {
             let Some(conn) = self.conns.get_mut(conn_key.0) else {
-                // The reactor filters stale registrations, so a live write event should map to a live
-                // connection; a miss means the generational key out-lived its slot. Fail safe.
                 log::trace!("dial: writable event for an unknown connection; ignoring");
                 return;
             };
@@ -302,9 +269,6 @@ impl DialDeviceProxy {
         }
     }
 
-    /// Remove the connection `conn_key` from the pool and tear down its watches and sockets. Every caller
-    /// holds a live key (just inserted, just matched, or from a live sweep), so the connection is present;
-    /// a half-built one may have no registrations yet.
     fn close_conn(&mut self, conn_key: ConnectionKey, reactor: &mut Reactor) {
         let conn = self
             .conns
@@ -315,8 +279,6 @@ impl DialDeviceProxy {
         log::debug!("dial: closed a connection to {endpoint}");
     }
 
-    /// Close connections past their deadline (connect timeout or idle). The proxy itself is evicted past
-    /// its advertisement grace by the [`DialContext`](crate::dispatch::DialContext) registry, not here.
     fn sweep(&mut self, now: Instant, reactor: &mut Reactor) {
         let expired: Vec<(ConnectionKey, SocketAddrV4)> = self
             .conns
@@ -356,8 +318,6 @@ impl Handler for DialDeviceProxy {
     }
 
     fn next_deadline(&self) -> Option<Instant> {
-        // Wake at the soonest connection deadline; an idle proxy has no timer of its own (the registry
-        // drives its grace eviction).
         self.conns.iter().map(|(_, conn)| conn.deadline()).min()
     }
 

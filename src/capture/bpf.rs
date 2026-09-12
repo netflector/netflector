@@ -1,14 +1,11 @@
 //! BPF packet capture (macOS and FreeBSD).
 //!
-//! Opens `/dev/bpfN`, binds it to an interface, installs a UDP-only classic-BPF
-//! filter, and reads link-layer frames. One `read` returns a *batch* of frames,
-//! each prefixed by a variable-length `bpf_hdr` and padded so the next record
-//! starts on a `BPF_ALIGNMENT` boundary; [`Capture::next_frame`] walks that batch.
+//! One `read` returns a batch of frames, each behind a variable-length `bpf_hdr` and padded
+//! to a `BPF_ALIGNMENT` boundary; [`Capture::next_frame`] walks the batch.
 //!
-//! Init order matters: bind (`BIOCSETIF`) happens before the filter (`BIOCSETF`).
-//! That's safe only because `BIOCSETF` flushes the kernel buffer, so the brief
-//! pre-filter window leaves nothing behind. (Linux's `SO_ATTACH_FILTER` does not
-//! flush, so its backend filters before bind instead.)
+//! Init order: bind (`BIOCSETIF`) before the filter (`BIOCSETF`). Safe only because
+//! `BIOCSETF` flushes the kernel buffer; Linux's `SO_ATTACH_FILTER` does not, so that
+//! backend filters first.
 
 use std::io;
 use std::ops::Range;
@@ -37,14 +34,11 @@ impl Capture {
     /// Open a BPF capture bound to `if_name`.
     ///
     /// # Errors
-    /// Returns an error if no BPF device is available, the interface can't be
-    /// bound, the link type is neither Ethernet nor `DLT_NULL`, or any
-    /// setup ioctl fails.
+    /// No free BPF device, an unbindable interface, a link type neither Ethernet nor
+    /// `DLT_NULL`, or a failed setup ioctl.
     pub(crate) fn open(if_name: &str) -> io::Result<Self> {
         let fd = open_bpf_device()?;
 
-        // Bind to the interface. Capture starts here; the filter installed by `attach`
-        // flushes the buffer, so nothing slips through unfiltered.
         let link_type = attach(&fd, if_name)?;
 
         // Deliver each frame as it arrives instead of blocking until the buffer fills.
@@ -52,7 +46,7 @@ impl Capture {
         // SAFETY: BIOCIMMEDIATE takes a `c_uint`.
         unsafe { ioctl(&fd, libc::BIOCIMMEDIATE, &mut immediate) }?;
 
-        // Size the read buffer to the kernel's preferred BPF buffer length.
+        // BPF requires each read to be exactly its buffer length.
         let mut blen: c_uint = 0;
         // SAFETY: BIOCGBLEN writes a `c_uint`.
         unsafe { ioctl(&fd, libc::BIOCGBLEN, &mut blen) }?;
@@ -71,19 +65,16 @@ impl Capture {
         })
     }
 
-    /// Re-attach the descriptor to the interface currently named at open. The kernel detaches
-    /// it when its interface is destroyed and never re-attaches it on its own, so this is the
-    /// recovery path after a recreation: `BIOCSETIF` from the detached state is the same path
-    /// as the initial attach, and it resets the kernel buffer. The fd is unchanged, so the
-    /// reactor's watch stays valid; the framing (and with it the filter and see-sent policy)
-    /// is re-derived in case the interface came back different.
+    /// Re-attach to the interface named at open. The kernel detaches the descriptor when its
+    /// interface is destroyed and never re-attaches it; `BIOCSETIF` from that state is the
+    /// initial attach path and resets the kernel buffer. Same fd, so the reactor's watch stays
+    /// valid.
     ///
     /// # Errors
     /// The attach ioctl failure while no interface bears the name, or an unsupported link type.
     pub(crate) fn rebind(&mut self) -> io::Result<()> {
         self.link_type = attach(&self.fd, &self.name)?;
-        // The kernel reset its buffer at the re-attach; drop the drained-batch state to
-        // match, discarding any stale frames from the old interface.
+        // The kernel reset its buffer at the re-attach; match it.
         self.filled = 0;
         self.offset = 0;
         log::debug!(
@@ -95,35 +86,28 @@ impl Capture {
     }
 
     /// Whether the descriptor is still attached to a live interface. The kernel clears the
-    /// attachment when the interface is destroyed, after which per-attachment ioctls fail --
-    /// and a recreated interface (same name, even a reused index) never re-attaches the old
-    /// descriptor, so this probe catches recreation where index comparison can't. `ifindex`
-    /// is unused: BPF attachment is to the kernel object itself; the parameter keeps the
-    /// signature uniform with the `AF_PACKET` backend, which compares bound indexes.
+    /// attachment when the interface is destroyed and per-attachment ioctls then fail; a
+    /// recreated interface (same name, even a reused index) never re-attaches, so this catches
+    /// recreation where an index comparison can't.
     pub(crate) fn attached(&self, _ifindex: u32) -> bool {
         let mut dlt: c_uint = 0;
         // SAFETY: BIOCGDLT writes a `c_uint`.
         unsafe { ioctl(&self.fd, libc::BIOCGDLT, &mut dlt) }.is_ok()
     }
 
-    /// The link-layer framing of the captured frames, so a consumer can strip the
-    /// right link header (Ethernet vs `DLT_NULL`) before parsing L3.
     pub(crate) fn link_type(&self) -> LinkType {
         self.link_type
     }
 
-    /// The interface this capture is bound to.
     pub(crate) fn if_name(&self) -> &str {
         &self.name
     }
 
-    /// The next read, refilling from the kernel when the current batch is drained: a frame,
-    /// or a truncated/oversized record dropped and counted. Returns `Ok(None)` when nothing
-    /// more is ready (the batch is empty and a read would block).
+    /// Refills from the kernel when the batch is drained; `Ok(None)` when nothing more is
+    /// ready.
     ///
     /// # Errors
-    /// Returns an error if the read fails, or the kernel batch is malformed (the
-    /// rest of that batch is then abandoned).
+    /// A failed read, or a malformed batch (the rest of which is abandoned).
     pub(crate) fn next_frame(&mut self) -> io::Result<Option<Read<'_>>> {
         if self.offset >= self.filled && !self.refill()? {
             return Ok(None);
@@ -141,8 +125,7 @@ impl Capture {
             Record::Frame(frame) => Ok(Some(Read::Frame(
                 &self.buf[start + frame.start..start + frame.end],
             ))),
-            // Rate-limited: this is the per-frame drain loop, and a remote peer can flood
-            // oversized frames.
+            // A remote peer can flood oversized frames.
             Record::Oversized { datalen } => {
                 log_rate!(
                     log::Level::Warn,
@@ -157,14 +140,13 @@ impl Capture {
         }
     }
 
-    /// Whether the current batch still holds unread records: the cue to keep
-    /// draining, since a level-triggered wait won't re-fire until new kernel data.
+    /// Unread records remain in the batch: a level-triggered wait won't re-fire for them, so
+    /// the caller keeps draining.
     pub(crate) fn has_buffered(&self) -> bool {
         self.offset < self.filled
     }
 
-    /// Whether a read error says the descriptor lost its interface: a detached BPF descriptor
-    /// reads `ENXIO`.
+    /// A detached BPF descriptor reads `ENXIO`.
     pub(crate) fn lost_interface(err: &io::Error) -> bool {
         err.raw_os_error() == Some(libc::ENXIO)
     }
@@ -172,7 +154,7 @@ impl Capture {
     /// Inject a fully-built link-layer `frame` on this interface.
     ///
     /// # Errors
-    /// Returns an error if the write fails or is short.
+    /// A failed or short write.
     pub(crate) fn send(&self, frame: &[u8]) -> io::Result<()> {
         // SAFETY: `frame` is a valid readable slice; the BPF fd accepts full frames.
         let written =
@@ -186,8 +168,7 @@ impl Capture {
         Ok(())
     }
 
-    /// Read one kernel batch into `buf`. Returns `false` if nothing is available
-    /// (would block) or the device reported EOF.
+    /// Read one kernel batch; `false` on would-block or EOF.
     fn refill(&mut self) -> io::Result<bool> {
         // SAFETY: writing up to `buf.len()` bytes into our own buffer.
         let n = unsafe {
@@ -216,18 +197,14 @@ impl AsRawFd for Capture {
     }
 }
 
-/// Outcome of parsing one BPF record: a good frame's byte range, or an oversized
-/// capture to drop (carrying its original length, for the trace log).
+/// One parsed BPF record.
 enum Record {
     Frame(Range<usize>),
     Oversized { datalen: u32 },
 }
 
-/// Parse the BPF record at the front of `record` (the still-unread slice of the
-/// current batch), returning it plus how many bytes to advance past it (its
-/// `libc::bpf_hdr` + frame, padded to `BPF_ALIGNMENT`). The frame range is
-/// relative to `record`. Pure (no I/O) so the batch walk, the fiddliest part,
-/// is unit-testable against synthetic buffers.
+/// Parse the record at the front of `record`: the frame range (relative to `record`) and how
+/// far to advance past it (`bpf_hdr` + frame, padded to `BPF_ALIGNMENT`).
 fn parse_record(record: &[u8]) -> io::Result<(Record, usize)> {
     if size_of::<libc::bpf_hdr>() > record.len() {
         return Err(io::Error::other("BPF batch ended mid-header"));
@@ -243,15 +220,12 @@ fn parse_record(record: &[u8]) -> io::Result<(Record, usize)> {
     }
     let advance = bpf_wordalign(frame_end);
     if advance == 0 {
-        // A record that doesn't advance would stall the drain loop forever. The
-        // kernel never emits one (bh_hdrlen is always >= the header size), so
-        // treat it as a malformed batch.
+        // Would stall the drain loop forever; the kernel never emits one.
         return Err(io::Error::other("BPF record did not advance"));
     }
 
-    // Truncated by the kernel, or whole but past what we can re-emit. BPF sizes its buffer from
-    // BIOCGBLEN, not from MAX_FRAME_LEN, so it can hand up frames the send path would go on to
-    // reject once per packet.
+    // Truncated by the kernel, or whole but past MAX_FRAME_LEN: the send path would reject it
+    // once per packet.
     if header.bh_datalen > header.bh_caplen || header.bh_caplen as usize > crate::net::MAX_FRAME_LEN
     {
         return Ok((
@@ -264,11 +238,9 @@ fn parse_record(record: &[u8]) -> io::Result<(Record, usize)> {
     Ok((Record::Frame(frame_start..frame_end), advance))
 }
 
-/// Attach `fd` to `if_name` and normalize the per-attachment state: read the link framing,
-/// set the see-sent policy for it, and install the matching UDP filter (`BIOCSETF` also
-/// flushes anything captured since the bind, so nothing slips through unfiltered). Shared by
-/// [`Capture::open`] and [`Capture::rebind`]; per-descriptor settings (immediate mode, buffer
-/// size) stay in `open`, since they survive re-attachment.
+/// Attach `fd` to `if_name`: read the framing, set the see-sent policy, install the filter
+/// (`BIOCSETF` also flushes anything captured since the bind). Per-descriptor settings stay in
+/// `open`; they survive re-attachment.
 fn attach(fd: &OwnedFd, if_name: &str) -> io::Result<LinkType> {
     // SAFETY: all-zero is a valid `ifreq`: `ifr_name` is a byte array and the `ifr_ifru`
     // union holds only integers/pointers/sockaddr, none with an invalid zero bit pattern.
@@ -292,7 +264,6 @@ fn attach(fd: &OwnedFd, if_name: &str) -> io::Result<LinkType> {
     // SAFETY: BIOCSETIF reads an `ifreq`.
     unsafe { ioctl(fd, libc::BIOCSETIF, &mut ifr) }?;
 
-    // The link framing selects the filter and the see-sent handling below.
     let mut dlt: c_uint = 0;
     // SAFETY: BIOCGDLT writes a `c_uint`.
     unsafe { ioctl(fd, libc::BIOCGDLT, &mut dlt) }?;
@@ -307,17 +278,15 @@ fn attach(fd: &OwnedFd, if_name: &str) -> io::Result<LinkType> {
         }
     };
 
-    // Loop prevention on Ethernet: don't hand us our own egress. A link that returns it
-    // as received frames gets past this; the dispatcher's echo drop catches those. On
-    // DLT_NULL links see-sent stays on: the BSD lo driver taps each frame once (and tags
-    // it outbound), so default BPF already delivers it; receive-only would instead silence
-    // the interface entirely. Set explicitly both ways so a rebind onto different framing
-    // restores the right mode.
+    // Ethernet: don't hand us our own egress (a hairpin bridge port returns it as received
+    // frames anyway; the dispatcher's echo drop catches those). DLT_NULL: see-sent stays on,
+    // since the BSD lo driver taps each frame once and tags it outbound; receive-only would
+    // silence the interface. Set both ways so a rebind onto different framing restores the
+    // right mode.
     let mut see_sent: c_uint = c_uint::from(link_type == LinkType::DltNull);
     // SAFETY: BIOCSSEESENT reads a `c_uint`.
     unsafe { ioctl(fd, libc::BIOCSSEESENT, &mut see_sent) }?;
 
-    // Install the link-appropriate UDP filter (and flush whatever queued before it).
     let filter: &[BpfInsn] = match link_type {
         LinkType::Ethernet => &ETHERNET_UDP_FILTER,
         LinkType::DltNull => &DLT_NULL_UDP_FILTER,
@@ -331,7 +300,6 @@ fn attach(fd: &OwnedFd, if_name: &str) -> io::Result<LinkType> {
     Ok(link_type)
 }
 
-/// Open the first available `/dev/bpfN`.
 fn open_bpf_device() -> io::Result<OwnedFd> {
     for n in 0..256 {
         let path = format!("/dev/bpf{n}\0");
@@ -346,7 +314,7 @@ fn open_bpf_device() -> io::Result<OwnedFd> {
             // SAFETY: `open` returned a fresh owned fd.
             return Ok(unsafe { OwnedFd::from_raw_fd(raw) });
         }
-        // EBUSY just means this device is taken; try the next. Anything else is real.
+        // EBUSY: this device is taken; anything else is real.
         if io::Error::last_os_error().raw_os_error() != Some(libc::EBUSY) {
             return Err(io::Error::last_os_error());
         }
@@ -354,8 +322,6 @@ fn open_bpf_device() -> io::Result<OwnedFd> {
     Err(io::Error::other("all /dev/bpf devices are busy"))
 }
 
-/// One `ioctl` on the BPF descriptor.
-///
 /// # Safety
 /// `request` must be a `BIOC*` request whose argument is exactly a `T`.
 unsafe fn ioctl<T>(fd: &OwnedFd, request: c_ulong, arg: &mut T) -> io::Result<()> {

@@ -1,6 +1,5 @@
-//! Linux: an rtnetlink (`NETLINK_ROUTE`) socket subscribed to the address and link change
-//! multicast groups. The message layer (header walk, `ifaddrmsg`/`ifinfomsg` bodies) is the
-//! resolver's, reused from [`super::super::rtnetlink`].
+//! Linux: an rtnetlink socket subscribed to the address and link change groups. The message
+//! layer is the resolver's, [`super::super::rtnetlink`].
 
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -12,25 +11,21 @@ use super::InterfaceEvent;
 use crate::libcex::nl_align;
 use crate::sys::{check, open_socket};
 
-/// Holds one notification. Multicast delivers one message per datagram, never a coalesced
-/// dump. Sized for the largest: an `RTM_NEWLINK` carries the interface's whole attribute set
-/// (stats, `IFLA_AF_SPEC`, VF info) at ~1 KB; addresses are far smaller. 8 KiB is roomy.
+/// One message per datagram, never a coalesced dump; the largest, an `RTM_NEWLINK` with the
+/// interface's whole attribute set, is ~1 KB.
 pub(super) const READ_BUF: usize = 8192;
 
-/// See [`InterfaceMonitor::INDEXES_MONOTONIC`](super::InterfaceMonitor::INDEXES_MONOTONIC):
-/// Linux allocates indexes cyclically over a 31-bit space, never reusing until wrap.
+/// See [`InterfaceMonitor::INDEXES_MONOTONIC`](super::InterfaceMonitor::INDEXES_MONOTONIC).
 pub(super) const INDEXES_MONOTONIC: bool = true;
 
-/// See [`InterfaceMonitor::LIFECYCLE_EVENTS`](super::InterfaceMonitor::LIFECYCLE_EVENTS):
-/// `RTM_{NEW,DEL}LINK` are subscribed and forwarded.
+/// See [`InterfaceMonitor::LIFECYCLE_EVENTS`](super::InterfaceMonitor::LIFECYCLE_EVENTS).
 pub(super) const LIFECYCLE_EVENTS: bool = true;
 
-/// Subscribe v4/v6 address adds+removes and link (MAC/state) changes. A MAC change arrives
-/// as `RTM_NEWLINK`, not an address event, so `RTMGRP_LINK` is needed to catch it.
+/// A MAC change arrives as `RTM_NEWLINK`, not an address event, so `RTMGRP_LINK` is needed to
+/// catch it.
 const SUBSCRIBED_GROUPS: u32 =
     (libc::RTMGRP_IPV4_IFADDR | libc::RTMGRP_IPV6_IFADDR | libc::RTMGRP_LINK) as u32;
 
-/// Open a `NETLINK_ROUTE` socket bound to the change groups, non-blocking + close-on-exec.
 pub(super) fn open() -> io::Result<OwnedFd> {
     let sock = open_socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_ROUTE)?;
     // SAFETY: a zeroed `sockaddr_nl` is an all-integer POD (libc keeps its padding field
@@ -51,20 +46,17 @@ pub(super) fn open() -> io::Result<OwnedFd> {
     Ok(sock)
 }
 
-/// Walk every netlink message in one datagram; report the interface index and event kind of
-/// each `RTM_{NEW,DEL}ADDR` ([`InterfaceEvent::Address`], from its `ifaddrmsg`) and
-/// `RTM_{NEW,DEL}LINK` ([`InterfaceEvent::Link`], from its `ifinfomsg`).
+/// Report the interface index of each `RTM_{NEW,DEL}ADDR` and `RTM_{NEW,DEL}LINK` in one
+/// datagram.
 pub(super) fn for_each_change(buf: &[u8], on_change: &mut impl FnMut(InterfaceEvent)) {
     let mut offset = 0;
     while let Some(hdr) = read_at::<libc::nlmsghdr>(buf, offset) {
         let len = hdr.nlmsg_len as usize;
-        // checked_add: a crafted len must not wrap `offset + len` past the bound on a 32-bit usize
-        // (which would also make `nl_align(len)` wrap to 0 and spin the walk forever).
+        // checked_add: a crafted len must not wrap `offset + len` on a 32-bit usize, which
+        // would also make `nl_align(len)` wrap to 0 and spin the walk forever.
         if len < size_of::<libc::nlmsghdr>()
             || offset.checked_add(len).is_none_or(|end| end > buf.len())
         {
-            // Not a normal end (that's the `while` running out): a message claims an
-            // impossible length (truncated datagram or corruption), so a change is dropped.
             log::warn!(
                 "netlink message walk stopped at offset {offset}: len {len}, buffer {} B \
                  (truncated or malformed); a change may be missed",
@@ -82,8 +74,7 @@ pub(super) fn for_each_change(buf: &[u8], on_change: &mut impl FnMut(InterfaceEv
             }
             libc::RTM_NEWLINK | libc::RTM_DELLINK => {
                 if let Some(body) = read_at::<libc::ifinfomsg>(&buf[..end], body_at) {
-                    // `ifi_index` is i32 but always a positive kernel index; a negative one is
-                    // as malformed as 0, so fold it in for report's drop-and-warn.
+                    // A negative `ifi_index` is as malformed as 0; fold it in.
                     report(
                         u32::try_from(body.ifi_index).unwrap_or(0),
                         InterfaceEvent::Link,
@@ -97,9 +88,8 @@ pub(super) fn for_each_change(buf: &[u8], on_change: &mut impl FnMut(InterfaceEv
     }
 }
 
-/// Whether a notification came from the kernel. The kernel's netlink source address has `nl_pid == 0`;
-/// a user process's carries its port id, so a non-zero pid is a locally-spoofed datagram (netlink
-/// user-to-user unicast needs no privilege) and is dropped.
+/// The kernel's netlink source address has `nl_pid == 0`; a non-zero pid is a locally spoofed
+/// datagram (netlink user-to-user unicast needs no privilege).
 pub(super) fn sender_ok(src: &libc::sockaddr_storage, len: socklen_t) -> bool {
     if usize::try_from(len).unwrap_or(0) < size_of::<libc::sockaddr_nl>() {
         return false;
@@ -109,10 +99,7 @@ pub(super) fn sender_ok(src: &libc::sockaddr_storage, len: socklen_t) -> bool {
     nl.nl_pid == 0
 }
 
-/// Forward an `event(index)` change; `event` is a variant constructor
-/// ([`InterfaceEvent::Address`] or [`InterfaceEvent::Link`]). Kernel indices are >= 1, so a 0
-/// (including a folded-in negative `ifi_index`) is a malformed message: dropped with a warn
-/// rather than forwarded as nonsense.
+/// Kernel indices are >= 1; a 0 is malformed and dropped with a warn.
 fn report(
     index: u32,
     event: fn(u32) -> InterfaceEvent,

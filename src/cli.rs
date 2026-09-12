@@ -1,7 +1,5 @@
-//! Command-line parsing.
-//!
-//! Hand-rolled rather than pulled from a crate: the whole surface is one optional
-//! positional and four flags, and the binary ships to embedded ARM.
+//! Command-line parsing, hand-rolled: one positional and four flags don't justify a dependency
+//! on an embedded target.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -11,31 +9,22 @@ use crate::error::UsageError;
 /// What the command line asked for.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Invocation<'a> {
-    /// Run netflector, configured from the given file (if any) plus `NETFLECTOR_*`.
     Run {
         path: Option<&'a Path>,
-        /// Whether to join the multicast groups the reflectors capture; `--no-join` clears it.
         join_groups: bool,
     },
-    /// Load and validate that same configuration, then exit.
     CheckConfig(Option<&'a Path>),
     Help,
     Version,
 }
 
-/// Parse `args` (with `argv[0]` already stripped).
-///
-/// `--help` and `--version` win over anything after them on the line, so they answer even when
-/// the rest is nonsense; an unknown option before them still errors, first bad token wins.
-/// Otherwise netflector takes at most one positional; extras are rejected rather than ignored,
-/// since a second path is far more likely a typo than an intent.
-///
-/// `--` ends option parsing, so a config file whose name begins with a dash is still reachable
-/// (`netflector -- --check-config` reads a file called `--check-config`). Without it such a path
-/// would be unreachable, since every leading-dash argument is otherwise read as an option.
+/// Parse `args` (`argv[0]` already stripped). `--help` and `--version` win over anything after
+/// them; an unknown option before them still errors. A second positional is refused rather than
+/// ignored, since a second path is far more likely a typo than an intent. `--` ends option
+/// parsing, so a config path that starts with a dash stays reachable.
 ///
 /// # Errors
-/// [`UsageError`] for an unknown option or a second positional argument.
+/// [`UsageError`] for an unknown option or a second positional.
 pub(crate) fn parse(args: &[OsString]) -> Result<Invocation<'_>, UsageError> {
     let mut check = false;
     let mut join_groups = true;
@@ -63,8 +52,7 @@ pub(crate) fn parse(args: &[OsString]) -> Result<Invocation<'_>, UsageError> {
                 continue;
             }
         }
-        // A lone "-" stays a path (some callers mean stdin by it); anything else that leads with a
-        // dash is an option we do not know, and guessing at it would be worse than saying so.
+        // A lone "-" stays a path (stdin by convention).
         let text = arg.to_string_lossy();
         if !options_done && text.starts_with('-') && text != "-" {
             return Err(UsageError::UnknownOption(text.into_owned()));
@@ -82,7 +70,7 @@ pub(crate) fn parse(args: &[OsString]) -> Result<Invocation<'_>, UsageError> {
     })
 }
 
-/// `--help` text. Ends with a newline; print it with `print!`.
+/// Ends with a newline; print with `print!`.
 pub(crate) const HELP: &str = concat!(
     "netflector ",
     env!("CARGO_PKG_VERSION"),

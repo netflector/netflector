@@ -1,8 +1,4 @@
 //! Configuration error types.
-//!
-//! [`ConfigError`] is the module's failure surface. [`ParseValueError`]
-//! aggregates the per-value parse errors so a bad environment value stays
-//! matchable while naming the variable that carried it.
 
 use std::fmt;
 use std::net::IpAddr;
@@ -18,14 +14,10 @@ use super::value::{
 use crate::net::mac::MacAddr;
 use crate::unique_list::ListError;
 
-/// Everything that can make a configuration invalid.
-///
-/// [`ConfigError::Parse`] carries value-level errors from the deserializer
-/// (wrong type, bad port, unparseable enum/MAC); the remaining variants are the
-/// cross-field and cross-reflector rules the deserializer cannot express.
+/// Value-level TOML errors (wrong type, bad port, unparseable MAC) arrive as
+/// [`ConfigError::Parse`]; the other variants are rules the deserializer cannot express.
 #[derive(Debug, Error)]
 pub(crate) enum ConfigError {
-    /// The text was not valid TOML, or a value had the wrong type/range.
     #[error("invalid configuration: {0}")]
     Parse(#[from] toml::de::Error),
 
@@ -38,7 +30,6 @@ pub(crate) enum ConfigError {
     #[error("must define at least one reflector")]
     NoReflectors,
 
-    /// key is the file table key, not a validated [`ReflectorName`].
     #[error("reflector name \"{key}\" is empty or whitespace-only")]
     EmptyReflectorName { key: String },
 
@@ -110,7 +101,6 @@ pub(crate) enum ConfigError {
     )]
     DuplicateReflectorName { name: ReflectorName },
 
-    /// Two reflectors would reflect the same protocol's packets twice.
     #[error(
         "reflectors \"{first}\" and \"{second}\" both reflect {protocol} on {source_if} -> {target_if} with overlapping MAC selection and address family"
     )]
@@ -162,12 +152,9 @@ pub(crate) enum ConfigError {
     },
 }
 
-/// A required reflector field, named in [`ConfigError::EnvMissingField`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RequiredField {
-    /// The listen interface (`source_if`).
     SourceIf,
-    /// The emit interface (`target_if`).
     TargetIf,
 }
 
@@ -180,36 +167,25 @@ impl fmt::Display for RequiredField {
     }
 }
 
-/// Any value-level parse failure an environment variable can carry.
-///
-/// Aggregating the per-type errors keeps [`ConfigError::EnvBadValue`] structured
-/// (matchable in tests) while attaching the originating variable name.
+/// The per-type parse errors, aggregated so [`ConfigError::EnvBadValue`] stays matchable in tests.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub(crate) enum ParseValueError {
-    /// `LOG_LEVEL`.
     #[error(transparent)]
     LogLevel(#[from] ParseLogLevelError),
-    /// `ADDRESS_FAMILY`.
     #[error(transparent)]
     AddressFamily(#[from] ParseAddressFamilyError),
-    /// `MACS`.
     #[error(transparent)]
     Macs(#[from] ListError<MacAddr>),
-    /// `SOURCE_IF`/`TARGET_IF`.
     #[error(transparent)]
     Interface(#[from] ParseInterfaceNameError),
-    /// `WOL_PORTS` / `UDP_PORTS`.
     #[error(transparent)]
     Ports(#[from] ListError<NonZeroU16>),
-    /// `UDP_GROUPS`, `SOURCE_PEERS` / `TARGET_PEERS`.
     #[error(transparent)]
     Addresses(#[from] ListError<IpAddr>),
-    /// `NAME`.
     #[error(transparent)]
     ReflectorName(#[from] ParseReflectorNameError),
     #[error(transparent)]
     Bool(#[from] ParseBoolError),
-    /// A whole-number setting, e.g. `COUNTERS_INTERVAL_SECS`.
     #[error(transparent)]
     Integer(#[from] std::num::ParseIntError),
 }

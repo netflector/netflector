@@ -1,8 +1,5 @@
-//! kqueue readiness backend for macOS (the dev host) and FreeBSD.
-//!
-//! Level-triggered: read and write interest are toggled per registration (independent kqueue
-//! filters). The reactor [`Key`] travels in each event's `udata`, so a wakeup carries its own
-//! routing; no fd-to-handler side table.
+//! kqueue readiness backend (macOS, FreeBSD). Level-triggered; the reactor [`Key`] rides in
+//! each event's `udata`.
 
 use std::io;
 use std::mem;
@@ -15,15 +12,13 @@ use super::PollEvent;
 use crate::reactor::{Key, Readiness};
 use crate::sys::check;
 
-// The Key rides in kevent's pointer-sized `udata`; a sub-64-bit pointer would
-// truncate the generation half and silently alias slots. Our kqueue targets
-// (macOS, FreeBSD amd64/arm64) are 64-bit, so fail the build loudly otherwise.
+// `udata` is pointer-sized; a 32-bit target would truncate the Key's generation half and
+// alias slots.
 const _: () = assert!(
     mem::size_of::<*mut libc::c_void>() >= mem::size_of::<u64>(),
     "kqueue backend needs a 64-bit udata to carry the full Key",
 );
 
-/// A kqueue descriptor and the reusable buffer its waits report into.
 pub(crate) struct Poller {
     poll_fd: OwnedFd,
     events: Box<[libc::kevent]>,
@@ -32,7 +27,6 @@ pub(crate) struct Poller {
 }
 
 impl Poller {
-    /// Create a kqueue reporting up to `capacity` ready fds per [`wait`](Self::wait).
     pub(crate) fn new(capacity: NonZeroUsize) -> io::Result<Self> {
         // SAFETY: kqueue() takes no arguments; it returns a fresh fd or -1.
         let poll_fd = crate::sys::owned_fd_from(unsafe { libc::kqueue() })?;
@@ -47,17 +41,13 @@ impl Poller {
         })
     }
 
-    /// Register `fd` with level-triggered read interest, tagged with `key`. Write
-    /// interest starts off; change either with [`set_interest`](Self::set_interest).
+    /// Register `fd` with read interest only.
     pub(crate) fn add(&self, fd: RawFd, key: Key) -> io::Result<()> {
         self.change(fd, libc::EVFILT_READ, libc::EV_ADD | libc::EV_ENABLE, key)?;
         log::trace!("kqueue: armed read on fd {fd}");
         Ok(())
     }
 
-    /// Set `fd`'s interest (already [added](Self::add)) to `read`/`write`. The read filter from
-    /// [`add`](Self::add) is toggled with `EV_ENABLE`/`EV_DISABLE` (it stays registered); the write
-    /// filter is added/deleted on demand.
     pub(crate) fn set_interest(
         &self,
         fd: RawFd,
@@ -78,7 +68,7 @@ impl Poller {
         };
         match self.change(fd, libc::EVFILT_WRITE, write_flags, key) {
             Ok(()) => {}
-            // Deleting a write filter that was never armed is a no-op.
+            // never armed
             Err(e) if !write && e.raw_os_error() == Some(libc::ENOENT) => {}
             Err(e) => return Err(e),
         }
@@ -86,9 +76,7 @@ impl Poller {
         Ok(())
     }
 
-    /// Drop all interest on `fd`. Both filters are deleted, but [`add`](Self::add) arms only the
-    /// read one, so deleting an unarmed write filter reports `ENOENT`. That is the usual case, not
-    /// an error, so it is swallowed.
+    /// `ENOENT` is swallowed: the write filter exists only while write interest is armed.
     pub(crate) fn remove(&self, fd: RawFd) -> io::Result<()> {
         for filter in [libc::EVFILT_READ, libc::EVFILT_WRITE] {
             match self.change_raw(fd, filter, libc::EV_DELETE, 0) {
@@ -101,10 +89,7 @@ impl Poller {
         Ok(())
     }
 
-    /// Block until at least one fd is ready, or until `timeout` elapses (`None`
-    /// blocks indefinitely), recording the ready events. Returns how many there
-    /// are; drain them with [`next_event`](Self::next_event). `EINTR` yields
-    /// `Ok(0)` so the caller can re-check shutdown state and poll again.
+    /// `None` blocks indefinitely. Returns the ready count; `EINTR` yields `Ok(0)`.
     pub(crate) fn wait(&mut self, timeout: Option<Duration>) -> io::Result<usize> {
         let max_events = libc::c_int::try_from(self.events.len()).unwrap_or(libc::c_int::MAX);
         let ts = timeout.map(to_timespec);
@@ -136,13 +121,11 @@ impl Poller {
         Ok(self.ready)
     }
 
-    /// The next event from the last [`wait`](Self::wait), or `None` once the batch
-    /// is drained. Advances an internal cursor, so each event is yielded once.
     pub(crate) fn next_event(&mut self) -> Option<PollEvent> {
         if self.next >= self.ready {
             return None;
         }
-        // Copy the (packed) kevent out so fields are read by value, never by ref.
+        // kevent is packed: copy it out, never borrow a field.
         let event = self.events[self.next];
         self.next += 1;
         let filter = event.filter;
@@ -184,8 +167,6 @@ impl Poller {
     }
 }
 
-/// A relative `timeout` as the `timespec` kqueue expects, clamping an
-/// out-of-range duration rather than overflowing.
 fn to_timespec(timeout: Duration) -> libc::timespec {
     // SAFETY: an all-zero timespec is valid; the meaningful fields are set below.
     let mut ts: libc::timespec = unsafe { mem::zeroed() };

@@ -1,11 +1,7 @@
-//! The SSDP reflector reflects Simple Service Discovery Protocol (`UPnP`) between the source and
-//! target interfaces so service discovery crosses the link. Advertisements (`NOTIFY`) reflect
-//! target → source as a plain multicast re-emit (a [`SimpleReflector`](super::SimpleReflector)). Searches (`M-SEARCH`)
-//! reflect source → target and each searcher's unicast `200 OK` replies route back through a
-//! per-searcher session (the shared [`SearchReflector`](super::search::SearchReflector)). Re-emits go to the same group at TTL 2,
-//! sourced from the egress interface. With `dial`, a target→source datagram's DIAL `LOCATION` is
-//! rewritten to a source-side proxy: [`DialRewrite`] is the SSDP [`ReplyRewrite`], used by both the
-//! advertisement direction and each search session's response.
+//! The SSDP reflector: `NOTIFY` advertisements reflect target → source as a plain multicast
+//! re-emit, `M-SEARCH`es source → target with each searcher's unicast `200 OK` routed back through
+//! a per-searcher session. With `dial`, [`DialRewrite`] rewrites a target→source datagram's DIAL
+//! `LOCATION` to a source-side proxy on both legs.
 
 use std::time::Duration;
 
@@ -26,20 +22,17 @@ use super::{
     directional_verdict,
 };
 
-/// What a DIAL-enabled SSDP reflector needs to rewrite a device's `LOCATION` to a source-side proxy: the
-/// target capture the device sits behind (its address and interface name resolve through it per
-/// rewrite) and a reused scratch sink the rewritten datagram is built in. Owned per rewriting reflector
-/// (the advertisement direction, and one per M-SEARCH session's response reflector), so it isn't `Copy`.
+/// The SSDP [`ReplyRewrite`] with `dial`: rewrites a device's `LOCATION` to a source-side proxy.
+/// The device's address and interface resolve through `target` per rewrite, so nothing is cached
+/// across an address change.
 struct DialRewrite {
     target: CaptureKey,
-    /// Reused sink for the rewritten datagram; see the [`ReplyRewrite`] impl. Bounded by the
-    /// payload that still frames within [`MAX_FRAME_LEN`](crate::net::MAX_FRAME_LEN), so a rewrite
-    /// that fits is always sendable.
+    /// Sized to the payload that still frames within [`MAX_FRAME_LEN`](crate::net::MAX_FRAME_LEN),
+    /// so a rewrite that fits is always sendable.
     scratch: StreamBuffer,
 }
 
 impl DialRewrite {
-    /// A rewriter for the device behind `target`.
     fn new(target: CaptureKey) -> Self {
         Self {
             target,
@@ -49,9 +42,6 @@ impl DialRewrite {
 }
 
 impl ReplyRewrite for DialRewrite {
-    /// Rewrite a target→source SSDP datagram's DIAL `LOCATION` to a source-side description proxy, into
-    /// the reused scratch. Returns the rewritten slice, or `None` to forward `payload` verbatim.
-    /// `egress` is the source capture the datagram reflects onto.
     fn rewrite<'a>(
         &'a mut self,
         payload: &[u8],
@@ -67,7 +57,6 @@ impl ReplyRewrite for DialRewrite {
                 .egress_addrs(self.target)
                 .and_then(InterfaceAddresses::v4),
         ) else {
-            // A family the proxy can't bridge yet; any DIAL LOCATION goes through unrewritten.
             log::debug!("SSDP: source or target has no IPv4; DIAL rewrite skipped");
             return None;
         };
@@ -88,8 +77,6 @@ impl ReplyRewrite for DialRewrite {
     }
 }
 
-/// SSDP's classifier kind maps to its two group message types. The unicast `200 OK` reply is a
-/// separate leg ([`MessageType::SsdpResponse`]), carried by the response reflector, not the classifier.
 impl From<SsdpKind> for MessageType {
     fn from(kind: SsdpKind) -> Self {
         match kind {
@@ -99,24 +86,17 @@ impl From<SsdpKind> for MessageType {
     }
 }
 
-/// The directional gate for the advertisement leg: a `NOTIFY` is an advertisement to reflect, an
-/// `M-SEARCH` belongs to the search direction, and anything else on the group is junk.
 fn advertisement_verdict(payload: &[u8]) -> Verdict {
     directional_verdict(classify(payload), SsdpKind::Advertisement)
 }
 
-/// The directional gate for the search leg: an `M-SEARCH` is a search to reflect, a `NOTIFY` belongs to
-/// the advertisement direction, and anything else on the group is junk.
 fn search_verdict(payload: &[u8]) -> Verdict {
     directional_verdict(classify(payload), SsdpKind::Search)
 }
 
-/// A session outlives the searcher's MX window by this grace, since a device's 200-OK may lag the
-/// search.
+/// Slack past the MX window for a device's late 200 OK.
 const SESSION_GRACE: Duration = Duration::from_secs(2);
 
-/// An `M-SEARCH`'s session window: its MX response window (clamped by [`parse_msearch_mx`]) plus the
-/// reply grace. A search with no usable MX falls back to the protocol default.
 fn search_window(payload: &[u8]) -> Duration {
     let mx = parse_msearch_mx(payload).unwrap_or_else(|| {
         log::debug!(
@@ -127,7 +107,7 @@ fn search_window(payload: &[u8]) -> Duration {
     Duration::from_secs(u64::from(mx)) + SESSION_GRACE
 }
 
-/// SSDP as a search-style protocol: one IPv4 group and, unlike mDNS and WSD, BOTH IPv6 scopes.
+/// Unlike mDNS and WSD, SSDP has two IPv6 scopes.
 const SSDP: SearchProtocol = SearchProtocol {
     name: "SSDP",
     announcement_kind: "advertisement",
@@ -142,10 +122,6 @@ const SSDP: SearchProtocol = SearchProtocol {
     suppress: advertises_only_unreachable,
 };
 
-/// Build the SSDP reflector for `reflector` and register both directions on `dispatcher`: the
-/// advertisement and search legs of [`build_pair`], with `dial` adding the DIAL `LOCATION` rewrite
-/// to both. A no-op when SSDP isn't enabled.
-///
 /// # Errors
 /// As [`build_pair`].
 pub(crate) fn build(
@@ -167,7 +143,6 @@ pub(crate) fn build(
     build_pair(reflector, interfaces, dispatcher, SSDP, rewrite, summary)
 }
 
-/// The DIAL rewrite for the device behind `target`.
 fn dial_rewrite(target: CaptureKey) -> Box<dyn ReplyRewrite> {
     Box::new(DialRewrite::new(target))
 }

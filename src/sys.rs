@@ -1,6 +1,5 @@
-//! Small platform/syscall helpers shared across subsystems. Some are unconditional (fd
-//! ownership); others are `cfg`-gated to the platforms that need them. macOS lacks `pipe2`
-//! and the `SOCK_*` type flags, so it applies close-on-exec and non-blocking by `fcntl`.
+//! Small syscall helpers shared across subsystems. macOS lacks `pipe2` and the `SOCK_*` type
+//! flags, so it applies close-on-exec and non-blocking by `fcntl`.
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -11,11 +10,10 @@ use std::ptr;
 
 use libc::{c_int, c_void, socklen_t};
 
-/// Take ownership of a raw fd returned by a fd-returning syscall: a negative value is the
-/// POSIX error sentinel; a non-negative one is a fresh fd we own.
+/// Take ownership of a fd-returning syscall's result.
 ///
 /// # Errors
-/// Returns the last OS error when `raw` is negative.
+/// The last OS error when `raw` is negative.
 pub(crate) fn owned_fd_from(raw: RawFd) -> io::Result<OwnedFd> {
     if raw < 0 {
         return Err(io::Error::last_os_error());
@@ -35,23 +33,21 @@ pub(crate) fn check(rc: c_int) -> io::Result<()> {
     Ok(())
 }
 
-/// The status of a non-blocking read/write syscall, from [`from_syscall`](IoStatus::from_syscall).
+/// The status of a non-blocking read/write syscall.
 pub(crate) enum IoStatus {
-    /// `n` bytes transferred (read or written), possibly 0. The caller decides what 0 means.
+    /// Bytes transferred, possibly 0; the caller decides what 0 means.
     Ready(usize),
-    /// `EAGAIN`/`EWOULDBLOCK`: nothing transferred on a non-blocking fd.
+    /// `EAGAIN`/`EWOULDBLOCK`.
     WouldBlock,
 }
 
 impl IoStatus {
-    /// Triage a read/write syscall's return value `n`: a non-negative count is `Ready`, a negative one
-    /// is `WouldBlock` on `EAGAIN`/`EWOULDBLOCK` or else a real error. `EINTR` is not special-cased:
-    /// the sockets are non-blocking and the shutdown signals install with `SA_RESTART`, so the
-    /// restartable read/write calls auto-restart rather than surfacing `EINTR` (only the
-    /// non-restartable reactor wait can, and it retries itself).
+    /// `EINTR` is not special-cased: the shutdown signals install with `SA_RESTART`, so
+    /// restartable read/write calls auto-restart; only the reactor wait can see it, and it
+    /// retries itself.
     ///
     /// # Errors
-    /// Returns the last OS error for any errno other than `EAGAIN`/`EWOULDBLOCK`.
+    /// The last OS error for any errno other than `EAGAIN`/`EWOULDBLOCK`.
     pub(crate) fn from_syscall(n: isize) -> io::Result<IoStatus> {
         if n >= 0 {
             return Ok(IoStatus::Ready(
@@ -66,28 +62,22 @@ impl IoStatus {
     }
 }
 
-/// Whether `err` is the non-blocking "nothing right now" signal (`EAGAIN`/`EWOULDBLOCK`). The two are
-/// equal on our targets, so they're matched with a guard, not an or-pattern whose second arm would be
-/// unreachable, for portability. Single-sources the would-block errno set for
-/// [`from_syscall`](IoStatus::from_syscall) and the TCP `accept` path.
+/// `EAGAIN` and `EWOULDBLOCK` are equal on our targets, so an or-pattern's second arm would be
+/// unreachable; hence the guard.
 pub(crate) fn would_block(err: &io::Error) -> bool {
     matches!(err.raw_os_error(), Some(e) if e == libc::EAGAIN || e == libc::EWOULDBLOCK)
 }
 
-/// `size_of::<T>()` as a `socklen_t`, for `setsockopt`/`bind` length arguments.
 pub(crate) fn socklen_of<T>() -> socklen_t {
     socklen_t::try_from(size_of::<T>()).expect("option/address size fits socklen_t")
 }
 
-/// Read (and thereby clear) the socket's pending error (`SO_ERROR`): a non-blocking connect's
-/// outcome after its writable edge, or an asynchronous error the kernel parked on the socket
-/// (e.g. `ENETDOWN` on a packet socket whose interface died).
+/// Read and clear the socket's pending error: a non-blocking connect's outcome, or an
+/// asynchronous error the kernel parked (`ENETDOWN` on a packet socket whose interface died).
 pub(crate) fn so_error(fd: RawFd) -> io::Result<c_int> {
     getsockopt_int(fd, libc::SOL_SOCKET, libc::SO_ERROR)
 }
 
-/// `setsockopt` with a plain-data option `value`.
-///
 /// # Errors
 /// The OS error if the option can't be set.
 pub(crate) fn setsockopt<T>(fd: RawFd, level: c_int, name: c_int, value: &T) -> io::Result<()> {
@@ -103,8 +93,6 @@ pub(crate) fn setsockopt<T>(fd: RawFd, level: c_int, name: c_int, value: &T) -> 
     })
 }
 
-/// The current value of a `c_int` socket option.
-///
 /// # Errors
 /// The OS error if the option can't be read.
 pub(crate) fn getsockopt_int(fd: RawFd, level: c_int, name: c_int) -> io::Result<c_int> {
@@ -123,17 +111,15 @@ pub(crate) fn getsockopt_int(fd: RawFd, level: c_int, name: c_int) -> io::Result
     Ok(value)
 }
 
-/// Bound a blocking socket's reads with `SO_RCVTIMEO`: an answer that never arrives then surfaces as
-/// would-block instead of parking the single-threaded reactor forever. Only the synchronous
-/// request/reply sockets need it; everything the reactor polls is non-blocking already.
+/// `SO_RCVTIMEO`: an answer that never arrives surfaces as would-block instead of parking the
+/// reactor. Only the synchronous request/reply sockets need it.
 ///
 /// # Errors
-/// Returns the OS error if the option can't be set.
+/// The OS error if the option can't be set.
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub(crate) fn set_recv_timeout(fd: RawFd, timeout: std::time::Duration) -> io::Result<()> {
-    // `tv_usec` is a `suseconds_t`, whose width varies by target: musl deprecates the name and
-    // widens it to 64-bit, so the conversion has to be fallible to compile where it is still 32-bit.
-    // Where it is already 64-bit the conversion can't fail, which is what clippy objects to.
+    // `suseconds_t` is 32-bit on some targets and 64-bit on musl: the conversion must stay
+    // fallible for the former, and clippy objects where it can't fail.
     #[allow(clippy::unnecessary_fallible_conversions)]
     let tv_usec = timeout
         .subsec_micros()
@@ -149,9 +135,8 @@ pub(crate) fn set_recv_timeout(fd: RawFd, timeout: std::time::Duration) -> io::R
     setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVTIMEO, &tv)
 }
 
-/// Raise the open-file soft limit to the hard one: a DIAL proxy costs two listener fds plus two per
-/// proxied connection, and each search session holds a port reservation. Best-effort, and only the
-/// soft limit moves, which needs no privilege.
+/// Raise the soft open-file limit to the hard one (needs no privilege). A DIAL proxy costs two
+/// listener fds plus two per connection, and each search session holds a port reservation.
 pub(crate) fn raise_file_limit() {
     // SAFETY: an all-zero `rlimit` is a valid value for `getrlimit` to overwrite.
     let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
@@ -188,8 +173,7 @@ pub(crate) fn raise_file_limit() {
     );
 }
 
-/// An open-file limit for the log: macOS reports an infinite hard limit, and the number for that is
-/// noise.
+/// macOS reports an infinite hard limit; the number for that is noise.
 fn show_limit(limit: libc::rlim_t) -> String {
     if limit == libc::RLIM_INFINITY {
         "unlimited".to_owned()
@@ -198,22 +182,20 @@ fn show_limit(limit: libc::rlim_t) -> String {
     }
 }
 
-/// Ask the kernel to report a receive-queue overflow (`SO_RERROR`) instead of dropping it silently:
-/// the next `recv` then fails with `ENOBUFS`, so a caller can tell "nothing arrived" from "something
-/// was thrown away". A FreeBSD 13.0+ option; macOS has the same silent drop and no equivalent, and
-/// Linux netlink reports overflow already.
+/// `SO_RERROR` (FreeBSD 13.0+): a receive-queue overflow fails the next `recv` with `ENOBUFS`
+/// instead of being dropped silently. macOS has no equivalent; Linux netlink reports overflow
+/// already.
 ///
 /// # Errors
-/// Returns the OS error if the option can't be set.
+/// The OS error if the option can't be set.
 #[cfg(target_os = "freebsd")]
 pub(crate) fn set_recv_error_reporting(fd: RawFd) -> io::Result<()> {
     setsockopt(fd, libc::SOL_SOCKET, libc::SO_RERROR, &1 as &c_int)
 }
 
-/// Best-effort: grow the kernel receive queue to `bytes` so a burst can't overflow it as easily,
-/// leaving an already-larger one alone. `SO_RCVBUF` sets an absolute size, so an operator who raised
-/// the default would otherwise have it silently cut back. Only the BSD route sockets need this (Linux
-/// netlink already defaults to the system max).
+/// Best-effort. Leaves an already-larger queue alone: `SO_RCVBUF` sets an absolute size, so an
+/// operator's raised default would otherwise be cut back. Linux netlink defaults to the system
+/// max and needs none of this.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub(crate) fn increase_recv_buffer(fd: RawFd, bytes: c_int) {
     match getsockopt_int(fd, libc::SOL_SOCKET, libc::SO_RCVBUF) {
@@ -231,8 +213,7 @@ pub(crate) fn increase_recv_buffer(fd: RawFd, bytes: c_int) {
     set_recv_buffer(fd, bytes);
 }
 
-/// Request `bytes` of receive queue. The kernel clamps it to its own maximum, and a failure is
-/// logged and ignored (the default buffer still works), so this never fails the caller.
+/// Kernel-clamped; a failure is logged, not returned, since the default buffer still works.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 fn set_recv_buffer(fd: RawFd, bytes: c_int) {
     if let Err(e) = setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, &bytes) {
@@ -240,13 +221,10 @@ fn set_recv_buffer(fd: RawFd, bytes: c_int) {
     }
 }
 
-/// A socket of `family` and `base_type` (e.g. `SOCK_DGRAM`/`SOCK_STREAM`) for `protocol`,
-/// close-on-exec and non-blocking. Non-blocking keeps a stray read from freezing the single-threaded
-/// reactor. Linux and FreeBSD set both flags in the socket type; macOS lacks them and applies them by
-/// `fcntl`.
+/// A close-on-exec, non-blocking socket.
 ///
 /// # Errors
-/// Returns the OS error if the socket can't be opened (or, on macOS, the flags can't be set).
+/// The OS error if the socket can't be opened (or, on macOS, the flags can't be set).
 pub(crate) fn open_socket(family: c_int, base_type: c_int, protocol: c_int) -> io::Result<OwnedFd> {
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     let fd = socket(
@@ -261,11 +239,11 @@ pub(crate) fn open_socket(family: c_int, base_type: c_int, protocol: c_int) -> i
     Ok(fd)
 }
 
-/// A blocking socket, close-on-exec: for a synchronous request/reply exchange (a netlink dump, a
-/// route query) the reactor never polls.
+/// A close-on-exec, blocking socket: for a synchronous request/reply exchange the reactor never
+/// polls.
 ///
 /// # Errors
-/// Returns the OS error if the socket can't be opened.
+/// The OS error if the socket can't be opened.
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub(crate) fn blocking_socket(
     family: c_int,
@@ -290,7 +268,7 @@ pub(crate) fn bind(fd: RawFd, addr: IpAddr, port: u16, scope_id: u32) -> io::Res
     check(unsafe { libc::bind(fd, (&raw const storage).cast::<libc::sockaddr>(), len) })
 }
 
-/// The address `fd` is bound to, via `getsockname`.
+/// The address `fd` is bound to.
 ///
 /// # Errors
 /// The OS error if the name can't be read, or a socket of neither IP family.
@@ -332,15 +310,11 @@ pub(crate) fn local_addr(fd: RawFd) -> io::Result<SocketAddr> {
     }
 }
 
-/// Marshal `addr`:`port` into a zeroed `sockaddr_storage` as a `sockaddr_in`/`sockaddr_in6`,
-/// returning it with the family-specific length for a `bind`/option argument. `scope_id` (an
-/// interface index) goes into `sin6_scope_id` for IPv6, required to bind a link-local address,
-/// and is ignored for IPv4. On the BSDs the `sin*_len` byte is set, which the kernel requires.
-///
-/// The scope is written only for addresses whose zone the kernel consults
-/// ([`needs_scope_id`]) and zeroed otherwise, so callers can pass their interface index
-/// unconditionally: FreeBSD rejects a bind with a nonzero `sin6_scope_id` on any other
-/// address (its lookup compares the whole sockaddr -> `EADDRNOTAVAIL`).
+/// Marshal `addr`:`port` into a `sockaddr_storage`, returning it with the family-specific
+/// length. The BSD kernels require `sin*_len`. `scope_id` is written only where the kernel
+/// consults it ([`needs_scope_id`]) and zeroed otherwise, so callers pass their interface index
+/// unconditionally: FreeBSD rejects a bind carrying a nonzero `sin6_scope_id` on any other
+/// address (`EADDRNOTAVAIL`).
 pub(crate) fn sockaddr_for(
     addr: IpAddr,
     port: u16,
@@ -391,10 +365,9 @@ pub(crate) fn sockaddr_for(
     (storage, len)
 }
 
-/// Whether the kernel consults `sin6_scope_id` for this address: link-local unicast, or
-/// multicast scoped to the interface (`ff01::`) or link (`ff02::`). For everything else,
-/// including site-scoped multicast, Linux ignores the field, macOS zeroes it before its
-/// lookup, and FreeBSD rejects binds that carry it.
+/// Whether the kernel consults `sin6_scope_id`: link-local unicast, or interface- (`ff01::`) or
+/// link-scoped (`ff02::`) multicast. For everything else, site-scoped multicast included, Linux
+/// ignores the field, macOS zeroes it, and FreeBSD rejects binds that carry it.
 fn needs_scope_id(v6: Ipv6Addr) -> bool {
     const INTERFACE_LOCAL: u16 = 1;
     const LINK_LOCAL: u16 = 2;
@@ -402,10 +375,10 @@ fn needs_scope_id(v6: Ipv6Addr) -> bool {
         || (v6.is_multicast() && matches!(v6.segments()[0] & 0xf, INTERFACE_LOCAL | LINK_LOCAL))
 }
 
-/// Set `FD_CLOEXEC` and `O_NONBLOCK` on `fd`, read-modify-write so any other flags survive.
+/// Read-modify-write so any other flags survive.
 ///
 /// # Errors
-/// Returns the first failing `fcntl`'s error.
+/// The first failing `fcntl`'s error.
 #[cfg(target_os = "macos")]
 pub(crate) fn set_cloexec_nonblock(fd: RawFd) -> io::Result<()> {
     // SAFETY: `fd` is a valid open fd; F_GETFD returns the descriptor flags.
@@ -420,10 +393,6 @@ pub(crate) fn set_cloexec_nonblock(fd: RawFd) -> io::Result<()> {
     set_nonblock(fd)
 }
 
-/// Set `O_NONBLOCK` on `fd`, read-modify-write so the other status flags survive.
-///
-/// # Errors
-/// Returns the failing `fcntl`'s error.
 #[cfg(target_os = "macos")]
 fn set_nonblock(fd: RawFd) -> io::Result<()> {
     // SAFETY: `fd` is valid; F_GETFL returns the status flags.
@@ -438,15 +407,12 @@ fn set_nonblock(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
-/// The process environment as UTF-8 key/value pairs; entries that are not
-/// valid UTF-8 (or lack a `=`) are skipped.
+/// The process environment as UTF-8 key/value pairs; non-UTF-8 entries are skipped.
 ///
-/// On FreeBSD this walks the CRT-provided `environ` table itself instead of
-/// calling `std::env::vars`: std resolves `environ` via
-/// `dlsym(RTLD_DEFAULT, ..)`, which returns null in a statically linked
-/// binary (no dynamic symbol table), and std dereferences the null -- the
-/// shipped static binary segfaulted on startup. An `extern` reference links
-/// against the crt1-provided symbol in any executable, static or dynamic.
+/// Walks the crt1-provided `environ` itself instead of calling `std::env::vars`: std resolves
+/// `environ` via `dlsym(RTLD_DEFAULT, ..)`, which is null in a statically linked binary, and
+/// the shipped static binary segfaulted on startup. Rust 1.99 ships the upstream fix; drop
+/// this at that bump.
 #[cfg(target_os = "freebsd")]
 pub(crate) fn process_env() -> Vec<(String, String)> {
     unsafe extern "C" {
@@ -470,8 +436,7 @@ pub(crate) fn process_env() -> Vec<(String, String)> {
     entries
 }
 
-/// The process environment as UTF-8 key/value pairs; entries that are not
-/// valid UTF-8 are skipped.
+/// The process environment as UTF-8 key/value pairs; non-UTF-8 entries are skipped.
 #[cfg(not(target_os = "freebsd"))]
 pub(crate) fn process_env() -> Vec<(String, String)> {
     std::env::vars_os()

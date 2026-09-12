@@ -1,9 +1,7 @@
-//! An ephemeral-UDP-port reservation: a held, never-read socket that keeps the kernel's UDP demux
-//! satisfied. The SSDP search reflector re-emits an M-SEARCH from this port so devices unicast their
-//! `200 OK` back to it. The port must stay claimed for the session's lifetime, else the kernel finds
-//! no socket for the reply and answers with an ICMP port-unreachable. The raw capture reads the actual
-//! datagram, not this socket; on Linux a drop-all BPF filter makes it enqueue nothing. Dropping it
-//! frees the port.
+//! A held, never-read UDP socket that keeps an ephemeral port claimed. The SSDP search reflector
+//! re-emits an M-SEARCH from it so devices unicast their `200 OK` back; without the socket the
+//! kernel answers with an ICMP port-unreachable. The raw capture reads the actual datagram; on
+//! Linux a drop-all BPF filter makes this socket enqueue nothing.
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -11,21 +9,17 @@ use std::os::fd::{AsRawFd, OwnedFd};
 
 use crate::sys::{bind, local_addr, open_socket};
 
-/// A reservation over one OS-assigned ephemeral UDP port on an interface's source address. Owns the
-/// bound socket; `Drop` frees the port.
+/// `Drop` frees the port.
 pub(crate) struct PortReservation {
-    /// Held to keep the port claimed; never read.
     _fd: OwnedFd,
     source: SocketAddr,
 }
 
 impl PortReservation {
-    /// Reserve an ephemeral port on `addr`, the egress interface's own address that the reflector
-    /// sends from and devices reply to. `ifindex` disambiguates an IPv6 link-local `addr` and is
-    /// used only for one.
+    /// `ifindex` disambiguates an IPv6 link-local `addr` and is used only for one.
     ///
     /// # Errors
-    /// Propagates the socket / filter / bind / `getsockname` syscall failure.
+    /// The socket / filter / bind / `getsockname` failure.
     pub(crate) fn create(addr: IpAddr, ifindex: u32) -> io::Result<Self> {
         let family = match addr {
             IpAddr::V4(_) => libc::AF_INET,
@@ -42,19 +36,15 @@ impl PortReservation {
         })
     }
 
-    /// The OS-assigned ephemeral port the reservation holds.
     pub(crate) fn port(&self) -> u16 {
         self.source.port()
     }
 
-    /// The reserved address and port: what the reflector sends from and devices reply to.
     pub(crate) fn source(&self) -> SocketAddr {
         self.source
     }
 }
 
-/// Attach a drop-all classic-BPF filter so the bound socket enqueues nothing: the bind already
-/// suppresses the ICMP port-unreachable, and the raw capture reads the real datagram.
 #[cfg(target_os = "linux")]
 fn attach_drop_all_filter(fd: std::os::fd::RawFd) -> io::Result<()> {
     // A single `BPF_RET | BPF_K` returning 0: accept zero bytes, i.e. drop every packet.

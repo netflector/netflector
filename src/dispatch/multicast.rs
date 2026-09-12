@@ -1,9 +1,7 @@
-//! Multicast group membership for the capture interfaces. The kernel admits a group's frames to the
-//! raw capture only once the interface joins it, which also drives the IGMP/MLD join upstream. One
-//! unbound `SOCK_DGRAM` socket per family, per interface. Sharding by interface caps each socket
-//! at the few reflected protocols (mDNS + SSDP), so Linux's `net.ipv4.igmp_max_memberships` (default
-//! 20, unraisable on a locked-down router) is never reached. Unbound so the kernel queues it no
-//! datagrams (UDP demux is by bound port); dropping the socket drops its memberships.
+//! Multicast group membership for the capture interfaces: the kernel admits a group's frames to the
+//! raw capture only once the interface joins it. One unbound `SOCK_DGRAM` socket per family per
+//! interface, so Linux's `net.ipv4.igmp_max_memberships` (default 20, unraisable on a locked-down
+//! router) is never reached; unbound, the kernel queues it no datagrams.
 
 use std::io;
 use std::net::IpAddr;
@@ -13,13 +11,8 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use crate::libcex::{GroupReq, MCAST_JOIN_GROUP};
 use crate::sys::{open_socket, setsockopt, sockaddr_for};
 
-/// How a [`rejoin`](MulticastJoiner::rejoin) replay landed: `joined` groups are members after the
-/// call (freshly re-joined, or already member), `deferred` groups have no address of their family
-/// yet, `failed` groups hit something else. The three sum to the desired-group count. Every desired
-/// group is re-applied on every call, so both failure kinds are retried alike; the split is about
-/// what to expect, since only a deferral has a known trigger that resolves it. `joined` (not
-/// "rejoined": the parked-return replay is a first join) is the signal a caller uses to tell a real
-/// replay from a vacuous one over an empty desired list.
+/// How a [`rejoin`](MulticastJoiner::rejoin) landed; the three sum to the desired-group count.
+/// Only a deferral (no address of its family yet) has a known trigger that resolves it.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub(crate) struct RejoinCounts {
     pub(crate) joined: usize,
@@ -27,24 +20,18 @@ pub(crate) struct RejoinCounts {
     pub(crate) failed: usize,
 }
 
-/// One recorded membership: the group wanted on this interface, and whether its current failure has
-/// been reported, so a group that can't join logs once per failure episode rather than on every
-/// replay. Cleared when the group joins, so a later relapse reports again.
+/// `reported`: the current failure episode has been logged; cleared when the group joins.
 struct Desired {
     group: IpAddr,
     reported: bool,
 }
 
-/// One capture interface's multicast memberships: one unbound `SOCK_DGRAM` fd per family, opened on
-/// that family's first join. The joiner holds no ifindex of its own -- the caller passes the
-/// interface's current one per call, so the table's [`Interface`](crate::interface::Interface) stays
-/// the single cached copy. `desired` records requested groups so they can be re-attempted when the
-/// interface re-resolves (a v4 group joined before its address existed becomes joinable then).
+/// One interface's memberships: a socket per family, opened on first join. The caller passes the
+/// interface's current ifindex per call; the joiner caches none.
 pub(crate) struct MulticastJoiner {
     v4: Option<OwnedFd>,
     v6: Option<OwnedFd>,
     desired: Vec<Desired>,
-    /// Cleared for an inert joiner, whose joins succeed without a membership.
     joins: bool,
 }
 
@@ -58,8 +45,7 @@ impl MulticastJoiner {
         }
     }
 
-    /// A joiner that joins nothing: `--no-join`. Its joins are successful no-ops and its
-    /// rejoins have nothing to replay.
+    /// Joins nothing: `--no-join`.
     pub(crate) fn inert() -> Self {
         Self {
             joins: false,
@@ -67,9 +53,8 @@ impl MulticastJoiner {
         }
     }
 
-    /// Record `group` for a later [`rejoin`](Self::rejoin) without joining now: the
-    /// parked-interface path, where no live index exists to join on. Deduped, like
-    /// [`join`](Self::join)'s own recording. Returns the group's index in the desired list.
+    /// Record `group` for a later [`rejoin`](Self::rejoin) without joining: the parked-interface
+    /// path. Returns its index in the desired list.
     pub(crate) fn record(&mut self, group: IpAddr) -> usize {
         if let Some(index) = self.desired.iter().position(|d| d.group == group) {
             return index;
@@ -81,16 +66,13 @@ impl MulticastJoiner {
         self.desired.len() - 1
     }
 
-    /// Join `group` on the interface `ifindex` and record it, so a later interface change
-    /// re-attempts it. Idempotent: the kernel keys memberships by `(group, ifindex)`.
-    /// `NonZeroU32` for the same reason as [`rejoin`](Self::rejoin); a parked caller
-    /// [`record`](Self::record)s instead.
+    /// Join `group` on `ifindex` and record it for later replays. Idempotent: the kernel keys
+    /// memberships by `(group, ifindex)`.
     ///
     /// # Errors
-    /// The OS error if the socket can't open or the membership can't be added. `EADDRNOTAVAIL` (no
-    /// address of that family yet) is deferrable: the group is recorded and [`rejoin`](Self::rejoin)
-    /// retries it on the next address-up event. Any other error is marked reported before it
-    /// returns -- the caller's log is the report, and the replay repeats it at debug only.
+    /// The OS error. `EADDRNOTAVAIL` (no address of that family yet) is deferrable:
+    /// [`rejoin`](Self::rejoin) retries on the next address event. Any other error is marked
+    /// reported: the caller's log is the report, and the replay repeats it at debug.
     pub(crate) fn join(&mut self, group: IpAddr, ifindex: NonZeroU32) -> io::Result<()> {
         if !self.joins {
             return Ok(());
@@ -105,27 +87,19 @@ impl MulticastJoiner {
         result
     }
 
-    /// Drop the per-family sockets, so the next join starts from fresh ones. For an interface
-    /// that was destroyed: memberships keyed to the dead index are never scrubbed from a
-    /// surviving socket, and on Linux those zombies still count toward
-    /// `igmp_max_memberships` (default 20, unraisable on a locked-down router), so re-joining
-    /// on kept sockets would exhaust the cap after a handful of recreations. Dropping the fds
-    /// releases every membership at once; `desired` survives for the replay.
+    /// Drop the sockets so the next join starts fresh. Memberships keyed to a destroyed
+    /// interface's index are never scrubbed from a surviving socket, and on Linux still count
+    /// toward `igmp_max_memberships`; dropping the fds releases them all. `desired` survives for
+    /// the replay.
     pub(crate) fn reset(&mut self) {
         self.v4 = None;
         self.v6 = None;
     }
 
-    /// Re-attempt every recorded membership after the interface re-resolves, returning the
-    /// [`RejoinCounts`] split of joined, deferred and failed. A group not joinable before its
-    /// address existed succeeds now; an already-held one is a no-op that still counts as joined.
-    /// Best-effort: a [deferrable](join_deferrable) failure logs at debug, since the address event
-    /// that resolves it is coming. Anything else logs at warn once per failure episode -- repeats
-    /// at debug, since the replay runs on every address event -- and at info when the group
-    /// finally joins.
-    /// `NonZeroU32` makes the parked case unrepresentable: `MCAST_JOIN_GROUP` on index 0
-    /// would let the kernel pick an arbitrary interface by route lookup and advertise our groups
-    /// there, so callers skip explicitly while parked.
+    /// Re-attempt every recorded membership. A deferrable failure logs at debug (its address
+    /// event is coming); anything else warns once per failure episode and logs info when it
+    /// finally joins. `NonZeroU32`: `MCAST_JOIN_GROUP` on index 0 lets the kernel pick an
+    /// arbitrary interface by route lookup, so callers skip explicitly while parked.
     pub(crate) fn rejoin(&mut self, ifindex: NonZeroU32) -> RejoinCounts {
         let mut counts = RejoinCounts::default();
         for i in 0..self.desired.len() {
@@ -173,30 +147,27 @@ impl MulticastJoiner {
                 .insert(open_socket(family, libc::SOCK_DGRAM, 0)?)
                 .as_raw_fd(),
         };
-        // Zero first: a field-by-field literal would leave the padding after `gr_interface`
-        // uninitialised, and `setsockopt` reads the whole struct (Valgrind flags them).
+        // Zeroed, not a field literal: `setsockopt` reads the padding after `gr_interface` too.
         // SAFETY: `group_req` is plain data; all-zero is valid.
         let mut req: GroupReq = unsafe { std::mem::zeroed() };
         req.gr_interface = ifindex.get();
-        // Interface is selected by `gr_interface`, so the group sockaddr carries no scope id.
+        // `gr_interface` selects the interface, so the group sockaddr carries no scope id.
         req.gr_group = sockaddr_for(group, 0, 0).0;
         match setsockopt(fd, level, MCAST_JOIN_GROUP, &req) {
-            // Already a member is success: the idempotent re-attempt depends on it.
             Err(e) if !already_member(&e) => Err(e),
             _ => Ok(()),
         }
     }
 }
 
-/// Whether a join error means the membership is already held, the benign duplicate the idempotent join
-/// relies on. Every target returns `EADDRINUSE` for an any-source re-join of an existing membership.
+/// Every target returns `EADDRINUSE` for an any-source re-join of a held membership; the
+/// idempotent replay relies on it.
 fn already_member(err: &io::Error) -> bool {
     err.raw_os_error() == Some(libc::EADDRINUSE)
 }
 
-/// Whether a join error means the environment can't perform the join at all (vs a real rejection),
-/// the cue for the join tests to self-skip. QEMU user-mode emulation doesn't implement the
-/// `MCAST_JOIN_GROUP` setsockopt (returns `ENOPROTOOPT`). Test seam only: at runtime these stay fatal.
+/// The environment can't join at all: QEMU user-mode returns `ENOPROTOOPT` for
+/// `MCAST_JOIN_GROUP`. The join tests self-skip on it.
 #[cfg(test)]
 pub(crate) fn join_unsupported(err: &io::Error) -> bool {
     matches!(
@@ -205,16 +176,14 @@ pub(crate) fn join_unsupported(err: &io::Error) -> bool {
     )
 }
 
-/// Whether a group-join failure means the socket holds as many memberships as the system allows:
-/// `ENOBUFS` on Linux (`net.ipv4.igmp_max_memberships`), `ETOOMANYREFS` on the BSDs.
+/// The socket holds as many memberships as the system allows: `ENOBUFS` on Linux
+/// (`net.ipv4.igmp_max_memberships`), `ETOOMANYREFS` on the BSDs.
 pub(crate) fn join_capped(e: &io::Error) -> bool {
     matches!(e.raw_os_error(), Some(libc::ENOBUFS | libc::ETOOMANYREFS))
 }
 
-/// Whether a group-join failure is deferrable: `EADDRNOTAVAIL` means the interface has no address of
-/// the group's family yet, so the group joins on the address event that supplies one. Every other
-/// error is replayed just the same, but has no trigger anyone can name, so it reports as a failure
-/// rather than a wait.
+/// `EADDRNOTAVAIL`: the interface has no address of the group's family yet; the address event
+/// that supplies one resolves it.
 pub(crate) fn join_deferrable(e: &io::Error) -> bool {
     e.raw_os_error() == Some(libc::EADDRNOTAVAIL)
 }

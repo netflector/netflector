@@ -1,8 +1,7 @@
 //! Interface lifecycle: keeping the table current as addresses change and as the kernel destroys
-//! and recreates interfaces. The monitor drain refreshes what a notification names and decides
-//! when the reconcile is due; the reconcile re-points a stale entry at its name's current interface
-//! (or parks it absent) and re-binds its captures in place. Both report what moved as capture keys,
-//! for the dispatcher to evict DIAL proxies and notify handlers by.
+//! and recreates interfaces. The monitor drain refreshes what a notification names; the reconcile
+//! re-points a stale entry at its name's current interface (or parks it absent) and re-binds its
+//! captures in place.
 
 use std::os::fd::RawFd;
 use std::time::{Duration, Instant};
@@ -13,54 +12,42 @@ use crate::linear_map::LinearMap;
 use super::CaptureKey;
 use super::interface_table::InterfaceTable;
 
-/// The reconcile's periodic floor: the guarantee that an interface recreation whose every
-/// event was lost (macOS's silent route-socket overflow) is still detected. Cheap while
-/// healthy -- one name lookup per watched interface plus one kernel probe per capture.
+/// The reconcile's periodic floor: an interface recreation whose every event was lost (macOS's
+/// silent route-socket overflow) is still detected.
 pub(super) const RECONCILE_TICK: Duration = Duration::from_secs(30);
 
-/// The reconcile cadence while an interface is parked absent or a rebuild step failed: the
-/// retry driver that picks up the interface's return and re-attempts failed re-binds.
+/// The reconcile cadence while an interface is parked absent or a rebuild step failed.
 pub(super) const RECONCILE_RETRY: Duration = Duration::from_secs(1);
 
 /// What a monitor drain found, as the captures on the interfaces concerned.
 #[derive(Default)]
 pub(super) struct Changes {
-    /// The interface lost or moved its IPv4 address, or could not be re-resolved: the DIAL
-    /// proxies, which bind IPv4, must re-mint.
+    /// The interface moved (or failed to re-resolve) its IPv4 address; DIAL proxies bind v4.
     pub(super) v4_moved: Vec<CaptureKey>,
-    /// The interface moved an address of either family: a search session's reserved reply
-    /// address may be stale.
+    /// The interface moved an address of either family.
     pub(super) touched: Vec<CaptureKey>,
     /// An event that can announce a destroyed or recreated interface arrived.
     pub(super) reconcile: bool,
 }
 
-/// One interface the reconcile rebuilt (or parked absent), with its captures. Whatever the
-/// replacement resolved to, state pinned to the old interface is stale.
+/// One interface the reconcile rebuilt (or parked absent), with its captures.
 pub(super) struct Rebuilt {
     pub(super) captures: Vec<CaptureKey>,
     pub(super) removed: bool,
 }
 
-/// The address-change monitor and the reconcile schedule.
 pub(super) struct InterfaceLifecycle {
-    /// Opened best-effort in [`new`](Self::new). `None` is a degraded mode: addresses stay at
-    /// their startup-resolved values.
+    /// `None` is a degraded mode: addresses stay at their startup values.
     monitor: Option<InterfaceMonitor>,
-    /// The largest kernel ifindex seen: the watched interfaces' own, raised by every drained
-    /// notification. On monotonic platforms ([`InterfaceMonitor::INDEXES_MONOTONIC`]) an
-    /// unknown-index Link event at or below this ceiling is churn on an existing unwatched
-    /// interface, not a creation, so it doesn't trigger the reconcile.
+    /// The largest kernel ifindex seen. Where indexes are monotonic, an unknown-index Link event
+    /// at or below this is churn on an unwatched interface, not a creation.
     max_seen_ifindex: u32,
-    /// When the next reconcile pass is due: the [`RECONCILE_TICK`] floor when healthy,
-    /// [`RECONCILE_RETRY`] while an interface is parked absent or a rebuild step failed, `now`
-    /// when a capture read error pulls it forward.
     next_reconcile: Instant,
 }
 
 impl InterfaceLifecycle {
-    /// Opens the monitor up front, before the first capture resolves, so a change during startup
-    /// is already queued rather than missed.
+    /// Opens the monitor before the first capture resolves, so a change during startup is
+    /// queued rather than missed.
     pub(super) fn new() -> Self {
         Self {
             monitor: open_monitor(),
@@ -69,12 +56,10 @@ impl InterfaceLifecycle {
         }
     }
 
-    /// The monitor's fd to watch, if it opened.
     pub(super) fn monitor_fd(&self) -> Option<RawFd> {
         self.monitor.as_ref().map(InterfaceMonitor::as_raw_fd)
     }
 
-    /// Seed the seen-index ceiling with a watched interface's own identity.
     pub(super) fn saw_interface(&mut self, ifindex: u32) {
         self.max_seen_ifindex = self.max_seen_ifindex.max(ifindex);
     }
@@ -83,28 +68,21 @@ impl InterfaceLifecycle {
         self.next_reconcile
     }
 
-    /// Pull the next reconcile forward to now: a capture read the error that says its interface
-    /// is gone.
     pub(super) fn reconcile_now(&mut self) {
         self.next_reconcile = Instant::now();
     }
 
-    /// Drain the monitor and re-resolve each interface a notification names, coalescing duplicates
-    /// so one interface re-resolves at most once per wakeup. An [`InterfaceEvent::Overflow`]
-    /// re-resolves every interface. Best-effort: a read or resolution failure logs and is
-    /// dropped, and the daemon keeps its last-known addresses.
-    ///
-    /// Doubles as the recreation detector: the returned [`Changes::reconcile`] asks for one after
-    /// an event that can announce a destroyed or recreated interface. A `Link` event on a watched
-    /// interface, or one carrying an index above everything seen (a creation, on platforms whose
-    /// indexes are monotonic), or any unknown-index event where no lifecycle messages exist
-    /// (macOS), or an overflow (the announcement may be among the drops) -- and, for a recreation
-    /// that reused the watched index, a per-capture kernel probe on every matched refresh.
+    /// Drain the monitor and re-resolve each interface a notification names, once per interface
+    /// per wakeup; an [`InterfaceEvent::Overflow`] re-resolves every interface. Best-effort: a
+    /// failure logs and the last-known addresses stand. [`Changes::reconcile`] is set by anything
+    /// that can announce a destroyed or recreated interface: a Link event on a watched interface,
+    /// an unknown index that reads as a creation, an overflow, or a capture whose kernel binding
+    /// died behind a matched index.
     pub(super) fn drain(&mut self, table: &mut InterfaceTable) -> Changes {
         let Some(monitor) = self.monitor.as_mut() else {
             return Changes::default();
         };
-        // Coalesce to one ifindex -> saw-a-Link-event entry per interface.
+        // ifindex -> saw a Link event
         let mut changed: LinearMap<u32, bool> = LinearMap::new();
         let mut overflow = false;
         if let Err(e) = monitor.drain(|event| match event {
@@ -119,36 +97,24 @@ impl InterfaceLifecycle {
                 }
             }
         }) {
-            // The drain already consumed and collected these notifications before failing, so refresh
-            // what we have rather than discard it; the socket's unread remainder stays readable and the
-            // level-triggered wait re-drains it.
+            // The unread remainder stays readable; the level-triggered wait re-drains it.
             log::warn!(
                 "interface monitor read failed mid-drain; refreshing what was collected: {e}"
             );
         }
         if changed.is_empty() && !overflow {
-            // nothing collected (a spurious wakeup, or a drain error before the first read)
             return Changes::default();
         }
-        // The creation gate compares against the ceiling from BEFORE this batch: the creation's
-        // own Link event would otherwise raise the ceiling past itself and slip through.
+        // Compared before this batch raises the ceiling, or a creation's own Link event would
+        // slip past.
         let prior_ceiling = self.max_seen_ifindex;
         for (ifindex, _) in changed.iter() {
             self.max_seen_ifindex = self.max_seen_ifindex.max(*ifindex);
         }
         let mut want_reconcile = overflow;
-        // The DIAL proxies bind IPv4 only, so collect the interfaces whose v4 address actually moved. A
-        // routine v6 or MAC change must not churn a proxy whose v4 (and cached LOCATION) is unchanged.
         let mut v4_moved: Vec<u32> = Vec::new();
-        // Interfaces whose addresses actually moved this cycle, for the session notification below:
-        // search reflectors drop sessions whose reserved port was bound to a re-addressed interface.
-        // Only a real address delta (either family) qualifies, not a benign Link / no-op-Address event,
-        // so a healthy session survives a carrier flap or an unrelated interface's churn. (DIAL is
-        // v4-only via v4_moved; sessions can be either family. Recreations are handled by the reconcile,
-        // keyed by capture, so they need no entry here.)
         let mut touched: Vec<u32> = Vec::new();
         if overflow {
-            // Notifications were dropped, so re-resolve every interface.
             log::debug!("interface monitor overflow; re-resolving all interfaces");
             for (ifindex, result) in table.refresh_all() {
                 match result {
@@ -161,10 +127,8 @@ impl InterfaceLifecycle {
                         }
                     }
                     Err(e) => {
-                        // The overflow already means notifications were dropped, so this is the one
-                        // chance to catch a move whose event was lost, and we can't confirm the address
-                        // survived. Treat it as moved so any DIAL proxy re-mints and any session drops
-                        // rather than keeping a listener bound to a possibly-vanished address.
+                        // Can't confirm the address survived: treat it as moved rather than keep
+                        // a listener on a possibly-vanished address.
                         log::warn!(
                             "re-resolving ifindex {ifindex} failed: {e}; evicting its proxies"
                         );
@@ -181,23 +145,19 @@ impl InterfaceLifecycle {
                         if change.v4 {
                             v4_moved.push(*ifindex);
                         }
-                        // Only a real address delta invalidates a session's reserved reply address; a
-                        // bare Link event (carrier / MTU / flag) with no delta must not clear sessions.
+                        // A bare Link event (carrier, MTU, flags) must not clear sessions.
                         if change.v4 || change.v6 {
                             touched.push(*ifindex);
                         }
-                        // A lifecycle event on a watched interface, or a capture whose kernel
-                        // binding died behind this (possibly reused) index: reconcile.
                         if *is_link || !table.probe_by_ifindex(*ifindex) {
                             want_reconcile = true;
                         }
                     }
                     Ok(None) => {
-                        // An interface we don't watch -- unless it is one of ours, recreated
-                        // under a new index. A Link event above every index seen so far is a
-                        // creation where indexes are monotonic; where they aren't (FreeBSD),
-                        // any Link announcement reconciles; where lifecycle events don't
-                        // exist at all (macOS), any unknown-index event has to.
+                        // Unwatched, unless it is ours recreated under a new index. With monotonic
+                        // indexes a Link event above the ceiling is a creation; FreeBSD reuses
+                        // indexes, so any Link event reconciles; macOS has no lifecycle events,
+                        // so any unknown-index event does.
                         let creation = if InterfaceMonitor::INDEXES_MONOTONIC {
                             *is_link && *ifindex > prior_ceiling
                         } else {
@@ -208,10 +168,8 @@ impl InterfaceLifecycle {
                         }
                     }
                     Err(e) => {
-                        // Same conservative stance as the overflow branch: a failed re-resolve can't
-                        // confirm the bound v4 survived (a notification arrived, so something changed),
-                        // so evict any proxy on it rather than risk a stale, silently-dead listener.
-                        // Reconcile, since it can't confirm the interface survived either.
+                        // As in the overflow branch: an unconfirmed address counts as moved, and
+                        // the interface may not have survived either.
                         log::warn!(
                             "re-resolving ifindex {ifindex} failed: {e}; evicting its proxies"
                         );
@@ -229,13 +187,9 @@ impl InterfaceLifecycle {
         }
     }
 
-    /// Detect and repair interfaces whose kernel identity moved out from under the table: the
-    /// recreation recovery. Each stale entry is re-pointed at its name's current interface (or
-    /// parked absent) and its captures re-bound in place behind their stable keys; the caller
-    /// evicts the interface's DIAL proxies and notifies the handlers, whose state died with the
-    /// old interface whatever the new one's values. Re-arms the next pass:
-    /// the [`RECONCILE_TICK`] floor when healthy, [`RECONCILE_RETRY`] while an interface is
-    /// absent or a rebuild step failed (the probe keeps re-flagging a half-rebuilt entry).
+    /// Repair every stale interface: re-point it at its name's current interface (or park it
+    /// absent) and re-bind its captures behind their stable keys. Re-arms the next pass at
+    /// [`RECONCILE_TICK`], or [`RECONCILE_RETRY`] while an interface is absent or a step failed.
     pub(super) fn reconcile(&mut self, table: &mut InterfaceTable) -> Vec<Rebuilt> {
         let mut pending = false;
         let mut rebuilt = Vec::new();
@@ -260,8 +214,8 @@ impl InterfaceLifecycle {
                 }
             }
             match table.rebind_interface(stale.key, stale.cur) {
-                // Both kinds are retried on every later address event, but only a deferral has a
-                // trigger that will resolve it, so only that one may promise a retry.
+                // Both are retried on every address event, but only a deferral has a trigger to
+                // promise.
                 Ok(counts) => {
                     if counts.failed > 0 {
                         log::warn!(
@@ -309,8 +263,7 @@ impl InterfaceLifecycle {
                 removed: stale.cur == 0,
             });
         }
-        // The fast cadence also covers parked interfaces (quiescent, so not in the stale list):
-        // their return must be picked up promptly even if every event for it is lost.
+        // Parked interfaces are not in the stale list; the fast cadence picks up their return.
         let retry = pending || table.any_absent();
         self.next_reconcile = Instant::now()
             + if retry {
@@ -322,8 +275,6 @@ impl InterfaceLifecycle {
     }
 }
 
-/// The captures on the interfaces currently at `ifindexes`, mapping the refresh path's kernel
-/// indexes to the stable [`CaptureKey`]s the eviction and session notification are keyed by.
 fn captures_for(table: &InterfaceTable, ifindexes: &[u32]) -> Vec<CaptureKey> {
     ifindexes
         .iter()

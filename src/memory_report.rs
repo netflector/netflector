@@ -1,21 +1,14 @@
-//! Optional memory-footprint diagnostics. `debug_memory_interval_secs` enables a periodic report; a
-//! SIGUSR1 [`ControlEvent::Dump`] emits one on demand regardless of that setting.
-//!
-//! [`MemoryReporter`] is a timer-only reactor handler (watches no fds) that logs resident set size
-//! every configured interval and on a control-event dump. [`run`](crate::run) also emits a baseline at
-//! startup and one at shutdown when the periodic report is on. Peak RSS comes from `getrusage`
-//! (cross-platform); current RSS is read from `/proc/self/status` on Linux, the `kern.proc.pid`
-//! sysctl on FreeBSD, and `proc_pidinfo` on macOS. Heap-arena stats (glibc `mallinfo2`) are
-//! omitted: the static musl build has no equivalent.
+//! Memory-footprint diagnostics: an RSS report every `debug_memory_interval_secs`, and one on
+//! every SIGUSR1 [`ControlEvent::Dump`] regardless. No heap-arena stats: the static musl build
+//! has no `mallinfo2`.
 
 use std::time::{Duration, Instant};
 
 use crate::reactor::{ControlEvent, Handler, Reactor, ReadyEvent};
 
-/// Peak resident set size in KiB via `getrusage`. No `/proc` needed, so it works on every target.
-/// `ru_maxrss` is in KiB on Linux and FreeBSD, in bytes on macOS. FreeBSD maintains it by
-/// statclock SAMPLING while a thread is on CPU, so a near-idle process the sampler never catches
-/// legitimately reads 0 forever; [`log_report`] folds in the process's own observations there.
+/// `ru_maxrss` is KiB on Linux/FreeBSD, bytes on macOS. FreeBSD samples it on statclock ticks
+/// while on CPU, so an idle process can read 0 forever; [`log_report`] folds in its own
+/// observations there.
 fn peak_rss_kib() -> u64 {
     // SAFETY: a zeroed `rusage` is a valid, fully-initialized buffer for `getrusage` to overwrite.
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
@@ -25,13 +18,12 @@ fn peak_rss_kib() -> u64 {
     }
     let maxrss = u64::try_from(usage.ru_maxrss).unwrap_or(0);
     if cfg!(target_os = "macos") {
-        maxrss / 1024 // bytes -> KiB
+        maxrss / 1024
     } else {
         maxrss
     }
 }
 
-/// The current resident set (`VmRSS`) in KiB from `/proc/self/status`, or `None` if it can't be read.
 #[cfg(target_os = "linux")]
 fn current_rss_kib() -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
@@ -44,9 +36,6 @@ fn current_rss_kib() -> Option<u64> {
     })
 }
 
-/// The current resident set in KiB from the `kern.proc.pid` sysctl (`ki_rssize`, in pages), or
-/// `None` on a sysctl failure or an unexpected reply size: a `kinfo_proc` ABI mismatch reads as
-/// absent rather than as garbage from a misaligned field.
 #[cfg(target_os = "freebsd")]
 fn current_rss_kib() -> Option<u64> {
     // SAFETY: a zeroed `kinfo_proc` is a plain-data buffer for the kernel to overwrite.
@@ -72,6 +61,7 @@ fn current_rss_kib() -> Option<u64> {
         );
         return None;
     }
+    // An ABI mismatch reads as absent rather than as a number off a misaligned field.
     if len != std::mem::size_of::<libc::kinfo_proc>() {
         log::debug!(
             "memory: kern.proc.pid returned {len} bytes, expected {}: kinfo_proc ABI mismatch",
@@ -80,14 +70,11 @@ fn current_rss_kib() -> Option<u64> {
         return None;
     }
     let pages = u64::try_from(kip.ki_rssize).ok()?;
-    // SAFETY: `sysconf(_SC_PAGESIZE)` is a pure query; libc serves it from the ELF aux vector,
-    // so it is not even a syscall.
+    // SAFETY: `sysconf` is a pure query.
     let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
     Some(pages * page / 1024)
 }
 
-/// The current resident set in KiB via `proc_pidinfo(PROC_PIDTASKINFO)` (`pti_resident_size`, in
-/// bytes), or `None` when the call fails or fills less than the full struct.
 #[cfg(target_os = "macos")]
 fn current_rss_kib() -> Option<u64> {
     // SAFETY: a zeroed `proc_taskinfo` is a plain-data buffer for the kernel to overwrite.
@@ -111,19 +98,16 @@ fn current_rss_kib() -> Option<u64> {
     Some(info.pti_resident_size / 1024)
 }
 
-/// This process's own RSS high-water mark in KiB, fed by [`log_report`]'s `current_rss_kib`
-/// readings: the substitute peak for FreeBSD's sampled-and-possibly-never `ru_maxrss`.
+/// Substitute for FreeBSD's sampled `ru_maxrss`; see [`peak_rss_kib`].
 #[cfg(target_os = "freebsd")]
 static OBSERVED_PEAK_KIB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Record an RSS observation and return the high-water mark including it.
 #[cfg(target_os = "freebsd")]
 fn fold_observed(rss: u64) -> u64 {
     let prev = OBSERVED_PEAK_KIB.fetch_max(rss, std::sync::atomic::Ordering::Relaxed);
     prev.max(rss)
 }
 
-/// Log one memory report at `info`.
 pub(crate) fn log_report() {
     let peak = peak_rss_kib();
     match current_rss_kib() {
@@ -136,17 +120,14 @@ pub(crate) fn log_report() {
     }
 }
 
-/// A reactor handler (watches no fds) that logs [`log_report`] every `interval` and on a control dump.
-/// `interval` is `None` for a dump-only reporter: no periodic timer, but it still dumps on demand.
+/// Timer-only reactor handler: a report every `interval` and on every dump. A `None` interval
+/// means dump-only.
 pub(crate) struct MemoryReporter {
     interval: Option<Duration>,
-    /// The next periodic report instant, or `None` when there is no periodic cadence.
     next: Option<Instant>,
 }
 
 impl MemoryReporter {
-    /// A reporter that logs every `interval` starting `interval` after `now`. When `interval` is
-    /// `None`, it logs only on a SIGUSR1 dump.
     pub(crate) fn new(interval: Option<Duration>, now: Instant) -> Self {
         Self {
             interval,
@@ -156,7 +137,6 @@ impl MemoryReporter {
 }
 
 impl Handler for MemoryReporter {
-    /// Never called: the reporter watches no fds.
     fn on_readable(&mut self, _event: ReadyEvent, _reactor: &mut Reactor) {}
 
     fn next_deadline(&self) -> Option<Instant> {
@@ -168,7 +148,6 @@ impl Handler for MemoryReporter {
         self.next = self.interval.map(|i| now + i);
     }
 
-    /// A SIGUSR1 diagnostics dump: log a memory report on demand, alongside the dispatcher's counters.
     fn on_control(&mut self, event: ControlEvent, _reactor: &mut Reactor) {
         match event {
             ControlEvent::Dump => log_report(),

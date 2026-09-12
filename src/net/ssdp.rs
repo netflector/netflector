@@ -8,39 +8,31 @@ use crate::net::http::{header_value, url_host_ip};
 
 use super::{is_link_local, is_never_a_peer};
 
-/// The SSDP UDP port (`UPnP` Device Architecture).
 pub(crate) const SSDP_PORT: u16 = 1900;
-/// SSDP messages default to IP TTL 2 (`UPnP` Device Architecture). The reflector re-emits a fresh
-/// message onto the other link rather than preserving the captured TTL, so it sets 2.
+/// The `UPnP` Device Architecture default. The reflector re-emits a fresh message rather than
+/// preserving the captured TTL, so it sets 2.
 pub(crate) const SSDP_TTL: u8 = 2;
-/// The IPv4 SSDP multicast group.
 pub(crate) const SSDP_GROUP_V4: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
-/// The IPv6 link-local SSDP multicast group (`ff02::c`).
 pub(crate) const SSDP_GROUP_V6_LINK_LOCAL: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0x0c);
-/// The IPv6 site-local SSDP multicast group (`ff05::c`); SSDP joins both v6 scopes.
+/// SSDP joins both v6 scopes.
 pub(crate) const SSDP_GROUP_V6_SITE_LOCAL: Ipv6Addr = Ipv6Addr::new(0xff05, 0, 0, 0, 0, 0, 0, 0x0c);
-/// The fallback M-SEARCH response window (seconds) the caller applies when [`parse_msearch_mx`]
-/// finds no usable MX. A multicast M-SEARCH MUST carry MX (`UPnP` Device Architecture 2.0). An
-/// absent or unparseable one is a non-conformant searcher, reflected anyway with this window.
+/// Applied when [`parse_msearch_mx`] finds no usable MX. A multicast M-SEARCH MUST carry one
+/// (UDA 2.0); a non-conformant searcher is reflected anyway with this window.
 pub(crate) const MSEARCH_MX_DEFAULT: u8 = 3;
 
-/// An SSDP message is a search or an advertisement, per its HTTPU request line. This split is the
-/// reflector's directional gate: searches (`M-SEARCH`) reflect source → target, advertisements
-/// (`NOTIFY`, both `ssdp:alive` and `ssdp:byebye`) reflect target → source.
+/// Searches (`M-SEARCH`) reflect source → target, advertisements (`NOTIFY`, alive and byebye)
+/// target → source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SsdpKind {
     Search,
     Advertisement,
 }
 
-/// The HTTPU request-line method tokens (method + SP) classify discriminates on.
 const MSEARCH_PREFIX: &[u8] = b"M-SEARCH ";
 const NOTIFY_PREFIX: &[u8] = b"NOTIFY ";
 
-/// Classify a payload by its leading HTTPU request line: an `M-SEARCH` is a search, a `NOTIFY` an
-/// advertisement. `None` for anything else, which the caller drops: a unicast `HTTP/1.1 200 OK`
-/// search response (handled off this multicast path) or junk on the group. Only the method token is
-/// read; the trailing space pins it so a longer word (`NOTIFYING`) is not a match. No header parsing.
+/// `None` for anything else: a unicast `200 OK` search response (handled off this multicast path)
+/// or junk. The trailing space in the prefixes keeps `NOTIFYING` from matching.
 pub(crate) fn classify(payload: &[u8]) -> Option<SsdpKind> {
     if payload.starts_with(MSEARCH_PREFIX) {
         Some(SsdpKind::Search)
@@ -51,9 +43,8 @@ pub(crate) fn classify(payload: &[u8]) -> Option<SsdpKind> {
     }
 }
 
-/// Whether the message's `LOCATION` names an IP literal no client on the other segment could use:
-/// link-local, or one that can never name a device at all ([`is_never_a_peer`]). An absent
-/// `LOCATION` (a `byebye`), a hostname, or a routable literal reads as `false`.
+/// The `LOCATION` names a link-local or [`is_never_a_peer`] literal. An absent `LOCATION` (a
+/// `byebye`) or a hostname reads as `false`.
 pub(crate) fn advertises_only_unreachable(payload: &[u8]) -> bool {
     dial::dial_location_value(payload)
         .and_then(url_host_ip)
@@ -64,15 +55,11 @@ pub(crate) fn advertises_only_unreachable(payload: &[u8]) -> bool {
 const MX_MIN: u8 = 1;
 const MX_MAX: u8 = 5;
 
-/// Parse an M-SEARCH's `MX:` header (the searcher's maximum response wait, in seconds), clamped to
-/// `[1, 5]`. Scans the payload's CRLF-delimited lines for the first `MX:` field (case-insensitive
-/// name; an M-SEARCH carries no body, so there is no header/body boundary to stop at) and reads its
-/// leading integer. The first `MX:` line is decisive. Returns `None` when MX is absent or its value
-/// isn't a number; the caller substitutes [`MSEARCH_MX_DEFAULT`] and logs the non-conformance.
+/// The `MX:` header (the searcher's maximum response wait, seconds), clamped to `[1, 5]`. `None`
+/// when absent or not a number; the caller substitutes [`MSEARCH_MX_DEFAULT`].
 pub(crate) fn parse_msearch_mx(payload: &[u8]) -> Option<u8> {
     let value = header_value(payload, b"MX")?;
-    // The leading run of digits: a trailing non-digit doesn't void a valid leading number. Empty or
-    // out-of-`u32`-range reads as "present but unparseable".
+    // A trailing non-digit doesn't void a valid leading number.
     let end = value
         .iter()
         .position(|b| !b.is_ascii_digit())

@@ -1,6 +1,5 @@
-//! Assembling a UDP datagram for an egress: pick the L2 destination MAC and the frame builder for the
-//! egress's link type, sourcing from the egress's own address. The dispatcher send path's adapter over
-//! [`net::frame`](crate::net::frame).
+//! Assembling a UDP datagram for an egress: the L2 destination and the frame builder for its link
+//! type. The dispatcher's adapter over [`net::frame`](crate::net::frame).
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
@@ -11,10 +10,8 @@ use crate::net::LinkType;
 use crate::net::frame::{self, FrameError};
 use crate::net::mac::MacAddr;
 
-/// Why a datagram could not be assembled for an egress: from [`build_udp`] (no source address or
-/// MAC, or a frame overflow) or [`ethernet_dst`] (a unicast destination). Each is a case the
-/// reflector's family/MAC gating makes unreachable in practice, but they stay typed so the
-/// builder is unit-testable and a stray one logs precisely.
+/// Each case is one the reflector's family and MAC gating makes unreachable in practice; they
+/// stay typed so the builder is unit-testable and a stray one logs precisely.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub(super) enum DatagramError {
     #[error("egress has no source address for the datagram's family")]
@@ -25,25 +22,21 @@ pub(super) enum DatagramError {
     UnicastDestination,
     #[error("source and destination are of different address families")]
     SourceFamilyMismatch,
-    /// The frame builder rejected the datagram (buffer too small, or payload too large).
     #[error(transparent)]
     Frame(#[from] FrameError),
 }
 
-/// The IP source of an injected datagram.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DatagramSource {
     /// The egress's own address of the destination's family, at `port`.
-    Egress { port: u16 },
-    /// This address and port: a relayed sender's own, or a session's reserved one.
+    Egress {
+        port: u16,
+    },
     Exact(SocketAddr),
 }
 
-/// The Ethernet destination MAC for an injected datagram to `dst`: the all-ones broadcast
-/// for the IPv4 limited broadcast and for the egress's own directed broadcast
-/// (`v4_directed_broadcast`, when its prefix is known), the RFC-derived group MAC for any multicast
-/// destination. Only broadcast/multicast destinations are injected here, so a unicast `dst`
-/// (whose MAC we would have to resolve) is a [`DatagramError::UnicastDestination`].
+/// Broadcast for the IPv4 limited broadcast and the egress's own directed broadcast, the group
+/// MAC for multicast. A unicast `dst` would need resolving, so it is an error.
 pub(super) fn ethernet_dst(
     dst: IpAddr,
     v4_directed_broadcast: Option<Ipv4Addr>,
@@ -57,13 +50,9 @@ pub(super) fn ethernet_dst(
     }
 }
 
-/// Assemble a UDP datagram for an egress with addresses `addrs` and link framing `link` into
-/// `scratch`. The IP source is `source`, the L2 source the egress's own
-/// MAC; the L2 destination is the caller-supplied `dst_mac` (so this serves unicast, multicast, and
-/// broadcast alike). A link without L2 addresses (BSD `DLT_NULL`, a Linux raw IP tunnel)
-/// ignores `dst_mac` and needs no source MAC.
-// A frame builder takes the full wire spec (egress addrs + link, dst addr + MAC, source, ttl,
-// payload, buffer); bundling any of these would obscure more than the arg count costs.
+/// A link without L2 addresses (BSD `DLT_NULL`, a Linux raw IP tunnel) ignores `dst_mac` and
+/// needs no source MAC.
+// The whole wire spec; bundling any of it would obscure more than the arg count costs.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_udp(
     addrs: &InterfaceAddresses,
@@ -104,8 +93,7 @@ pub(super) fn build_udp(
         }
         SocketAddr::V6(dst) => {
             let src = match source {
-                // Source the datagram from an address matching the destination's scope, so a
-                // site-local group (`ff05::c`) isn't sourced from a link-local address.
+                // Match the destination's scope: ff05::c must not be sourced from a link-local.
                 DatagramSource::Egress { port } => {
                     let src_ip = addrs
                         .v6(Ipv6Scope::of(*dst.ip()))

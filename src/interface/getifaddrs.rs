@@ -15,15 +15,10 @@ use super::{InterfaceAddresses, V6Pick, v6_rank};
 use crate::net::mac::MacAddr;
 use crate::sys::{check, open_socket};
 
-/// Resolve `if_name`'s current source addresses (plus the interface MTU) in one `getifaddrs`
-/// pass.
-///
 /// # Errors
-/// Returns an error if `getifaddrs` fails or the v6 flag socket can't open; an unknown
-/// interface (or one with no addresses yet) yields an all-absent [`InterfaceAddresses`],
-/// as does a host with no IPv6 stack.
+/// `getifaddrs` failing or the v6 flag socket not opening. An unknown interface, or a host with
+/// no IPv6 stack, yields all-absent addresses instead.
 pub(super) fn resolve(if_name: &str) -> io::Result<(InterfaceAddresses, Option<u32>)> {
-    // One socket for the per-v6 `SIOCGIFAFLAG_IN6` ioctl.
     let v6_sock = inet6_socket()?;
 
     let mut head: *mut libc::ifaddrs = ptr::null_mut();
@@ -58,11 +53,9 @@ pub(super) fn resolve(if_name: &str) -> io::Result<(InterfaceAddresses, Option<u
         match family {
             libc::AF_INET => {
                 let v4 = read_v4(sa);
-                // First address wins, matching the rtnetlink backend. Taking the last would let a
-                // secondary alias and the kernel's enumeration order flip the chosen v4 on unrelated
-                // alias churn, producing a spurious v4 delta that needlessly evicts DIAL proxies.
+                // First wins, like rtnetlink: alias churn must not flip the v4 and evict the DIAL
+                // proxies.
                 if addrs.v4.is_none() {
-                    // An `AF_INET` entry's netmask, when present, is a `sockaddr_in` like the address.
                     let prefix = (!ifa.ifa_netmask.is_null())
                         // SAFETY: a non-null `ifa_netmask` is a sockaddr the list owns, like `ifa_addr`.
                         .then(|| unsafe { sockaddr_bytes(ifa.ifa_netmask) })
@@ -120,7 +113,7 @@ pub(super) fn resolve(if_name: &str) -> io::Result<(InterfaceAddresses, Option<u
     Ok((addrs, mtu))
 }
 
-/// The bytes of a BSD sockaddr: `sa_len` of them.
+/// The `sa_len` bytes of a BSD sockaddr.
 ///
 /// # Safety
 /// `addr` must point at a live sockaddr whose `sa_len` is within its allocation.
@@ -129,8 +122,8 @@ unsafe fn sockaddr_bytes<'a>(addr: *const libc::sockaddr) -> &'a [u8] {
     unsafe { slice::from_raw_parts(addr.cast::<u8>(), usize::from((*addr).sa_len)) }
 }
 
-/// The IPv4 address of an `AF_INET` sockaddr's bytes. A routing-table sockaddr (a netmask) can stop
-/// after its last non-zero byte, so a missing tail reads as zero.
+/// A routing-table sockaddr (a netmask) can stop after its last non-zero byte, so a missing tail
+/// reads as zero.
 fn read_v4(sa: &[u8]) -> Ipv4Addr {
     let tail = sa
         .get(offset_of!(libc::sockaddr_in, sin_addr)..)
@@ -141,15 +134,14 @@ fn read_v4(sa: &[u8]) -> Ipv4Addr {
     Ipv4Addr::from(octets)
 }
 
-/// The prefix length a contiguous IPv4 netmask encodes, or `None` for a non-contiguous one.
 fn prefix_len(mask: Ipv4Addr) -> Option<u8> {
     let bits = u32::from(mask);
     let ones = bits.leading_ones();
     (bits.count_ones() == ones).then(|| u8::try_from(ones).expect("at most 32"))
 }
 
-/// The MAC of an `AF_LINK` `sockaddr_dl`'s bytes, or `None` if the link has none (loopback) or
-/// the address would run past the sockaddr. It sits after the `sdl_nlen`-byte name.
+/// The MAC follows the `sdl_nlen`-byte name in `sdl_data`; `None` for a link without one
+/// (loopback) or one that would run past the sockaddr.
 fn read_mac(sa: &[u8]) -> Option<MacAddr> {
     let nlen = usize::from(*sa.get(offset_of!(libc::sockaddr_dl, sdl_nlen))?);
     if *sa.get(offset_of!(libc::sockaddr_dl, sdl_alen))? != 6 {
@@ -160,9 +152,8 @@ fn read_mac(sa: &[u8]) -> Option<MacAddr> {
     Some(MacAddr::from(mac))
 }
 
-/// Canonicalize a link-local address from `getifaddrs`: the BSDs embed the scope id (the
-/// interface index) in bytes 2-3 of a `fe80::/10` `sockaddr_in6` (the KAME convention), so
-/// clear them to recover the on-the-wire `fe80::/64`. A no-op for any other address.
+/// The BSDs embed the scope id (the interface index) in bytes 2-3 of a `fe80::/10`
+/// `sockaddr_in6` (the KAME convention); clear them to recover the on-the-wire address.
 fn canonical_v6(mut octets: [u8; 16]) -> Ipv6Addr {
     if octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80 {
         octets[2] = 0;
@@ -171,12 +162,12 @@ fn canonical_v6(mut octets: [u8; 16]) -> Ipv6Addr {
     Ipv6Addr::from(octets)
 }
 
-/// An `AF_INET6` datagram socket for the flag ioctl, or `None` if the host has no IPv6.
+/// `None` only when the host has no IPv6 stack.
 ///
 /// # Errors
-/// Any other `socket` failure. Under fd or memory pressure the host still has IPv6, and
-/// reading that as "no v6" would filter every candidate and commit the false loss; the error
-/// fails the whole resolve instead, which the caller retries.
+/// Any other `socket` failure. Under fd or memory pressure the host still has IPv6; reading
+/// that as "no v6" would filter every candidate and commit a false loss, so the error fails the
+/// whole resolve and the caller retries.
 fn inet6_socket() -> io::Result<Option<OwnedFd>> {
     match open_socket(libc::AF_INET6, libc::SOCK_DGRAM, 0) {
         Ok(sock) => Ok(Some(sock)),
@@ -185,8 +176,6 @@ fn inet6_socket() -> io::Result<Option<OwnedFd>> {
     }
 }
 
-/// Whether a `socket(AF_INET6, ...)` failure means the host has no IPv6 stack, the one case
-/// where an absent socket is the truth rather than a transient failure.
 fn no_ipv6_stack(e: &io::Error) -> bool {
     matches!(
         e.raw_os_error(),
@@ -194,13 +183,11 @@ fn no_ipv6_stack(e: &io::Error) -> bool {
     )
 }
 
-/// `IN6_IFF_*` bits that disqualify a v6 address as a source: DAD in progress, DAD failed
-/// (duplicate), or preferred-lifetime expired.
+/// `IN6_IFF_*` bits that disqualify a v6 address as a source.
 const IN6_IFF_UNUSABLE: c_int =
     libc::IN6_IFF_TENTATIVE | libc::IN6_IFF_DUPLICATED | libc::IN6_IFF_DEPRECATED;
 
-/// The `IN6_IFF_*` flags of `addr` on `if_name`, queried via `SIOCGIFAFLAG_IN6`, or `None`
-/// if the ioctl fails (the address is then treated as unusable).
+/// The `IN6_IFF_*` flags of `addr` via `SIOCGIFAFLAG_IN6`; `None` if the ioctl fails.
 fn v6_flags(sock: &OwnedFd, if_name: &str, addr: libc::sockaddr_in6) -> Option<c_int> {
     // SAFETY: an all-zero `in6_ifreq` is valid (a zeroed name and union).
     let mut req: libc::in6_ifreq = unsafe { std::mem::zeroed() };

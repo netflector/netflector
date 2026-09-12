@@ -14,7 +14,6 @@ use crate::net::ssdp::{
 };
 use crate::net::wsd::{WSD_GROUP_V4, WSD_GROUP_V6, WSD_PORT};
 
-/// A reflected discovery protocol, named in [`ConfigError::ConflictingReflectors`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Protocol {
     Wol,
@@ -47,7 +46,6 @@ enum Reach {
 }
 
 impl Reach {
-    /// Whether a datagram exists that both admit.
     fn overlaps(self, other: Reach) -> bool {
         match (self, other) {
             (Self::Any(a), Self::Any(b)) => families_overlap(a, b),
@@ -76,7 +74,6 @@ struct Flow<'a> {
 }
 
 impl Flow<'_> {
-    /// Whether a datagram exists in both flows.
     fn overlaps(&self, other: &Flow<'_>) -> bool {
         self.ingress == other.ingress
             && self.egress == other.egress
@@ -100,8 +97,6 @@ impl UdpRelay {
 }
 
 impl Reflector {
-    /// The `(source, target)` pairs this entry relays over: its own, plus the reverse when
-    /// bidirectional.
     fn directions(&self) -> impl Iterator<Item = (&InterfaceName, &InterfaceName)> {
         std::iter::once((&self.source_if, &self.target_if)).chain(
             self.bidirectional
@@ -109,10 +104,8 @@ impl Reflector {
         )
     }
 
-    /// Every flow the entry's protocols relay. mDNS, SSDP and WSD capture on both interfaces
-    /// whatever the entry's direction, queries on the source and responses on the target, for
-    /// the groups of the families the entry uses; Wake-on-LAN admits anything on its ports and
-    /// the relay its groups and broadcast, each on the entry's directions.
+    /// mDNS, SSDP and WSD flow both ways whatever the entry's direction (queries arrive on the
+    /// source, responses on the target); Wake-on-LAN and the relay follow the entry's directions.
     fn flows(&self) -> Vec<Flow<'_>> {
         let family = self.address_family;
         let mut flows = Vec::new();
@@ -170,11 +163,9 @@ impl Reflector {
         flows
     }
 
-    /// The protocol on which `self` and `other` would reflect the same packet twice, if any: a
-    /// protocol both enable, or a flow of one the UDP relay of the other overlaps. Two
-    /// discovery protocols on one port don't duplicate: each classifier admits only its own
-    /// messages. The relay admits every datagram it captures, so it duplicates any protocol
-    /// capturing the same on the same leg, and the conflict is named after that protocol.
+    /// Two discovery protocols on one port don't duplicate: each classifier admits only its own
+    /// messages. The relay admits everything it captures, so it duplicates any protocol on the
+    /// same leg, and the conflict is named after that protocol.
     fn conflicts_with(&self, other: &Reflector) -> Option<Protocol> {
         self.shared_protocol(other).or_else(|| {
             self.relay_overlap(other.flows())
@@ -183,8 +174,6 @@ impl Reflector {
         })
     }
 
-    /// A protocol both enable on a shared direction with overlapping MAC selection and address
-    /// family (for `WoL`, also a shared port).
     fn shared_protocol(&self, other: &Reflector) -> Option<Protocol> {
         if !self
             .directions()
@@ -214,8 +203,6 @@ impl Reflector {
         None
     }
 
-    /// The first of `others` whose datagrams the entry's UDP relay would carry a second time,
-    /// as its protocol and port.
     fn relay_overlap<'a>(
         &self,
         others: impl IntoIterator<Item = Flow<'a>>,
@@ -227,7 +214,7 @@ impl Reflector {
             .find(|other| relay().any(|mine| mine.overlaps(other)))
             .map(|other| (other.protocol, other.port))
     }
-    /// The protocol and port the entry's own UDP relay would carry a second time, if any.
+
     pub(super) fn relay_duplicates(&self) -> Option<(Protocol, u16)> {
         let flows = self.flows();
         let others = flows
@@ -238,8 +225,6 @@ impl Reflector {
     }
 }
 
-/// Two MAC selections overlap when they share at least one address, or either is
-/// absent (an absent filter matches any device).
 fn macs_overlap(a: Option<&MacSet>, b: Option<&MacSet>) -> bool {
     match (a, b) {
         (Some(a), Some(b)) => a.iter().any(|mac| b.contains(mac)),
@@ -247,14 +232,12 @@ fn macs_overlap(a: Option<&MacSet>, b: Option<&MacSet>) -> bool {
     }
 }
 
-/// Two address families overlap when they both carry the same IP version.
 fn families_overlap(a: AddressFamily, b: AddressFamily) -> bool {
     (a.uses_ipv4() && b.uses_ipv4()) || (a.uses_ipv6() && b.uses_ipv6())
 }
 
-/// Reject any pair of reflectors that share a name or would reflect the same packet twice. Names are the
-/// canonical (lowercased) identity, so `==` catches keys that only differ in case or whitespace — which
-/// `merge_env` folds env-vs-file but the file table cannot.
+/// Names compare in canonical form (trimmed, lowercased), so two file tables whose keys differ only
+/// in case or padding collide here; as map keys they did not.
 pub(super) fn check_conflicts(reflectors: &[Reflector]) -> Result<(), ConfigError> {
     for (i, a) in reflectors.iter().enumerate() {
         for b in &reflectors[i + 1..] {

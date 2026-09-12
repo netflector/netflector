@@ -1,8 +1,5 @@
-//! epoll readiness backend for Linux (including the embedded ARM targets).
-//!
-//! Level-triggered: read and write interest are toggled per registration via a full-mask
-//! `EPOLL_CTL_MOD` (epoll has no per-direction enable). The reactor [`Key`] travels in each event's
-//! `u64` field, so a wakeup carries its own routing without an fd-to-handler side table.
+//! epoll readiness backend (Linux). Level-triggered; the reactor [`Key`] rides in each
+//! event's `u64`.
 
 use std::io;
 use std::mem;
@@ -15,17 +12,12 @@ use super::PollEvent;
 use crate::reactor::{Key, Readiness};
 use crate::sys::check;
 
-// libc's EPOLL* constants are `c_int`; `epoll_event.events` is `u32`, so
-// `cast_unsigned` reinterprets the (positive) flag bits without a sign-loss lint.
-// READ/WRITE are the interests we register; READABLE/WRITABLE classify a returned
-// event. Errors and hangups arrive unsolicited and count as readable, so the next
-// read observes them; the write side has no equivalent, hence WRITABLE == WRITE.
+// EPOLLERR/EPOLLHUP arrive unsolicited and count as readable so the next read observes them.
 const READ: u32 = libc::EPOLLIN.cast_unsigned();
 const WRITE: u32 = libc::EPOLLOUT.cast_unsigned();
 const READABLE: u32 = (libc::EPOLLIN | libc::EPOLLERR | libc::EPOLLHUP).cast_unsigned();
 const WRITABLE: u32 = WRITE;
 
-/// An epoll descriptor and the reusable buffer its waits report into.
 pub(crate) struct Poller {
     poll_fd: OwnedFd,
     events: Box<[libc::epoll_event]>,
@@ -34,7 +26,6 @@ pub(crate) struct Poller {
 }
 
 impl Poller {
-    /// Create an epoll instance reporting up to `capacity` ready fds per [`wait`](Self::wait).
     pub(crate) fn new(capacity: NonZeroUsize) -> io::Result<Self> {
         // SAFETY: epoll_create1 takes only flags; it returns a fresh fd or -1.
         let poll_fd =
@@ -50,20 +41,15 @@ impl Poller {
         })
     }
 
-    /// Register `fd` with level-triggered read interest, tagged with `key`. Write
-    /// interest starts off; change either with [`set_interest`](Self::set_interest).
+    /// Register `fd` with read interest only.
     pub(crate) fn add(&self, fd: RawFd, key: Key) -> io::Result<()> {
-        // A re-add (EEXIST) is a caller bug; surface it instead of silently
-        // modifying. The reactor enforces add-once uniformly (kqueue's EV_ADD
-        // can't report a re-add, so the Poller can't catch it on its own).
         self.ctl(libc::EPOLL_CTL_ADD, fd, READ, key)?;
         log::trace!("epoll: armed read on fd {fd}");
         Ok(())
     }
 
-    /// Set `fd`'s interest (already [added](Self::add)) to `read`/`write`. epoll has no per-direction
-    /// toggle, so this rewrites the full mask from both flags. Errors and hangups are reported
-    /// regardless of the mask, so a read-disarmed fd still wakes (as readable) on a hangup/error.
+    /// Rewrites the full mask (epoll has no per-direction toggle). A hangup or error still wakes
+    /// the fd as readable whatever the mask.
     pub(crate) fn set_interest(
         &self,
         fd: RawFd,
@@ -83,9 +69,8 @@ impl Poller {
         Ok(())
     }
 
-    /// Drop all interest on `fd`. `ENOENT` (open but not registered, e.g. a repeated remove) is
-    /// benign and swallowed. A closed fd reports `EBADF` instead, which propagates: the reactor
-    /// drops kernel interest before a handler closes its fds, so that would mean the order broke.
+    /// `ENOENT` (not registered) is swallowed; `EBADF` (already closed) propagates, since
+    /// interest must go before the fd closes.
     pub(crate) fn remove(&self, fd: RawFd) -> io::Result<()> {
         // SAFETY: poll_fd is our epoll instance; EPOLL_CTL_DEL ignores the event arg.
         check(unsafe {
@@ -107,18 +92,13 @@ impl Poller {
         Ok(())
     }
 
-    /// Block until at least one fd is ready, or until `timeout` elapses (`None`
-    /// blocks indefinitely), recording the ready events. Returns how many there
-    /// are; drain them with [`next_event`](Self::next_event). `EINTR` yields
-    /// `Ok(0)` so the caller can re-check shutdown state and poll again.
+    /// `None` blocks indefinitely. Returns the ready count; `EINTR` yields `Ok(0)`.
     pub(crate) fn wait(&mut self, timeout: Option<Duration>) -> io::Result<usize> {
         let max_events = libc::c_int::try_from(self.events.len()).unwrap_or(libc::c_int::MAX);
         let timeout_ms = match timeout {
             None => -1,
-            // Round up to whole milliseconds: a sub-millisecond (but non-zero) deadline must not
-            // truncate to a 0 ms epoll_wait, which would return immediately with nothing ready and
-            // busy-spin until the deadline. An exactly-due (zero) deadline stays 0 for an immediate
-            // sweep. kqueue keeps sub-ms precision via tv_nsec, so this also aligns the two backends.
+            // Round up: a sub-millisecond deadline truncated to 0 ms would return at once and
+            // busy-spin until due.
             Some(d) => {
                 libc::c_int::try_from(d.as_nanos().div_ceil(1_000_000)).unwrap_or(libc::c_int::MAX)
             }
@@ -147,13 +127,11 @@ impl Poller {
         Ok(self.ready)
     }
 
-    /// The next event from the last [`wait`](Self::wait), or `None` once the batch
-    /// is drained. Advances an internal cursor, so each event is yielded once.
     pub(crate) fn next_event(&mut self) -> Option<PollEvent> {
         if self.next >= self.ready {
             return None;
         }
-        // Copy the (packed) epoll_event out so fields are read by value, never by ref.
+        // epoll_event is packed: copy it out, never borrow a field.
         let event = self.events[self.next];
         self.next += 1;
         let flags = event.events;

@@ -32,28 +32,25 @@ use crate::net::LinkType;
 use crate::net::mac::{MacAddr, MacSet};
 use crate::reactor::Reactor;
 
-/// A reflector's verdict on a captured payload, from its protocol's classifier. `Reflect`/`Skip` carry
-/// the message's own [`MessageType`] (the packet's *intrinsic* type) so the handler can count it. See
-/// [`From`] impls like `From<MdnsKind>` in each protocol reflector.
+/// A classifier's verdict on a captured payload. `Reflect`/`Skip` carry the message's own
+/// [`MessageType`] so the handler can count it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Verdict {
-    /// A message for this direction. Re-emit it.
     Reflect(MessageType),
-    /// A message for the *other* direction; drop it silently. Dropping the opposite direction is
-    /// the loop-breaker (atop the capture's own-egress drop and the dispatcher's echo drop): a
-    /// reflected query re-emitted on the egress is still a query, which the egress side's
-    /// response-only reflector skips.
+    /// A message for the other direction, dropped silently. This is the loop-breaker atop the
+    /// capture's own-egress drop and the dispatcher's echo drop: a reflected query re-emitted on
+    /// the egress is still a query, which that side's response-only reflector skips.
     Skip(MessageType),
-    /// A message this leg recognizes but is configured not to relay (a wake for a device outside
-    /// the allow-set). The classifier logged why; drop it silently.
+    /// Recognized but configured out (a wake for a device outside the allow-set); the classifier
+    /// already logged why.
     Excluded,
-    /// Not a recognizable protocol message on this dedicated group. Drop it with a debug log.
+    /// Not a recognizable protocol message; the handler logs the drop.
     Junk,
 }
 
-/// Where a leg's re-emits go: group and broadcast ones onto the link, or, behind a link without a
-/// broadcast domain, to each of the entry's peers as unicast; a reply leg's to the one searcher
-/// that asked, at its captured frame MAC (no ARP/ND).
+/// Where a leg's re-emits go: onto the link, to each of the entry's peers as unicast (a link
+/// without a broadcast domain), or to the one searcher that asked, at its captured frame MAC (no
+/// ARP/ND).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Delivery {
     Link,
@@ -62,7 +59,6 @@ pub(crate) enum Delivery {
 }
 
 impl Delivery {
-    /// The delivery an entry's `source_peers` / `target_peers` value describes.
     pub(crate) fn new(peers: Option<&PeerList>) -> Self {
         match peers {
             Some(peers) => Self::Peers(peers.iter().copied().collect()),
@@ -70,9 +66,8 @@ impl Delivery {
         }
     }
 
-    /// The address a datagram to `dst` reaches under this delivery: `dst` on the link, the first
-    /// peer of its family, or the fixed unicast target. A reply to it must be listened for on a
-    /// source of that scope.
+    /// The address a datagram to `dst` actually reaches; a reply must be listened for on a source
+    /// of that scope.
     pub(crate) fn destination(&self, dst: IpAddr) -> IpAddr {
         match self {
             Self::Link => dst,
@@ -85,13 +80,8 @@ impl Delivery {
         }
     }
 
-    /// Send a datagram to `dst` on `egress` where the delivery says; a fixed unicast delivery
-    /// ignores `dst`.
-    ///
     /// # Errors
-    /// As the dispatcher's [`send_udp_group`](PacketDispatcher::send_udp_group),
-    /// [`send_udp_to_peers`](PacketDispatcher::send_udp_to_peers) (only when no copy went out)
-    /// and [`send_udp`](PacketDispatcher::send_udp).
+    /// As the dispatcher send it delegates to; a peers send fails only when no copy went out.
     pub(crate) fn send(
         &self,
         dispatcher: &mut PacketDispatcher,
@@ -113,13 +103,11 @@ impl Delivery {
     }
 }
 
-/// Transforms a datagram's payload before it is re-emitted: the SSDP DIAL `LOCATION` rewrite, applied
-/// on both the advertisement direction and each search session's reply. Returns the rewrite, held in
-/// the implementor's own reused scratch, or `None` to forward `payload` verbatim; the caller also
+/// Transforms a payload before re-emit (the SSDP DIAL `LOCATION` rewrite). Returns the rewrite,
+/// held in the implementor's own scratch, or `None` to forward `payload` verbatim; the caller also
 /// reads `None` as "still advertising the device's own addresses" for the unreachable-advertisement
 /// suppression.
-/// The `Fn` traits can't express that lending signature, which is why this is a trait rather than a
-/// closure.
+/// A trait rather than a closure: the `Fn` traits can't express that lending signature.
 pub(crate) trait ReplyRewrite {
     fn rewrite<'a>(
         &'a mut self,
@@ -130,8 +118,6 @@ pub(crate) trait ReplyRewrite {
     ) -> Option<&'a [u8]>;
 }
 
-/// The identity transform: forward the payload verbatim. A ZST for the reflectors (mDNS, WSD, and SSDP
-/// without DIAL) that re-emit unchanged.
 pub(crate) struct NoRewrite;
 
 impl ReplyRewrite for NoRewrite {
@@ -146,8 +132,7 @@ impl ReplyRewrite for NoRewrite {
     }
 }
 
-/// A concrete IP version: the family a reflector requires of an interface. Distinct from the
-/// config's `AddressFamily` policy (which may name both at once).
+/// A concrete IP version, unlike the config's `AddressFamily` policy, which may name both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IpFamily {
     V4,
@@ -163,50 +148,38 @@ impl fmt::Display for IpFamily {
     }
 }
 
-/// Maps each configured interface name to the capture `run()` opened for it, so a reflector's
-/// `source_if` / `target_if` resolve to the ingress / egress [`CaptureKey`]s. `run()` opens one
-/// capture per distinct interface and records it here; the per-protocol `build` functions look
-/// names up.
+/// Interface name → the capture `run()` opened for it; the `build` functions resolve `source_if` /
+/// `target_if` through it.
 #[derive(Default)]
 pub(crate) struct InterfaceMap(LinearMap<String, CaptureKey>);
 
 impl InterfaceMap {
-    /// Record the capture `run()` opened for `name`.
     pub(crate) fn insert(&mut self, name: String, key: CaptureKey) {
         self.0.insert(name, key);
     }
 
-    /// The capture key recorded for `name`, or `None` if none was.
     pub(crate) fn key_for(&self, name: &str) -> Option<CaptureKey> {
         self.0.get(name).copied()
     }
 
-    /// The capture key for `name`, or [`BuildError::UnknownInterface`]. Build functions call this
-    /// to resolve a configured interface name to its capture.
     pub(crate) fn require(&self, name: &str) -> Result<CaptureKey, BuildError> {
         self.key_for(name)
             .ok_or_else(|| BuildError::UnknownInterface(name.to_owned()))
     }
 }
 
-/// Why a reflector could not be built from its config.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub(crate) enum BuildError {
-    /// Names a `source_if` / `target_if` that `run()` opened no capture for. A wiring bug.
+    /// A wiring bug: `run()` opens a capture for every configured interface.
     #[error("no capture for interface \"{0}\"")]
     UnknownInterface(String),
-    /// An interface can't currently send a family the reflector requires, so it would reflect
-    /// nothing for that family. A startup failure rather than a silent half-run. For a
-    /// bidirectional reflector (mDNS/SSDP/WSD) the named interface may be the source or the target.
+    /// A startup failure rather than a silent half-run. For a bidirectional reflector the named
+    /// interface may be the source or the target.
     #[error("interface \"{interface}\" cannot send {family}, required by the reflector")]
     RequiredFamilyUnavailable { interface: String, family: IpFamily },
-    /// A `macs` filter on a target whose link framing carries no MAC addresses: it would match
-    /// nothing, silently discarding every device-side packet.
     #[error("macs can never match on interface \"{0}\": its link carries no MAC addresses")]
     MacsUnmatchable(String),
-    /// A group the reflector captures could not be joined, for a reason no later event clears,
-    /// so its traffic would never arrive. A startup failure rather than a running daemon that
-    /// reflects nothing for it.
+    /// For a reason no later event clears; a deferrable failure is retried instead.
     #[error("cannot join {group} on interface \"{interface}\": {reason}")]
     GroupJoin {
         group: IpAddr,
@@ -215,8 +188,6 @@ pub(crate) enum BuildError {
     },
 }
 
-/// The verdict of a two-kind classifier for the leg that reflects `reflect`: a message of that kind
-/// is reflected, one of the other kind belongs to the other leg, and no kind is junk.
 fn directional_verdict<K: PartialEq + Copy + Into<MessageType>>(
     kind: Option<K>,
     reflect: K,
@@ -228,9 +199,8 @@ fn directional_verdict<K: PartialEq + Copy + Into<MessageType>>(
     }
 }
 
-/// Refuse a `macs` filter on a target whose link framing carries no MAC addresses:
 /// [`Filter`](crate::dispatch::Filter)'s MAC fields never match a `DLT_NULL` frame. `WoL` never
-/// calls this: it matches the MAC inside the magic packet's payload, not the frame's.
+/// calls this: it matches the MAC inside the magic packet, not the frame's.
 fn require_macs_matchable(
     dispatcher: &PacketDispatcher,
     macs: Option<&MacSet>,
@@ -245,9 +215,8 @@ fn require_macs_matchable(
     Ok(())
 }
 
-/// Whether `egress` currently has a source address of `dst`'s family, which `send_udp_group` needs
-/// to build the frame. The per-packet gate a reflector applies before re-emitting, so a family
-/// whose address has gone away is dropped rather than mis-sent.
+/// The per-packet gate before a re-emit: a family whose address has gone away is dropped rather
+/// than mis-sent.
 fn egress_sources(dispatcher: &PacketDispatcher, egress: CaptureKey, dst: SocketAddr) -> bool {
     dispatcher
         .egress_addrs(egress)
@@ -257,8 +226,8 @@ fn egress_sources(dispatcher: &PacketDispatcher, egress: CaptureKey, dst: Socket
         })
 }
 
-/// The family `addrs` cannot source but `family` requires, if any: the startup check's verdict.
-/// `None` means every required family is available (a v6-best-effort `Default` with no v6 passes).
+/// The family `family` requires but `addrs` cannot source; a v6-best-effort `Default` with no v6
+/// passes.
 fn missing_required_family(family: AddressFamily, addrs: &InterfaceAddresses) -> Option<IpFamily> {
     if family.requires_ipv4() && !addrs.has_v4() {
         Some(IpFamily::V4)
@@ -269,11 +238,10 @@ fn missing_required_family(family: AddressFamily, addrs: &InterfaceAddresses) ->
     }
 }
 
-/// Enforce that `egress` can source every family `address_family` requires: the one-sided check
-/// of a protocol that re-emits on the target alone.
+/// The one-sided family check of a protocol that re-emits on the target alone.
 ///
 /// # Errors
-/// [`BuildError::RequiredFamilyUnavailable`] naming the interface and the family it can't send.
+/// [`BuildError::RequiredFamilyUnavailable`].
 fn require_egress_family(
     dispatcher: &PacketDispatcher,
     egress: CaptureKey,
@@ -290,13 +258,10 @@ fn require_egress_family(
     }
 }
 
-/// Enforce that a protocol re-emitting on both interfaces (mDNS, SSDP, WSD) can source every
-/// required family on BOTH. Checks each required family on both interfaces (v4 before v6, the
-/// single-interface policy order) and blames the side that actually lacks it: the source when it's
-/// the one missing, otherwise the target.
+/// The two-sided family check of a protocol re-emitting on both interfaces.
 ///
 /// # Errors
-/// [`BuildError::RequiredFamilyUnavailable`] naming the interface and the family it can't send.
+/// [`BuildError::RequiredFamilyUnavailable`], blaming the side that lacks the family.
 fn require_both_sides_family(
     dispatcher: &PacketDispatcher,
     address_family: AddressFamily,
@@ -325,14 +290,11 @@ fn require_both_sides_family(
     Ok(())
 }
 
-/// The build steps mDNS, SSDP and WSD share: resolve both captures, require the families both
-/// sides re-emit and a matchable `macs` filter on the target, and join every group on both
-/// interfaces. Returns the captures.
+/// The build steps mDNS, SSDP and WSD share; returns the two captures.
 ///
 /// # Errors
-/// [`BuildError::UnknownInterface`] for an unopened source/target,
-/// [`BuildError::RequiredFamilyUnavailable`], [`BuildError::MacsUnmatchable`], or
-/// [`BuildError::GroupJoin`] for a join no later event clears.
+/// [`BuildError::UnknownInterface`], [`BuildError::RequiredFamilyUnavailable`],
+/// [`BuildError::MacsUnmatchable`] or [`BuildError::GroupJoin`].
 fn open_pair(
     reflector: &Reflector,
     interfaces: &InterfaceMap,
@@ -356,8 +318,6 @@ fn open_pair(
         target,
         reflector.target_if.as_str(),
     )?;
-    // A family with no address yet is recorded and re-attempted on the next address change, so a
-    // deferred join logs rather than fails the build.
     for group in groups {
         for (capture, interface) in [
             (source, &reflector.source_if),
@@ -375,7 +335,6 @@ fn open_pair(
     Ok((source, target))
 }
 
-/// The group socket addresses `family` reflects to: `v4` if it uses IPv4, each of `v6` if IPv6.
 fn group_addrs(family: AddressFamily, port: u16, v4: Ipv4Addr, v6: &[Ipv6Addr]) -> Vec<SocketAddr> {
     let mut groups = Vec::with_capacity(1 + v6.len());
     if family.uses_ipv4() {
@@ -387,12 +346,10 @@ fn group_addrs(family: AddressFamily, port: u16, v4: Ipv4Addr, v6: &[Ipv6Addr]) 
     groups
 }
 
-/// Join `group` on `capture`, the capture of `interface`, for `protocol`. A
-/// [deferrable](join_deferrable) failure logs at debug (it retries on the next address change);
-/// any other fails the build.
+/// A [deferrable](join_deferrable) failure only logs: it retries on the next address change.
 ///
 /// # Errors
-/// [`BuildError::GroupJoin`], naming the system's membership cap when that is the cause.
+/// [`BuildError::GroupJoin`].
 fn require_group_join(
     dispatcher: &mut PacketDispatcher,
     capture: CaptureKey,

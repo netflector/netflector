@@ -17,11 +17,9 @@ pub(crate) mod stream_buffer;
 pub(crate) mod tcp;
 pub(crate) mod wsd;
 
-/// Link-layer framing of a captured or injected frame. The capture layer reports
-/// it per interface; [`frame`] adds the matching link header and [`packet`] strips
-/// it before parsing L3. A 14-byte Ethernet header; on BSD `DLT_NULL`'s 4-byte
-/// host-order address family (loopback/tunnel interfaces); on Linux no header at all,
-/// the bare IP packet a tunnel (`WireGuard`, tun) carries. Linux frames loopback as
+/// Link-layer framing of a captured or injected frame, reported per interface by the capture
+/// layer. Ethernet; BSD `DLT_NULL` (loopback/tunnel interfaces); on Linux the bare IP packet a
+/// tunnel (`WireGuard`, tun) carries, with no link header at all. Linux frames loopback as
 /// Ethernet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LinkType {
@@ -32,7 +30,6 @@ pub(crate) enum LinkType {
     RawIp,
 }
 
-/// IANA protocol number for UDP.
 const IP_PROTO_UDP: u8 = 17;
 
 /// Ethernet link header: dst MAC(6) + src MAC(6) + ethertype(2).
@@ -40,32 +37,25 @@ const ETHERNET_HEADER_SIZE: usize = 14;
 /// BSD `DLT_NULL` link header: a 4-byte address family in host byte order (`lo0`).
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 const DLT_NULL_HEADER_SIZE: usize = 4;
-/// IPv4 header without options (the minimum), the fixed IPv6 base header, and the
-/// fixed UDP header.
+/// IPv4 without options (the minimum); the IPv6 base header and UDP header are fixed.
 const IPV4_HEADER_SIZE: usize = 20;
 const IPV6_HEADER_SIZE: usize = 40;
 const UDP_HEADER_SIZE: usize = 8;
 
-/// The largest frame the daemon builds, captures or forwards. Every buffer on the frame path is
-/// sized from this: the dispatcher's send scratch, and each capture backend's read buffer, so
-/// anything captured can be re-emitted. Clears a standard 1514-byte Ethernet frame (the FCS is
-/// stripped before capture) with headroom for a baby-jumbo MTU. True 9000-byte jumbo is out of
-/// reach, and no discovery protocol comes near it.
+/// The largest frame the daemon builds, captures or forwards; every frame-path buffer is sized
+/// from it. Clears a 1514-byte Ethernet frame (the FCS is stripped before capture) with headroom
+/// for a baby-jumbo MTU; true 9000-byte jumbo is out of reach.
 pub(crate) const MAX_FRAME_LEN: usize = 2048;
 
-/// The largest UDP payload that still fits [`MAX_FRAME_LEN`] once framed, so anything built within
-/// it is forwardable. The worst-case header stack: Ethernet (over `DLT_NULL`) plus IPv6 (over
-/// IPv4, and fixed at 40 since the builders emit no extension headers) plus UDP.
+/// The largest UDP payload that still fits [`MAX_FRAME_LEN`] under the worst-case header stack.
+/// IPv6 is fixed at 40: the builders emit no extension headers.
 pub(crate) const MAX_UDP_PAYLOAD_LEN: usize =
     MAX_FRAME_LEN - (ETHERNET_HEADER_SIZE + IPV6_HEADER_SIZE + UDP_HEADER_SIZE);
 
-/// The largest interface MTU whose full-size packets still fit [`MAX_FRAME_LEN`] once framed (an
-/// MTU counts L3 bytes; the frame adds the link header). Ethernet is the binding case; a
-/// `DLT_NULL` link's 4-byte header leaves a little more room, accepted as slack.
+/// The largest interface MTU whose full-size packets still fit [`MAX_FRAME_LEN`] once framed. An
+/// MTU counts L3 bytes; Ethernet's link header is the binding case.
 pub(crate) const MAX_MTU: usize = MAX_FRAME_LEN - ETHERNET_HEADER_SIZE;
 
-/// Whether `ip` is link-local (IPv4 `169.254.0.0/16`, IPv6 `fe80::/10`). A v4-mapped IPv6 address
-/// is judged by its IPv4 rules, like [`is_never_a_peer`].
 pub(crate) fn is_link_local(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => v4.is_link_local(),
@@ -76,12 +66,10 @@ pub(crate) fn is_link_local(ip: IpAddr) -> bool {
     }
 }
 
-/// Whether `ip` can never name another single host: loopback is the connecting host itself,
-/// unspecified is no host, and multicast / IPv4 limited broadcast are groups. Unlike link-local,
-/// which is a valid peer on its own link, such an address names no device from any segment. A
-/// v4-mapped IPv6 address is judged by its IPv4 rules (`::ffff:127.0.0.1` reaches `127.0.0.1`,
-/// and std's `Ipv6Addr::is_loopback` would miss it). A directed IPv4 broadcast is
-/// indistinguishable from a host address without the subnet mask and reads as `false`.
+/// Whether `ip` can never name another single host: loopback, unspecified, multicast, the IPv4
+/// limited broadcast. A v4-mapped IPv6 address is judged by its IPv4 rules (std's
+/// `Ipv6Addr::is_loopback` misses `::ffff:127.0.0.1`). A directed IPv4 broadcast is
+/// indistinguishable from a host address without the mask and reads as `false`.
 pub(crate) fn is_never_a_peer(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
