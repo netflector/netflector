@@ -372,13 +372,7 @@ mod tests {
 
     use super::*;
     use crate::sys::IoStatus;
-
-    /// A do-nothing handler, needed only so the reactor will hand out registrations and a key for the
-    /// proxy tests below (they drive the proxy directly, never through dispatch).
-    struct NoopHandler;
-    impl Handler for NoopHandler {
-        fn on_readable(&mut self, _event: ReadyEvent, _reactor: &mut Reactor) {}
-    }
+    use crate::test_support::NoopHandler;
 
     /// A proxy with bound loopback desc/rest listeners, its key borrowed from a placeholder handler so
     /// `start_connection`'s watches resolve without dispatching through the reactor. Returns the proxy and

@@ -328,21 +328,9 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use super::*;
-    use crate::capture::{Capture, loopback_lock};
     use crate::interface::LOOPBACK_IFACE;
     use crate::net::mac::MacAddr;
-
-    /// Open a loopback capture, or `None` (skip) without `CAP_NET_RAW`.
-    fn open_loopback_or_skip() -> Option<Capture> {
-        match Capture::open(LOOPBACK_IFACE) {
-            Ok(cap) => Some(cap),
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                eprintln!("skip: no CAP_NET_RAW to open a loopback capture ({e})");
-                None
-            }
-            Err(e) => panic!("unexpected loopback capture open failure: {e}"),
-        }
-    }
+    use crate::test_support::{loopback_lock, open_loopback_or_skip};
 
     #[test]
     fn delivery_follows_the_entrys_peers() {

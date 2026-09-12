@@ -1,7 +1,6 @@
-
 use super::*;
-use crate::capture::{loopback_lock, open_or_skip};
 use crate::interface::LOOPBACK_IFACE;
+use crate::test_support::{loopback_lock, open_or_skip};
 use std::cell::{Cell, RefCell};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::rc::Rc;
@@ -495,7 +494,9 @@ fn routes_a_captured_packet_to_a_matching_reflector() -> io::Result<()> {
 
 /// Every `sood` datagram out of the tun's far end within a second: source, destination, TTL.
 #[cfg(target_os = "linux")]
-fn sood_deliveries(tun: &crate::capture::Tun) -> io::Result<Vec<(SocketAddr, SocketAddr, u8)>> {
+fn sood_deliveries(
+    tun: &crate::test_support::Tun,
+) -> io::Result<Vec<(SocketAddr, SocketAddr, u8)>> {
     let mut delivered = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(1);
     while let Some(packet) = tun.next_packet(deadline)? {
@@ -514,7 +515,7 @@ fn sood_deliveries(tun: &crate::capture::Tun) -> io::Result<Vec<(SocketAddr, Soc
 #[test]
 #[cfg_attr(miri, ignore = "needs a real capture device")]
 fn group_sends_fan_out_to_the_peers_of_a_raw_ip_link() -> io::Result<()> {
-    let Some(tun) = crate::capture::Tun::create() else {
+    let Some(tun) = crate::test_support::Tun::create() else {
         return Ok(());
     };
     let mut dispatcher = PacketDispatcher::new();
@@ -558,7 +559,7 @@ fn group_sends_fan_out_to_the_peers_of_a_raw_ip_link() -> io::Result<()> {
 #[test]
 #[cfg_attr(miri, ignore = "needs a real capture device")]
 fn overlapping_peer_lists_deliver_to_each_peer_once() -> io::Result<()> {
-    let Some(tun) = crate::capture::Tun::create() else {
+    let Some(tun) = crate::test_support::Tun::create() else {
         return Ok(());
     };
     let mut dispatcher = PacketDispatcher::new();
@@ -594,7 +595,7 @@ fn overlapping_peer_lists_deliver_to_each_peer_once() -> io::Result<()> {
 #[test]
 #[cfg_attr(miri, ignore = "needs a real capture device")]
 fn peers_whose_frames_share_a_checksum_each_get_a_copy() -> io::Result<()> {
-    let Some(tun) = crate::capture::Tun::create() else {
+    let Some(tun) = crate::test_support::Tun::create() else {
         return Ok(());
     };
     let mut dispatcher = PacketDispatcher::new();
@@ -633,7 +634,7 @@ fn a_unicast_mdns_answer_from_a_peer_goes_to_the_group() -> io::Result<()> {
     use crate::reflector::{InterfaceMap, mdns};
 
     let _serial = loopback_lock();
-    let Some(mut tun) = crate::capture::Tun::create() else {
+    let Some(mut tun) = crate::test_support::Tun::create() else {
         return Ok(());
     };
     assert!(tun.add_address("10.99.200.1/24"));

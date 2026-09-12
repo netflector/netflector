@@ -174,12 +174,7 @@ mod tests {
 
     use std::time::Duration;
 
-    use crate::reactor::{Handler, ReadyEvent};
-
-    struct Dummy;
-    impl Handler for Dummy {
-        fn on_readable(&mut self, _event: ReadyEvent, _reactor: &mut Reactor) {}
-    }
+    use crate::test_support::NoopHandler;
 
     fn ep(n: u8) -> SocketAddrV4 {
         SocketAddrV4::new(std::net::Ipv4Addr::new(10, 0, 0, n), 8008)
@@ -201,9 +196,9 @@ mod tests {
         assert_eq!(ctx.next_grace(), None);
 
         let base = Instant::now();
-        let hk1 = reactor.register(Box::new(Dummy));
+        let hk1 = reactor.register(Box::new(NoopHandler));
         ctx.insert(key(0, 1, ep(1)), hk1, ep(9), base + Duration::from_secs(10));
-        let hk2 = reactor.register(Box::new(Dummy));
+        let hk2 = reactor.register(Box::new(NoopHandler));
         ctx.insert(key(0, 1, ep(2)), hk2, ep(9), base + Duration::from_secs(5));
         assert_eq!(ctx.next_grace(), Some(base + Duration::from_secs(5)));
     }
@@ -213,7 +208,7 @@ mod tests {
     fn lookup_finds_a_live_proxy_and_prunes_an_evicted_one() {
         let mut reactor = Reactor::new().unwrap();
         let mut ctx = DialContext::new();
-        let hk = reactor.register(Box::new(Dummy));
+        let hk = reactor.register(Box::new(NoopHandler));
         let base = Instant::now();
         ctx.insert(key(0, 1, ep(1)), hk, ep(9), base);
 
@@ -238,7 +233,7 @@ mod tests {
         let mut reactor = Reactor::new().unwrap();
         let mut ctx = DialContext::new();
         let base = Instant::now();
-        let hk = reactor.register(Box::new(Dummy));
+        let hk = reactor.register(Box::new(NoopHandler));
         ctx.insert(key(0, 1, ep(1)), hk, ep(9), base);
 
         assert_eq!(ctx.lookup(key(0, 1, ep(1)), &reactor, base), Some(ep(9)));
@@ -253,7 +248,7 @@ mod tests {
     fn fill(ctx: &mut DialContext, reactor: &mut Reactor, which: std::ops::Range<usize>) {
         let grace = Instant::now() + Duration::from_mins(1);
         for i in which {
-            let hk = reactor.register(Box::new(Dummy));
+            let hk = reactor.register(Box::new(NoopHandler));
             let ep = SocketAddrV4::new(
                 std::net::Ipv4Addr::new(10, 0, 0, u8::try_from(i).unwrap()),
                 8008,
