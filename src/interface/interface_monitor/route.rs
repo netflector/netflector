@@ -47,15 +47,7 @@ const _: () =
 
 /// Open a `PF_ROUTE` socket, non-blocking + close-on-exec.
 pub(super) fn open() -> io::Result<OwnedFd> {
-    // FreeBSD accepts CLOEXEC|NONBLOCK in the socket type; macOS needs a follow-up fcntl.
-    #[cfg(target_os = "freebsd")]
-    let socktype = libc::SOCK_RAW | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK;
-    #[cfg(target_os = "macos")]
-    let socktype = libc::SOCK_RAW;
-    // SAFETY: `socket` returns a fresh fd or -1.
-    let sock = crate::sys::owned_fd_from(unsafe { libc::socket(libc::PF_ROUTE, socktype, 0) })?;
-    #[cfg(target_os = "macos")]
-    crate::sys::set_cloexec_nonblock(sock.as_raw_fd())?;
+    let sock = crate::sys::open_socket(libc::PF_ROUTE, libc::SOCK_RAW, 0)?;
     crate::sys::increase_recv_buffer(sock.as_raw_fd(), RECV_BUFFER);
     // Without it the drain's ENOBUFS re-resolve-all recovery never fires and address changes are lost
     // under pressure. macOS has the same silent drop and no equivalent, so the gap is unfixable there.

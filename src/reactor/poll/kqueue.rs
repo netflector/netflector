@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use super::PollEvent;
 use crate::reactor::{Key, Readiness};
+use crate::sys::check;
 
 // The Key rides in kevent's pointer-sized `udata`; a sub-64-bit pointer would
 // truncate the generation half and silently alias slots. Our kqueue targets
@@ -170,7 +171,7 @@ impl Poller {
             usize::try_from(token).expect("token fits a 64-bit pointer"),
         );
         // SAFETY: submit exactly one change; request no events and do not wait.
-        let rc = unsafe {
+        check(unsafe {
             libc::kevent(
                 self.poll_fd.as_raw_fd(),
                 &raw const change,
@@ -179,11 +180,7 @@ impl Poller {
                 0,
                 ptr::null(),
             )
-        };
-        if rc < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        })
     }
 }
 

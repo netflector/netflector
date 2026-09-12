@@ -5,13 +5,14 @@
 use std::ffi::CStr;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::ptr;
 
 use libc::c_int;
 
 use super::{InterfaceAddresses, V6Pick, v6_rank};
 use crate::net::mac::MacAddr;
+use crate::sys::{check, open_socket};
 
 /// Resolve `if_name`'s current source addresses (plus the interface MTU) in one `getifaddrs`
 /// pass.
@@ -27,9 +28,7 @@ pub(super) fn resolve(if_name: &str) -> io::Result<(InterfaceAddresses, Option<u
     let mut head: *mut libc::ifaddrs = ptr::null_mut();
     // SAFETY: `getifaddrs` writes a freshly-allocated linked list into `head` (or returns
     // nonzero); we own it and release it with `freeifaddrs` below.
-    if unsafe { libc::getifaddrs(&raw mut head) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
+    check(unsafe { libc::getifaddrs(&raw mut head) })?;
 
     let mut addrs = InterfaceAddresses::default();
     let mut v6_pick = V6Pick::default();
@@ -182,17 +181,11 @@ fn canonical_v6(mut octets: [u8; 16]) -> Ipv6Addr {
 /// reading that as "no v6" would filter every candidate and commit the false loss; the error
 /// fails the whole resolve instead, which the caller retries.
 fn inet6_socket() -> io::Result<Option<OwnedFd>> {
-    // SAFETY: `socket` returns a fresh fd or -1.
-    let raw = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0) };
-    if raw >= 0 {
-        // SAFETY: `raw` is a fresh owned socket fd.
-        return Ok(Some(unsafe { OwnedFd::from_raw_fd(raw) }));
+    match open_socket(libc::AF_INET6, libc::SOCK_DGRAM, 0) {
+        Ok(sock) => Ok(Some(sock)),
+        Err(e) if no_ipv6_stack(&e) => Ok(None),
+        Err(e) => Err(e),
     }
-    let err = io::Error::last_os_error();
-    if no_ipv6_stack(&err) {
-        return Ok(None);
-    }
-    Err(err)
 }
 
 /// Whether a `socket(AF_INET6, ...)` failure means the host has no IPv6 stack, the one case
@@ -223,9 +216,7 @@ fn v6_flags(sock: &OwnedFd, if_name: &str, addr: libc::sockaddr_in6) -> Option<c
     req.ifr_ifru.ifru_addr = addr;
     // SAFETY: the ioctl reads `req` (name + queried address) and writes the address flags
     // back into the union; `sock` is a valid `AF_INET6` socket.
-    if unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCGIFAFLAG_IN6, &raw mut req) } < 0 {
-        return None;
-    }
+    check(unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCGIFAFLAG_IN6, &raw mut req) }).ok()?;
     // SAFETY: a successful ioctl wrote `ifru_flags6` into the union.
     Some(unsafe { req.ifr_ifru.ifru_flags6 })
 }

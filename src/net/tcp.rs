@@ -10,7 +10,9 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use libc::{c_int, c_void};
 
-use crate::sys::{IoStatus, open_socket, so_error, sockaddr_for, socklen_of, would_block};
+use crate::sys::{
+    IoStatus, check, local_addr, open_socket, setsockopt, so_error, sockaddr_for, would_block,
+};
 
 /// Listen backlog. A DIAL listener fields a few short-lived client fetches, so this is ample.
 const LISTEN_BACKLOG: c_int = 16;
@@ -34,12 +36,10 @@ impl TcpSocket {
     /// # Errors
     /// Propagates the socket / `setsockopt` / `bind` / `listen` syscall failure.
     pub(crate) fn listen(addr: Ipv4Addr) -> io::Result<Self> {
-        let fd = open_socket(libc::AF_INET, libc::SOCK_STREAM)?;
-        bind_v4(fd.as_raw_fd(), addr, 0)?;
+        let fd = open_socket(libc::AF_INET, libc::SOCK_STREAM, 0)?;
+        crate::sys::bind(fd.as_raw_fd(), IpAddr::V4(addr), 0, 0)?;
         // SAFETY: `fd` is a valid bound socket; `listen` marks it passive.
-        if unsafe { libc::listen(fd.as_raw_fd(), LISTEN_BACKLOG) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
+        check(unsafe { libc::listen(fd.as_raw_fd(), LISTEN_BACKLOG) })?;
         let local_addr = local_addr_v4(fd.as_raw_fd())?;
         Ok(Self {
             fd,
@@ -91,11 +91,11 @@ impl TcpSocket {
     ) -> io::Result<Self> {
         #[cfg(target_os = "freebsd")]
         verify_egress(dst, iface)?;
-        let fd = open_socket(libc::AF_INET, libc::SOCK_STREAM)?;
+        let fd = open_socket(libc::AF_INET, libc::SOCK_STREAM, 0)?;
         set_nodelay(fd.as_raw_fd())?;
         #[cfg(not(target_os = "freebsd"))]
         pin_egress(fd.as_raw_fd(), iface)?;
-        bind_v4(fd.as_raw_fd(), source, 0)?;
+        crate::sys::bind(fd.as_raw_fd(), IpAddr::V4(source), 0, 0)?;
         let local_addr = local_addr_v4(fd.as_raw_fd())?;
         let connecting = connect_v4(fd.as_raw_fd(), dst)?;
         Ok(Self {
@@ -213,36 +213,12 @@ impl AsRawFd for TcpSocket {
     }
 }
 
-fn bind_v4(fd: RawFd, addr: Ipv4Addr, port: u16) -> io::Result<()> {
-    let (storage, len) = sockaddr_for(IpAddr::V4(addr), port, 0);
-    // SAFETY: `storage` is a valid `sockaddr_in` of length `len` for `fd`'s family.
-    let rc = unsafe { libc::bind(fd, (&raw const storage).cast::<libc::sockaddr>(), len) };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-/// The IPv4 address `fd` is bound to, via `getsockname`.
+/// The IPv4 address `fd` is bound to.
 fn local_addr_v4(fd: RawFd) -> io::Result<SocketAddrV4> {
-    // SAFETY: an all-zero `sockaddr_storage` is a valid out-buffer; `getsockname` fills it + sets `len`.
-    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-    let mut len = socklen_of::<libc::sockaddr_storage>();
-    // SAFETY: `storage`/`len` are a valid (sockaddr, length) out-pair for `fd`.
-    let rc = unsafe {
-        libc::getsockname(
-            fd,
-            (&raw mut storage).cast::<libc::sockaddr>(),
-            &raw mut len,
-        )
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
+    match local_addr(fd)? {
+        std::net::SocketAddr::V4(addr) => Ok(addr),
+        std::net::SocketAddr::V6(_) => Err(io::Error::other("the socket is not IPv4")),
     }
-    // SAFETY: an AF_INET socket's name is a `sockaddr_in`.
-    let sin = unsafe { &*(&raw const storage).cast::<libc::sockaddr_in>() };
-    let addr = Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes());
-    Ok(SocketAddrV4::new(addr, u16::from_be(sin.sin_port)))
 }
 
 /// Accept a pending connection on listener `fd` (close-on-exec + non-blocking), or `None` on
@@ -322,21 +298,7 @@ fn connect_v4(fd: RawFd, dst: SocketAddrV4) -> io::Result<bool> {
 /// peer's delayed ACK fires (40-100ms), and the peer can't ACK early: it's mid-body with nothing to
 /// send. Writes are already message-shaped, so Nagle has nothing to usefully coalesce here.
 fn set_nodelay(fd: RawFd) -> io::Result<()> {
-    let on: c_int = 1;
-    // SAFETY: `&on` is a valid `c_int` option value for `fd`.
-    let rc = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::IPPROTO_TCP,
-            libc::TCP_NODELAY,
-            (&raw const on).cast::<c_void>(),
-            socklen_of::<c_int>(),
-        )
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, &1 as &c_int)
 }
 
 /// Constrain `fd`'s egress to the interface named `iface` so a route lookup can't leak the connect
@@ -358,7 +320,7 @@ fn pin_egress(fd: RawFd, iface: Option<&str>) -> io::Result<()> {
             ));
         }
         // SAFETY: `name` points at `name.len()` valid bytes; the kernel NUL-terminates its copy.
-        let rc = unsafe {
+        check(unsafe {
             libc::setsockopt(
                 fd,
                 libc::SOL_SOCKET,
@@ -367,10 +329,7 @@ fn pin_egress(fd: RawFd, iface: Option<&str>) -> io::Result<()> {
                 libc::socklen_t::try_from(name.len())
                     .expect("interface name length fits socklen_t"),
             )
-        };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
-        }
+        })?;
     }
     #[cfg(target_os = "macos")]
     {
@@ -381,19 +340,7 @@ fn pin_egress(fd: RawFd, iface: Option<&str>) -> io::Result<()> {
             )
         })?;
         let index = c_int::try_from(index).map_err(|_| io::Error::other("ifindex too large"))?;
-        // SAFETY: `&index` is a valid `c_int` option value for `fd`.
-        let rc = unsafe {
-            libc::setsockopt(
-                fd,
-                libc::IPPROTO_IP,
-                libc::IP_BOUND_IF,
-                (&raw const index).cast::<c_void>(),
-                socklen_of::<c_int>(),
-            )
-        };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
-        }
+        setsockopt(fd, libc::IPPROTO_IP, libc::IP_BOUND_IF, &index)?;
     }
     log::trace!("connect egress pinned to {name}");
     Ok(())
@@ -449,20 +396,9 @@ mod tests {
 
     /// Read back the `TCP_NODELAY` flag via `getsockopt`.
     fn nodelay(socket: &TcpSocket) -> bool {
-        let mut on: c_int = 0;
-        let mut len = socklen_of::<c_int>();
-        // SAFETY: `on`/`len` are a valid (value, length) out-pair for a `c_int` option on `fd`.
-        let rc = unsafe {
-            libc::getsockopt(
-                socket.as_raw_fd(),
-                libc::IPPROTO_TCP,
-                libc::TCP_NODELAY,
-                (&raw mut on).cast::<c_void>(),
-                &raw mut len,
-            )
-        };
-        assert_eq!(rc, 0, "getsockopt(TCP_NODELAY) failed");
-        on != 0
+        crate::sys::getsockopt_int(socket.as_raw_fd(), libc::IPPROTO_TCP, libc::TCP_NODELAY)
+            .expect("getsockopt(TCP_NODELAY) failed")
+            != 0
     }
 
     /// Drive a non-blocking op to completion on loopback (no reactor in the test).

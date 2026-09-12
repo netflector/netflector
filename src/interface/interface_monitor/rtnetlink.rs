@@ -10,6 +10,7 @@ use libc::socklen_t;
 use super::super::rtnetlink::read_at;
 use super::InterfaceEvent;
 use crate::libcex::nl_align;
+use crate::sys::{check, open_socket};
 
 /// Holds one notification. Multicast delivers one message per datagram, never a coalesced
 /// dump. Sized for the largest: an `RTM_NEWLINK` carries the interface's whole attribute set
@@ -31,15 +32,7 @@ const SUBSCRIBED_GROUPS: u32 =
 
 /// Open a `NETLINK_ROUTE` socket bound to the change groups, non-blocking + close-on-exec.
 pub(super) fn open() -> io::Result<OwnedFd> {
-    // SAFETY: `socket` returns a fresh fd or -1; the type arg carries CLOEXEC|NONBLOCK
-    // (Linux applies both atomically, with no fcntl race).
-    let sock = crate::sys::owned_fd_from(unsafe {
-        libc::socket(
-            libc::AF_NETLINK,
-            libc::SOCK_RAW | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
-            libc::NETLINK_ROUTE,
-        )
-    })?;
+    let sock = open_socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_ROUTE)?;
     // SAFETY: a zeroed `sockaddr_nl` is an all-integer POD (libc keeps its padding field
     // private, so there is no literal to write); the two meaningful fields are set below.
     let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
@@ -47,17 +40,14 @@ pub(super) fn open() -> io::Result<OwnedFd> {
     addr.nl_groups = SUBSCRIBED_GROUPS;
     // SAFETY: a fully-initialized `sockaddr_nl` of its own size; `bind` reads it and
     // subscribes the multicast groups.
-    let rc = unsafe {
+    check(unsafe {
         libc::bind(
             sock.as_raw_fd(),
             (&raw const addr).cast::<libc::sockaddr>(),
             socklen_t::try_from(size_of::<libc::sockaddr_nl>())
                 .expect("sockaddr_nl fits socklen_t"),
         )
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
+    })?;
     Ok(sock)
 }
 
