@@ -45,7 +45,7 @@ use crate::interface::InterfaceAddresses;
 use crate::net::LinkType;
 use crate::net::mac::{MacAddr, MacSet};
 use crate::net::packet::Packet;
-use crate::reactor::{Arena, ControlEvent, Handler, Key, Reactor, ReadyEvent};
+use crate::reactor::{Arena, ControlEvent, Handler, HandlerSlot, Key, Reactor, ReadyEvent};
 
 use self::counters::log_counters;
 use self::egress::{Datagram, Egress};
@@ -231,6 +231,18 @@ struct Registration {
     ingress: CaptureKey,
     filter: Filter,
     handler: Option<Box<dyn PacketHandler>>,
+}
+
+impl HandlerSlot for Registration {
+    type Handler = dyn PacketHandler;
+
+    fn slot(&self) -> &Option<Box<dyn PacketHandler>> {
+        &self.handler
+    }
+
+    fn slot_mut(&mut self) -> &mut Option<Box<dyn PacketHandler>> {
+        &mut self.handler
+    }
 }
 
 /// The periodic counter-summary schedule: log every capture's counts every `interval`. Held as an
@@ -610,20 +622,14 @@ impl PacketDispatcher {
                 continue;
             }
             // Take the matched reflector out so `&mut self` is free for the call, then restore it
-            // by key. `take` never misses: a `handler` is `None` only transiently while out
-            // mid-call, and `route` doesn't re-enter the same registration in one pass. A `get_mut`
-            // miss on the put-back means the call removed this registration: drop it, don't revive.
+            // by key. The take never misses: a `handler` is `None` only transiently while out
+            // mid-call, and `route` doesn't re-enter the same registration in one pass.
             let mut handler = self
                 .registrations
-                .get_mut(key.0)
-                .expect("a key that just matched is still live")
-                .handler
-                .take()
-                .expect("a matching registration has its handler present");
+                .take_handler(key.0)
+                .expect("a registration that just matched is live with its handler present");
             let outcome = handler.on_packet(packet, self, reactor);
-            if let Some(reg) = self.registrations.get_mut(key.0) {
-                reg.handler = Some(handler);
-            }
+            self.registrations.restore_handler(key.0, handler);
             // Fold this handler's outcome into the packet's running result (highest disposition wins),
             // logging the "can't happen under a valid config" anomalies the fold surfaces.
             final_outcome = Some(match final_outcome {
@@ -689,11 +695,7 @@ impl PacketDispatcher {
             .map(|(key, _)| RegistrationKey(key))
             .collect();
         for key in keys {
-            let Some(mut handler) = self
-                .registrations
-                .get_mut(key.0)
-                .and_then(|reg| reg.handler.take())
-            else {
+            let Some(mut handler) = self.registrations.take_handler(key.0) else {
                 // Expected, not an error: an earlier reflector in this broadcast cleared its sessions
                 // and unregistered their response registrations, which are in this snapshot, so they resolve
                 // to None here. Mirrors on_deadline's mid-sweep skip.
@@ -703,9 +705,7 @@ impl PacketDispatcher {
                 continue;
             };
             handler.on_iface_change(captures, self, reactor);
-            if let Some(reg) = self.registrations.get_mut(key.0) {
-                reg.handler = Some(handler);
-            }
+            self.registrations.restore_handler(key.0, handler);
         }
     }
 
@@ -747,8 +747,8 @@ impl Handler for PacketDispatcher {
         // worth the entry invalidation a cancelled or moved deadline would force. Revisit if
         // timers grow.
         self.registrations
-            .iter()
-            .filter_map(|(_, reg)| reg.handler.as_ref().and_then(|h| h.next_deadline()))
+            .handlers()
+            .filter_map(|(_, handler)| handler.next_deadline())
             .chain(self.dial.next_grace()) // and the soonest DIAL proxy grace, for its eviction sweep
             .chain(self.report.as_ref().map(|r| r.next)) // and the next counter summary, if enabled
             .chain(Some(self.lifecycle.next_reconcile())) // and the interface reconcile tick
@@ -762,29 +762,18 @@ impl Handler for PacketDispatcher {
     fn on_deadline(&mut self, now: Instant, reactor: &mut Reactor) {
         let due: Vec<RegistrationKey> = self
             .registrations
-            .iter()
-            .filter(|(_, reg)| {
-                reg.handler
-                    .as_ref()
-                    .and_then(|h| h.next_deadline())
-                    .is_some_and(|d| d <= now)
-            })
+            .handlers()
+            .filter(|(_, handler)| handler.next_deadline().is_some_and(|d| d <= now))
             .map(|(key, _)| RegistrationKey(key))
             .collect();
         for key in due {
             // Gone if an earlier handler in this sweep unregistered it (a sibling, or itself).
-            let Some(mut handler) = self
-                .registrations
-                .get_mut(key.0)
-                .and_then(|reg| reg.handler.take())
-            else {
+            let Some(mut handler) = self.registrations.take_handler(key.0) else {
                 log::trace!("deadline sweep: handler for {key:?} gone mid-sweep, skipped");
                 continue;
             };
             handler.on_deadline(now, self, reactor);
-            if let Some(reg) = self.registrations.get_mut(key.0) {
-                reg.handler = Some(handler);
-            }
+            self.registrations.restore_handler(key.0, handler);
         }
         self.dial.sweep(now, reactor); // evict DIAL proxies whose advertisement grace has lapsed
 

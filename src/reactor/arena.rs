@@ -163,6 +163,43 @@ impl<T> Default for Arena<T> {
     }
 }
 
+/// A slot value holding its handler in an `Option`: the handler is taken out for its call, so the
+/// arena's owner is free to hand itself to it, and put back after. `None` marks "out mid-call".
+pub(crate) trait HandlerSlot {
+    type Handler: ?Sized;
+
+    // The slot itself is the interface: `slot_mut` mirrors it and `handler` derives from it.
+    #[allow(clippy::ref_option)]
+    fn slot(&self) -> &Option<Box<Self::Handler>>;
+
+    fn slot_mut(&mut self) -> &mut Option<Box<Self::Handler>>;
+
+    fn handler(&self) -> Option<&Self::Handler> {
+        self.slot().as_deref()
+    }
+}
+
+impl<T: HandlerSlot> Arena<T> {
+    /// Take `key`'s handler out for a call: `None` if the slot is gone or the handler is already
+    /// out.
+    pub(crate) fn take_handler(&mut self, key: Key) -> Option<Box<T::Handler>> {
+        self.get_mut(key)?.slot_mut().take()
+    }
+
+    /// Put a handler back after its call. A slot removed during the call drops it.
+    pub(crate) fn restore_handler(&mut self, key: Key, handler: Box<T::Handler>) {
+        if let Some(slot) = self.get_mut(key) {
+            *slot.slot_mut() = Some(handler);
+        }
+    }
+
+    /// Every present handler with its key, in slot order.
+    pub(crate) fn handlers(&self) -> impl Iterator<Item = (Key, &T::Handler)> + '_ {
+        self.iter()
+            .filter_map(|(key, slot)| Some((key, slot.handler()?)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -22,7 +22,7 @@ mod arena;
 mod poll;
 mod signal;
 
-pub(crate) use self::arena::{Arena, Key};
+pub(crate) use self::arena::{Arena, HandlerSlot, Key};
 
 use std::io;
 use std::num::NonZeroUsize;
@@ -120,6 +120,18 @@ pub(crate) enum ControlEvent {
 struct HandlerEntry {
     handler: Option<Box<dyn Handler>>,
     regs: Vec<RegKey>,
+}
+
+impl HandlerSlot for HandlerEntry {
+    type Handler = dyn Handler;
+
+    fn slot(&self) -> &Option<Box<dyn Handler>> {
+        &self.handler
+    }
+
+    fn slot_mut(&mut self) -> &mut Option<Box<dyn Handler>> {
+        &mut self.handler
+    }
 }
 
 /// One watched fd: the fd, the handler it dispatches to, and whether its read/write interest
@@ -435,8 +447,8 @@ impl Reactor {
     /// The soonest deadline any handler is waiting on, or `None` if none has a pending timer.
     fn next_deadline(&self) -> Option<Instant> {
         self.handlers
-            .iter()
-            .filter_map(|(_, entry)| entry.handler.as_ref().and_then(|h| h.next_deadline()))
+            .handlers()
+            .filter_map(|(_, handler)| handler.next_deadline())
             .min()
     }
 
@@ -452,32 +464,20 @@ impl Reactor {
         self.dispatch_keys.clear();
         self.dispatch_keys.extend(
             self.handlers
-                .iter()
-                .filter(|(_, entry)| {
-                    entry
-                        .handler
-                        .as_ref()
-                        .and_then(|h| h.next_deadline())
-                        .is_some_and(|d| d <= now)
-                })
+                .handlers()
+                .filter(|(_, handler)| handler.next_deadline().is_some_and(|d| d <= now))
                 .map(|(key, _)| key),
         );
         for i in 0..self.dispatch_keys.len() {
             let key = self.dispatch_keys[i];
             // Gone if an earlier sweep in this pass removed it (its key went stale); benign.
-            let Some(mut handler) = self
-                .handlers
-                .get_mut(key)
-                .and_then(|entry| entry.handler.take())
-            else {
+            let Some(mut handler) = self.handlers.take_handler(key) else {
                 log::trace!("dispatch_deadlines: handler for {key:?} gone mid-sweep, skipped");
                 continue;
             };
             log::trace!("deadline fired for {key:?}");
             handler.on_deadline(now, self);
-            if let Some(entry) = self.handlers.get_mut(key) {
-                entry.handler = Some(handler);
-            }
+            self.handlers.restore_handler(key, handler);
         }
     }
 
@@ -495,18 +495,12 @@ impl Reactor {
         for i in 0..self.dispatch_keys.len() {
             let key = self.dispatch_keys[i];
             // Gone if an earlier handler in this pass removed it (its key went stale); benign.
-            let Some(mut handler) = self
-                .handlers
-                .get_mut(key)
-                .and_then(|entry| entry.handler.take())
-            else {
+            let Some(mut handler) = self.handlers.take_handler(key) else {
                 log::trace!("dispatch_control: handler for {key:?} gone mid-broadcast, skipped");
                 continue;
             };
             handler.on_control(event, self);
-            if let Some(entry) = self.handlers.get_mut(key) {
-                entry.handler = Some(handler);
-            }
+            self.handlers.restore_handler(key, handler);
         }
     }
 
@@ -542,13 +536,13 @@ impl Reactor {
         };
         // Take the handler out so `self` is free to pass to it; the slot stays put, so
         // `handler_key` stays valid and the handler is returned after the call.
-        let Some(handler_entry) = self.handlers.get_mut(handler_key.0) else {
-            log::trace!("dispatch: {reg_key:?} -> {handler_key:?} gone, ignored");
-            return;
-        };
-        let Some(mut handler) = handler_entry.handler.take() else {
-            // reentrant dispatch of a handler already in flight
-            log::trace!("dispatch: {handler_key:?} already in flight, ignored");
+        let Some(mut handler) = self.handlers.take_handler(handler_key.0) else {
+            if self.handlers.contains(handler_key.0) {
+                // reentrant dispatch of a handler already in flight
+                log::trace!("dispatch: {handler_key:?} already in flight, ignored");
+            } else {
+                log::trace!("dispatch: {reg_key:?} -> {handler_key:?} gone, ignored");
+            }
             return;
         };
 
@@ -576,11 +570,7 @@ impl Reactor {
             }
         }
 
-        // Return the handler, unless it was removed during the call, in which case its
-        // entry is gone and the handler is dropped.
-        if let Some(handler_entry) = self.handlers.get_mut(handler_key.0) {
-            handler_entry.handler = Some(handler);
-        }
+        self.handlers.restore_handler(handler_key.0, handler);
     }
 }
 
