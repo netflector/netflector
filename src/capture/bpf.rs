@@ -31,9 +31,6 @@ pub(crate) struct Capture {
     offset: usize,
     link_type: LinkType,
     name: String,
-    /// Frames dropped for exceeding the forwarding limit since the last
-    /// [`take_oversized`](Self::take_oversized) drain.
-    oversized: u64,
 }
 
 impl Capture {
@@ -69,7 +66,6 @@ impl Capture {
             offset: 0,
             link_type,
             name: if_name.into(),
-            oversized: 0,
         })
     }
 
@@ -153,7 +149,6 @@ impl Capture {
                     self.name,
                     crate::net::MAX_FRAME_LEN
                 );
-                self.oversized += 1;
                 Ok(Some(Read::Oversized))
             }
         }
@@ -163,12 +158,6 @@ impl Capture {
     /// draining, since a level-triggered wait won't re-fire until new kernel data.
     pub(crate) fn has_buffered(&self) -> bool {
         self.offset < self.filled
-    }
-
-    /// The oversized-frame drops since the last call, resetting the count: the dispatcher folds
-    /// them into the interface's counter row after each drain.
-    pub(crate) fn take_oversized(&mut self) -> u64 {
-        std::mem::take(&mut self.oversized)
     }
 
     /// Whether a read error says the descriptor lost its interface: a detached BPF descriptor
@@ -544,7 +533,6 @@ mod tests {
                 None => panic!("did not capture the oversized datagram on lo0"),
             }
         }
-        assert!(capture.take_oversized() >= 1);
         Ok(())
     }
 

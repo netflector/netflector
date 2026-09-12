@@ -651,6 +651,7 @@ impl PacketDispatcher {
         let link = capture.link_type(); // hoisted: next_frame's borrow would pin `capture`
         let fd = capture.as_raw_fd();
         let mut drained = 0u32;
+        let mut oversized = 0u64;
         loop {
             if drained >= MAX_FRAMES_PER_EVENT && !capture.has_buffered() {
                 break;
@@ -659,6 +660,7 @@ impl PacketDispatcher {
                 Ok(Some(Read::Frame(frame))) => frame,
                 Ok(Some(Read::Oversized)) => {
                     drained += 1;
+                    oversized += 1;
                     continue;
                 }
                 Ok(None) => break,
@@ -695,7 +697,6 @@ impl PacketDispatcher {
         if drained > 0 {
             log::trace!("fd {fd}: drained {drained} frame(s)");
         }
-        let oversized = capture.take_oversized();
         if oversized > 0 {
             self.table.record_oversized(ingress, oversized);
         }
