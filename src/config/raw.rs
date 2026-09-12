@@ -17,7 +17,10 @@ use crate::net::mac::MacSet;
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RawConfig {
-    pub(super) log_level: Option<LogLevel>,
+    /// Accepted (so the key is part of the schema) and validated, never read here: the level is
+    /// resolved by [`resolve_log_level`](super::resolve_log_level) before the full parse.
+    #[serde(rename = "log_level")]
+    pub(super) _log_level: Option<LogLevel>,
     /// Seconds between memory-footprint diagnostic reports; `0` or absent disables them.
     pub(super) debug_memory_interval_secs: Option<u64>,
     /// Seconds between periodic counter summaries; `0` or absent disables them.
@@ -67,7 +70,6 @@ impl RawConfig {
     /// Overlay environment-derived settings: env globals win, env reflectors are
     /// added, and a reflector named by both sources is rejected.
     pub(super) fn merge_env(&mut self, env: RawConfig) -> Result<(), ConfigError> {
-        self.log_level = env.log_level.or(self.log_level);
         self.debug_memory_interval_secs = env
             .debug_memory_interval_secs
             .or(self.debug_memory_interval_secs);

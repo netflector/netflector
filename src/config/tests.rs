@@ -34,7 +34,6 @@ fn minimal_reflector_uses_defaults() {
             "#,
     )
     .unwrap();
-    assert_eq!(cfg.log_level, LogLevel::Info);
     assert!(cfg.debug_memory_interval.is_none());
     assert_eq!(cfg.reflectors.len(), 1);
     let r = &cfg.reflectors[0];
@@ -343,7 +342,6 @@ fn full_reflector_parses() {
             "#,
     )
     .unwrap();
-    assert_eq!(cfg.log_level, LogLevel::Debug);
     assert_eq!(cfg.debug_memory_interval, Some(Duration::from_secs(30)));
     assert_eq!(cfg.reflectors.len(), 1);
     let r = &cfg.reflectors[0];
@@ -567,6 +565,16 @@ fn multiple_reflectors_parse() {
 #[test]
 fn empty_config_is_rejected() {
     assert!(matches!(err(""), ConfigError::NoReflectors));
+}
+
+#[test]
+fn log_level_resolves_from_the_file_before_the_full_parse() {
+    // The probe reads only the top-level key, so a broken reflector table can't hide the level.
+    assert_eq!(resolve_log_level(None, &[]).unwrap(), LogLevel::Info);
+    assert_eq!(
+        resolve_log_level(Some("log_level = \"DEBUG\"\n[reflectors.x]\n"), &[]).unwrap(),
+        LogLevel::Debug
+    );
 }
 
 #[test]

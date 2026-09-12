@@ -472,8 +472,6 @@ impl TryFrom<(String, RawReflector)> for Reflector {
 /// A fully-validated configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Config {
-    /// Minimum severity to log.
-    pub(crate) log_level: LogLevel,
     /// How often to log memory-footprint diagnostics, or `None` to disable them.
     pub(crate) debug_memory_interval: Option<Duration>,
     /// How often to log per-interface packet counters, or `None` to disable them.
@@ -529,7 +527,6 @@ impl TryFrom<RawConfig> for Config {
         check_conflicts(&reflectors)?;
 
         Ok(Config {
-            log_level: raw.log_level.unwrap_or_default(),
             debug_memory_interval: interval_from(
                 raw.debug_memory_interval_secs,
                 "debug_memory_interval_secs",
