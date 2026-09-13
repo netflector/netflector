@@ -109,3 +109,27 @@ debug and release. `clippy` and the rustdoc link gate run per target. The e2e su
 Docker backend on amd64 and arm64 (plus a Valgrind memcheck job) and natively on linux amd64/arm64
 (glibc and musl), armv7/armv5 (daemon under qemu-user), and FreeBSD amd64/arm64. The armv7 and armv5
 images are covered by the native lanes rather than the Docker ones.
+
+## Platform policy
+
+`ci/platforms.toml` is the catalog: the shipped targets and their runners, the container
+platforms, the FreeBSD majors and architectures, the static release baseline, and the OPNsense
+series. `ci/platforms.py` renders it into the marked blocks of the workflows, which are checked in
+so a matrix is reviewable where it runs:
+
+```sh
+python3 ci/platforms.py --write   # regenerate the marked blocks
+python3 ci/platforms.py --check   # fail on drift, or on a pin file the catalog does not name
+```
+
+The two FreeBSD pin families are separate: `freebsd<major>.env` selects the CI kernel and the
+release sysroot; `freebsd<major>-opnsense.env` selects the older userland that stamps the daemon
+packages for that OPNsense series. `ci/freebsd-pin.sh` refreshes the hashes. A major also has its
+Renovate manager and rule in `renovate.json`. A retired series leaves the catalog and its
+package-base pin; a published tree the catalog does not name is outside the all-ABIs-published
+check.
+
+`ci/freebsd-ci-setup.sh` installs QEMU, enables KVM where the runner has it, and launches the
+selected VM; `ci/freebsd-cross-env.sh` prepares the sysroot and exports the target's linker and
+runner for a cross-building lane. Both assume an Ubuntu GitHub runner; `ci/freebsd-vm.sh` is the
+layer underneath.

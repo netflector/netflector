@@ -51,30 +51,16 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
+        # BEGIN platforms: release
         include:
-          - variant: linux-amd64
-            runner: ubuntu-24.04
-            target: x86_64-unknown-linux-musl
-          - variant: linux-arm64
-            runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-musl
-          - variant: linux-armv7
-            runner: ubuntu-24.04
-            target: armv7-unknown-linux-musleabihf
-          - variant: linux-armv5
-            runner: ubuntu-24.04
-            target: armv5te-unknown-linux-musleabi
-          - variant: macos-arm64
-            runner: macos-15
-            target: aarch64-apple-darwin
-          - variant: freebsd-amd64
-            runner: ubuntu-24.04
-            target: x86_64-unknown-freebsd
-            freebsd_arch: amd64
-          - variant: freebsd-arm64
-            runner: ubuntu-24.04
-            target: aarch64-unknown-freebsd
-            freebsd_arch: arm64
+          - {"variant": "linux-amd64", "runner": "ubuntu-24.04", "target": "x86_64-unknown-linux-musl"}
+          - {"variant": "linux-arm64", "runner": "ubuntu-24.04-arm", "target": "aarch64-unknown-linux-musl"}
+          - {"variant": "linux-armv7", "runner": "ubuntu-24.04", "target": "armv7-unknown-linux-musleabihf"}
+          - {"variant": "linux-armv5", "runner": "ubuntu-24.04", "target": "armv5te-unknown-linux-musleabi"}
+          - {"variant": "macos-arm64", "runner": "macos-15", "target": "aarch64-apple-darwin"}
+          - {"variant": "freebsd-amd64", "runner": "ubuntu-24.04", "target": "x86_64-unknown-freebsd", "freebsd_arch": "amd64", "freebsd_baseline": 14}
+          - {"variant": "freebsd-arm64", "runner": "ubuntu-24.04", "target": "aarch64-unknown-freebsd", "freebsd_arch": "arm64", "freebsd_baseline": 14}
+        # END platforms
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -120,12 +106,11 @@ jobs:
           FREEBSD_SYSROOT_ARCH: ${{ matrix.freebsd_arch }}
           # The oldest supported major, so the static assets reach the widest range of releases.
           # Which point release that is comes from ci/freebsd14.env.
-          FREEBSD_SYSROOT_VERSION: 14
+          FREEBSD_SYSROOT_VERSION: ${{ matrix.freebsd_baseline }}
         run: |
-          ci/freebsd-sysroot.sh
+          ci/freebsd-cross-env.sh
           prefix="CARGO_TARGET_$(echo '${{ matrix.target }}' | tr 'a-z-' 'A-Z_')"
           {
-            echo "${prefix}_LINKER=$HOME/freebsd-sysroot/bin/freebsd-clang"
             echo "${prefix}_RUSTFLAGS=-C target-feature=+crt-static"
           } >> "$GITHUB_ENV"
 
@@ -184,19 +169,13 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
+        # BEGIN platforms: images
         include:
-          - arch: amd64
-            runner: ubuntu-24.04
-            platform: linux/amd64
-          - arch: arm64
-            runner: ubuntu-24.04-arm
-            platform: linux/arm64
-          - arch: armv7
-            runner: ubuntu-24.04
-            platform: linux/arm/v7
-          - arch: armv5
-            runner: ubuntu-24.04
-            platform: linux/arm/v5
+          - {"arch": "amd64", "runner": "ubuntu-24.04", "platform": "linux/amd64"}
+          - {"arch": "arm64", "runner": "ubuntu-24.04-arm", "platform": "linux/arm64"}
+          - {"arch": "armv7", "runner": "ubuntu-24.04", "platform": "linux/arm/v7"}
+          - {"arch": "armv5", "runner": "ubuntu-24.04", "platform": "linux/arm/v5"}
+        # END platforms
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7

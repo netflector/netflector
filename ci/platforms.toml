@@ -1,0 +1,60 @@
+# Deployment policy, shared by CI, release assets, and package publication.
+# Point releases and hashes remain in freebsd<major>[-opnsense].env: latest CI
+# kernels and the older OPNsense package userlands deliberately have different pins.
+freebsd_majors = [14, 15]
+freebsd_static_baseline = 14
+
+[[linux]]
+arch = "amd64"
+runner = "ubuntu-24.04"
+triple = "x86_64-unknown-linux-musl"
+gnu = "x86_64-unknown-linux-gnu"
+platform = "linux/amd64"
+
+[[linux]]
+arch = "arm64"
+runner = "ubuntu-24.04-arm"
+triple = "aarch64-unknown-linux-musl"
+gnu = "aarch64-unknown-linux-gnu"
+platform = "linux/arm64"
+
+[[linux]]
+arch = "armv7"
+runner = "ubuntu-24.04"
+triple = "armv7-unknown-linux-musleabihf"
+platform = "linux/arm/v7"
+emulated = true
+
+[[linux]]
+arch = "armv5"
+runner = "ubuntu-24.04"
+triple = "armv5te-unknown-linux-musleabi"
+platform = "linux/arm/v5"
+emulated = true
+
+[[freebsd]]
+name = "amd64"
+abi = "amd64"
+triple = "x86_64-unknown-freebsd"
+kvm = true
+packages = "qemu-system-x86"
+
+[[freebsd]]
+name = "arm64"
+abi = "aarch64"
+triple = "aarch64-unknown-freebsd"
+kvm = false
+packages = "qemu-system-arm qemu-efi-aarch64"
+
+[[macos]]
+arch = "arm64"
+runner = "macos-15"
+triple = "aarch64-apple-darwin"
+
+[[opnsense]]
+series = "26.1"
+major = 14
+
+[[opnsense]]
+series = "26.7"
+major = 15

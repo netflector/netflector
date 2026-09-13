@@ -83,10 +83,11 @@ jobs:
             fi
             daemon_version=$version
           done
+          abi_arches=$(python3 ci/platforms.py --abi-arches)
           for dir in incoming/plugin-pkg-freebsd-*; do
             pkg=$(one_pkg "$dir")
             os=${dir##*-}
-            for arch in amd64 aarch64; do
+            for arch in $abi_arches; do
               tree="pkg-repo/opnsense/FreeBSD:${os}:${arch}/latest"
               mkdir -p "$tree"
               cp "$pkg" "$tree/"
@@ -107,20 +108,8 @@ jobs:
           [ -n "$daemon_version" ] && message="daemon ${daemon_version}"
           [ -n "$plugin_version" ] && message="${message:+${message} + }plugin ${plugin_version}"
           echo "message=$message" >> "$GITHUB_OUTPUT"
-      - name: Install QEMU
-        run: |
-          # A failing third-party repo (packages.microsoft.com flakes) must not kill the step:
-          # the packages come from the Ubuntu archive, and a broken archive still fails the
-          # install below loudly.
-          sudo apt-get update || true
-          sudo apt-get install -y --no-install-recommends qemu-utils qemu-system-x86 genisoimage
-      - name: Enable KVM
-        run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-      - name: Launch the FreeBSD VM
-        run: ci/freebsd-vm.sh launch
+      - name: Prepare and launch FreeBSD
+        run: ci/freebsd-ci-setup.sh
       - name: Wait for the VM
         run: ci/freebsd-vm.sh wait
       - name: Sign the catalogues
@@ -183,9 +172,11 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
+        # BEGIN platforms: opnsense
         include:
-          - { opnsense: '26.1', os: 14, abi: 'FreeBSD:14:amd64' }
-          - { opnsense: '26.7', os: 15, abi: 'FreeBSD:15:amd64' }
+          - {"opnsense": "26.1", "os": 14, "plugins_branch": "stable/26.1", "abi": "FreeBSD:14:amd64"}
+          - {"opnsense": "26.7", "os": 15, "plugins_branch": "stable/26.7", "abi": "FreeBSD:15:amd64"}
+        # END platforms
     env:
       FREEBSD_VM_ARCH: amd64
       FREEBSD_VM_VERSION: '${{ matrix.os }}-opnsense'
@@ -201,20 +192,8 @@ jobs:
         run: |
           mkdir signed
           tar -xf signed-trees.tar -C signed
-      - name: Install QEMU
-        run: |
-          # A failing third-party repo (packages.microsoft.com flakes) must not kill the step:
-          # the packages come from the Ubuntu archive, and a broken archive still fails the
-          # install below loudly.
-          sudo apt-get update || true
-          sudo apt-get install -y --no-install-recommends qemu-utils qemu-system-x86 genisoimage
-      - name: Enable KVM
-        run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-      - name: Launch the FreeBSD VM
-        run: ci/freebsd-vm.sh launch
+      - name: Prepare and launch FreeBSD
+        run: ci/freebsd-ci-setup.sh
       - name: Wait for the VM
         run: ci/freebsd-vm.sh wait
       - name: Convert the VM to OPNsense ${{ matrix.opnsense }}

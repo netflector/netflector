@@ -9,38 +9,13 @@
 # result means a publish died midway, and calling that published would freeze the gap:
 # both callers skip a version once, and nothing ever revisits it.
 #
-# The majors are derived, never written down. ci/freebsd<major>-opnsense.env exists for
-# exactly the ones we serve, so adding or retiring a series moves this probe with no
-# edit here -- which matters because keep-all retention leaves a retired tree in place
-# but unwritten, and a probe pinned to it would never match again.
+# Served ABIs come from the same catalog as the package matrix. Retained trees
+# for retired series do not participate in the all-published decision.
 set -euo pipefail
-
-# Every served major is built for both of these; matches build-daemon-pkgs.yml's arch
-# matrix. pkg's ABI string spells arm64 as the processor name, aarch64.
-ARCHES=(amd64 aarch64)
-
 here=$(dirname "$0")
 
 served_abis() {
-    local majors=() pin
-    for pin in "$here"/freebsd*-opnsense.env; do
-        [ -e "$pin" ] || continue
-        pin=${pin##*/}
-        pin=${pin#freebsd}
-        majors+=("${pin%-opnsense.env}")
-    done
-    # Stop rather than guess: an invented ABI would answer "not published" and
-    # republish over a released package.
-    [ ${#majors[@]} -gt 0 ] || {
-        echo "no ci/freebsd<major>-opnsense.env: cannot tell which trees to probe" >&2
-        return 1
-    }
-    local major arch
-    for major in $(printf '%s\n' "${majors[@]}" | sort -n); do
-        for arch in "${ARCHES[@]}"; do
-            echo "FreeBSD:${major}:${arch}"
-        done
-    done
+    python3 "$here/platforms.py" --abis
 }
 
 if [ "${1:-}" = --abis ]; then
