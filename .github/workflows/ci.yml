@@ -65,6 +65,19 @@ jobs:
               | tee -a "${GITHUB_OUTPUT}"
           fi
 
+  # The catalog and the classifier are checked once here, whatever lanes the change selects.
+  tooling:
+    name: CI tooling
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Platform catalog and generated matrices
+        run: |
+          python3 ci/platforms.py --check
+          python3 -m unittest discover -s ci -p 'test_*.py'
+
   code:
     name: Code
     needs: changes
@@ -94,7 +107,7 @@ jobs:
   success:
     name: Success
     if: ${{ !cancelled() }}
-    needs: [changes, code, opnsense, port, supply-chain]
+    needs: [changes, tooling, code, opnsense, port, supply-chain]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

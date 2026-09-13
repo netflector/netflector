@@ -35,10 +35,6 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
-      - name: Platform catalog and generated matrices
-        run: |
-          python3 ci/platforms.py --check
-          python3 -m unittest discover -s ci -p 'test_*.py'
       - name: Port matches the lockfile of the release it builds
         run: ci/port-sync.py --check
 
