@@ -125,6 +125,15 @@ ANSWER_CASES = [
         query_hex=MDNS_QUERY_HEX,
         answer_hex=MDNS_RESPONSE_HEX,
     ),
+    AnswerCase(
+        name="mdns_answer_from_target_peer_reaches_source_peer_with_both_peers",
+        group=MDNS_GROUP_V4,
+        port=MDNS_PORT,
+        query_hex=MDNS_QUERY_HEX,
+        answer_hex=MDNS_RESPONSE_HEX,
+        config="config-peers-both.toml",
+        expect_unicast=True,
+    ),
 ]
 
 

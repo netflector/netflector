@@ -100,33 +100,11 @@ fn peer_of_unused_family(raw: &RawReflector) -> Option<IpAddr> {
         .copied()
 }
 
-/// The peers parameter an mDNS entry's answers would go to, if any: `source_peers`, or
-/// `target_peers` once the entry is bidirectional. A client takes a unicast answer only to a
-/// question it asked with the unicast-response bit (RFC 6762 §5.4), so such peers get nothing.
-fn mdns_answers_to_peers(raw: &RawReflector) -> Option<&'static str> {
-    if !raw.mdns {
-        return None;
-    }
-    if raw.source_peers.is_some() {
-        Some("source_peers")
-    } else if raw.bidirectional && raw.target_peers.is_some() {
-        Some("target_peers")
-    } else {
-        None
-    }
-}
-
 fn check_peers(raw: &RawReflector, name: &ReflectorName) -> Result<(), ConfigError> {
     if let Some(peer) = peer_of_unused_family(raw) {
         return Err(ConfigError::PeerFamily {
             name: name.clone(),
             peer,
-        });
-    }
-    if let Some(param) = mdns_answers_to_peers(raw) {
-        return Err(ConfigError::MdnsAnswersToPeers {
-            name: name.clone(),
-            param,
         });
     }
     Ok(())

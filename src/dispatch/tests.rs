@@ -704,6 +704,87 @@ fn a_unicast_mdns_answer_from_a_peer_goes_to_the_group() -> io::Result<()> {
     Ok(())
 }
 
+// An answer off the target goes to the source's peers as unicast copies, not to the group (the
+// mDNS module doc, on RFC 6762 §5.4).
+#[cfg(target_os = "linux")]
+#[test]
+#[cfg_attr(miri, ignore = "needs a real capture device")]
+fn an_mdns_answer_goes_to_the_source_peers() -> io::Result<()> {
+    use std::io::Write as _;
+
+    use crate::net::frame;
+    use crate::net::mdns::{MDNS_GROUP_V4, MDNS_PORT};
+    use crate::reflector::{InterfaceMap, mdns};
+
+    let _serial = loopback_lock();
+    let Some(mut tun) = crate::test_support::Tun::create() else {
+        return Ok(());
+    };
+    assert!(tun.add_address("10.99.201.1/24"));
+    let mut dispatcher = PacketDispatcher::without_group_joins();
+    let source = dispatcher.add_capture(Capture::open(LOOPBACK_IFACE)?)?;
+    let target = dispatcher.add_capture(Capture::open(&tun.name)?)?;
+    let mut interfaces = InterfaceMap::default();
+    interfaces.insert(LOOPBACK_IFACE.to_owned(), source);
+    interfaces.insert(tun.name.clone(), target);
+    let peer = Ipv4Addr::new(127, 0, 0, 2);
+    let entry = crate::config::Config::from_sources(
+        Some(&format!(
+            "[reflectors.a]\nsource_if = \"{LOOPBACK_IFACE}\"\ntarget_if = \"{}\"\n\
+                 mdns = true\naddress_family = \"ipv4\"\nsource_peers = [\"{peer}\"]\n",
+            tun.name
+        )),
+        std::iter::empty(),
+    )
+    .expect("a valid configuration")
+    .reflectors
+    .remove(0);
+    mdns::build(&entry, &interfaces, &mut dispatcher).expect("build the mDNS reflector");
+    let mut observer = Capture::open(LOOPBACK_IFACE)?;
+
+    // A DNS header with QR set: a response with no records, sent to the group.
+    let answer = [0, 0, 0x84, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let mut packet = [0u8; 64];
+    let n = frame::ipv4_udp(
+        SocketAddrV4::new(Ipv4Addr::new(10, 99, 201, 2), MDNS_PORT),
+        SocketAddrV4::new(MDNS_GROUP_V4, MDNS_PORT),
+        255,
+        &answer,
+        &mut packet,
+    )
+    .expect("build the answer");
+    tun.far_end.write_all(&packet[..n])?;
+
+    let mut reactor = Reactor::new()?;
+    let mut relayed = None;
+    pump_until(
+        2,
+        || {
+            while relayed.is_none()
+                && let Some(read) = observer.next_frame().unwrap()
+            {
+                if let Read::Frame(frame) = read
+                    && let Ok(parsed) = Packet::parse(LinkType::Ethernet, frame)
+                    && parsed.payload == answer
+                {
+                    relayed = Some((parsed.source, parsed.dest));
+                }
+            }
+            relayed.is_some()
+        },
+        || dispatcher.drain_and_route(target, &mut reactor),
+    );
+    assert_eq!(
+        relayed,
+        Some((
+            SocketAddr::from((Ipv4Addr::LOCALHOST, MDNS_PORT)),
+            SocketAddr::from((peer, MDNS_PORT)),
+        )),
+        "the answer was not copied to the source peer"
+    );
+    Ok(())
+}
+
 /// A `WireGuard` interface with two peers, one with an endpoint and one without. FreeBSD
 /// only: `wg` ships in base there, and the interface is created as root.
 #[cfg(target_os = "freebsd")]

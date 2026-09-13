@@ -252,7 +252,7 @@ counters_interval_secs = 0         # optional; seconds between per-interface pac
 source_if = "en0"                # required; interface to listen on (must differ from target_if)
 target_if = "lo0"                # required; interface to emit reflected traffic on
 target_peers = ["10.10.10.2"]    # optional; the hosts behind target_if when a group sent there reaches nobody (see Peers)
-# source_peers = ["10.0.0.2"]    # optional; the same for source_if; not with mdns, whose answers go there
+source_peers = ["10.0.0.2"]      # optional; the same for source_if
 macs      = ["B0:37:95:C5:60:BE"] # optional; device(s) to scope to (see below). Omit for a whole network.
 wol       = true                 # optional; enable Wake-on-LAN reflection (default false)
 mdns      = true                 # optional; enable mDNS reflection (default false)
@@ -507,10 +507,14 @@ unreachable. List the hosts behind such an interface in `source_peers` or `targe
 group or broadcast the entry would send there goes to each of them as a unicast copy instead, same
 port, same source, for every protocol the entry enables. A tunnel that carries multicast, such as
 GRE, needs no peers. Peers work on any link; on Ethernet each copy travels in a broadcast frame,
-since netflector resolves no MAC addresses. The exception is mDNS answers: a client takes a
-unicast answer only to a question it asked with the unicast-response bit, so an entry with `mdns`
-may list `target_peers` for its queries but no peers on the side its answers go to. Roon for road
-warriors, with the server on the LAN and the phones behind the tunnel:
+since netflector resolves no MAC addresses. mDNS answers reach a peer the same way, and not every
+client takes one: RFC 6762 has a client accept a unicast answer only to a question it asked with
+the unicast-response bit. Avahi accepts any answer from the link; Apple devices accept one only
+within two seconds of such a question, which iOS sends when a browse starts, so a service can drop
+off an Apple device's list until its next browse, and unsolicited announcements never reach it.
+Either discards an answer from outside its own subnet, so a peer's tunnel address needs a prefix
+that covers netflector's. Roon for road warriors, with the server on the LAN and the phones behind
+the tunnel:
 
 ```toml
 [reflectors.roon-remote]

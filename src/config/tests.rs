@@ -131,29 +131,19 @@ fn peers_parse_and_swap_with_the_direction() {
     assert!(reversed.target_peers.is_none());
 }
 
+// Peers on the side an mDNS entry's answers go to are allowed (see the mdns module doc).
 #[test]
-fn mdns_answers_cannot_go_to_peers() {
+fn mdns_may_list_peers_on_either_side() {
     let entry = |extra: &str| {
         format!("[reflectors.a]\nsource_if = \"lan\"\ntarget_if = \"wg0\"\nmdns = true\n{extra}")
     };
-    assert!(matches!(
-        err(&entry("source_peers = [\"192.0.2.2\"]\n")),
-        ConfigError::MdnsAnswersToPeers {
-            param: "source_peers",
-            ..
-        }
-    ));
-    assert!(matches!(
-        err(&entry(
-            "target_peers = [\"10.10.10.2\"]\nbidirectional = true\n"
-        )),
-        ConfigError::MdnsAnswersToPeers {
-            param: "target_peers",
-            ..
-        }
-    ));
-    // Queries may go to peers: a device answers a direct unicast query.
-    assert!(from_toml(&entry("target_peers = [\"10.10.10.2\"]\n")).is_ok());
+    for extra in [
+        "source_peers = [\"192.0.2.2\"]\n",
+        "target_peers = [\"10.10.10.2\"]\n",
+        "target_peers = [\"10.10.10.2\"]\nbidirectional = true\n",
+    ] {
+        from_toml(&entry(extra)).unwrap_or_else(|e| panic!("{extra:?}: {e}"));
+    }
 }
 
 #[test]

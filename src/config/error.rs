@@ -80,15 +80,6 @@ pub(crate) enum ConfigError {
     DialWithoutSsdp { name: ReflectorName },
 
     #[error(
-        "reflector \"{name}\" enables mdns with {param}, but a client takes a unicast mDNS answer \
-         only to a question it asked with the unicast-response bit"
-    )]
-    MdnsAnswersToPeers {
-        name: ReflectorName,
-        param: &'static str,
-    },
-
-    #[error(
         "reflector \"{name}\" enables dial but the address family has no IPv4 (DIAL is IPv4-only)"
     )]
     DialRequiresIpv4 { name: ReflectorName },

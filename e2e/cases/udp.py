@@ -285,10 +285,6 @@ def _peers_cases() -> list[TestCase]:
     cases = []
     for label, (config, sides) in PEERS_CONFIGS.items():
         for protocol, forward, reverse in PEERS_LEGS:
-            # An mDNS entry may not list source peers (its answers go there), so the configs with
-            # source peers leave mDNS out.
-            if protocol == "mdns" and "source" in sides:
-                continue
             for direction, (message, fields), side in (("forward", forward, "target"), ("reverse", reverse, "source")):
                 unicast = side in sides
                 reach = "peers" if unicast else ("broadcast" if protocol == "wol" else "group")

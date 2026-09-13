@@ -128,28 +128,36 @@ class AnswerRunner:
 
     def run(self) -> None:
         ifname = self.env.backend.helper_ifname(RECEIVER_IFNAME)
-        # Pinned: with peers on the source too, the answer comes to it as a unicast copy.
+        receiver_args = [
+            "receive",
+            "--port",
+            str(self.answer.port),
+            "--timeout",
+            str(self.answer.timeout_seconds),
+            "--family",
+            str(self.answer.family),
+            "--expect-payload-hex",
+            self.answer.answer_hex,
+            "--ignore-payload-hex",
+            self.answer.query_hex,
+        ]
+        if self.answer.expect_unicast:
+            receiver_args.extend(
+                [
+                    "--bind-address",
+                    self.env.backend.helper_address(
+                        self.sender_segment, self.answer.family
+                    ),
+                ]
+            )
+        else:
+            receiver_args.extend(["--join-group", self.answer.group, "--interface", ifname])
+        # Pinned: a config with source peers names this address.
         self.env.backend.start_probe(
             "receiver",
             self.sender_segment,
             ifname,
-            [
-                "receive",
-                "--port",
-                str(self.answer.port),
-                "--timeout",
-                str(self.answer.timeout_seconds),
-                "--family",
-                str(self.answer.family),
-                "--join-group",
-                self.answer.group,
-                "--interface",
-                ifname,
-                "--expect-payload-hex",
-                self.answer.answer_hex,
-                "--ignore-payload-hex",
-                self.answer.query_hex,
-            ],
+            receiver_args,
             pin_address=True,
         )
         self.env.wait_for_log("receiver", "receiver ready", "receiver")
