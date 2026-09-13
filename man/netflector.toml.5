@@ -79,10 +79,12 @@ On Ethernet each copy travels in a broadcast frame, since the daemon resolves
 no MAC addresses.
 An entry with
 .Ic mdns
-may list
-.Ic target_peers
-for its queries but no peers on the side its answers go to: a client takes a
-unicast answer only to a question it asked with the unicast-response bit.
+may list peers on the side its answers go to as well, though not every client
+takes an answer that arrives as unicast: Avahi does, Apple's resolver only
+within two seconds of its own question that asked for one, which iOS sends when
+a browse starts.
+Either discards an answer from outside its own subnet, so a peer's tunnel
+address needs a prefix that covers the daemon's.
 A list of unicast addresses of the families the entry's
 .Ic address_family
 uses.

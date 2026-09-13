@@ -90,9 +90,10 @@ class RoundTripCase:
 @dataclasses.dataclass(frozen=True)
 class AnswerCase:
     # A query relayed to a peer as unicast is answered by unicast to netflector, and the answer
-    # must come out on the source segment's group. A sender on the source queries the group; a
-    # responder on the target, bound to its own address, answers whatever reaches it; a receiver
-    # on the source, joined to the group, must see the answer once.
+    # must come out on the source segment's group, or as a unicast copy to the source's peer. A
+    # sender on the source queries the group; a responder on the target, bound to its own address,
+    # answers whatever reaches it; a receiver on the source, joined to the group or bound to its
+    # own address, must see the answer once.
     name: str
     group: str
     port: int
@@ -101,6 +102,7 @@ class AnswerCase:
     family: int = 4
     timeout_seconds: float = 5.0
     config: str = "config-peers-target.toml"
+    expect_unicast: bool = False  # the receiver is the source's peer; only its own address hears the copy
 
 
 @dataclasses.dataclass(frozen=True)

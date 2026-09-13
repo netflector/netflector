@@ -17,7 +17,7 @@ source_if = "nf_source"
 target_if = "nf_target"
 source_peers = ["192.0.2.20", "fd00:e2e0:1::20"]
 target_peers = ["198.51.100.20", "fd00:e2e0:2::20"]
-# No mdns: its answers go to the source, and an mDNS entry may not list peers there.
+mdns = true
 ssdp = true
 wsd = true
 

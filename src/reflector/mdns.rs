@@ -1,6 +1,14 @@
 //! The mDNS reflector: queries flow source → target, responses target → source, each re-emitted to
 //! the same group at TTL 255 (RFC 6762 §11) from the egress interface.
 //!
+//! Answers bound for a side with peers go to each peer as a unicast copy, on purpose. RFC 6762
+//! §5.4 has a client take a unicast answer only to a question it asked with the unicast-response
+//! bit: Apple's resolver enforces that (within two seconds of the question, from a source on the
+//! interface's subnet; mDNSResponder's `ExpectingUnicastResponseForRecord`), Avahi takes any
+//! answer from the link. iOS asks that way when a browse starts, so the copies serve Apple clients
+//! for their initial discovery and Avahi ones throughout. The alternative on such a link, a
+//! multicast answer, reaches nobody, so the RFC is no reason to refuse the peers here.
+//!
 //! Limitation: a legacy querier asking from an ephemeral port expects its answer there, but the
 //! relayed query is sourced from port 5353, so the device answers on the group, which that
 //! querier does not listen on.
@@ -87,9 +95,9 @@ pub(crate) fn build(
         Box::new(
             SimpleReflector::new(
                 source,
-                // Never to peers: a client takes a unicast answer only to its own question that
-                // asked for one (§5.4); the config refuses peers on this side.
-                Delivery::Link,
+                // To the source's peers as unicast copies, §5.4 notwithstanding: a deliberate
+                // choice, reasoned in the module doc. Don't "fix" it back to the link.
+                Delivery::new(reflector.source_peers.as_ref()),
                 "mDNS",
                 "response",
                 response_verdict,
