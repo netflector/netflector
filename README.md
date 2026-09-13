@@ -66,13 +66,13 @@ send, an oversized frame) are logged at most once per minute; occurrences inside
 counted and reported by the next logged warning as `(N suppressed)`; the counters carry the exact
 volumes.
 
-| Option | |
-| --- | --- |
-| `--check-config` | Load and validate the configuration, print a summary, exit. |
-| `--no-join` | Do not join multicast groups. Group traffic then reaches netflector only where the link delivers it without a membership, as an emulated or promiscuous fabric does. A warning is logged at startup. |
-| `-V`, `--version` | Print the version and exit. |
-| `-h`, `--help` | Print the usage and exit. |
-| `--` | End of options. Needed only for a config file whose name begins with a dash. |
+- `--check-config`: Load and validate the configuration, print a summary, exit.
+- `--no-join`: Do not join multicast groups. Group traffic then reaches netflector only where the
+  link delivers it without a membership, as an emulated or promiscuous fabric does. A warning is
+  logged at startup.
+- `-V`, `--version`: Print the version and exit.
+- `-h`, `--help`: Print the usage and exit.
+- `--`: End of options. Needed only for a config file whose name begins with a dash.
 
 `--check-config` parses and validates only. It opens no interface, so it needs no privileges and runs
 on a machine where the configured interfaces do not exist (useful for validating a generated config on
