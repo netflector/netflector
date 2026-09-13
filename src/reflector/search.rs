@@ -201,21 +201,6 @@ impl SearchReflector {
     }
 }
 
-/// The same scope-matched pick `build_udp` makes for the reflected search, so the reservation
-/// watches the address the device actually answers.
-fn reply_source(dispatcher: &PacketDispatcher, target: CaptureKey, dest: IpAddr) -> Option<IpAddr> {
-    match dest {
-        IpAddr::V4(_) => dispatcher
-            .egress_addrs(target)
-            .and_then(InterfaceAddresses::v4)
-            .map(IpAddr::V4),
-        IpAddr::V6(dst6) => dispatcher
-            .egress_addrs(target)
-            .and_then(|a| a.v6(Ipv6Scope::of(dst6)))
-            .map(IpAddr::V6),
-    }
-}
-
 impl PacketHandler for SearchReflector {
     fn on_packet(
         &mut self,
@@ -368,6 +353,21 @@ impl PacketHandler for SearchReflector {
             "{}: cleared all sessions after the target interface changed",
             self.protocol.name
         );
+    }
+}
+
+/// The same scope-matched pick `build_udp` makes for the reflected search, so the reservation
+/// watches the address the device actually answers.
+fn reply_source(dispatcher: &PacketDispatcher, target: CaptureKey, dest: IpAddr) -> Option<IpAddr> {
+    match dest {
+        IpAddr::V4(_) => dispatcher
+            .egress_addrs(target)
+            .and_then(InterfaceAddresses::v4)
+            .map(IpAddr::V4),
+        IpAddr::V6(dst6) => dispatcher
+            .egress_addrs(target)
+            .and_then(|a| a.v6(Ipv6Scope::of(dst6)))
+            .map(IpAddr::V6),
     }
 }
 
