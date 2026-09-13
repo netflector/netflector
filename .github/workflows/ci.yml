@@ -1,0 +1,108 @@
+# The one workflow every pull request runs, and the only one posting the required check
+# "Success". The first job classifies the changed paths; each lane runs as a reusable workflow
+# behind that verdict, so a change outside its paths skips it as one row. "Success" needs every
+# lane and is created only after the last one finishes: nothing satisfies the ruleset before the
+# work is done, and a path no lane claims runs the code lanes rather than nothing.
+name: CI
+
+on:
+  pull_request:
+  # By hand, on any branch: the lanes to run, since there is no pull request to classify.
+  workflow_dispatch:
+    inputs:
+      code:
+        description: Run the code lanes
+        type: boolean
+        default: true
+      opnsense:
+        description: Run the OPNsense pipeline
+        type: boolean
+        default: false
+      port:
+        description: Run the port pipeline
+        type: boolean
+        default: false
+      supply-chain:
+        description: Run the supply-chain audit
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    name: Changed paths
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      code: ${{ steps.areas.outputs.code }}
+      opnsense: ${{ steps.areas.outputs.opnsense }}
+      port: ${{ steps.areas.outputs.port }}
+      supply-chain: ${{ steps.areas.outputs.supply-chain }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Classify the changed paths
+        id: areas
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          FORCE_CODE: ${{ inputs.code }}
+          FORCE_OPNSENSE: ${{ inputs.opnsense }}
+          FORCE_PORT: ${{ inputs.port }}
+          FORCE_SUPPLY_CHAIN: ${{ inputs.supply-chain }}
+        run: |
+          if [ -n "${PR_NUMBER}" ]; then
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" --jq '.[].filename' \
+              | python3 ci/changed_areas.py | tee -a "${GITHUB_OUTPUT}"
+          else
+            printf 'code=%s\nopnsense=%s\nport=%s\nsupply-chain=%s\n' \
+              "${FORCE_CODE}" "${FORCE_OPNSENSE}" "${FORCE_PORT}" "${FORCE_SUPPLY_CHAIN}" \
+              | tee -a "${GITHUB_OUTPUT}"
+          fi
+
+  code:
+    name: Code
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    uses: ./.github/workflows/ci-code.yml
+
+  opnsense:
+    name: OPNsense
+    needs: changes
+    if: needs.changes.outputs.opnsense == 'true'
+    uses: ./.github/workflows/ci-opnsense.yml
+
+  port:
+    name: Port
+    needs: changes
+    if: needs.changes.outputs.port == 'true'
+    uses: ./.github/workflows/ci-port.yml
+
+  supply-chain:
+    name: Supply chain
+    needs: changes
+    if: needs.changes.outputs.supply-chain == 'true'
+    uses: ./.github/workflows/ci-supply-chain.yml
+
+  # Without `!cancelled()` a failed lane would skip this job, and the ruleset counts a skipped
+  # required check as passing.
+  success:
+    name: Success
+    if: ${{ !cancelled() }}
+    needs: [changes, code, opnsense, port, supply-chain]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Report the lanes
+        run: |
+          echo "Lane results: ${{ join(needs.*.result, ', ') }}"
+      - name: Fail if any lane did not succeed
+        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: |
+          echo "::error::A lane failed or was cancelled."
+          exit 1

@@ -37,7 +37,7 @@ CONSUMERS = {
         "lint",
     ],
     "ci-port.yml": ["freebsd-port", "freebsd-majors"],
-    "ci-opnsense.yml": ["package-pins", "opnsense"],
+    "ci-opnsense.yml": ["opnsense"],
     "build-daemon-pkgs.yml": ["freebsd-package"],
     "publish-plugin.yml": ["opnsense"],
     "pkg-deploy.yml": ["opnsense"],

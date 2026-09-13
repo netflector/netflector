@@ -102,7 +102,13 @@ python3 -m unittest discover -s e2e -p 'test_*.py'  # the harness's own unit tes
 
 ## CI
 
-CI runs the unit suite on Ubuntu 24.04 (amd64 and arm64, both glibc and the shipped static musl),
+Every pull request runs one workflow, `ci.yml`. Its first job classifies the changed paths with
+`ci/changed_areas.py`; the code lanes (`ci-code.yml`), the OPNsense and port pipelines and the
+supply-chain audit run as reusable workflows behind that verdict, each skipped as one row when
+its paths are untouched, and the required check `Success` needs all of them. A path no pipeline
+claims runs the code lanes.
+
+The code lanes run the unit suite on Ubuntu 24.04 (amd64 and arm64, both glibc and the shipped static musl),
 macOS 15, FreeBSD 14 and 15 (amd64 and arm64, cross-compiled on the runner and executed in QEMU VMs), and
 the cross-compiled `linux/arm/v7` and `linux/arm/v5` builds whose suites run under QEMU, each in both
 debug and release. `clippy` and the rustdoc link gate run per target. The e2e suite runs on the

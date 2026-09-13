@@ -3,21 +3,12 @@
 # Scheduled as well as triggered: an advisory lands against a version already in Cargo.lock, so the
 # tree turns vulnerable with no commit of ours to fire on.
 #
-# One of the path-filtered pipelines partitioning the tree; ci.yml takes the rest.
-# Each reports the required check "Success": duplicate names are all-must-pass.
-# ci.yml also fires on the manifests: a dependency change needs the full matrix too.
+# Called from ci.yml when a change touches the manifests, deny.toml or the pins (the list
+# lives in ci/changed_areas.py); ci.yml runs the code lanes on those too.
 name: Supply chain CI
 
 on:
-  pull_request:
-    paths:
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'deny.toml'
-      # The pipeline, its pins, and their generator: changing any of them runs it.
-      - 'ci/supply-chain.env'
-      - 'ci/supply-chain-pin.sh'
-      - '.github/workflows/ci-supply-chain.yml'
+  workflow_call:
   schedule:
     # Weekly. Off the hour, which GitHub asks for to spread scheduler load.
     - cron: '17 6 * * 1'
@@ -28,8 +19,8 @@ permissions:
 
 jobs:
   # On a scheduled run there is no pull request, so the result lands on the default branch.
-  success:
-    name: Success
+  audit:
+    name: Audit
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:

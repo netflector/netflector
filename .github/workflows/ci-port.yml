@@ -1,28 +1,12 @@
 # The port as shipped: built from the pinned release tarball and QA'd the way
 # a ports committer would. publish-daemon runs this before packaging; code
-# changes are covered by ci.yml's from-source port build.
+# changes are covered by ci-code.yml's from-source port build.
 #
-# One of the path-filtered pipelines partitioning the tree; ci.yml takes the rest.
-# Each reports the required check "Success": duplicate names are all-must-pass.
+# Called from ci.yml when a change touches the port or its scripts (the lists live in
+# ci/changed_areas.py), and from publish-daemon before packaging.
 name: Port CI
 
 on:
-  pull_request:
-    paths:
-      - 'ci/platforms.toml'
-      - 'ci/platforms.py'
-      - 'ci/test_platforms.py'
-      - 'ci/freebsd-ci-setup.sh'
-      - 'dist/freebsd/**'
-      # The pipeline itself: changing it runs it.
-      - '.github/workflows/ci-port.yml'
-      # --check runs only here; ci.yml exercises just --local.
-      - 'ci/port-sync.py'
-      # Consumed by the port-build install and e2e steps.
-      - 'ci/port-install.sh'
-      - 'ci/port-e2e.sh'
-      # Shared by port-build and port-testport.
-      - 'ci/port-into-tree.sh'
   workflow_call:
     inputs:
       # For publish-daemon: build-daemon-pkgs builds the port on every ABI
@@ -31,6 +15,7 @@ on:
       skip_build:
         type: boolean
         default: false
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -193,21 +178,3 @@ jobs:
         if: always()
         run: ci/freebsd-vm.sh crash
 
-  # The aggregate the ruleset requires: green only when every job above is.
-  # Without !cancelled() a failed job would skip this one, and a skipped
-  # required check counts as passing.
-  success:
-    name: Success
-    if: ${{ !cancelled() }}
-    needs: [port-check, port-build, port-testport]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - name: Report upstream results
-        run: |
-          echo "Upstream job results: ${{ join(needs.*.result, ', ') }}"
-      - name: Fail if any required job did not succeed
-        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
-        run: |
-          echo "::error::One or more required jobs failed or were cancelled."
-          exit 1
