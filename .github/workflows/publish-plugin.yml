@@ -86,31 +86,16 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        # One build per OPNsense SERIES, on its plugins branch: plugins.mk
-        # stamps product_abi from the branch, and the branch is where any
-        # series-specific divergence would land. The package is no-arch
-        # (PHP/XML), so it serves every arch tree of its major; the VM's
-        # FreeBSD version never enters the artifact.
+        # BEGIN platforms: opnsense
         include:
-          - { os: 14, plugins_branch: stable/26.1 }
-          - { os: 15, plugins_branch: stable/26.7 }
+          - {"opnsense": "26.1", "os": 14, "plugins_branch": "stable/26.1", "abi": "FreeBSD:14:amd64"}
+          - {"opnsense": "26.7", "os": 15, "plugins_branch": "stable/26.7", "abi": "FreeBSD:15:amd64"}
+        # END platforms
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Install QEMU
-        run: |
-          # A failing third-party repo (packages.microsoft.com flakes) must not kill the step:
-          # the packages come from the Ubuntu archive, and a broken archive still fails the
-          # install below loudly.
-          sudo apt-get update || true
-          sudo apt-get install -y --no-install-recommends qemu-utils qemu-system-x86 genisoimage
-      - name: Enable KVM
-        run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-      - name: Launch the FreeBSD VM
-        run: ci/freebsd-vm.sh launch
+      - name: Prepare and launch FreeBSD
+        run: ci/freebsd-ci-setup.sh
       - name: Wait for the VM
         run: ci/freebsd-vm.sh wait
       - name: Download the paired daemon package

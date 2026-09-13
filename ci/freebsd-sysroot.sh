@@ -21,18 +21,17 @@ case "$ARCH" in
 amd64)
     BASE_URL=$BASE_URL_AMD64
     BASE_SHA=$BASE_SHA256_AMD64
-    TRIPLE=x86_64-unknown-freebsd
     ;;
 arm64)
     BASE_URL=$BASE_URL_ARM64
     BASE_SHA=$BASE_SHA256_ARM64
-    TRIPLE=aarch64-unknown-freebsd
     ;;
 *)
     echo "error: unknown FREEBSD_SYSROOT_ARCH '$ARCH' (amd64|arm64)" >&2
     exit 64
     ;;
 esac
+TRIPLE=$(python3 "$(dirname "$0")/platforms.py" --freebsd "$ARCH" --field triple)
 SYSROOT=$HOME/freebsd-sysroot
 
 mkdir -p "$SYSROOT"

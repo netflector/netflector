@@ -9,6 +9,10 @@ name: Port CI
 on:
   pull_request:
     paths:
+      - 'ci/platforms.toml'
+      - 'ci/platforms.py'
+      - 'ci/test_platforms.py'
+      - 'ci/freebsd-ci-setup.sh'
       - 'dist/freebsd/**'
       # The pipeline itself: changing it runs it.
       - '.github/workflows/ci-port.yml'
@@ -46,6 +50,10 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
+      - name: Platform catalog and generated matrices
+        run: |
+          python3 ci/platforms.py --check
+          python3 -m unittest discover -s ci -p 'test_*.py'
       - name: Port matches the lockfile of the release it builds
         run: ci/port-sync.py --check
 
@@ -60,25 +68,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [14, 15]
+        # BEGIN platforms: freebsd-port
+        os:
+          - 14
+          - 15
         arch:
-          - { name: amd64, kvm: true, packages: qemu-system-x86 }
-          - { name: arm64, kvm: false, packages: qemu-system-arm qemu-efi-aarch64 }
+          - {"name": "amd64", "abi": "amd64", "triple": "x86_64-unknown-freebsd", "kvm": true, "packages": "qemu-system-x86"}
+          - {"name": "arm64", "abi": "aarch64", "triple": "aarch64-unknown-freebsd", "kvm": false, "packages": "qemu-system-arm qemu-efi-aarch64"}
+        # END platforms
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Install QEMU
-        run: |
-          sudo apt-get update || true
-          sudo apt-get install -y --no-install-recommends qemu-utils genisoimage ${{ matrix.arch.packages }}
-      - name: Enable KVM
-        if: matrix.arch.kvm
-        run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-      - name: Launch the FreeBSD VM
-        run: ci/freebsd-vm.sh launch
+      - name: Prepare and launch FreeBSD
+        run: ci/freebsd-ci-setup.sh
       - name: Wait for the VM
         run: ci/freebsd-vm.sh wait
       - name: Ports tree, pinned to the commit our packages were built from
@@ -141,21 +143,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [14, 15]
+        # BEGIN platforms: freebsd-majors
+        os:
+          - 14
+          - 15
+        # END platforms
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Install QEMU
-        run: |
-          sudo apt-get update || true
-          sudo apt-get install -y --no-install-recommends qemu-utils genisoimage qemu-system-x86
-      - name: Enable KVM
-        run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-      - name: Launch the FreeBSD VM
-        run: ci/freebsd-vm.sh launch
+      - name: Prepare and launch FreeBSD
+        run: ci/freebsd-ci-setup.sh
       - name: Wait for the VM
         run: ci/freebsd-vm.sh wait
       # Current main, not the package pin: -b latest serves packages a pinned

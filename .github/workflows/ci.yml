@@ -21,8 +21,10 @@ on:
       - '.github/workflows/ci-docs.yml'
       - '.github/workflows/ci-supply-chain.yml'
       - 'ci/supply-chain-pin.sh'
-      - 'ci/freebsd14-opnsense.env'
-      - 'ci/freebsd15-opnsense.env'
+      # BEGIN platforms: package-pins
+      - "ci/freebsd14-opnsense.env"
+      - "ci/freebsd15-opnsense.env"
+      # END platforms
       - 'ci/freebsd-port-package.sh'
       - 'ci/freebsd-plugin-package.sh'
       - 'ci/freebsd-to-opnsense.sh'
@@ -56,18 +58,18 @@ jobs:
       # Dynamic rows link against the sysroot of the release they run on; release-static rows
       # always use the 14 baseline, because they test the shipped asset configuration
       # (release.yml links against the 14 pin) wherever it lands.
-      FREEBSD_SYSROOT_VERSION: ${{ matrix.profile.name == 'release-static' && '14' || matrix.os }}
+      FREEBSD_SYSROOT_VERSION: ${{ matrix.profile.name == 'release-static' && matrix.arch.baseline || matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        # Both pinned majors: 14 is the release baseline, 15 is what current OPNsense (and soon
-        # most deployments) runs. The daemon's kernel surface (kqueue, BPF, routing) is where
-        # majors actually diverge - FreeBSD 15 dropped the broadcast connect the e2e harness
-        # relied on.
-        os: [14, 15]
+        # BEGIN platforms: freebsd-ci
+        os:
+          - 14
+          - 15
         arch:
-          - { name: amd64, triple: x86_64-unknown-freebsd, kvm: true, packages: qemu-system-x86 }
-          - { name: arm64, triple: aarch64-unknown-freebsd, kvm: false, packages: qemu-system-arm qemu-efi-aarch64 }
+          - {"name": "amd64", "abi": "amd64", "triple": "x86_64-unknown-freebsd", "kvm": true, "packages": "qemu-system-x86", "baseline": 14}
+          - {"name": "arm64", "abi": "aarch64", "triple": "aarch64-unknown-freebsd", "kvm": false, "packages": "qemu-system-arm qemu-efi-aarch64", "baseline": 14}
+        # END platforms
         profile:
           - { name: debug, flags: '', rustflags: '' }
           - { name: release, flags: '--release', rustflags: '' }
@@ -85,28 +87,10 @@ jobs:
             target
           key: cargo-freebsd${{ matrix.os }}-${{ matrix.arch.name }}-${{ matrix.profile.name }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-freebsd${{ matrix.os }}-${{ matrix.arch.name }}-${{ matrix.profile.name }}-
-      - name: Install clang, lld + QEMU
-        run: |
-          # A failing third-party repo (packages.microsoft.com flakes) must not kill the step:
-          # the packages come from the Ubuntu archive, and a broken archive still fails the
-          # install below loudly.
-          sudo apt-get update || true
-          sudo apt-get install -y --no-install-recommends clang lld qemu-utils genisoimage ${{ matrix.arch.packages }}
-      # /dev/kvm exists on the runner but is root:kvm 0660; GitHub's documented udev recipe opens it
-      # (a group add wouldn't apply to the already-running session).
-      - name: Enable KVM
-        if: matrix.arch.kvm
-        run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-      # Launch first so the VM boots while the sysroot downloads and the build runs.
-      - name: Launch the FreeBSD VM
-        run: ci/freebsd-vm.sh launch
-      - name: Add the Rust target
-        run: rustup target add ${{ matrix.arch.triple }}
+      - name: Prepare and launch FreeBSD
+        run: ci/freebsd-ci-setup.sh --cross
       - name: FreeBSD link sysroot
-        run: ci/freebsd-sysroot.sh
+        run: ci/freebsd-cross-env.sh
       - name: Show toolchain
         run: rustc -V && cargo -V
       - name: Wait for the VM
@@ -115,8 +99,6 @@ jobs:
         run: |
           triple='${{ matrix.arch.triple }}'
           prefix="CARGO_TARGET_$(echo "$triple" | tr 'a-z-' 'A-Z_')"
-          export "${prefix}_LINKER=$HOME/freebsd-sysroot/bin/freebsd-clang"
-          export "${prefix}_RUNNER=$PWD/ci/freebsd-ssh-runner.sh"
           export "${prefix}_RUSTFLAGS=${{ matrix.profile.rustflags }}"
           cargo test --locked --target "$triple" ${{ matrix.profile.flags }}
       - name: VM console log
@@ -143,19 +125,18 @@ jobs:
       # Dynamic rows link against the sysroot of the release they run on (the port's
       # configuration is built ON its target); static rows keep the 14 baseline the release
       # assets are linked against.
-      FREEBSD_SYSROOT_VERSION: ${{ matrix.linkage.name == 'static' && '14' || matrix.os }}
+      FREEBSD_SYSROOT_VERSION: ${{ matrix.linkage.name == 'static' && matrix.arch.baseline || matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        # Same version axis as freebsd-tests: the e2e suite exercises the kernel surface
-        # (epair, vnet, BPF, PF_ROUTE) where the majors actually differ.
-        os: [14, 15]
+        # BEGIN platforms: freebsd-ci
+        os:
+          - 14
+          - 15
         arch:
-          - { name: amd64, triple: x86_64-unknown-freebsd, kvm: true, packages: qemu-system-x86 }
-          - { name: arm64, triple: aarch64-unknown-freebsd, kvm: false, packages: qemu-system-arm qemu-efi-aarch64 }
-        # Both linkages, because they behave differently at runtime (the static-only environ
-        # crash), and each is shipped: static as the release assets, dynamic as the FreeBSD port.
-        # Cross-built from PR source either way; the VM only executes.
+          - {"name": "amd64", "abi": "amd64", "triple": "x86_64-unknown-freebsd", "kvm": true, "packages": "qemu-system-x86", "baseline": 14}
+          - {"name": "arm64", "abi": "aarch64", "triple": "aarch64-unknown-freebsd", "kvm": false, "packages": "qemu-system-arm qemu-efi-aarch64", "baseline": 14}
+        # END platforms
         linkage:
           - { name: static, rustflags: '-C target-feature=+crt-static' }
           - { name: dynamic, rustflags: '' }
@@ -172,33 +153,16 @@ jobs:
             target
           key: cargo-freebsd${{ matrix.os }}-e2e-${{ matrix.arch.name }}-${{ matrix.linkage.name }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-freebsd${{ matrix.os }}-e2e-${{ matrix.arch.name }}-${{ matrix.linkage.name }}-
-      - name: Install clang, lld + QEMU
-        run: |
-          # A failing third-party repo (packages.microsoft.com flakes) must not kill the step:
-          # the packages come from the Ubuntu archive, and a broken archive still fails the
-          # install below loudly.
-          sudo apt-get update || true
-          sudo apt-get install -y --no-install-recommends clang lld qemu-utils genisoimage ${{ matrix.arch.packages }}
-      - name: Enable KVM
-        if: matrix.arch.kvm
-        run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-      # Launch first so the VM boots while the sysroot downloads and the build runs.
-      - name: Launch the FreeBSD VM
-        run: ci/freebsd-vm.sh launch
-      - name: Add the Rust target
-        run: rustup target add ${{ matrix.arch.triple }}
+      - name: Prepare and launch FreeBSD
+        run: ci/freebsd-ci-setup.sh --cross
       - name: FreeBSD link sysroot
-        run: ci/freebsd-sysroot.sh
+        run: ci/freebsd-cross-env.sh
       - name: Show toolchain
         run: rustc -V && cargo -V
       - name: Build the release binary
         run: |
           triple='${{ matrix.arch.triple }}'
           prefix="CARGO_TARGET_$(echo "$triple" | tr 'a-z-' 'A-Z_')"
-          export "${prefix}_LINKER=$HOME/freebsd-sysroot/bin/freebsd-clang"
           export "${prefix}_RUSTFLAGS=${{ matrix.linkage.rustflags }}"
           cargo build --release --locked --target "$triple"
       - name: Wait for the VM
@@ -237,25 +201,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # amd64 only: arm64 already runs in this PR's FreeBSD test/e2e lanes,
-        # and ci-port.yml builds the port itself on arm64.
-        os: [14, 15]
+        # BEGIN platforms: freebsd-majors
+        os:
+          - 14
+          - 15
+        # END platforms
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Regenerate the crate list from this tree's Cargo.lock
         run: ci/port-sync.py --local
-      - name: Install QEMU
-        run: |
-          sudo apt-get update || true
-          sudo apt-get install -y --no-install-recommends qemu-utils qemu-system-x86 genisoimage
-      - name: Enable KVM
-        run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-      - name: Launch the FreeBSD VM
-        run: ci/freebsd-vm.sh launch
+      - name: Prepare and launch FreeBSD
+        run: ci/freebsd-ci-setup.sh
       - name: Wait for the VM
         run: ci/freebsd-vm.sh wait
       - name: Ports tree, pinned to the commit our packages were built from
@@ -338,9 +295,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # BEGIN platforms: docker-native
         arch:
-          - { name: amd64, runner: ubuntu-24.04 }
-          - { name: arm64, runner: ubuntu-24.04-arm }
+          - {"name": "amd64", "runner": "ubuntu-24.04"}
+          - {"name": "arm64", "runner": "ubuntu-24.04-arm"}
+        # END platforms
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -373,15 +332,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # triple '' = the runner's native gnu toolchain; a triple without `emulated` is that musl
-        # target built and run natively; `emulated` lanes cross-link and run under qemu binfmt.
+        # BEGIN platforms: linux-test
         target:
-          - { name: linux-amd64-glibc, runner: ubuntu-24.04, triple: '' }
-          - { name: linux-arm64-glibc, runner: ubuntu-24.04-arm, triple: '' }
-          - { name: linux-amd64-musl, runner: ubuntu-24.04, triple: x86_64-unknown-linux-musl }
-          - { name: linux-arm64-musl, runner: ubuntu-24.04-arm, triple: aarch64-unknown-linux-musl }
-          - { name: linux-armv7-musl, runner: ubuntu-24.04, triple: armv7-unknown-linux-musleabihf, emulated: true }
-          - { name: linux-armv5-musl, runner: ubuntu-24.04, triple: armv5te-unknown-linux-musleabi, emulated: true }
+          - {"name": "linux-amd64-glibc", "runner": "ubuntu-24.04", "triple": ""}
+          - {"name": "linux-arm64-glibc", "runner": "ubuntu-24.04-arm", "triple": ""}
+          - {"name": "linux-amd64-musl", "runner": "ubuntu-24.04", "triple": "x86_64-unknown-linux-musl"}
+          - {"name": "linux-arm64-musl", "runner": "ubuntu-24.04-arm", "triple": "aarch64-unknown-linux-musl"}
+          - {"name": "linux-armv7-musl", "runner": "ubuntu-24.04", "triple": "armv7-unknown-linux-musleabihf", "emulated": true}
+          - {"name": "linux-armv5-musl", "runner": "ubuntu-24.04", "triple": "armv5te-unknown-linux-musleabi", "emulated": true}
+        # END platforms
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -463,16 +422,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # BEGIN platforms: miri
         target:
-          - x86_64-unknown-linux-gnu
-          - aarch64-unknown-linux-gnu
-          - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-musl
-          - armv7-unknown-linux-musleabihf
-          - armv5te-unknown-linux-musleabi
-          - x86_64-unknown-freebsd
-          - aarch64-unknown-freebsd
-          - aarch64-apple-darwin
+          - "x86_64-unknown-linux-gnu"
+          - "aarch64-unknown-linux-gnu"
+          - "x86_64-unknown-linux-musl"
+          - "aarch64-unknown-linux-musl"
+          - "armv7-unknown-linux-musleabihf"
+          - "armv5te-unknown-linux-musleabi"
+          - "x86_64-unknown-freebsd"
+          - "aarch64-unknown-freebsd"
+          - "aarch64-apple-darwin"
+        # END platforms
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -540,21 +501,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Both profiles: the shipped binary is release (overflow checks off, debug_assert! compiled
-        # out, LTO) while debug keeps them on, so a test can pass under one and not the other.
+        # BEGIN platforms: test
+        target:
+          - {"name": "linux-amd64-glibc", "runner": "ubuntu-24.04", "triple": ""}
+          - {"name": "linux-arm64-glibc", "runner": "ubuntu-24.04-arm", "triple": ""}
+          - {"name": "linux-amd64-musl", "runner": "ubuntu-24.04", "triple": "x86_64-unknown-linux-musl"}
+          - {"name": "linux-arm64-musl", "runner": "ubuntu-24.04-arm", "triple": "aarch64-unknown-linux-musl"}
+          - {"name": "linux-armv7-musl", "runner": "ubuntu-24.04", "triple": "armv7-unknown-linux-musleabihf", "emulated": true}
+          - {"name": "linux-armv5-musl", "runner": "ubuntu-24.04", "triple": "armv5te-unknown-linux-musleabi", "emulated": true}
+          - {"name": "macos-arm64", "runner": "macos-15", "triple": ""}
+        # END platforms
         profile:
           - { name: debug, flags: '' }
           - { name: release, flags: '--release' }
-        # triple '' = the runner's native gnu toolchain; a triple without `emulated` is that musl
-        # target built and run natively; `emulated` lanes cross-link and run under qemu-arm.
-        target:
-          - { name: linux-amd64-glibc, runner: ubuntu-24.04, triple: '' }
-          - { name: linux-arm64-glibc, runner: ubuntu-24.04-arm, triple: '' }
-          - { name: linux-amd64-musl, runner: ubuntu-24.04, triple: x86_64-unknown-linux-musl }
-          - { name: linux-arm64-musl, runner: ubuntu-24.04-arm, triple: aarch64-unknown-linux-musl }
-          - { name: linux-armv7-musl, runner: ubuntu-24.04, triple: armv7-unknown-linux-musleabihf, emulated: true }
-          - { name: linux-armv5-musl, runner: ubuntu-24.04, triple: armv5te-unknown-linux-musleabi, emulated: true }
-          - { name: macos-arm64, runner: macos-15, triple: '' }
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -663,8 +622,7 @@ jobs:
   # macOS/FreeBSD host, no cross-linker, no QEMU (the same mechanism as the `cargo check --target
   # x86_64-unknown-freebsd` gate). Every shipped target is linted, not one per OS: the source has no
   # target_arch cfgs, but libc/usize widths differ, so the 32- and 64-bit checks aren't redundant.
-  # (aarch64-unknown-freebsd is tier 3 -- no rustup std -- and is the same 64-bit-LE code as the amd64
-  # FreeBSD lane, which covers it.) The Cargo.toml [lints.rustdoc] denies make `cargo doc` the link gate.
+  # The Cargo.toml [lints.rustdoc] denies make `cargo doc` the link gate.
   lint:
     name: Lint (${{ matrix.target }})
     runs-on: ubuntu-24.04
@@ -672,13 +630,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # BEGIN platforms: lint
         target:
-          - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-musl
-          - armv7-unknown-linux-musleabihf
-          - armv5te-unknown-linux-musleabi
-          - x86_64-unknown-freebsd
-          - aarch64-apple-darwin
+          - "x86_64-unknown-linux-musl"
+          - "aarch64-unknown-linux-musl"
+          - "armv7-unknown-linux-musleabihf"
+          - "armv5te-unknown-linux-musleabi"
+          - "x86_64-unknown-freebsd"
+          - "aarch64-unknown-freebsd"
+          - "aarch64-apple-darwin"
+        # END platforms
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -709,6 +670,12 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Platform catalog and generated matrices
+        run: |
+          python3 ci/platforms.py --check
+          python3 -m unittest discover -s ci -p 'test_*.py'
+      - name: Harness failure paths
+        run: python3 -m unittest discover -s e2e -p 'test_*.py'
       - name: rustfmt
         run: cargo fmt --check
 
