@@ -2,35 +2,11 @@
 # real converted OPNsense of each supported series. publish-plugin runs this
 # before packaging.
 #
-# One of the path-filtered pipelines partitioning the tree; ci.yml takes the rest.
-# Each reports the required check "Success": duplicate names are all-must-pass.
+# Called from ci.yml when a change touches the plugin, the package pins or the FreeBSD
+# scripts (the lists live in ci/changed_areas.py), and from publish-plugin before packaging.
 name: OPNsense CI
 
 on:
-  pull_request:
-    paths:
-      - 'ci/platforms.toml'
-      - 'ci/platforms.py'
-      - 'ci/test_platforms.py'
-      - 'ci/freebsd-ci-setup.sh'
-      - 'dist/opnsense/**'
-      # The pipeline itself: changing it runs it.
-      - '.github/workflows/ci-opnsense.yml'
-      # The OPNsense-base pins and the VM scripts: consumed only here and in
-      # the publish flows.
-      # BEGIN platforms: package-pins
-      - "ci/freebsd14-opnsense.env"
-      - "ci/freebsd15-opnsense.env"
-      # END platforms
-      - 'ci/freebsd-port-package.sh'
-      - 'ci/freebsd-plugin-package.sh'
-      - 'ci/freebsd-to-opnsense.sh'
-      - 'ci/opnsense-exercise.sh'
-      # Shared with ci.yml rather than exclusive to this pipeline, so both fire
-      # on it: the 14.3 cloud-init seed and the extra-NIC setup are reached
-      # only under the OPNsense pins, which ci.yml's lanes never use.
-      - 'ci/freebsd-vm.sh'
-      - 'ci/pkg-published.sh'
   workflow_call:
     inputs:
       # For publish-plugin: pkg-deploy's gate runs the same journey against
@@ -38,6 +14,7 @@ on:
       skip_exercise:
         type: boolean
         default: false
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -177,21 +154,3 @@ jobs:
         if: always()
         run: ci/freebsd-vm.sh crash
 
-  # The aggregate the ruleset requires: green only when every job above is.
-  # Without !cancelled() a failed job would skip this one, and a skipped
-  # required check counts as passing.
-  success:
-    name: Success
-    if: ${{ !cancelled() }}
-    needs: [lint, exercise]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - name: Report upstream results
-        run: |
-          echo "Upstream job results: ${{ join(needs.*.result, ', ') }}"
-      - name: Fail if any required job did not succeed
-        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
-        run: |
-          echo "::error::One or more required jobs failed or were cancelled."
-          exit 1
