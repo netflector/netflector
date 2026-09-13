@@ -26,8 +26,7 @@ BLOCK = re.compile(
 # Every consumer must retain its marker: accidentally deleting a whole block is
 # an error too, even though there would be nothing left for the regex to compare.
 CONSUMERS = {
-    "ci.yml": [
-        "package-pins",
+    "ci-code.yml": [
         "freebsd-ci",
         "freebsd-ci",
         "freebsd-majors",
