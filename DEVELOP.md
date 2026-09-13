@@ -89,6 +89,17 @@ cargo build --release --locked
 sudo python3 e2e/run.py --backend native --binary target/release/netflector
 ```
 
+Where things live under `e2e/`: packet bytes and protocol constants in `fixtures.py`; the case
+catalog in `cases/`, one module per protocol; how each case type runs in `harness/scenarios/`; the
+setup, readiness wait, failure diagnostics and cleanup of one isolated environment in
+`harness/environment.py`; the Docker, Linux netns and FreeBSD jail operations in
+`harness/backends/`. The probe side, the socket and protocol operations that run inside the helper
+containers, is `probes/` behind the `probe.py` command line.
+
+```sh
+python3 -m unittest discover -s e2e -p 'test_*.py'  # the harness's own unit tests
+```
+
 ## CI
 
 CI runs the unit suite on Ubuntu 24.04 (amd64 and arm64, both glibc and the shipped static musl),
