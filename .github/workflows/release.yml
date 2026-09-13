@@ -32,7 +32,7 @@ jobs:
 
   verify-ci:
     needs: tag-check
-    uses: ./.github/workflows/ci.yml
+    uses: ./.github/workflows/ci-code.yml
 
   # Downloadable binaries, built with rustc's default toolchain wherever one exists: amd64 and
   # arm64 are static musl on their native runners (the self-contained default, gcc-driven link),

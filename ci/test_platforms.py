@@ -29,7 +29,7 @@ class PlatformTests(unittest.TestCase):
             patch.object(platforms, "CATALOG", root / "ci/platforms.toml")
         )
         self.enterContext(contextlib.redirect_stdout(io.StringIO()))
-        self.workflow = workflows / "ci.yml"
+        self.workflow = workflows / "ci-code.yml"
 
     def test_drift_fails_then_regeneration_preserves_surrounding_workflow(self) -> None:
         original = self.workflow.read_text()
