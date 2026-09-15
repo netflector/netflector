@@ -193,6 +193,7 @@ mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     use super::*;
+    use crate::test_support::{Capability, skip};
 
     #[test]
     fn an_inert_joiner_joins_nothing_and_opens_no_socket() {
@@ -257,7 +258,7 @@ mod tests {
         match joiner.join(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)), ifindex) {
             Ok(()) => {}
             Err(e) if join_unsupported(&e) => {
-                eprintln!("skip reset_keeps_desired: MCAST_JOIN_GROUP unsupported here ({e})");
+                skip(Capability::Membership, e);
                 return;
             }
             Err(e) => panic!("kernel must accept the loopback join: {e}"),
@@ -314,7 +315,7 @@ mod tests {
         match joiner.join(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)), ifindex) {
             Ok(()) => {}
             Err(e) if join_unsupported(&e) => {
-                eprintln!("skip a_join_clears_the_reported_mark: unsupported here ({e})");
+                skip(Capability::Membership, e);
                 return;
             }
             Err(e) => panic!("kernel must accept the loopback join: {e}"),
@@ -357,9 +358,7 @@ mod tests {
             match joiner.join(group, ifindex) {
                 Ok(()) => {}
                 Err(e) if join_unsupported(&e) => {
-                    eprintln!(
-                        "skip kernel_accepts_a_join: MCAST_JOIN_GROUP unsupported here ({e})"
-                    );
+                    skip(Capability::Membership, e);
                     return;
                 }
                 Err(e) => panic!("kernel must accept the {group} group join: {e}"),

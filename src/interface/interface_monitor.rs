@@ -134,6 +134,7 @@ impl InterfaceMonitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{Capability, skip};
 
     // A freshly-opened monitor drains at once (the socket is non-blocking) without blocking
     // or erroring. Best-effort: some sandboxes deny the routing socket, where the monitor
@@ -144,7 +145,7 @@ mod tests {
         let mut monitor = match InterfaceMonitor::open() {
             Ok(monitor) => monitor,
             Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-                eprintln!("skip: the routing socket could not be opened: {e}");
+                skip(Capability::Monitor, e);
                 return;
             }
             Err(e) => panic!("unexpected monitor open failure: {e}"),

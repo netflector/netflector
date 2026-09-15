@@ -1,7 +1,7 @@
 use super::lifecycle::RECONCILE_RETRY;
 use super::*;
 use crate::interface::LOOPBACK_IFACE;
-use crate::test_support::{loopback_lock, open_or_skip};
+use crate::test_support::{Capability, loopback_lock, open_or_skip, skip};
 use std::cell::{Cell, RefCell};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::rc::Rc;
@@ -451,10 +451,10 @@ impl PacketHandler for Echo {
 #[cfg_attr(miri, ignore = "needs a real capture device")]
 fn routes_a_captured_packet_to_a_matching_reflector() -> io::Result<()> {
     let _serial = loopback_lock();
-    let Some(ingress_cap) = open_or_skip(LOOPBACK_IFACE, "dispatch_ingress")? else {
+    let Some(ingress_cap) = open_or_skip(LOOPBACK_IFACE)? else {
         return Ok(());
     };
-    let Some(egress_cap) = open_or_skip(LOOPBACK_IFACE, "dispatch_egress")? else {
+    let Some(egress_cap) = open_or_skip(LOOPBACK_IFACE)? else {
         return Ok(());
     };
 
@@ -803,15 +803,21 @@ impl WgPeers {
     /// process spawning crashes (see the pair tests).
     fn create() -> Option<Self> {
         if cfg!(target_feature = "crt-static") {
-            eprintln!("skip wg test: process spawning crashes static FreeBSD binaries");
+            skip(
+                Capability::WireGuard,
+                "process spawning crashes static FreeBSD binaries",
+            );
             return None;
         }
         // SAFETY: geteuid takes no arguments and cannot fail.
         if unsafe { libc::geteuid() } != 0 {
-            eprintln!("skip wg test: interface creation requires root");
+            skip(Capability::WireGuard, "interface creation requires root");
             return None;
         }
-        let name = sh_output("ifconfig wg create")?;
+        let Some(name) = sh_output("ifconfig wg create") else {
+            skip(Capability::WireGuard, "could not create a wg interface");
+            return None;
+        };
         let this = Self {
             name,
             reachable: IpAddr::V4(Ipv4Addr::new(10, 99, 77, 2)),
@@ -1273,7 +1279,7 @@ impl PacketHandler for Reentrant {
 #[cfg_attr(miri, ignore = "needs a real capture device")]
 fn reentrant_drain_on_the_same_ingress_hits_the_guard() -> io::Result<()> {
     let _serial = loopback_lock();
-    let Some(ingress_cap) = open_or_skip(LOOPBACK_IFACE, "dispatch_reentrant")? else {
+    let Some(ingress_cap) = open_or_skip(LOOPBACK_IFACE)? else {
         return Ok(());
     };
 
@@ -1346,10 +1352,10 @@ impl PacketHandler for CrossDrainer {
 #[cfg_attr(miri, ignore = "needs a real capture device")]
 fn reentrant_drain_on_another_ingress_trips_the_assert() -> io::Result<()> {
     let _serial = loopback_lock();
-    let Some(cap_a) = open_or_skip(LOOPBACK_IFACE, "dispatch_cross_a")? else {
+    let Some(cap_a) = open_or_skip(LOOPBACK_IFACE)? else {
         return Ok(());
     };
-    let Some(cap_b) = open_or_skip(LOOPBACK_IFACE, "dispatch_cross_b")? else {
+    let Some(cap_b) = open_or_skip(LOOPBACK_IFACE)? else {
         return Ok(());
     };
 
@@ -1399,10 +1405,10 @@ fn reentrant_drain_on_another_ingress_trips_the_assert() -> io::Result<()> {
 #[cfg_attr(miri, ignore = "needs a real capture device")]
 fn reactor_drives_the_dispatcher_to_route_a_packet() -> io::Result<()> {
     let _serial = loopback_lock();
-    let Some(ingress_cap) = open_or_skip(LOOPBACK_IFACE, "dispatch_reactor_in")? else {
+    let Some(ingress_cap) = open_or_skip(LOOPBACK_IFACE)? else {
         return Ok(());
     };
-    let Some(egress_cap) = open_or_skip(LOOPBACK_IFACE, "dispatch_reactor_eg")? else {
+    let Some(egress_cap) = open_or_skip(LOOPBACK_IFACE)? else {
         return Ok(());
     };
 
@@ -1505,7 +1511,7 @@ impl PacketHandler for MidDrainProbe {
 #[cfg_attr(miri, ignore = "needs a real capture device")]
 fn ingress_resolves_and_drops_while_taken_out() -> io::Result<()> {
     let _serial = loopback_lock();
-    let Some(ingress_cap) = open_or_skip(LOOPBACK_IFACE, "dispatch_mid_drain")? else {
+    let Some(ingress_cap) = open_or_skip(LOOPBACK_IFACE)? else {
         return Ok(());
     };
 
@@ -1557,7 +1563,10 @@ fn monitor_fd_is_watched_under_the_sentinel_tag() {
     let dispatcher = PacketDispatcher::new();
     let watches = dispatcher.capture_watches();
     if watches.is_empty() {
-        eprintln!("skip: the routing socket could not be opened in this environment");
+        skip(
+            Capability::Monitor,
+            "the routing socket could not be opened",
+        );
         return;
     }
     // No captures were added, so the monitor fd is the sole watch, under MONITOR_TAG.

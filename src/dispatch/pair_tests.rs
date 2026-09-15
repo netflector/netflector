@@ -17,6 +17,7 @@ use crate::capture::{Capture, Read};
 use crate::interface::{Interface, InterfaceAddresses, Ipv6Scope, if_index};
 use crate::net::packet::Packet;
 use crate::sys::setsockopt;
+use crate::test_support::{Capability, skip};
 #[cfg(target_os = "linux")]
 use crate::{
     libcex::{GroupReq, MCAST_JOIN_GROUP},
@@ -95,12 +96,15 @@ impl InterfacePair {
         // from the dynamic (debug) lane; the static lane keeps proving the +crt-static build
         // for the rest of the suite.
         if cfg!(all(target_os = "freebsd", target_feature = "crt-static")) {
-            eprintln!("skip pair test: process spawning crashes static FreeBSD binaries");
+            skip(
+                Capability::Pair,
+                "process spawning crashes static FreeBSD binaries",
+            );
             return None;
         }
         // SAFETY: geteuid takes no arguments and cannot fail.
         if unsafe { libc::geteuid() } != 0 {
-            eprintln!("skip pair test: interface creation requires root");
+            skip(Capability::Pair, "interface creation requires root");
             return None;
         }
         // Held through create + settle so no parallel pair test creates an interface concurrently
@@ -183,7 +187,7 @@ impl InterfacePair {
         if !run(&format!(
             "ip link add {inject} type veth peer name {receive}"
         )) {
-            eprintln!("skip pair test: could not create a veth pair");
+            skip(Capability::Pair, "could not create a veth pair");
             return None;
         }
         let pair = Self {
@@ -192,7 +196,7 @@ impl InterfacePair {
             subnet,
         }; // Drop cleans up from here on
         if !pair.configure() {
-            eprintln!("skip pair test: could not configure the veth pair");
+            skip(Capability::Pair, "could not configure the veth pair");
             return None;
         }
         Some(pair)
@@ -264,10 +268,13 @@ impl InterfacePair {
     /// creations never collide with an existing interface or a concurrent test.
     #[cfg(target_os = "macos")]
     fn create_platform(subnet: u8) -> Option<Self> {
-        let inject = run_capture("ifconfig feth create")?;
+        let Some(inject) = run_capture("ifconfig feth create") else {
+            skip(Capability::Pair, "could not create a feth");
+            return None;
+        };
         let Some(receive) = run_capture("ifconfig feth create") else {
             run(&format!("ifconfig {inject} destroy"));
-            eprintln!("skip pair test: could not create the second feth");
+            skip(Capability::Pair, "could not create the second feth");
             return None;
         };
         let pair = Self {
@@ -276,7 +283,7 @@ impl InterfacePair {
             subnet,
         }; // Drop cleans up from here on
         if !pair.configure() {
-            eprintln!("skip pair test: could not configure the feth pair");
+            skip(Capability::Pair, "could not configure the feth pair");
             return None;
         }
         Some(pair)
@@ -328,10 +335,16 @@ impl InterfacePair {
     /// is the same name with a trailing `b`. Destroying the `a` end removes both.
     #[cfg(target_os = "freebsd")]
     fn create_platform(subnet: u8) -> Option<Self> {
-        let inject = run_capture("ifconfig epair create")?;
+        let Some(inject) = run_capture("ifconfig epair create") else {
+            skip(Capability::Pair, "could not create an epair");
+            return None;
+        };
         if !inject.ends_with('a') {
             run(&format!("ifconfig {inject} destroy"));
-            eprintln!("skip pair test: unexpected epair name {inject}");
+            skip(
+                Capability::Pair,
+                format_args!("unexpected epair name {inject}"),
+            );
             return None;
         }
         let receive = format!("{}b", &inject[..inject.len() - 1]);
@@ -341,7 +354,7 @@ impl InterfacePair {
             subnet,
         }; // Drop cleans up from here on
         if !pair.configure() {
-            eprintln!("skip pair test: could not configure the epair");
+            skip(Capability::Pair, "could not configure the epair");
             return None;
         }
         Some(pair)

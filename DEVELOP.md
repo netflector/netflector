@@ -61,6 +61,8 @@ A subset of tests does privileged work (real packet capture, or binding a socket
 needs the same privileges netflector itself does (see
 [Runtime privileges](README.md#runtime-privileges)). Each probes for the privilege and self-skips
 cleanly when it's missing, so a default `cargo test` run is green on an under-privileged box.
+`NETFLECTOR_TEST_REQUIRE=capture,pair,...` turns the listed skips into failures; the CI lanes set
+it to what each runner provides, and `src/test_support.rs` lists the names.
 
 ## End-to-end tests
 
