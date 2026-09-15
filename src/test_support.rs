@@ -28,8 +28,8 @@ pub(crate) enum Capability {
     Ipv6,
     /// The interface monitor's socket; some sandboxes deny it.
     Monitor,
-    /// A `WireGuard` interface: root and `wg` in base.
-    #[cfg(target_os = "freebsd")]
+    /// A `WireGuard` interface: root and wg(8).
+    #[cfg(any(target_os = "freebsd", target_os = "linux"))]
     WireGuard,
 }
 
@@ -43,7 +43,7 @@ impl Capability {
             Self::Tun => "tun",
             Self::Ipv6 => "ipv6",
             Self::Monitor => "monitor",
-            #[cfg(target_os = "freebsd")]
+            #[cfg(any(target_os = "freebsd", target_os = "linux"))]
             Self::WireGuard => "wireguard",
         }
     }
@@ -57,7 +57,7 @@ impl Capability {
             "tun" => Self::Tun,
             "ipv6" => Self::Ipv6,
             "monitor" => Self::Monitor,
-            #[cfg(target_os = "freebsd")]
+            #[cfg(any(target_os = "freebsd", target_os = "linux"))]
             "wireguard" => Self::WireGuard,
             _ => return None,
         })
