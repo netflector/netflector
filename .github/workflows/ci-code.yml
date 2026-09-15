@@ -69,6 +69,10 @@ jobs:
       - name: Wait for the VM
         run: ci/freebsd-vm.sh wait
       - name: cargo test
+        env:
+          # The static build cannot spawn processes (see the pair fixture), so the interface
+          # fixtures skip there.
+          NETFLECTOR_TEST_REQUIRE: ${{ matrix.profile.name == 'release-static' && 'capture,membership,ipv6,monitor' || 'capture,membership,pair,ipv6,monitor,wireguard' }}
         run: |
           triple='${{ matrix.arch.triple }}'
           prefix="CARGO_TARGET_$(echo "$triple" | tr 'a-z-' 'A-Z_')"
@@ -535,15 +539,26 @@ jobs:
       # is root already. The qemu lanes stay unprivileged: their datapath-under-emulation coverage
       # lives in the native e2e lanes, and they double as the guard that the suite still runs (and
       # skips its privileged tests) without root, the way contributors run it.
+      - name: Install wireguard-tools
+        if: ${{ !matrix.target.emulated && runner.os == 'Linux' }}
+        run: |
+          # As in the valgrind lane: a flaking third-party repo must not kill the step.
+          sudo apt-get update || true
+          sudo apt-get install -y --no-install-recommends wireguard-tools
       - name: cargo test (root)
         if: ${{ !matrix.target.emulated }}
+        env:
+          NETFLECTOR_TEST_REQUIRE: ${{ startsWith(matrix.target.name, 'macos') && 'capture,membership,pair,ipv6,monitor' || 'capture,membership,pair,tun,ipv6,monitor,wireguard' }}
         run: |
           # Not -E: sudo-rs (the default sudo since Ubuntu 25.10) ignores it. HOME is where the
-          # rustup shim finds the toolchain, and the only variable the suite needs.
+          # rustup shim finds the toolchain.
           triple='${{ matrix.target.triple }}'
-          sudo --preserve-env=HOME "$(command -v cargo)" test --locked ${{ matrix.profile.flags }} ${triple:+--target "$triple"}
+          sudo --preserve-env=HOME,NETFLECTOR_TEST_REQUIRE "$(command -v cargo)" test --locked ${{ matrix.profile.flags }} ${triple:+--target "$triple"}
       - name: cargo test (under QEMU)
         if: matrix.target.emulated
+        env:
+          # Unprivileged, and qemu-user has no MCAST_JOIN_GROUP.
+          NETFLECTOR_TEST_REQUIRE: ipv6,monitor
         run: cargo test --locked --target ${{ matrix.target.triple }} ${{ matrix.profile.flags }}
 
   # The unit suite under Valgrind memcheck. The valgrind-e2e job below only ever sees the daemon's
@@ -581,13 +596,15 @@ jobs:
           # the packages come from the Ubuntu archive, and a broken archive still fails the
           # install below loudly.
           sudo apt-get update || true
-          sudo apt-get install -y --no-install-recommends valgrind
+          sudo apt-get install -y --no-install-recommends valgrind wireguard-tools
       - name: Show toolchain
         run: rustc -V && cargo -V && valgrind --version
       - name: cargo test (under memcheck)
+        env:
+          NETFLECTOR_TEST_REQUIRE: capture,membership,pair,tun,ipv6,monitor,wireguard
         run: |
           export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-fds=yes --num-callers=30 --error-exitcode=1'
-          sudo --preserve-env=HOME,CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER "$(command -v cargo)" test --locked
+          sudo --preserve-env=HOME,CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER,NETFLECTOR_TEST_REQUIRE "$(command -v cargo)" test --locked
 
   # clippy + the rustdoc intra-link gate, per supported target. clippy/build/doc only analyze the code active
   # for the *target* platform, so each cfg(target_os) backend must be linted under its own --target. Both are

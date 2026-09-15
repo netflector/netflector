@@ -32,7 +32,8 @@ for a in "$@"; do
 done
 # Root's login shell is csh, so feed a script to sh on stdin. The binary reads
 # /dev/null instead of that stdin, or it could eat the lines sh has not
-# consumed yet.
-printf 'chmod +x %s\n%s%s </dev/null\nrc=$?\nrm -f %s\nexit $rc\n' \
-    "$remote" "$remote" "$args" "$remote" |
+# consumed yet. cargo's environment ends at this runner, so the require list
+# is set again on the remote command line.
+printf 'chmod +x %s\nNETFLECTOR_TEST_REQUIRE=%q %s%s </dev/null\nrc=$?\nrm -f %s\nexit $rc\n' \
+    "$remote" "${NETFLECTOR_TEST_REQUIRE-}" "$remote" "$args" "$remote" |
     ssh "${SSH_OPTS[@]}" -p "$SSH_PORT" root@127.0.0.1 sh

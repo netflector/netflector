@@ -22,8 +22,11 @@
 #               there panics the HOST) and /proc/kcore (the live kernel memory image).
 #   --device    /dev/net/tun, so the raw IP link test can attach a tun device (a Linux host
 #               without the node wants `modprobe tun`)
-# rust:slim also ships no `ip`, and without it the veth fixture skips every pair test instead of
-# failing, so the image adds iproute2. The layer is cached, so later runs pay nothing for it.
+# rust:slim ships neither `ip` nor `wg`, which the interface fixtures need, so the image adds
+# iproute2 and wireguard-tools. The layer is cached, so later runs pay nothing for it.
+#
+# The container then has every capability the Linux tests probe for, and the suite runs with them
+# all required (NETFLECTOR_TEST_REQUIRE, see DEVELOP.md).
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -36,7 +39,7 @@ docker build -q -t "$IMAGE" --build-arg RUST_VERSION="$rust_version" - >/dev/nul
 ARG RUST_VERSION
 FROM rust:${RUST_VERSION}-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends iproute2 \
+    && apt-get install -y --no-install-recommends iproute2 wireguard-tools \
     && rm -rf /var/lib/apt/lists/*
 DOCKERFILE
 
@@ -50,6 +53,7 @@ exec docker run --rm \
     -v netflector-cargo-registry:/usr/local/cargo/registry \
     -v netflector-rustup:/usr/local/rustup \
     -e CARGO_TARGET_DIR=/linux-target \
+    -e NETFLECTOR_TEST_REQUIRE="${NETFLECTOR_TEST_REQUIRE-capture,membership,pair,tun,ipv6,monitor,wireguard}" \
     -w /netflector \
     "$IMAGE" \
     cargo "$@"
