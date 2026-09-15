@@ -420,6 +420,7 @@ mod tests {
     use crate::dispatch::MessageType;
     use crate::dispatch::multicast::join_unsupported;
     use crate::interface::{LOOPBACK_IFACE, if_index};
+    use crate::test_support::{Capability, skip};
 
     impl InterfaceTable {
         /// Overwrite an entry's cached identity, standing in for the kernel recreating the
@@ -545,7 +546,7 @@ mod tests {
             // QEMU user-mode emulation doesn't implement the join setsockopt; self-skip there.
             if let Err(e) = table.join_on(iface, group) {
                 if join_unsupported(&e) {
-                    eprintln!("skip join_on_records: MCAST_JOIN_GROUP unsupported here ({e})");
+                    skip(Capability::Membership, e);
                     return Ok(());
                 }
                 return Err(e);
@@ -633,7 +634,7 @@ mod tests {
         let key = table.find_or_add_interface(LOOPBACK_IFACE)?;
         if let Err(e) = table.join_on(key, IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251))) {
             if join_unsupported(&e) {
-                eprintln!("skip refresh_all_does_not_rejoin: joins unsupported here ({e})");
+                skip(Capability::Membership, e);
                 return Ok(());
             }
             return Err(e);

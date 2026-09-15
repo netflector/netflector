@@ -38,7 +38,7 @@ mod tests {
             return Ok(());
         };
         let iface = iface.to_string_lossy();
-        let Some(mut capture) = open_or_skip(&iface, "live_capture")? else {
+        let Some(mut capture) = open_or_skip(&iface)? else {
             return Ok(());
         };
         assert_eq!(capture.link_type(), LinkType::Ethernet);

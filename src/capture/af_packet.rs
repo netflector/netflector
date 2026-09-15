@@ -433,7 +433,7 @@ mod tests {
     fn captures_a_known_frame_on_lo() -> io::Result<()> {
         const PROBE: &[u8] = b"netflector-afpacket-capture-probe";
         let _serial = loopback_lock();
-        let Some(mut capture) = open_or_skip("lo", "afpacket_capture")? else {
+        let Some(mut capture) = open_or_skip("lo")? else {
             return Ok(());
         };
         assert_eq!(capture.link_type(), LinkType::Ethernet);
@@ -475,7 +475,7 @@ mod tests {
     #[cfg_attr(miri, ignore = "needs a real capture device")]
     fn an_oversized_frame_costs_a_read() -> io::Result<()> {
         let _serial = loopback_lock();
-        let Some(mut capture) = open_or_skip("lo", "afpacket_oversized")? else {
+        let Some(mut capture) = open_or_skip("lo")? else {
             return Ok(());
         };
         let receiver = UdpSocket::bind("127.0.0.1:0")?;
@@ -510,7 +510,7 @@ mod tests {
     fn send_loops_back_on_lo() -> io::Result<()> {
         const PROBE: &[u8] = b"netflector-afpacket-send-probe";
         let _serial = loopback_lock();
-        let Some(mut capture) = open_or_skip("lo", "afpacket_send")? else {
+        let Some(mut capture) = open_or_skip("lo")? else {
             return Ok(());
         };
 

@@ -335,7 +335,7 @@ mod tests {
 
     use super::*;
     use crate::libcex::BPF_ALIGN;
-    use crate::test_support::{loopback_lock, open_or_skip};
+    use crate::test_support::{Capability, loopback_lock, open_or_skip, skip};
 
     /// Append one synthetic BPF record (header + frame + word-align padding) to
     /// `batch`. Serializes the header field-by-field at its repr(C) offsets rather
@@ -488,7 +488,7 @@ mod tests {
     #[cfg_attr(miri, ignore = "needs a real capture device")]
     fn an_oversized_record_costs_a_read() -> io::Result<()> {
         let _serial = loopback_lock();
-        let Some(mut capture) = open_or_skip("lo0", "bpf_oversized")? else {
+        let Some(mut capture) = open_or_skip("lo0")? else {
             return Ok(());
         };
         let receiver = std::net::UdpSocket::bind("127.0.0.1:0")?;
@@ -521,7 +521,7 @@ mod tests {
     #[cfg_attr(miri, ignore = "needs a real capture device")]
     fn loopback_capture_decodes_known_frames() -> io::Result<()> {
         let _serial = loopback_lock();
-        let Some(mut capture) = open_or_skip("lo0", "loopback_capture")? else {
+        let Some(mut capture) = open_or_skip("lo0")? else {
             return Ok(());
         };
         assert_eq!(capture.link_type(), LinkType::DltNull);
@@ -544,7 +544,7 @@ mod tests {
                 "did not capture a DLT_NULL IPv6 UDP probe on lo0",
             );
         } else {
-            eprintln!("skip loopback IPv6: ::1 unavailable");
+            skip(Capability::Ipv6, "::1 unavailable");
         }
         Ok(())
     }
@@ -565,7 +565,7 @@ mod tests {
         const PROBE: &[u8] = b"netflector-loopback-send-probe";
 
         let _serial = loopback_lock();
-        let Some(cap) = open_or_skip("lo0", "loopback_send")? else {
+        let Some(cap) = open_or_skip("lo0")? else {
             return Ok(());
         };
 
@@ -589,7 +589,7 @@ mod tests {
                 .expect("build DLT_NULL IPv6 frame");
             expect_send_delivered(&cap, &receiver, &frame[..n], PROBE);
         } else {
-            eprintln!("skip loopback_send IPv6: ::1 unavailable");
+            skip(Capability::Ipv6, "::1 unavailable");
         }
         Ok(())
     }

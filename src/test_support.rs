@@ -1,15 +1,109 @@
 //! Scaffolding shared by the unit tests: privileged-resource probes that self-skip, and stand-in
 //! handlers.
 
+use std::fmt;
 use std::io;
+use std::sync::LazyLock;
 
 use crate::capture::Capture;
 use crate::interface::LOOPBACK_IFACE;
 use crate::reactor::{Handler, Reactor, ReadyEvent};
 
-/// Open a capture on `if_name`, or `Ok(None)` (with a note) when the host can't: no BPF access /
+/// Something a test needs from the host and not every host offers. A test that finds one missing
+/// skips with a note, unless `NETFLECTOR_TEST_REQUIRE` (a comma-separated list of the names
+/// below) lists it: then the test fails, so a CI lane set up to provide the facility cannot go
+/// green without it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Capability {
+    /// A raw capture on the loopback interface: `CAP_NET_RAW`, or access to `/dev/bpf`.
+    Capture,
+    /// `MCAST_JOIN_GROUP` on the loopback interface; QEMU user mode refuses it.
+    Membership,
+    /// A connected interface pair (veth, feth, epair): root and the platform's tooling.
+    Pair,
+    /// A tun device: root and `/dev/net/tun`.
+    #[cfg(target_os = "linux")]
+    Tun,
+    /// `::1` usable.
+    Ipv6,
+    /// The interface monitor's socket; some sandboxes deny it.
+    Monitor,
+    /// A `WireGuard` interface: root and `wg` in base.
+    #[cfg(target_os = "freebsd")]
+    WireGuard,
+}
+
+impl Capability {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Capture => "capture",
+            Self::Membership => "membership",
+            Self::Pair => "pair",
+            #[cfg(target_os = "linux")]
+            Self::Tun => "tun",
+            Self::Ipv6 => "ipv6",
+            Self::Monitor => "monitor",
+            #[cfg(target_os = "freebsd")]
+            Self::WireGuard => "wireguard",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "capture" => Self::Capture,
+            "membership" => Self::Membership,
+            "pair" => Self::Pair,
+            #[cfg(target_os = "linux")]
+            "tun" => Self::Tun,
+            "ipv6" => Self::Ipv6,
+            "monitor" => Self::Monitor,
+            #[cfg(target_os = "freebsd")]
+            "wireguard" => Self::WireGuard,
+            _ => return None,
+        })
+    }
+}
+
+impl fmt::Display for Capability {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// The capabilities `NETFLECTOR_TEST_REQUIRE` lists. A name this platform does not know is a
+/// misconfigured lane and panics.
+fn required_capabilities() -> &'static [Capability] {
+    static REQUIRED: LazyLock<Vec<Capability>> = LazyLock::new(|| {
+        let list = match std::env::var("NETFLECTOR_TEST_REQUIRE") {
+            Ok(list) => list,
+            Err(std::env::VarError::NotPresent) => return Vec::new(),
+            Err(e) => panic!("NETFLECTOR_TEST_REQUIRE: {e}"),
+        };
+        list.split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(|name| {
+                Capability::from_name(name).unwrap_or_else(|| {
+                    panic!("NETFLECTOR_TEST_REQUIRE: unknown capability {name:?}")
+                })
+            })
+            .collect()
+    });
+    &REQUIRED
+}
+
+/// Note that the test skips for want of `cap`, or fail it when the lane requires `cap`.
+pub(crate) fn skip(cap: Capability, reason: impl fmt::Display) {
+    assert!(
+        !required_capabilities().contains(&cap),
+        "{cap} is required by NETFLECTOR_TEST_REQUIRE: {reason}"
+    );
+    eprintln!("skip {cap}: {reason}");
+}
+
+/// Open a capture on `if_name`, or `Ok(None)` (skip) when the host can't: no BPF access /
 /// `CAP_NET_RAW`, or the interface is absent. Other errors propagate for the caller to `?`.
-pub(crate) fn open_or_skip(if_name: &str, what: &str) -> io::Result<Option<Capture>> {
+pub(crate) fn open_or_skip(if_name: &str) -> io::Result<Option<Capture>> {
     match Capture::open(if_name) {
         Ok(capture) => Ok(Some(capture)),
         Err(e)
@@ -18,7 +112,10 @@ pub(crate) fn open_or_skip(if_name: &str, what: &str) -> io::Result<Option<Captu
                 io::ErrorKind::PermissionDenied | io::ErrorKind::NotFound
             ) =>
         {
-            eprintln!("skip {what}: cannot capture on {if_name} ({e})");
+            skip(
+                Capability::Capture,
+                format_args!("cannot capture on {if_name} ({e})"),
+            );
             Ok(None)
         }
         Err(e) => Err(e),
@@ -27,8 +124,7 @@ pub(crate) fn open_or_skip(if_name: &str, what: &str) -> io::Result<Option<Captu
 
 /// A loopback capture, or `None` (skip) without `CAP_NET_RAW`.
 pub(crate) fn open_loopback_or_skip() -> Option<Capture> {
-    open_or_skip(LOOPBACK_IFACE, "loopback capture")
-        .expect("unexpected loopback capture open failure")
+    open_or_skip(LOOPBACK_IFACE).expect("unexpected loopback capture open failure")
 }
 
 /// The tests that open a capture on the loopback interface hold this for their duration: every
@@ -83,7 +179,7 @@ impl Tun {
         const TEMPLATE: &[u8] = b"nftun%d";
         // SAFETY: geteuid takes no arguments and cannot fail.
         if unsafe { libc::geteuid() } != 0 {
-            eprintln!("skip tun test: creating a tun device requires root");
+            skip(Capability::Tun, "creating a tun device requires root");
             return None;
         }
         let far_end = match std::fs::File::options()
@@ -93,7 +189,7 @@ impl Tun {
         {
             Ok(file) => file,
             Err(e) => {
-                eprintln!("skip tun test: /dev/net/tun: {e}");
+                skip(Capability::Tun, format_args!("/dev/net/tun: {e}"));
                 return None;
             }
         };
@@ -111,9 +207,9 @@ impl Tun {
             libc::c_short::try_from(libc::IFF_TUN | libc::IFF_NO_PI).expect("tun flags fit");
         // SAFETY: TUNSETIFF reads the flags and name template, and writes the name back.
         if unsafe { libc::ioctl(far_end.as_raw_fd(), libc::TUNSETIFF, &raw mut ifr) } < 0 {
-            eprintln!(
-                "skip tun test: TUNSETIFF: {}",
-                std::io::Error::last_os_error()
+            skip(
+                Capability::Tun,
+                format_args!("TUNSETIFF: {}", std::io::Error::last_os_error()),
             );
             return None;
         }
@@ -126,7 +222,10 @@ impl Tun {
             .status()
             .is_ok_and(|status| status.success());
         if !up {
-            eprintln!("skip tun test: cannot bring {name} up (no ip(8)?)");
+            skip(
+                Capability::Tun,
+                format_args!("cannot bring {name} up (no ip(8)?)"),
+            );
             return None;
         }
         Some(Self { far_end, name })
@@ -183,5 +282,16 @@ impl Tun {
             }
         }
         Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Forces the parse on every lane, so a misspelled name fails even where nothing skips.
+    #[test]
+    fn require_list_parses() {
+        required_capabilities();
     }
 }
