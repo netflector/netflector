@@ -785,24 +785,29 @@ fn an_mdns_answer_goes_to_the_source_peers() -> io::Result<()> {
     Ok(())
 }
 
-/// A `WireGuard` interface with two peers, one with an endpoint and one without. FreeBSD
-/// only: `wg` ships in base there, and the interface is created as root.
-#[cfg(target_os = "freebsd")]
+/// A `WireGuard` interface with two peers, one with an endpoint and one without, created as
+/// root with wg(8): from base on FreeBSD, wireguard-tools on Linux.
+#[cfg(any(target_os = "freebsd", target_os = "linux"))]
 struct WgPeers {
     name: String,
     reachable: IpAddr,
     unreachable: IpAddr,
 }
 
-#[cfg(target_os = "freebsd")]
+#[cfg(any(target_os = "freebsd", target_os = "linux"))]
 impl WgPeers {
     /// The endpoint the reachable peer's handshake goes to.
     const ENDPOINT: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51820);
+    /// What a send to the peer without an endpoint fails with.
+    #[cfg(target_os = "freebsd")]
+    const NO_ENDPOINT: i32 = libc::EHOSTUNREACH;
+    #[cfg(target_os = "linux")]
+    const NO_ENDPOINT: i32 = libc::EDESTADDRREQ;
 
-    /// `None`, with a note, where the test can't run: not root, or the static build, whose
-    /// process spawning crashes (see the pair tests).
+    /// `None`, with a note, where the test can't run: not root, or the static FreeBSD build,
+    /// whose process spawning crashes (see the pair tests).
     fn create() -> Option<Self> {
-        if cfg!(target_feature = "crt-static") {
+        if cfg!(all(target_os = "freebsd", target_feature = "crt-static")) {
             skip(
                 Capability::WireGuard,
                 "process spawning crashes static FreeBSD binaries",
@@ -814,7 +819,7 @@ impl WgPeers {
             skip(Capability::WireGuard, "interface creation requires root");
             return None;
         }
-        let Some(name) = sh_output("ifconfig wg create") else {
+        let Some(name) = Self::create_link() else {
             skip(Capability::WireGuard, "could not create a wg interface");
             return None;
         };
@@ -827,29 +832,58 @@ impl WgPeers {
         let configured = sh(&format!(
             "umask 077 && wg genkey > {key} && wg set {name} private-key {key} listen-port 0 \
                  peer $(wg genkey | wg pubkey) allowed-ips {reachable}/32 endpoint {endpoint} \
-                 peer $(wg genkey | wg pubkey) allowed-ips {unreachable}/32 \
-                 && ifconfig {name} inet 10.99.77.1/24 up",
+                 peer $(wg genkey | wg pubkey) allowed-ips {unreachable}/32 && {up}",
             key = key.display(),
             name = this.name,
             reachable = this.reachable,
             unreachable = this.unreachable,
             endpoint = Self::ENDPOINT,
+            up = this.address_and_up(),
         ));
         std::fs::remove_file(&key).ok();
         assert!(configured, "could not configure {}", this.name);
         Some(this)
     }
+
+    /// FreeBSD: `ifconfig wg create` mints the interface and prints its kernel-assigned name.
+    #[cfg(target_os = "freebsd")]
+    fn create_link() -> Option<String> {
+        sh_output("ifconfig wg create")
+    }
+
+    #[cfg(target_os = "freebsd")]
+    fn address_and_up(&self) -> String {
+        format!("ifconfig {} inet 10.99.77.1/24 up", self.name)
+    }
+
+    /// Linux: names are caller-chosen; the pid keeps two test processes apart.
+    #[cfg(target_os = "linux")]
+    fn create_link() -> Option<String> {
+        let name = format!("nfwg{}", std::process::id() % 100_000);
+        sh(&format!("ip link add {name} type wireguard")).then_some(name)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn address_and_up(&self) -> String {
+        format!(
+            "ip addr add 10.99.77.1/24 dev {0} && ip link set {0} up",
+            self.name
+        )
+    }
 }
 
-#[cfg(target_os = "freebsd")]
+#[cfg(any(target_os = "freebsd", target_os = "linux"))]
 impl Drop for WgPeers {
     fn drop(&mut self) {
+        #[cfg(target_os = "freebsd")]
         sh(&format!("ifconfig {} destroy", self.name));
+        #[cfg(target_os = "linux")]
+        sh(&format!("ip link del {}", self.name));
     }
 }
 
 /// Run `command` through the shell, succeeding only on exit 0.
-#[cfg(target_os = "freebsd")]
+#[cfg(any(target_os = "freebsd", target_os = "linux"))]
 fn sh(command: &str) -> bool {
     std::process::Command::new("sh")
         .args(["-ec", command])
@@ -870,11 +904,10 @@ fn sh_output(command: &str) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
-// WireGuard refuses a copy for a peer it has no endpoint for, and on FreeBSD the BPF write
-// reports that at once. The other peers still get theirs: the send counts as delivered, and
-// the reachable peer's handshake shows up at its endpoint. Only when every copy fails does
-// the send fail.
-#[cfg(target_os = "freebsd")]
+// WireGuard refuses a copy for a peer it has no endpoint for, and the write reports that at
+// once. The other peers still get theirs: the send counts as delivered, and the reachable
+// peer's handshake shows up at its endpoint. Only when every copy fails does the send fail.
+#[cfg(any(target_os = "freebsd", target_os = "linux"))]
 #[test]
 #[cfg_attr(miri, ignore = "needs a real capture device")]
 fn a_peer_without_an_endpoint_costs_only_its_own_copy() -> io::Result<()> {
@@ -898,7 +931,7 @@ fn a_peer_without_an_endpoint_costs_only_its_own_copy() -> io::Result<()> {
     let failed = dispatcher.send_udp_to_peers(egress, &only_unreachable, group, source, 1, b"sood");
     assert_eq!(
         failed.map_err(|e| e.raw_os_error()),
-        Err(Some(libc::EHOSTUNREACH))
+        Err(Some(WgPeers::NO_ENDPOINT))
     );
     Ok(())
 }
