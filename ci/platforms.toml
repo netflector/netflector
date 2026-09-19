@@ -48,7 +48,7 @@ packages = "qemu-system-arm qemu-efi-aarch64"
 
 [[macos]]
 arch = "arm64"
-runner = "macos-15"
+runner = "macos-26"
 triple = "aarch64-apple-darwin"
 
 [[opnsense]]

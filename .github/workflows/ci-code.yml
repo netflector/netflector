@@ -486,7 +486,7 @@ jobs:
           - {"name": "linux-arm64-musl", "runner": "ubuntu-26.04-arm", "triple": "aarch64-unknown-linux-musl"}
           - {"name": "linux-armv7-musl", "runner": "ubuntu-26.04", "triple": "armv7-unknown-linux-musleabihf", "emulated": true}
           - {"name": "linux-armv5-musl", "runner": "ubuntu-26.04", "triple": "armv5te-unknown-linux-musleabi", "emulated": true}
-          - {"name": "macos-arm64", "runner": "macos-15", "triple": ""}
+          - {"name": "macos-arm64", "runner": "macos-26", "triple": ""}
         # END platforms
         profile:
           - { name: debug, flags: '' }
