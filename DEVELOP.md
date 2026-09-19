@@ -110,8 +110,8 @@ supply-chain audit run as reusable workflows behind that verdict, each skipped a
 its paths are untouched, and the required check `Success` needs all of them. A path no pipeline
 claims runs the code lanes.
 
-The code lanes run the unit suite on Ubuntu 24.04 (amd64 and arm64, both glibc and the shipped static musl),
-macOS 15, FreeBSD 14 and 15 (amd64 and arm64, cross-compiled on the runner and executed in QEMU VMs), and
+The code lanes run the unit suite on Ubuntu (amd64 and arm64, both glibc and the shipped static musl),
+macOS, FreeBSD 14 and 15 (amd64 and arm64, cross-compiled on the runner and executed in QEMU VMs), and
 the cross-compiled `linux/arm/v7` and `linux/arm/v5` builds whose suites run under QEMU, each in both
 debug and release. `clippy` and the rustdoc link gate run per target. The e2e suite runs on the
 Docker backend on amd64 and arm64 (plus a Valgrind memcheck job) and natively on linux amd64/arm64
