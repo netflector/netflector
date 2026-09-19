@@ -15,7 +15,7 @@ jobs:
   # and the GitHub release name can never disagree. Fails within a minute, before CI spends anything.
   tag-check:
     name: Tag matches Cargo.toml
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
       - name: Check out repository
@@ -53,13 +53,13 @@ jobs:
       matrix:
         # BEGIN platforms: release
         include:
-          - {"variant": "linux-amd64", "runner": "ubuntu-24.04", "target": "x86_64-unknown-linux-musl"}
-          - {"variant": "linux-arm64", "runner": "ubuntu-24.04-arm", "target": "aarch64-unknown-linux-musl"}
-          - {"variant": "linux-armv7", "runner": "ubuntu-24.04", "target": "armv7-unknown-linux-musleabihf"}
-          - {"variant": "linux-armv5", "runner": "ubuntu-24.04", "target": "armv5te-unknown-linux-musleabi"}
+          - {"variant": "linux-amd64", "runner": "ubuntu-26.04", "target": "x86_64-unknown-linux-musl"}
+          - {"variant": "linux-arm64", "runner": "ubuntu-26.04-arm", "target": "aarch64-unknown-linux-musl"}
+          - {"variant": "linux-armv7", "runner": "ubuntu-26.04", "target": "armv7-unknown-linux-musleabihf"}
+          - {"variant": "linux-armv5", "runner": "ubuntu-26.04", "target": "armv5te-unknown-linux-musleabi"}
           - {"variant": "macos-arm64", "runner": "macos-15", "target": "aarch64-apple-darwin"}
-          - {"variant": "freebsd-amd64", "runner": "ubuntu-24.04", "target": "x86_64-unknown-freebsd", "freebsd_arch": "amd64", "freebsd_baseline": 14}
-          - {"variant": "freebsd-arm64", "runner": "ubuntu-24.04", "target": "aarch64-unknown-freebsd", "freebsd_arch": "arm64", "freebsd_baseline": 14}
+          - {"variant": "freebsd-amd64", "runner": "ubuntu-26.04", "target": "x86_64-unknown-freebsd", "freebsd_arch": "amd64", "freebsd_baseline": 14}
+          - {"variant": "freebsd-arm64", "runner": "ubuntu-26.04", "target": "aarch64-unknown-freebsd", "freebsd_arch": "arm64", "freebsd_baseline": 14}
         # END platforms
     steps:
       - name: Check out repository
@@ -171,10 +171,10 @@ jobs:
       matrix:
         # BEGIN platforms: images
         include:
-          - {"arch": "amd64", "runner": "ubuntu-24.04", "platform": "linux/amd64"}
-          - {"arch": "arm64", "runner": "ubuntu-24.04-arm", "platform": "linux/arm64"}
-          - {"arch": "armv7", "runner": "ubuntu-24.04", "platform": "linux/arm/v7"}
-          - {"arch": "armv5", "runner": "ubuntu-24.04", "platform": "linux/arm/v5"}
+          - {"arch": "amd64", "runner": "ubuntu-26.04", "platform": "linux/amd64"}
+          - {"arch": "arm64", "runner": "ubuntu-26.04-arm", "platform": "linux/arm64"}
+          - {"arch": "armv7", "runner": "ubuntu-26.04", "platform": "linux/arm/v7"}
+          - {"arch": "armv5", "runner": "ubuntu-26.04", "platform": "linux/arm/v5"}
         # END platforms
     steps:
       - name: Check out repository
@@ -220,7 +220,7 @@ jobs:
   manifest:
     name: Image manifest -> GHCR
     needs: image
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     outputs:
       latest: ${{ steps.ord.outputs.latest }}
@@ -306,7 +306,7 @@ jobs:
   release:
     name: GitHub release
     needs: [binaries, manifest]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
       contents: write

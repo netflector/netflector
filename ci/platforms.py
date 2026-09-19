@@ -108,7 +108,7 @@ def views(data: dict) -> dict:
     releases.extend(
         dict(
             variant=f"freebsd-{row['name']}",
-            runner="ubuntu-24.04",
+            runner="ubuntu-26.04",
             target=row["triple"],
             freebsd_arch=row["name"],
             freebsd_baseline=baseline,

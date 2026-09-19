@@ -27,7 +27,7 @@ permissions:
 jobs:
   guard:
     name: Check the tag and decide pairing
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     outputs:
       pair: ${{ steps.decide.outputs.pair }}
@@ -78,7 +78,7 @@ jobs:
     # publishes, so run unless something actually failed or was cancelled.
     needs: [guard, verify-ci, build-daemon]
     if: ${{ !failure() && !cancelled() }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     env:
       FREEBSD_VM_ARCH: amd64
