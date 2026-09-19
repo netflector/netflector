@@ -828,19 +828,18 @@ impl WgPeers {
             reachable: IpAddr::V4(Ipv4Addr::new(10, 99, 77, 2)),
             unreachable: IpAddr::V4(Ipv4Addr::new(10, 99, 77, 3)),
         };
-        let key = std::env::temp_dir().join(format!("netflector-{}.key", this.name));
+        // The key goes in on stdin: Ubuntu's AppArmor profile for wg(8) lets it read key files
+        // under /etc/wireguard only.
         let configured = sh(&format!(
-            "umask 077 && wg genkey > {key} && wg set {name} private-key {key} listen-port 0 \
+            "wg genkey | wg set {name} private-key /dev/stdin listen-port 0 \
                  peer $(wg genkey | wg pubkey) allowed-ips {reachable}/32 endpoint {endpoint} \
                  peer $(wg genkey | wg pubkey) allowed-ips {unreachable}/32 && {up}",
-            key = key.display(),
             name = this.name,
             reachable = this.reachable,
             unreachable = this.unreachable,
             endpoint = Self::ENDPOINT,
             up = this.address_and_up(),
         ));
-        std::fs::remove_file(&key).ok();
         assert!(configured, "could not configure {}", this.name);
         Some(this)
     }
