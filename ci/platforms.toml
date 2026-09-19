@@ -6,28 +6,28 @@ freebsd_static_baseline = 14
 
 [[linux]]
 arch = "amd64"
-runner = "ubuntu-24.04"
+runner = "ubuntu-26.04"
 triple = "x86_64-unknown-linux-musl"
 gnu = "x86_64-unknown-linux-gnu"
 platform = "linux/amd64"
 
 [[linux]]
 arch = "arm64"
-runner = "ubuntu-24.04-arm"
+runner = "ubuntu-26.04-arm"
 triple = "aarch64-unknown-linux-musl"
 gnu = "aarch64-unknown-linux-gnu"
 platform = "linux/arm64"
 
 [[linux]]
 arch = "armv7"
-runner = "ubuntu-24.04"
+runner = "ubuntu-26.04"
 triple = "armv7-unknown-linux-musleabihf"
 platform = "linux/arm/v7"
 emulated = true
 
 [[linux]]
 arch = "armv5"
-runner = "ubuntu-24.04"
+runner = "ubuntu-26.04"
 triple = "armv5te-unknown-linux-musleabi"
 platform = "linux/arm/v5"
 emulated = true
