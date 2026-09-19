@@ -22,7 +22,7 @@ jobs:
   # Everything fetched is FreeBSD-project-official and hash-pinned.
   freebsd-tests:
     name: Test (freebsd${{ matrix.os }}-${{ matrix.arch.name }}, ${{ matrix.profile.name }})
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     env:
       FREEBSD_VM_ARCH: ${{ matrix.arch.name }}
@@ -93,7 +93,7 @@ jobs:
   # jails, probes) under TCG; the suite mostly waits on wall-clock timers, so emulation adds little.
   freebsd-native-e2e:
     name: Native e2e (freebsd${{ matrix.os }}-${{ matrix.arch.name }}, ${{ matrix.linkage.name }})
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 40
     env:
       FREEBSD_VM_ARCH: ${{ matrix.arch.name }}
@@ -170,7 +170,7 @@ jobs:
   # the Rust compiler from source for hours.
   freebsd-port-build-src:
     name: Port builds from this commit on FreeBSD ${{ matrix.os }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 25
     env:
       FREEBSD_VM_ARCH: amd64
@@ -241,7 +241,7 @@ jobs:
   # --skip-build reuses the image built here.
   valgrind-e2e:
     name: Valgrind e2e
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
       - name: Check out repository
@@ -394,7 +394,7 @@ jobs:
   # be deleted by hand; the lane just makes that possible.
   miri:
     name: Miri (${{ matrix.target }})
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -575,7 +575,7 @@ jobs:
   # process-lifetime statics live to exit by design.
   valgrind-test:
     name: Valgrind test
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - name: Check out repository
@@ -615,7 +615,7 @@ jobs:
   # The Cargo.toml [lints.rustdoc] denies make `cargo doc` the link gate.
   lint:
     name: Lint (${{ matrix.target }})
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     strategy:
       fail-fast: false
@@ -655,7 +655,7 @@ jobs:
   # rustfmt is target-independent, so run it once.
   fmt:
     name: Format
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
       - name: Check out repository
@@ -667,7 +667,7 @@ jobs:
 
   man-lint:
     name: Lint (man pages)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
       - name: Check out repository

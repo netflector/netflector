@@ -15,7 +15,7 @@ jobs:
   # and the GitHub release name can never disagree. Fails within a minute, before CI spends anything.
   tag-check:
     name: Tag matches Cargo.toml
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
       - name: Check out repository
@@ -220,7 +220,7 @@ jobs:
   manifest:
     name: Image manifest -> GHCR
     needs: image
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     outputs:
       latest: ${{ steps.ord.outputs.latest }}
@@ -306,7 +306,7 @@ jobs:
   release:
     name: GitHub release
     needs: [binaries, manifest]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
       contents: write
