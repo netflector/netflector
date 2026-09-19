@@ -33,7 +33,7 @@ permissions:
 jobs:
   changes:
     name: Changed paths
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions:
       contents: read
@@ -68,7 +68,7 @@ jobs:
   # The catalog and the classifier are checked once here, whatever lanes the change selects.
   tooling:
     name: CI tooling
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
       - name: Check out repository
@@ -108,7 +108,7 @@ jobs:
     name: Success
     if: ${{ !cancelled() }}
     needs: [changes, tooling, code, opnsense, port, supply-chain]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
       - name: Report the lanes
