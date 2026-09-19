@@ -18,6 +18,18 @@
         "# renovate: datasource=(?<datasource>[a-z-]+) depName=(?<depName>\\S+)\\n[A-Z]+_VERSION=(?<currentValue>\\S+)"
       ],
       "extractVersionTemplate": "^(?:cargo-audit/v)?(?<version>.+)$"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "ci/platforms.toml",
+        "ci/platforms.py",
+        "/^\\.github/workflows/[^/]+\\.yml$/"
+      ],
+      "matchStrings": [
+        "\"?runner\"?\\s*[=:]\\s*\"(?<depName>ubuntu|macos)-(?<currentValue>[^\"]+)\""
+      ],
+      "datasourceTemplate": "github-runners"
     }
   ],
   "packageRules": [
