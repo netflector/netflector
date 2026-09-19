@@ -110,18 +110,6 @@ write_files:
     content: |
       firstboot_pkg_upgrade_enable="NO"
 EOF
-    # TCG only: noble's QEMU 8.2 keys translation blocks by virtual PC (the 8.2.1 stable
-    # revert of PCREL TB sharing), so ASLR makes every short-lived process retranslate
-    # libc at fresh addresses. Pinning layouts restores reuse across the e2e exec storm.
-    # KVM does not translate; the amd64 guest stays production-like.
-    if [ "$ARCH" = arm64 ]; then
-        cat <<EOF
-  - path: /etc/sysctl.conf.local
-    content: |
-      kern.elf64.aslr.enable=0
-      kern.elf64.aslr.pie_enable=0
-EOF
-    fi
 }
 
 seed_script() {
@@ -135,14 +123,6 @@ echo 'PermitRootLogin prohibit-password' >> /etc/ssh/sshd_config
 echo 'firstboot_freebsd_update_enable="NO"' > /etc/rc.conf.d/firstboot_freebsd_update
 echo 'firstboot_pkg_upgrade_enable="NO"' > /etc/rc.conf.d/firstboot_pkg_upgrade
 EOF
-    # Same ASLR pin as the cloud-config flavor, applied immediately as well:
-    # rc.d/sysctl has already run by the time this script executes.
-    if [ "$ARCH" = arm64 ]; then
-        cat <<EOF
-sysctl kern.elf64.aslr.enable=0 kern.elf64.aslr.pie_enable=0
-printf 'kern.elf64.aslr.enable=0\nkern.elf64.aslr.pie_enable=0\n' >> /etc/sysctl.conf.local
-EOF
-    fi
 }
 
 launch() {
