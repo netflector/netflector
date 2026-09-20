@@ -133,6 +133,104 @@ foreach (
     }
 }
 
+/* the relay's and the peers' fields, and the one rule between them */
+function entry_messages(array $values): array
+{
+    $model = new Netflector();
+    $entry = $model->reflectors->reflector->Add();
+    $entry->enabled = '1';
+    $entry->name = 'modelcheck';
+    foreach ($values as $field => $value) {
+        $entry->$field = $value;
+    }
+    $messages = [];
+    foreach ($model->performValidation() as $message) {
+        $field = substr(strrchr($message->getField(), '.'), 1);
+        if (str_starts_with($field, 'udp_') || str_ends_with($field, '_peers')) {
+            $messages[] = $field . ': ' . $message->getMessage();
+        }
+    }
+    return $messages;
+}
+
+foreach (
+    [
+        [['udp_ports' => '9003', 'udp_groups' => '239.255.90.90'], true],
+        [['udp_ports' => '9003,9004', 'udp_groups' => '239.255.90.90,ff05::90', 'udp_broadcast' => '1'], true],
+        [['udp_ports' => '9003', 'udp_broadcast' => '1'], true],
+        [['udp_ports' => '9003,70000', 'udp_broadcast' => '1'], false],
+        [['udp_ports' => '9003', 'udp_groups' => 'nonsense'], false],
+        [['udp_ports' => '9003', 'udp_groups' => '239.255.90.0/24'], false],
+        [['udp_ports' => '9003', 'udp_groups' => 'any'], false],
+        /* a relay without ports */
+        [['udp_groups' => '239.255.90.90'], false],
+        [['udp_broadcast' => '1'], false],
+        [['target_peers' => '10.10.10.2,fd00::2', 'source_peers' => '10.0.0.2'], true],
+        [['target_peers' => '10.10.10.0/24'], false],
+        [['source_peers' => 'phone.example'], false],
+        [['target_peers' => 'any'], false],
+    ] as [$values, $expect_valid]
+) {
+    $messages = entry_messages($values);
+    if ($expect_valid && $messages !== []) {
+        fail(sprintf('%s rejected: %s', json_encode($values), implode(' | ', $messages)));
+    } elseif (!$expect_valid && $messages === []) {
+        fail(sprintf('%s accepted, expected a validation error', json_encode($values)));
+    }
+}
+
+/* the pair collision follows the entries' directions */
+function pair_collides(array $first, array $second): bool
+{
+    $model = new Netflector();
+    /* only the two entries under test: the firewall's own may share their interfaces */
+    foreach ($model->reflectors->reflector->iterateItems() as $uuid => $unused) {
+        $model->reflectors->reflector->del($uuid);
+    }
+    foreach ([$first, $second] as $index => $values) {
+        $entry = $model->reflectors->reflector->Add();
+        $entry->enabled = '1';
+        $entry->name = 'modelcheck' . $index;
+        $entry->mdns = '1';
+        foreach ($values as $field => $value) {
+            $entry->$field = $value;
+        }
+    }
+    foreach ($model->performValidation() as $message) {
+        if (str_contains($message->getMessage(), 'reflected twice')) {
+            return true;
+        }
+    }
+    return false;
+}
+
+$interfaces = array_keys((new Netflector())->reflectors->reflector->Add()->source_if->getNodeData());
+if (count($interfaces) < 2) {
+    fail('the pair collision needs two interfaces on this firewall');
+} else {
+    [$x, $y] = $interfaces;
+    $forward = ['source_if' => $x, 'target_if' => $y];
+    $backward = ['source_if' => $y, 'target_if' => $x];
+    foreach (
+        [
+            [$forward, $forward, true],
+            [$forward, $backward, false],
+            [$forward + ['bidirectional' => '1'], $backward, true],
+            [$forward, $backward + ['bidirectional' => '1'], true],
+            [$forward + ['address_family' => 'ipv4'], $backward + ['bidirectional' => '1', 'address_family' => 'ipv6'], false],
+        ] as [$first, $second, $expect_collision]
+    ) {
+        if (pair_collides($first, $second) !== $expect_collision) {
+            fail(sprintf(
+                '%s and %s: expected %s',
+                json_encode($first),
+                json_encode($second),
+                $expect_collision ? 'a collision' : 'no collision'
+            ));
+        }
+    }
+}
+
 if ($failures === 0) {
     echo 'model check ok' . PHP_EOL;
     exit(0);
