@@ -27,10 +27,10 @@ jobs:
   package:
     name: Package (freebsd${{ matrix.os }}-${{ matrix.arch.name }})
     runs-on: ubuntu-26.04
-    # Measured across publish runs: KVM lanes 2-5 minutes plus ~9 of e2e,
-    # arm64 13-14 plus ~12 (no GitHub runner offers KVM for aarch64 guests,
-    # so rustc and the suite run under TCG).
-    timeout-minutes: ${{ matrix.arch.kvm && 25 || 40 }}
+    # Measured on the 0.16.0 publish: KVM lanes 11-14 minutes; arm64 builds
+    # in 11-16 and the e2e suite adds 16 to 22+ (no GitHub runner offers KVM
+    # for aarch64 guests, so rustc and the suite run under TCG).
+    timeout-minutes: ${{ matrix.arch.kvm && 30 || 60 }}
     env:
       FREEBSD_VM_ARCH: ${{ matrix.arch.name }}
       FREEBSD_VM_VERSION: ${{ matrix.os }}-opnsense
