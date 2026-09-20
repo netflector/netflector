@@ -6,6 +6,9 @@ on:
   push:
     tags:
       - 'v*'
+  # Dispatch from the tag: tag-check refuses any other ref. The run uses the workflow files at the
+  # tag, as a re-run does.
+  workflow_dispatch:
 
 permissions:
   contents: read
