@@ -137,6 +137,26 @@
           <macs/>
           <address_family>default</address_family>
         </reflector>
+        <reflector uuid="9a1b0c62-4c58-4b2e-9a41-6f2f5d7a0004">
+          <enabled>1</enabled>
+          <name>roon</name>
+          <source_if>opt1</source_if>
+          <target_if>opt2</target_if>
+          <bidirectional>1</bidirectional>
+          <wol>0</wol>
+          <wol_ports/>
+          <mdns>0</mdns>
+          <ssdp>0</ssdp>
+          <dial>0</dial>
+          <wsd>0</wsd>
+          <macs/>
+          <udp_ports>9003</udp_ports>
+          <udp_groups>239.255.90.90</udp_groups>
+          <udp_broadcast>1</udp_broadcast>
+          <source_peers>10.10.1.50</source_peers>
+          <target_peers>10.10.2.50,10.10.2.51</target_peers>
+          <address_family>ipv4</address_family>
+        </reflector>
       </reflectors>
     </Netflector>
   </OPNsense>
