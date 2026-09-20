@@ -527,6 +527,15 @@ udp_broadcast = true
 bidirectional = true
 ```
 
+A tunnel client that broadcasts, as the Roon app does, needs the tunnel's real prefix,
+`10.10.10.2/24` rather than `/32`: it derives the broadcast address from its own address and mask,
+and under a /32 that is its own address, so the datagram never leaves it. The router has to drop
+datagrams to the tunnel subnet's broadcast address (`10.10.10.255` in this example) as they leave
+the tunnel interface. A WireGuard interface has no broadcast address, so the router forwards such
+a datagram back into the tunnel as unicast, no peer covers it, the client gets an ICMP unreachable,
+and netflector relays the forwarded copy a second time. netflector still receives the original,
+since it captures ahead of the packet filter.
+
 The relay ignores `macs`: a datagram to a group or a broadcast has no single target device. It admits
 every datagram it captures, so it must not overlap a protocol that relays the same datagrams; see
 [duplicate detection](#duplicate-detection). Its counters are reported as `UDP relay`, except that a
