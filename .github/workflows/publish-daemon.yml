@@ -10,14 +10,19 @@ on:
     branches: [main]
     paths:
       - 'dist/freebsd/net/netflector/**'
+  # For a publish that failed on something a later commit to main fixed (a job
+  # budget, a CI script): no push repeats it, and a re-run keeps the failed
+  # run's workflow files. Dispatch from main; the guard skips a published
+  # version, so a needless run is a no-op.
+  workflow_dispatch:
 
 # Whole publishes serialize, never partially interleave: with the tail split
 # into sign/gate/push jobs, a job-level group could let two publishes overlap
 # stage-wise and the later push would drop the earlier one's packages.
 # GitHub holds at most ONE pending run per group: a third publish queuing up
-# displaces the pending one, which is cancelled with no failure signal. A
-# displaced run needs a manual "Re-run all jobs" (re-runs keep their original
-# snapshot); nothing re-triggers it, so watch for cancelled runs here.
+# displaces the pending one, which is cancelled with no failure signal.
+# Nothing re-triggers a displaced run, so watch for cancelled runs here and
+# dispatch the workflow again.
 concurrency:
   group: pkg-publish
   cancel-in-progress: false
@@ -33,6 +38,11 @@ jobs:
     outputs:
       publish: ${{ steps.decide.outputs.publish }}
     steps:
+      - name: Refuse a dispatch from anywhere but main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::dispatch this workflow from main: it publishes main's port"
+          exit 1
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Compare the port against the published trees

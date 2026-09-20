@@ -9,6 +9,10 @@ name: Publish plugin
 on:
   push:
     tags: ['os-v*']
+  # Dispatch from the tag: the guard refuses any other ref. The run uses the
+  # workflow files at the tag, as a re-run does, so a fix made on main after
+  # the tag needs a new tag.
+  workflow_dispatch:
 
 # Whole publishes serialize, never partially interleave: with the tail split
 # into sign/gate/push jobs, a job-level group could let two publishes overlap

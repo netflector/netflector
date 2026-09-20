@@ -56,3 +56,11 @@ A plugin content or metadata change ships only with a `PLUGIN_VERSION` bump: the
 tag-driven and the workflow refuses a tag that does not match `PLUGIN_VERSION`, so without a bump
 there is no new tag to cut. `PLUGIN_REVISION` is no substitute; `release-os.sh` tags
 `os-v<version>` and a revision is not part of that version.
+
+## Repeating a failed run
+
+A re-run repeats a run with the workflow files it started with, so it cannot pick up a fix made since.
+When a daemon publish failed on something fixed on main afterwards (a job budget, a CI script), run
+`Publish daemon` by hand from main instead (Actions > Publish daemon > Run workflow); it skips a
+version that is already published. `Release` and `Publish plugin` can be run by hand too, from their
+tag only, and then use the tag's own workflow files as a re-run does: a fix they need means a new tag.
