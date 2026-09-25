@@ -15,7 +15,7 @@ use super::filter::{
     BpfInsn, DROP_OUTGOING_PROLOGUE, DROP_VLAN_TAGGED_PROLOGUE, ETHERNET_UDP_FILTER,
     RAW_IP_UDP_FILTER,
 };
-use crate::interface::{Interface, if_index};
+use crate::interface::Interface;
 use crate::logging::{WARN_WINDOW, log_rate};
 use crate::net::LinkType;
 use crate::sys::{IoStatus, check, open_socket, setsockopt, socklen_of};
@@ -38,7 +38,7 @@ impl Capture {
     pub(crate) fn open(interface: &Interface) -> io::Result<Self> {
         // Protocol 0: nothing is captured until the bind.
         let fd = open_socket(libc::AF_PACKET, libc::SOCK_RAW, 0)?;
-        let link_type = attach(&fd, &interface.name)?;
+        let link_type = attach(&fd, interface)?;
         log::debug!(
             "opened AF_PACKET capture on {} (fd {}, {link_type:?})",
             interface.name,
@@ -59,7 +59,7 @@ impl Capture {
     /// [`io::ErrorKind::NotFound`] while no interface bears the name; otherwise the attach
     /// failure.
     pub(crate) fn rebind(&mut self, interface: &Interface) -> io::Result<()> {
-        self.link_type = attach(&self.fd, &interface.name)?;
+        self.link_type = attach(&self.fd, interface)?;
         // The kernel parked ENETDOWN on the socket when the old interface died; consume it so
         // the first post-rebind recv surfaces frames, not the stale failure.
         match crate::sys::so_error(self.fd.as_raw_fd()) {
@@ -197,11 +197,11 @@ impl AsRawFd for Capture {
 }
 
 /// The filter goes in before the bind, so no frame is ever delivered unfiltered.
-fn attach(fd: &OwnedFd, if_name: &str) -> io::Result<LinkType> {
-    let ifindex = resolve_ifindex(if_name)?;
-    let link_type = link_type_of(fd, if_name)?;
+fn attach(fd: &OwnedFd, interface: &Interface) -> io::Result<LinkType> {
+    let addr = link_addr(interface)?;
+    let link_type = link_type_of(fd, &interface.name)?;
     install_filter(fd, link_type)?;
-    bind_interface(fd, link_addr(ifindex))?;
+    bind_interface(fd, addr)?;
     Ok(link_type)
 }
 
@@ -268,22 +268,19 @@ fn drop_outgoing_filter(classifier: &[BpfInsn]) -> Vec<BpfInsn> {
         .collect()
 }
 
-fn resolve_ifindex(if_name: &str) -> io::Result<c_int> {
-    let ifindex = if_index(if_name).ok_or_else(|| {
-        io::Error::new(
+fn link_addr(interface: &Interface) -> io::Result<libc::sockaddr_ll> {
+    if interface.ifindex == 0 {
+        return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!("interface {if_name} not found"),
-        )
-    })?;
-    c_int::try_from(ifindex).map_err(|_| io::Error::other("interface index too large"))
-}
-
-fn link_addr(ifindex: c_int) -> libc::sockaddr_ll {
+            format!("interface {} not found", interface.name),
+        ));
+    }
     // SAFETY: all-zero is a valid `sockaddr_ll`: integer and byte-array fields only.
     let mut addr: libc::sockaddr_ll = unsafe { core::mem::zeroed() };
     addr.sll_family = u16::try_from(libc::AF_PACKET).expect("AF_PACKET fits u16");
-    addr.sll_ifindex = ifindex;
-    addr
+    addr.sll_ifindex = c_int::try_from(interface.ifindex)
+        .map_err(|_| io::Error::other("interface index too large"))?;
+    Ok(addr)
 }
 
 fn set_ignore_outgoing(fd: &OwnedFd) -> io::Result<()> {
