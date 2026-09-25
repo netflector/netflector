@@ -63,6 +63,31 @@ pub(crate) const DROP_OUTGOING_PROLOGUE: [BpfInsn; 3] = [
     insn(0x0006, 0, 0, 0x0000_0000), // BPF_RET|BPF_K drop
 ];
 
+/// Prepended to the Ethernet classifier on Linux. The kernel moves an 802.1Q tag into
+/// `skb->vlan_tci` before packet sockets on the parent interface see the frame, so without this
+/// the classifier reads the inner ethertype and takes another VLAN's traffic as the parent's.
+/// Untagged and priority-tagged (VID 0) frames fall through.
+///
+/// ```text
+/// ld #vlan_tci             skb->vlan_tci via the ancillary offset
+/// and 0x0fff               keep the VLAN ID
+/// jeq 0 -> classifier      else fall through
+/// ret 0                    drop
+/// ```
+#[cfg(target_os = "linux")]
+pub(crate) const DROP_VLAN_TAGGED_PROLOGUE: [BpfInsn; 4] = [
+    // BPF_LD|BPF_W|BPF_ABS: A = vlan_tci, from the negative ancillary offset.
+    insn(
+        0x0020,
+        0,
+        0,
+        (libc::SKF_AD_OFF + libc::SKF_AD_VLAN_TAG).cast_unsigned(),
+    ),
+    insn(0x0054, 0, 0, 0x0000_0fff), // BPF_ALU|BPF_AND|BPF_K the VLAN ID
+    insn(0x0015, 1, 0, 0x0000_0000), // BPF_JMP|BPF_JEQ|BPF_K 0: jt=1 -> the classifier
+    insn(0x0006, 0, 0, 0x0000_0000), // BPF_RET|BPF_K drop
+];
+
 /// Accept IPv4 UDP or IPv6 UDP on a raw IP link (a Linux tunnel). No link header: the IP
 /// version nibble at offset 0 picks the layout.
 ///

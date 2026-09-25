@@ -11,7 +11,10 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use libc::{c_int, c_void};
 
 use super::Read;
-use super::filter::{BpfInsn, DROP_OUTGOING_PROLOGUE, ETHERNET_UDP_FILTER, RAW_IP_UDP_FILTER};
+use super::filter::{
+    BpfInsn, DROP_OUTGOING_PROLOGUE, DROP_VLAN_TAGGED_PROLOGUE, ETHERNET_UDP_FILTER,
+    RAW_IP_UDP_FILTER,
+};
 use crate::interface::if_index;
 use crate::logging::{WARN_WINDOW, log_rate};
 use crate::net::LinkType;
@@ -232,19 +235,27 @@ fn link_type_of(fd: &OwnedFd, if_name: &str) -> io::Result<LinkType> {
 /// bridge port returns our frames as received ones and gets past both; the dispatcher's echo
 /// drop catches those.
 fn install_filter(fd: &OwnedFd, link_type: LinkType) -> io::Result<()> {
-    let classifier: &[BpfInsn] = match link_type {
-        LinkType::Ethernet => &ETHERNET_UDP_FILTER,
-        LinkType::RawIp => &RAW_IP_UDP_FILTER,
-    };
+    let classifier = classifier(link_type);
     match set_ignore_outgoing(fd) {
-        Ok(()) => attach_filter(fd, classifier),
+        Ok(()) => attach_filter(fd, &classifier),
         Err(e) => {
             log::info!(
                 "PACKET_IGNORE_OUTGOING unavailable ({e}); dropping our own frames in the BPF \
                  filter"
             );
-            attach_filter(fd, &drop_outgoing_filter(classifier))
+            attach_filter(fd, &drop_outgoing_filter(&classifier))
         }
+    }
+}
+
+fn classifier(link_type: LinkType) -> Vec<BpfInsn> {
+    match link_type {
+        LinkType::Ethernet => DROP_VLAN_TAGGED_PROLOGUE
+            .iter()
+            .chain(&ETHERNET_UDP_FILTER)
+            .copied()
+            .collect(),
+        LinkType::RawIp => RAW_IP_UDP_FILTER.to_vec(),
     }
 }
 
