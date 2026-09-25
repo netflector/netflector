@@ -13,27 +13,40 @@ const fn insn(code: u16, jt: u8, jf: u8, k: u32) -> BpfInsn {
     BpfInsn { code, jt, jf, k }
 }
 
-/// Accept IPv4 UDP or IPv6 UDP on an Ethernet link, drop everything else in-kernel (no VLAN
-/// tags, no IPv6 extension headers).
+/// Accept IPv4 UDP or IPv6 UDP on an Ethernet link, drop everything else in-kernel (no IPv6
+/// extension headers). A priority tag (802.1Q with VLAN ID 0) belongs to the untagged network and
+/// is read past, the index register holding its length; a frame tagged for a VLAN is dropped.
 ///
 /// ```text
-/// ldh [12]                 load ethertype
-/// jeq 0x0800 -> IPv4@5     else fall through
-/// jeq 0x86dd -> IPv6 fall  else drop@8
-/// ldb [20]                 IPv6 next-header
-/// jeq 17     -> accept@7   else drop@8
-/// ldb [23]                 IPv4 protocol
-/// jeq 17     -> accept@7   else drop@8
-/// ret 0xffffffff           accept
-/// ret 0                    drop
+///  0 ldx #0                   no tag
+///  1 ldh [12]                 ethertype
+///  2 jeq 0x8100 -> 3          else -> 6
+///  3 ldh [14]                 tag control information
+///  4 jset 0x0fff -> drop@14   else fall through: VLAN ID 0
+///  5 ldx #4                   the tag's length
+///  6 ldh [x+12]               ethertype past any tag
+///  7 jeq 0x0800 -> IPv4@11    else fall through
+///  8 jeq 0x86dd -> IPv6 fall  else drop@14
+///  9 ldb [x+20]               IPv6 next-header
+/// 10 jeq 17     -> accept@13  else drop@14
+/// 11 ldb [x+23]               IPv4 protocol
+/// 12 jeq 17     -> accept@13  else drop@14
+/// 13 ret 0xffffffff           accept
+/// 14 ret 0                    drop
 /// ```
-pub(crate) const ETHERNET_UDP_FILTER: [BpfInsn; 9] = [
+pub(crate) const ETHERNET_UDP_FILTER: [BpfInsn; 15] = [
+    insn(0x0001, 0, 0, 0x0000_0000), // BPF_LDX|BPF_W|BPF_IMM X = 0
     insn(0x0028, 0, 0, 0x0000_000c), // BPF_LD|BPF_H|BPF_ABS  [12] ethertype
+    insn(0x0015, 0, 3, 0x0000_8100), // BPF_JMP|BPF_JEQ|BPF_K 0x8100 802.1Q
+    insn(0x0028, 0, 0, 0x0000_000e), // BPF_LD|BPF_H|BPF_ABS  [14] tag control information
+    insn(0x0045, 9, 0, 0x0000_0fff), // BPF_JMP|BPF_JSET|BPF_K a VLAN ID
+    insn(0x0001, 0, 0, 0x0000_0004), // BPF_LDX|BPF_W|BPF_IMM X = 4
+    insn(0x0048, 0, 0, 0x0000_000c), // BPF_LD|BPF_H|BPF_IND  [x+12] ethertype
     insn(0x0015, 3, 0, 0x0000_0800), // BPF_JMP|BPF_JEQ|BPF_K 0x0800 IPv4
     insn(0x0015, 0, 5, 0x0000_86dd), // BPF_JMP|BPF_JEQ|BPF_K 0x86dd IPv6
-    insn(0x0030, 0, 0, 0x0000_0014), // BPF_LD|BPF_B|BPF_ABS  [20] IPv6 next-header
+    insn(0x0050, 0, 0, 0x0000_0014), // BPF_LD|BPF_B|BPF_IND  [x+20] IPv6 next-header
     insn(0x0015, 2, 3, 0x0000_0011), // BPF_JMP|BPF_JEQ|BPF_K 17 UDP
-    insn(0x0030, 0, 0, 0x0000_0017), // BPF_LD|BPF_B|BPF_ABS  [23] IPv4 protocol
+    insn(0x0050, 0, 0, 0x0000_0017), // BPF_LD|BPF_B|BPF_IND  [x+23] IPv4 protocol
     insn(0x0015, 0, 1, 0x0000_0011), // BPF_JMP|BPF_JEQ|BPF_K 17 UDP
     insn(0x0006, 0, 0, 0xffff_ffff), // BPF_RET|BPF_K accept
     insn(0x0006, 0, 0, 0x0000_0000), // BPF_RET|BPF_K drop

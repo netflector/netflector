@@ -422,8 +422,9 @@ debug level.
 
 netflector reads untagged Ethernet frames carrying IPv4 or IPv6 UDP, and the bare IP packets of a
 link that has no Ethernet header: a loopback, or a WireGuard or tun tunnel (Linux 5.8 or later).
-Other link types are refused at startup. VLAN-tagged frames and IPv6 extension headers are not
-parsed, so configure the VLAN as its own interface (`vlan10`, `em0.10`) and name that as the entry's
+Other link types are refused at startup. A priority-tagged frame (VLAN ID 0) counts as untagged.
+Frames tagged for a VLAN are ignored and IPv6 extension headers are not parsed, so configure the
+VLAN as its own interface (`vlan10`, `em0.10`) and name that as the entry's
 `source_if` / `target_if` rather than the trunk.
 
 For SSDP, multicast reflection delivers **passive** discovery: devices' periodic `NOTIFY ssdp:alive`
