@@ -52,6 +52,8 @@ pub(crate) enum ParseError {
     NotUdp(u8),
     #[error("inconsistent length field")]
     BadLength,
+    #[error("frame tagged for VLAN {0}")]
+    VlanTagged(u16),
 }
 
 impl<'a> Packet<'a> {
@@ -80,10 +82,8 @@ struct LinkHeader<'a> {
 fn parse_link_header(link_type: LinkType, frame: &[u8]) -> Result<LinkHeader<'_>, ParseError> {
     match link_type {
         LinkType::Ethernet => {
-            let l3 = frame
-                .get(ETHERNET_HEADER_SIZE..)
-                .ok_or(ParseError::Truncated)?;
-            // The `get` above proved all 14 header bytes are present: the MAC slices can't panic.
+            let l3 = ethernet_l3(frame)?;
+            // `ethernet_l3` proved all 14 header bytes are present: the MAC slices can't panic.
             Ok(LinkHeader {
                 dst_mac: Some(read_mac(&frame[0..6])?),
                 src_mac: Some(read_mac(&frame[6..12])?),
@@ -104,6 +104,26 @@ fn parse_link_header(link_type: LinkType, frame: &[u8]) -> Result<LinkHeader<'_>
             src_mac: None,
             l3: frame,
         }),
+    }
+}
+
+const ETHERTYPE_VLAN: u16 = 0x8100;
+const VLAN_ID_MASK: u16 = 0x0fff;
+
+/// The bytes past the Ethernet header. An 802.1Q tag with VLAN ID 0 carries only a priority: the
+/// frame belongs to the untagged network, so the tag is skipped. A frame tagged for a VLAN is
+/// refused.
+fn ethernet_l3(frame: &[u8]) -> Result<&[u8], ParseError> {
+    let (header, rest) = frame
+        .split_at_checked(ETHERNET_HEADER_SIZE)
+        .ok_or(ParseError::Truncated)?;
+    if header[12..] != ETHERTYPE_VLAN.to_be_bytes() {
+        return Ok(rest);
+    }
+    let ([tci_hi, tci_lo, _, _], l3) = rest.split_first_chunk().ok_or(ParseError::Truncated)?;
+    match u16::from_be_bytes([*tci_hi, *tci_lo]) & VLAN_ID_MASK {
+        0 => Ok(l3),
+        vid => Err(ParseError::VlanTagged(vid)), // Cannot really happen due to BPF filter
     }
 }
 
@@ -563,6 +583,42 @@ mod tests {
     fn rejects_ethernet_frame_with_no_l3_bytes() {
         assert_eq!(
             Packet::parse(LinkType::Ethernet, &[0u8; ETHERNET_HEADER_SIZE]),
+            Err(ParseError::Truncated)
+        );
+    }
+
+    /// `frame` with an 802.1Q tag carrying `tci` inserted after the MACs.
+    fn tagged(frame: &[u8], tci: u16) -> Vec<u8> {
+        let [tci_hi, tci_lo] = tci.to_be_bytes();
+        [&frame[..12], &[0x81, 0x00, tci_hi, tci_lo], &frame[12..]].concat()
+    }
+
+    #[test]
+    fn reads_a_priority_tagged_frame_past_its_tag() {
+        let mut buf = [0u8; 64];
+        let n = valid_ethernet_ipv4(&mut buf);
+        let untagged = Packet::parse(LinkType::Ethernet, &buf[..n]).unwrap();
+        let frame = tagged(&buf[..n], 0xa000); // PCP 5, VID 0
+        assert_eq!(Packet::parse(LinkType::Ethernet, &frame), Ok(untagged));
+    }
+
+    #[test]
+    fn rejects_a_frame_tagged_for_a_vlan() {
+        let mut buf = [0u8; 64];
+        let n = valid_ethernet_ipv4(&mut buf);
+        let frame = tagged(&buf[..n], 0xa01e); // PCP 5, VID 30
+        assert_eq!(
+            Packet::parse(LinkType::Ethernet, &frame),
+            Err(ParseError::VlanTagged(30))
+        );
+    }
+
+    #[test]
+    fn rejects_a_vlan_tag_cut_short() {
+        let mut frame = [0u8; ETHERNET_HEADER_SIZE + 2];
+        frame[12..14].copy_from_slice(&[0x81, 0x00]);
+        assert_eq!(
+            Packet::parse(LinkType::Ethernet, &frame),
             Err(ParseError::Truncated)
         );
     }

@@ -604,6 +604,29 @@ fn pair_capture_drops_vlan_tagged_frames() -> io::Result<()> {
     }
 }
 
+// A priority-tagged frame (VID 0) is the parent's untagged traffic with a priority attached:
+// Linux, FreeBSD and macOS all deliver it to the parent's own sockets, so the capture takes it
+// too.
+#[test]
+fn pair_capture_takes_priority_tagged_frames() -> io::Result<()> {
+    let Some(pair) = InterfacePair::create() else {
+        return Ok(());
+    };
+    let iface = Interface::open(&pair.inject)?;
+    let injector = Capture::open(&pair.inject)?;
+    let mut peer = Capture::open(&pair.receive)?;
+    let dst = SocketAddr::from((Ipv4Addr::BROADCAST, INJECT_DST_PORT));
+
+    let payload = b"pair-priority-5";
+    inject_tagged(&iface.addrs, &injector, dst, payload, 0xa000)?; // PCP 5, VID 0
+
+    let captured =
+        capture_injected(&mut peer, dst.ip())?.expect("peer captured the priority-tagged frame");
+    assert_eq!(captured.payload, payload);
+    assert_eq!(captured.source.ip(), IpAddr::V4(pair.inject_v4()));
+    Ok(())
+}
+
 // Interface recreation gives the name a fresh kernel identity, stranding the old capture:
 // attached() flips false, rebind() re-attaches the same fd (Linux: bind(2) re-hooks the packet
 // socket from its unregistered state; BSD: BIOCSETIF re-attaches the detached descriptor), and
