@@ -6,7 +6,8 @@ use std::io;
 use std::sync::LazyLock;
 
 use crate::capture::Capture;
-use crate::interface::LOOPBACK_IFACE;
+use crate::dispatch::{CaptureKey, PacketDispatcher};
+use crate::interface::{Interface, LOOPBACK_IFACE};
 use crate::reactor::{Handler, Reactor, ReadyEvent};
 
 /// Something a test needs from the host and not every host offers. A test that finds one missing
@@ -104,8 +105,29 @@ pub(crate) fn skip(cap: Capability, reason: impl fmt::Display) {
 /// Open a capture on `if_name`, or `Ok(None)` (skip) when the host can't: no BPF access /
 /// `CAP_NET_RAW`, or the interface is absent. Other errors propagate for the caller to `?`.
 pub(crate) fn open_or_skip(if_name: &str) -> io::Result<Option<Capture>> {
-    match Capture::open(if_name) {
-        Ok(capture) => Ok(Some(capture)),
+    skip_unless_captured(
+        if_name,
+        Interface::open(if_name).and_then(|interface| Capture::open(&interface)),
+    )
+}
+
+/// [`open_or_skip`] into `dispatcher`, which keeps the capture.
+pub(crate) fn open_capture_or_skip(
+    dispatcher: &mut PacketDispatcher,
+    if_name: &str,
+) -> io::Result<Option<CaptureKey>> {
+    skip_unless_captured(if_name, dispatcher.open_capture(if_name))
+}
+
+/// A loopback capture in `dispatcher`, or `None` (skip) without `CAP_NET_RAW`.
+pub(crate) fn open_loopback_or_skip(dispatcher: &mut PacketDispatcher) -> Option<CaptureKey> {
+    open_capture_or_skip(dispatcher, LOOPBACK_IFACE)
+        .expect("unexpected loopback capture open failure")
+}
+
+fn skip_unless_captured<T>(if_name: &str, opened: io::Result<T>) -> io::Result<Option<T>> {
+    match opened {
+        Ok(opened) => Ok(Some(opened)),
         Err(e)
             if matches!(
                 e.kind(),
@@ -120,11 +142,6 @@ pub(crate) fn open_or_skip(if_name: &str) -> io::Result<Option<Capture>> {
         }
         Err(e) => Err(e),
     }
-}
-
-/// A loopback capture, or `None` (skip) without `CAP_NET_RAW`.
-pub(crate) fn open_loopback_or_skip() -> Option<Capture> {
-    open_or_skip(LOOPBACK_IFACE).expect("unexpected loopback capture open failure")
 }
 
 /// The tests that open a capture on the loopback interface hold this for their duration: every

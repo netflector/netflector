@@ -428,13 +428,10 @@ mod tests {
     #[cfg_attr(miri, ignore = "needs a real capture device")]
     fn macs_matchability_follows_the_target_link_framing() {
         let _serial = loopback_lock();
-        let Some(cap) = open_loopback_or_skip() else {
+        let mut dispatcher = PacketDispatcher::new();
+        let Some(target) = open_loopback_or_skip(&mut dispatcher) else {
             return;
         };
-        let mut dispatcher = PacketDispatcher::new();
-        let target = dispatcher
-            .add_capture(cap)
-            .expect("add the loopback capture");
         // No filter configured: nothing to refuse, whatever the framing.
         assert_eq!(
             require_macs_matchable(&dispatcher, None, target, LOOPBACK_IFACE),
@@ -457,13 +454,10 @@ mod tests {
     #[cfg_attr(miri, ignore = "needs a real capture device")]
     fn a_join_failure_no_event_clears_fails_the_build() {
         let _serial = loopback_lock();
-        let Some(cap) = open_loopback_or_skip() else {
+        let mut dispatcher = PacketDispatcher::new();
+        let Some(capture) = open_loopback_or_skip(&mut dispatcher) else {
             return;
         };
-        let mut dispatcher = PacketDispatcher::new();
-        let capture = dispatcher
-            .add_capture(cap)
-            .expect("add the loopback capture");
         // A unicast address is no group: the join is refused outright, whatever the platform.
         let not_a_group = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
         let result = require_group_join(

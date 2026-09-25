@@ -349,11 +349,8 @@ mod tests {
         rewrite: Box<dyn ReplyRewrite>,
         suppress: fn(&[u8]) -> bool,
     ) -> Option<LoopbackRig> {
-        let cap = open_loopback_or_skip()?;
         let mut dispatcher = PacketDispatcher::new();
-        let egress = dispatcher
-            .add_capture(cap)
-            .expect("add the loopback capture");
+        let egress = open_loopback_or_skip(&mut dispatcher)?;
         let reactor = Reactor::new().expect("reactor");
         let reflector = SimpleReflector::new(
             egress,
@@ -500,13 +497,10 @@ mod tests {
     #[cfg_attr(miri, ignore = "needs a real capture device")]
     fn a_fixed_unicast_delivery_ignores_the_captured_destination() {
         let _serial = loopback_lock();
-        let Some(cap) = open_loopback_or_skip() else {
+        let mut dispatcher = PacketDispatcher::new();
+        let Some(egress) = open_loopback_or_skip(&mut dispatcher) else {
             return;
         };
-        let mut dispatcher = PacketDispatcher::new();
-        let egress = dispatcher
-            .add_capture(cap)
-            .expect("add the loopback capture");
         let mut reactor = Reactor::new().expect("reactor");
         let mut reflector = SimpleReflector::new(
             egress,

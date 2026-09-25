@@ -15,7 +15,7 @@ use super::filter::{
     BpfInsn, DROP_OUTGOING_PROLOGUE, DROP_VLAN_TAGGED_PROLOGUE, ETHERNET_UDP_FILTER,
     RAW_IP_UDP_FILTER,
 };
-use crate::interface::if_index;
+use crate::interface::{Interface, if_index};
 use crate::logging::{WARN_WINDOW, log_rate};
 use crate::net::LinkType;
 use crate::sys::{IoStatus, check, open_socket, setsockopt, socklen_of};
@@ -30,35 +30,36 @@ pub(crate) struct Capture {
 }
 
 impl Capture {
-    /// Open an `AF_PACKET` capture bound to `if_name`.
+    /// Open an `AF_PACKET` capture bound to `interface`.
     ///
     /// # Errors
     /// An unknown interface, a hardware type neither Ethernet nor raw IP, or a failed
     /// socket/filter/bind.
-    pub(crate) fn open(if_name: &str) -> io::Result<Self> {
+    pub(crate) fn open(interface: &Interface) -> io::Result<Self> {
         // Protocol 0: nothing is captured until the bind.
         let fd = open_socket(libc::AF_PACKET, libc::SOCK_RAW, 0)?;
-        let link_type = attach(&fd, if_name)?;
+        let link_type = attach(&fd, &interface.name)?;
         log::debug!(
-            "opened AF_PACKET capture on {if_name} (fd {}, {link_type:?})",
+            "opened AF_PACKET capture on {} (fd {}, {link_type:?})",
+            interface.name,
             fd.as_raw_fd()
         );
         Ok(Self {
             fd,
             buf: vec![0u8; crate::net::MAX_FRAME_LEN].into_boxed_slice(),
             link_type,
-            name: if_name.into(),
+            name: interface.name.clone(),
         })
     }
 
-    /// Re-attach to the interface named at open, after it was recreated. Same fd, so the
+    /// Re-attach to `interface`, the one named at open, after it was recreated. Same fd, so the
     /// reactor's watch stays valid.
     ///
     /// # Errors
     /// [`io::ErrorKind::NotFound`] while no interface bears the name; otherwise the attach
     /// failure.
-    pub(crate) fn rebind(&mut self) -> io::Result<()> {
-        self.link_type = attach(&self.fd, &self.name)?;
+    pub(crate) fn rebind(&mut self, interface: &Interface) -> io::Result<()> {
+        self.link_type = attach(&self.fd, &interface.name)?;
         // The kernel parked ENETDOWN on the socket when the old interface died; consume it so
         // the first post-rebind recv surfaces frames, not the stale failure.
         match crate::sys::so_error(self.fd.as_raw_fd()) {
@@ -401,7 +402,7 @@ mod tests {
         let Some(mut tun) = Tun::create() else {
             return Ok(());
         };
-        let mut capture = Capture::open(&tun.name)?;
+        let mut capture = Capture::open(&Interface::open(&tun.name)?)?;
         assert_eq!(capture.link_type(), LinkType::RawIp);
         for packet in bare_datagrams(b"netflector-tun-in") {
             tun.far_end.write_all(&packet)?;
@@ -423,7 +424,7 @@ mod tests {
         let Some(tun) = Tun::create() else {
             return Ok(());
         };
-        let capture = Capture::open(&tun.name)?;
+        let capture = Capture::open(&Interface::open(&tun.name)?)?;
         for packet in bare_datagrams(b"netflector-tun-out") {
             capture.send(&packet)?;
             assert!(

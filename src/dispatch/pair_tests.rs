@@ -558,8 +558,8 @@ fn pair_injected_broadcast_is_captured_on_the_peer() -> io::Result<()> {
         return Ok(());
     };
     let iface = Interface::open(&pair.inject)?;
-    let injector = Capture::open(&pair.inject)?;
-    let mut peer = Capture::open(&pair.receive)?;
+    let injector = Capture::open(&iface)?;
+    let mut peer = Capture::open(&Interface::open(&pair.receive)?)?;
 
     let payload = b"pair-broadcast";
     let dst = SocketAddr::from((Ipv4Addr::BROADCAST, INJECT_DST_PORT));
@@ -581,8 +581,8 @@ fn pair_capture_drops_vlan_tagged_frames() -> io::Result<()> {
         return Ok(());
     };
     let iface = Interface::open(&pair.inject)?;
-    let injector = Capture::open(&pair.inject)?;
-    let mut peer = Capture::open(&pair.receive)?;
+    let injector = Capture::open(&iface)?;
+    let mut peer = Capture::open(&Interface::open(&pair.receive)?)?;
     let dst = SocketAddr::from((Ipv4Addr::BROADCAST, INJECT_DST_PORT));
 
     let tagged_payload = b"pair-vlan-30";
@@ -613,8 +613,8 @@ fn pair_capture_takes_priority_tagged_frames() -> io::Result<()> {
         return Ok(());
     };
     let iface = Interface::open(&pair.inject)?;
-    let injector = Capture::open(&pair.inject)?;
-    let mut peer = Capture::open(&pair.receive)?;
+    let injector = Capture::open(&iface)?;
+    let mut peer = Capture::open(&Interface::open(&pair.receive)?)?;
     let dst = SocketAddr::from((Ipv4Addr::BROADCAST, INJECT_DST_PORT));
 
     let payload = b"pair-priority-5";
@@ -637,7 +637,7 @@ fn pair_capture_rebinds_after_interface_recreation() -> io::Result<()> {
     let Some(pair) = InterfacePair::create() else {
         return Ok(());
     };
-    let mut peer = Capture::open(&pair.receive)?;
+    let mut peer = Capture::open(&Interface::open(&pair.receive)?)?;
     let index = if_index(&pair.receive).expect("receive ifindex");
     assert!(peer.attached(index), "a fresh capture reports attached");
 
@@ -648,7 +648,7 @@ fn pair_capture_rebinds_after_interface_recreation() -> io::Result<()> {
         "a capture on the destroyed interface reports detached"
     );
 
-    peer.rebind()?;
+    peer.rebind(&Interface::open(&pair.receive)?)?;
     assert!(
         peer.attached(index),
         "the re-bound capture reports attached"
@@ -656,7 +656,7 @@ fn pair_capture_rebinds_after_interface_recreation() -> io::Result<()> {
 
     // Delivery is live again: inject on the recreated far end, capture on the re-bound fd.
     let iface = Interface::open(&pair.inject)?;
-    let injector = Capture::open(&pair.inject)?;
+    let injector = Capture::open(&iface)?;
     let payload = b"pair-rebind";
     let dst = SocketAddr::from((Ipv4Addr::BROADCAST, INJECT_DST_PORT));
     inject(&iface.addrs, &injector, dst, payload)?;
@@ -682,10 +682,9 @@ fn pair_interface_table_recovers_after_interface_recreation() -> io::Result<()> 
         return Ok(());
     };
     let mut table = InterfaceTable::new();
-    let inject_key = table.find_or_add_interface(&pair.inject)?;
-    let injector = table.add_capture(Capture::open(&pair.inject)?, inject_key);
+    let injector = table.open_capture(&pair.inject)?;
+    let receiver = table.open_capture(&pair.receive)?;
     let receive_key = table.find_or_add_interface(&pair.receive)?;
-    let receiver = table.add_capture(Capture::open(&pair.receive)?, receive_key);
     // Record memberships on the receive side so its rebuild has groups to replay on the fresh socket.
     table.join_on(receive_key, IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)))?;
     table.join_on(
@@ -787,7 +786,7 @@ fn pair_injected_v6_multicast_reaches_a_joined_udp_socket() -> io::Result<()> {
         return Ok(());
     };
     let iface = Interface::open(&pair.inject)?;
-    let injector = Capture::open(&pair.inject)?;
+    let injector = Capture::open(&iface)?;
 
     let receiver = UdpSocket::bind(SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)))?;
     let all_nodes = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
@@ -821,8 +820,8 @@ fn pair_sources_v6_multicast_by_destination_scope() -> io::Result<()> {
         return Ok(());
     };
     let iface = Interface::open(&pair.inject)?;
-    let injector = Capture::open(&pair.inject)?;
-    let mut peer = Capture::open(&pair.receive)?;
+    let injector = Capture::open(&iface)?;
+    let mut peer = Capture::open(&Interface::open(&pair.receive)?)?;
     let payload = b"pair-scope";
 
     let site_group = Ipv6Addr::new(0xff05, 0, 0, 0, 0, 0, 0, 0x0c);

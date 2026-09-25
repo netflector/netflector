@@ -249,15 +249,16 @@ impl PacketDispatcher {
     /// Captures on the same interface share one [`Interface`](crate::interface::Interface) record.
     ///
     /// # Errors
-    /// A resolution syscall failure when first opening the capture's interface.
-    pub(crate) fn add_capture(&mut self, capture: Capture) -> io::Result<CaptureKey> {
-        let interface = self.table.find_or_add_interface(capture.if_name())?;
-        let key = self.table.add_capture(capture, interface);
-        self.lifecycle
-            .saw_interface(self.table.interface_index(interface).unwrap_or(0));
-        if let Some(name) = self.table.interface_name(interface) {
-            log::debug!("watching {name} as capture {key:?}");
-        }
+    /// A resolution syscall failure when first opening the interface, or the capture failing to
+    /// open.
+    pub(crate) fn open_capture(&mut self, name: &str) -> io::Result<CaptureKey> {
+        let key = self.table.open_capture(name)?;
+        let ifindex = self
+            .table
+            .interface_of(key)
+            .and_then(|interface| self.table.interface_index(interface));
+        self.lifecycle.saw_interface(ifindex.unwrap_or(0));
+        log::debug!("watching {name} as capture {key:?}");
         Ok(key)
     }
 
