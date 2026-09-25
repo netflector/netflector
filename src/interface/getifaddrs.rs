@@ -18,7 +18,7 @@ use crate::sys::{check, open_socket};
 /// # Errors
 /// `getifaddrs` failing or the v6 flag socket not opening. An unknown interface, or a host with
 /// no IPv6 stack, yields all-absent addresses instead.
-pub(super) fn resolve(if_name: &str) -> io::Result<(InterfaceAddresses, Option<u32>)> {
+pub(super) fn resolve(if_name: &str) -> io::Result<(InterfaceAddresses, Option<u32>, bool)> {
     let v6_sock = inet6_socket()?;
 
     let mut head: *mut libc::ifaddrs = ptr::null_mut();
@@ -29,6 +29,7 @@ pub(super) fn resolve(if_name: &str) -> io::Result<(InterfaceAddresses, Option<u
     let mut addrs = InterfaceAddresses::default();
     let mut v6_pick = V6Pick::default();
     let mut mtu: Option<u32> = None;
+    let mut loopback = false;
     let mut node = head;
     while !node.is_null() {
         // SAFETY: `node` points at a live list entry owned by `head`, valid until
@@ -50,6 +51,7 @@ pub(super) fn resolve(if_name: &str) -> io::Result<(InterfaceAddresses, Option<u
         if name.to_bytes() != if_name.as_bytes() {
             continue;
         }
+        loopback |= ifa.ifa_flags & libc::IFF_LOOPBACK.cast_unsigned() != 0;
         match family {
             libc::AF_INET => {
                 let v4 = read_v4(sa);
@@ -110,7 +112,7 @@ pub(super) fn resolve(if_name: &str) -> io::Result<(InterfaceAddresses, Option<u
 
     // SAFETY: `head` came from the matching `getifaddrs` and has not been freed yet.
     unsafe { libc::freeifaddrs(head) };
-    Ok((addrs, mtu))
+    Ok((addrs, mtu, loopback))
 }
 
 /// The `sa_len` bytes of a BSD sockaddr.
