@@ -492,15 +492,15 @@ fn capture_injected(peer: &mut Capture, dest: IpAddr) -> io::Result<Option<Captu
 }
 
 /// Build a datagram with the production builder (the egress's own addresses and MAC, per-scope
-/// v6 source) and inject it through the production send path.
-fn inject(
+/// v6 source) into `scratch`, returning its length.
+fn build_injected(
     addrs: &InterfaceAddresses,
     injector: &Capture,
     dst: SocketAddr,
     payload: &[u8],
-) -> io::Result<()> {
-    let mut scratch = [0u8; 2048];
-    let n = build_udp(
+    scratch: &mut [u8],
+) -> usize {
+    build_udp(
         addrs,
         injector.link_type(),
         dst,
@@ -510,10 +510,42 @@ fn inject(
         },
         64,
         payload,
-        &mut scratch,
+        scratch,
     )
-    .expect("build the injected frame");
+    .expect("build the injected frame")
+}
+
+/// Inject a [`build_injected`] datagram through the production send path.
+fn inject(
+    addrs: &InterfaceAddresses,
+    injector: &Capture,
+    dst: SocketAddr,
+    payload: &[u8],
+) -> io::Result<()> {
+    let mut scratch = [0u8; 2048];
+    let n = build_injected(addrs, injector, dst, payload, &mut scratch);
     injector.send(&scratch[..n])
+}
+
+/// [`inject`] with an 802.1Q tag carrying `tci` (PCP, DEI, VID) between the MACs and the
+/// ethertype.
+fn inject_tagged(
+    addrs: &InterfaceAddresses,
+    injector: &Capture,
+    dst: SocketAddr,
+    payload: &[u8],
+    tci: u16,
+) -> io::Result<()> {
+    let mut scratch = [0u8; 2048];
+    let n = build_injected(addrs, injector, dst, payload, &mut scratch);
+    let [tci_hi, tci_lo] = tci.to_be_bytes();
+    let tagged = [
+        &scratch[..12],
+        &[0x81, 0x00, tci_hi, tci_lo],
+        &scratch[12..n],
+    ]
+    .concat();
+    injector.send(&tagged)
 }
 
 // Injects a broadcast on one end and captures it on the other: the send and capture backends,
@@ -538,6 +570,38 @@ fn pair_injected_broadcast_is_captured_on_the_peer() -> io::Result<()> {
     assert_eq!(captured.dest.port(), INJECT_DST_PORT);
     assert_eq!(captured.source.ip(), IpAddr::V4(pair.inject_v4()));
     Ok(())
+}
+
+// A frame tagged for VLAN 30 belongs to that VLAN's interface, not to a capture on the parent.
+// Linux strips the tag before packet sockets see the frame, so only the filter can tell. The
+// untagged control sent after it bounds the wait.
+#[test]
+fn pair_capture_drops_vlan_tagged_frames() -> io::Result<()> {
+    let Some(pair) = InterfacePair::create() else {
+        return Ok(());
+    };
+    let iface = Interface::open(&pair.inject)?;
+    let injector = Capture::open(&pair.inject)?;
+    let mut peer = Capture::open(&pair.receive)?;
+    let dst = SocketAddr::from((Ipv4Addr::BROADCAST, INJECT_DST_PORT));
+
+    let tagged_payload = b"pair-vlan-30";
+    inject_tagged(&iface.addrs, &injector, dst, tagged_payload, 30)?;
+    let control_payload = b"pair-untagged";
+    inject(&iface.addrs, &injector, dst, control_payload)?;
+
+    loop {
+        let captured =
+            capture_injected(&mut peer, dst.ip())?.expect("peer captured the untagged control");
+        assert_ne!(
+            captured.payload, tagged_payload,
+            "the capture on {} took a frame tagged for VLAN 30",
+            pair.receive
+        );
+        if captured.payload == control_payload {
+            return Ok(());
+        }
+    }
 }
 
 // Interface recreation gives the name a fresh kernel identity, stranding the old capture:
