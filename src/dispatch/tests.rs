@@ -785,6 +785,67 @@ fn an_mdns_answer_goes_to_the_source_peers() -> io::Result<()> {
     Ok(())
 }
 
+/// `false`, with a note, where a `WireGuard` fixture can't run: not root, or the static FreeBSD
+/// build, whose process spawning crashes (see the pair tests).
+#[cfg(any(target_os = "freebsd", target_os = "linux"))]
+fn wg_can_run() -> bool {
+    if cfg!(all(target_os = "freebsd", target_feature = "crt-static")) {
+        skip(
+            Capability::WireGuard,
+            "process spawning crashes static FreeBSD binaries",
+        );
+        return false;
+    }
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    if unsafe { libc::geteuid() } != 0 {
+        skip(Capability::WireGuard, "interface creation requires root");
+        return false;
+    }
+    true
+}
+
+/// A new `WireGuard` interface, or `None` with a note. FreeBSD: `ifconfig wg create` prints the
+/// kernel-assigned name.
+#[cfg(target_os = "freebsd")]
+fn wg_create(_tag: &str) -> Option<String> {
+    let name = sh_output("ifconfig wg create");
+    if name.is_none() {
+        skip(Capability::WireGuard, "could not create a wg interface");
+    }
+    name
+}
+
+/// Linux: names are caller-chosen; `tag` keeps one fixture's interfaces apart from another's, the
+/// pid two test processes.
+#[cfg(target_os = "linux")]
+fn wg_create(tag: &str) -> Option<String> {
+    let name = format!("nf{tag}{}", std::process::id() % 100_000);
+    if sh(&format!("ip link add {name} type wireguard")) {
+        Some(name)
+    } else {
+        skip(Capability::WireGuard, "could not create a wg interface");
+        None
+    }
+}
+
+#[cfg(target_os = "freebsd")]
+fn wg_address_and_up(name: &str, cidr: &str) -> String {
+    format!("ifconfig {name} inet {cidr} up")
+}
+
+#[cfg(target_os = "linux")]
+fn wg_address_and_up(name: &str, cidr: &str) -> String {
+    format!("ip addr add {cidr} dev {name} && ip link set {name} up")
+}
+
+#[cfg(any(target_os = "freebsd", target_os = "linux"))]
+fn wg_destroy(name: &str) {
+    #[cfg(target_os = "freebsd")]
+    sh(&format!("ifconfig {name} destroy"));
+    #[cfg(target_os = "linux")]
+    sh(&format!("ip link del {name}"));
+}
+
 /// A `WireGuard` interface with two peers, one with an endpoint and one without, created as
 /// root with wg(8): from base on FreeBSD, wireguard-tools on Linux.
 #[cfg(any(target_os = "freebsd", target_os = "linux"))]
@@ -804,27 +865,12 @@ impl WgPeers {
     #[cfg(target_os = "linux")]
     const NO_ENDPOINT: i32 = libc::EDESTADDRREQ;
 
-    /// `None`, with a note, where the test can't run: not root, or the static FreeBSD build,
-    /// whose process spawning crashes (see the pair tests).
     fn create() -> Option<Self> {
-        if cfg!(all(target_os = "freebsd", target_feature = "crt-static")) {
-            skip(
-                Capability::WireGuard,
-                "process spawning crashes static FreeBSD binaries",
-            );
+        if !wg_can_run() {
             return None;
         }
-        // SAFETY: geteuid takes no arguments and cannot fail.
-        if unsafe { libc::geteuid() } != 0 {
-            skip(Capability::WireGuard, "interface creation requires root");
-            return None;
-        }
-        let Some(name) = Self::create_link() else {
-            skip(Capability::WireGuard, "could not create a wg interface");
-            return None;
-        };
         let this = Self {
-            name,
+            name: wg_create("wg")?,
             reachable: IpAddr::V4(Ipv4Addr::new(10, 99, 77, 2)),
             unreachable: IpAddr::V4(Ipv4Addr::new(10, 99, 77, 3)),
         };
@@ -838,46 +884,75 @@ impl WgPeers {
             reachable = this.reachable,
             unreachable = this.unreachable,
             endpoint = Self::ENDPOINT,
-            up = this.address_and_up(),
+            up = wg_address_and_up(&this.name, "10.99.77.1/24"),
         ));
         assert!(configured, "could not configure {}", this.name);
         Some(this)
-    }
-
-    /// FreeBSD: `ifconfig wg create` mints the interface and prints its kernel-assigned name.
-    #[cfg(target_os = "freebsd")]
-    fn create_link() -> Option<String> {
-        sh_output("ifconfig wg create")
-    }
-
-    #[cfg(target_os = "freebsd")]
-    fn address_and_up(&self) -> String {
-        format!("ifconfig {} inet 10.99.77.1/24 up", self.name)
-    }
-
-    /// Linux: names are caller-chosen; the pid keeps two test processes apart.
-    #[cfg(target_os = "linux")]
-    fn create_link() -> Option<String> {
-        let name = format!("nfwg{}", std::process::id() % 100_000);
-        sh(&format!("ip link add {name} type wireguard")).then_some(name)
-    }
-
-    #[cfg(target_os = "linux")]
-    fn address_and_up(&self) -> String {
-        format!(
-            "ip addr add 10.99.77.1/24 dev {0} && ip link set {0} up",
-            self.name
-        )
     }
 }
 
 #[cfg(any(target_os = "freebsd", target_os = "linux"))]
 impl Drop for WgPeers {
     fn drop(&mut self) {
-        #[cfg(target_os = "freebsd")]
-        sh(&format!("ifconfig {} destroy", self.name));
-        #[cfg(target_os = "linux")]
-        sh(&format!("ip link del {}", self.name));
+        wg_destroy(&self.name);
+    }
+}
+
+/// Two `WireGuard` interfaces peered with each other over the loopback: a frame sent on `near`
+/// arrives on `far` as received traffic.
+#[cfg(any(target_os = "freebsd", target_os = "linux"))]
+struct WgLink {
+    near: String,
+    far: String,
+}
+
+#[cfg(any(target_os = "freebsd", target_os = "linux"))]
+impl WgLink {
+    const NEAR: Ipv4Addr = Ipv4Addr::new(10, 99, 78, 1);
+    const FAR: Ipv4Addr = Ipv4Addr::new(10, 99, 78, 2);
+
+    fn create() -> Option<Self> {
+        if !wg_can_run() {
+            return None;
+        }
+        let near = wg_create("wgn")?;
+        let Some(far) = wg_create("wgf") else {
+            wg_destroy(&near);
+            return None;
+        };
+        let this = Self { near, far };
+        // Listen ports are kernel-chosen, so each peer's endpoint is read back from the other,
+        // after the interfaces are up: Linux binds the port only then.
+        let configured = sh(&format!(
+            "near_key=$(wg genkey); far_key=$(wg genkey); \
+             echo \"$near_key\" | wg set {near} private-key /dev/stdin listen-port 0; \
+             echo \"$far_key\" | wg set {far} private-key /dev/stdin listen-port 0; \
+             {near_up}; {far_up}; \
+             wg set {near} peer $(echo \"$far_key\" | wg pubkey) allowed-ips {far_ip}/32 \
+                 endpoint 127.0.0.1:$(wg show {far} listen-port); \
+             wg set {far} peer $(echo \"$near_key\" | wg pubkey) allowed-ips {near_ip}/32 \
+                 endpoint 127.0.0.1:$(wg show {near} listen-port)",
+            near = this.near,
+            far = this.far,
+            near_ip = Self::NEAR,
+            far_ip = Self::FAR,
+            near_up = wg_address_and_up(&this.near, &format!("{}/32", Self::NEAR)),
+            far_up = wg_address_and_up(&this.far, &format!("{}/32", Self::FAR)),
+        ));
+        assert!(
+            configured,
+            "could not configure {} and {}",
+            this.near, this.far
+        );
+        Some(this)
+    }
+}
+
+#[cfg(any(target_os = "freebsd", target_os = "linux"))]
+impl Drop for WgLink {
+    fn drop(&mut self) {
+        wg_destroy(&self.near);
+        wg_destroy(&self.far);
     }
 }
 
@@ -931,6 +1006,64 @@ fn a_peer_without_an_endpoint_costs_only_its_own_copy() -> io::Result<()> {
     assert_eq!(
         failed.map_err(|e| e.raw_os_error()),
         Err(Some(WgPeers::NO_ENDPOINT))
+    );
+    Ok(())
+}
+
+// A tunnel's frames carry no MAC for the echo drop, so one sent on it must not come back through
+// its own capture: it would route as the tunnel's ingress, and a reverse leg would re-emit it.
+// The far end receiving it shows the capture still sees what arrives.
+#[cfg(any(target_os = "freebsd", target_os = "linux"))]
+#[test]
+#[cfg_attr(miri, ignore = "needs a real capture device")]
+fn a_tunnel_capture_sees_what_arrives_but_not_what_it_sent() -> io::Result<()> {
+    let Some(link) = WgLink::create() else {
+        return Ok(());
+    };
+    let mut dispatcher = PacketDispatcher::new();
+    let mut reactor = Reactor::new()?;
+    let near = dispatcher.open_capture(&link.near)?;
+    let far = dispatcher.open_capture(&link.far)?;
+    let read_back = Rc::new(RefCell::new(Vec::new()));
+    let arrived = Rc::new(RefCell::new(Vec::new()));
+    dispatcher.register(
+        near,
+        Filter::default(),
+        Box::new(Recorder {
+            seen: read_back.clone(),
+        }),
+    );
+    dispatcher.register(
+        far,
+        Filter::default(),
+        Box::new(Recorder {
+            seen: arrived.clone(),
+        }),
+    );
+
+    let dst = SocketAddr::from((WgLink::FAR, 9003));
+    let source = DatagramSource::Egress { port: 40000 };
+    dispatcher.send_udp_to_peers(near, &[dst.ip()], dst, source, 64, b"across")?;
+    pump_until(
+        3,
+        || !arrived.borrow().is_empty(),
+        || {
+            dispatcher.drain_and_route(near, &mut reactor);
+            dispatcher.drain_and_route(far, &mut reactor);
+        },
+    );
+    assert_eq!(
+        *arrived.borrow(),
+        vec![b"across".to_vec()],
+        "{} did not receive what {} sent",
+        link.far,
+        link.near
+    );
+    assert!(
+        read_back.borrow().is_empty(),
+        "the capture on {} read back what it sent: {:?}",
+        link.near,
+        read_back.borrow()
     );
     Ok(())
 }

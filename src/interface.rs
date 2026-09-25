@@ -136,6 +136,9 @@ pub(crate) struct Interface {
     /// Outside [`InterfaceAddresses`] on purpose: that struct's equality drives the refresh
     /// diffing, and a bare MTU change must not read as an address change (which clears sessions).
     pub(crate) mtu: Option<u32>,
+    /// `IFF_LOOPBACK`: the one link whose capture must see what the host sends.
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    pub(crate) loopback: bool,
 }
 
 impl Interface {
@@ -149,6 +152,8 @@ impl Interface {
             ifindex: if_index(name).unwrap_or(0),
             addrs: InterfaceAddresses::default(),
             mtu: None,
+            #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+            loopback: false,
         };
         match iface.ifindex {
             0 => log::debug!("{name}: no kernel ifindex (interface absent)"),
@@ -164,7 +169,11 @@ impl Interface {
     /// Propagates a resolution syscall failure.
     pub(crate) fn refresh(&mut self) -> io::Result<AddressChange> {
         #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-        let (addrs, mtu) = self::getifaddrs::resolve(&self.name)?;
+        let (addrs, mtu) = {
+            let (addrs, mtu, loopback) = self::getifaddrs::resolve(&self.name)?;
+            self.loopback = loopback;
+            (addrs, mtu)
+        };
         #[cfg(target_os = "linux")]
         let (addrs, mtu) = self::rtnetlink::resolve(&self.name, self.ifindex)?;
         self.mtu = mtu;
@@ -372,6 +381,13 @@ mod tests {
         // exercises the full backend (the v4 path, and on Linux the rtnetlink round-trip).
         let addrs = Interface::open(LOOPBACK_IFACE).unwrap().addrs;
         assert_eq!(addrs.v4, Some(Ipv4Addr::LOCALHOST));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    #[test]
+    #[cfg_attr(miri, ignore = "resolves a real interface")]
+    fn resolves_the_loopback_flag() {
+        assert!(Interface::open(LOOPBACK_IFACE).unwrap().loopback);
     }
 
     #[test]

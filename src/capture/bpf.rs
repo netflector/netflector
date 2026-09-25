@@ -40,7 +40,7 @@ impl Capture {
     pub(crate) fn open(interface: &Interface) -> io::Result<Self> {
         let fd = open_bpf_device()?;
 
-        let link_type = attach(&fd, &interface.name)?;
+        let link_type = attach(&fd, interface)?;
 
         // Deliver each frame as it arrives instead of blocking until the buffer fills.
         let mut immediate: c_uint = 1;
@@ -75,7 +75,7 @@ impl Capture {
     /// # Errors
     /// The attach ioctl failure while no interface bears the name, or an unsupported link type.
     pub(crate) fn rebind(&mut self, interface: &Interface) -> io::Result<()> {
-        self.link_type = attach(&self.fd, &interface.name)?;
+        self.link_type = attach(&self.fd, interface)?;
         // The kernel reset its buffer at the re-attach; match it.
         self.filled = 0;
         self.offset = 0;
@@ -240,14 +240,14 @@ fn parse_record(record: &[u8]) -> io::Result<(Record, usize)> {
     Ok((Record::Frame(frame_start..frame_end), advance))
 }
 
-/// Attach `fd` to `if_name`: read the framing, set the see-sent policy, install the filter
+/// Attach `fd` to `interface`: read the framing, set the see-sent policy, install the filter
 /// (`BIOCSETF` also flushes anything captured since the bind). Per-descriptor settings stay in
 /// `open`; they survive re-attachment.
-fn attach(fd: &OwnedFd, if_name: &str) -> io::Result<LinkType> {
+fn attach(fd: &OwnedFd, interface: &Interface) -> io::Result<LinkType> {
     // SAFETY: all-zero is a valid `ifreq`: `ifr_name` is a byte array and the `ifr_ifru`
     // union holds only integers/pointers/sockaddr, none with an invalid zero bit pattern.
     let mut ifr: libc::ifreq = unsafe { core::mem::zeroed() };
-    let name = if_name.as_bytes();
+    let name = interface.name.as_bytes();
     if name.len() >= ifr.ifr_name.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -280,12 +280,12 @@ fn attach(fd: &OwnedFd, if_name: &str) -> io::Result<LinkType> {
         }
     };
 
-    // Ethernet: don't hand us our own egress (a hairpin bridge port returns it as received
-    // frames anyway; the dispatcher's echo drop catches those). DLT_NULL: see-sent stays on,
-    // since the BSD lo driver taps each frame once and tags it outbound; receive-only would
-    // silence the interface. Set both ways so a rebind onto different framing restores the
-    // right mode.
-    let mut see_sent: c_uint = c_uint::from(link_type == LinkType::DltNull);
+    // See-sent only on the loopback: lo(4) taps each looped frame once, on macOS as outbound, so
+    // receive-only would lose its traffic. Anywhere else our own sends stay out: a tunnel taps
+    // every frame it sends, and with no MAC the dispatcher's echo drop can't tell them from
+    // received ones (a hairpin bridge port hands Ethernet egress back as received frames
+    // anyway; the echo drop catches those). Set both ways: the mode outlives a rebind.
+    let mut see_sent = c_uint::from(interface.loopback);
     // SAFETY: BIOCSSEESENT reads a `c_uint`.
     unsafe { ioctl(fd, libc::BIOCSSEESENT, &mut see_sent) }?;
 
