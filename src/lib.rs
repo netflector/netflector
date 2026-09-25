@@ -26,7 +26,6 @@ pub use self::logging::init as init_logging;
 use std::ffi::OsString;
 use std::path::Path;
 
-use self::capture::Capture;
 use self::cli::Invocation;
 use self::config::Config;
 use self::dispatch::PacketDispatcher;
@@ -169,9 +168,8 @@ fn open_captures(config: &Config, dispatcher: &mut PacketDispatcher) -> Result<I
             if interfaces.key_for(name).is_some() {
                 continue;
             }
-            let capture = Capture::open(name).map_err(|e| Error::capture(name, e))?;
             let key = dispatcher
-                .add_capture(capture)
+                .open_capture(name)
                 .map_err(|e| Error::capture(name, e))?;
             interfaces.insert(name.to_owned(), key);
         }

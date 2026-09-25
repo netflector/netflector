@@ -127,8 +127,13 @@ impl InterfaceTable {
         }
     }
 
-    /// Startup-only.
-    pub(super) fn add_capture(&mut self, capture: Capture, interface: InterfaceKey) -> CaptureKey {
+    /// Startup-only. The capture opens from the interface record, resolved once per name.
+    ///
+    /// # Errors
+    /// A resolution syscall failure, or the capture failing to open.
+    pub(super) fn open_capture(&mut self, name: &str) -> io::Result<CaptureKey> {
+        let interface = self.find_or_add_interface(name)?;
+        let capture = Capture::open(&self.entries[interface.0 as usize].interface)?;
         let key = CaptureKey(u32::try_from(self.captures.len()).expect("capture count fits a u32"));
         self.captures.push(CaptureEntry {
             capture: Some(capture),
@@ -137,7 +142,7 @@ impl InterfaceTable {
             sent_packet: 0,
             sent: Vec::new(),
         });
-        key
+        Ok(key)
     }
 
     pub(super) fn interface_of(&self, capture: CaptureKey) -> Option<InterfaceKey> {
@@ -365,13 +370,15 @@ impl InterfaceTable {
     /// # Errors
     /// The re-bind syscall failure.
     pub(super) fn rebind_capture(&mut self, key: CaptureKey) -> io::Result<bool> {
-        match self
-            .captures
-            .get_mut(key.0 as usize)
-            .and_then(|entry| entry.capture.as_mut())
-        {
-            Some(capture) => capture.rebind().map(|()| true),
-            None => Ok(false),
+        match self.captures.get_mut(key.0 as usize) {
+            Some(CaptureEntry {
+                capture: Some(capture),
+                interface,
+                ..
+            }) => capture
+                .rebind(&self.entries[interface.0 as usize].interface)
+                .map(|()| true),
+            _ => Ok(false),
         }
     }
 

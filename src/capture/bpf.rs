@@ -15,6 +15,7 @@ use libc::{c_uint, c_ulong, c_void};
 
 use super::Read;
 use super::filter::{BpfInsn, DLT_NULL_UDP_FILTER, ETHERNET_UDP_FILTER};
+use crate::interface::Interface;
 use crate::libcex::bpf_wordalign;
 use crate::logging::{WARN_WINDOW, log_rate};
 use crate::net::LinkType;
@@ -31,15 +32,15 @@ pub(crate) struct Capture {
 }
 
 impl Capture {
-    /// Open a BPF capture bound to `if_name`.
+    /// Open a BPF capture bound to `interface`.
     ///
     /// # Errors
     /// No free BPF device, an unbindable interface, a link type neither Ethernet nor
     /// `DLT_NULL`, or a failed setup ioctl.
-    pub(crate) fn open(if_name: &str) -> io::Result<Self> {
+    pub(crate) fn open(interface: &Interface) -> io::Result<Self> {
         let fd = open_bpf_device()?;
 
-        let link_type = attach(&fd, if_name)?;
+        let link_type = attach(&fd, &interface.name)?;
 
         // Deliver each frame as it arrives instead of blocking until the buffer fills.
         let mut immediate: c_uint = 1;
@@ -52,7 +53,8 @@ impl Capture {
         unsafe { ioctl(&fd, libc::BIOCGBLEN, &mut blen) }?;
 
         log::debug!(
-            "opened BPF capture on {if_name} (fd {}, {link_type:?}, {blen}-byte buffer)",
+            "opened BPF capture on {} (fd {}, {link_type:?}, {blen}-byte buffer)",
+            interface.name,
             fd.as_raw_fd()
         );
         Ok(Self {
@@ -61,19 +63,19 @@ impl Capture {
             filled: 0,
             offset: 0,
             link_type,
-            name: if_name.into(),
+            name: interface.name.clone(),
         })
     }
 
-    /// Re-attach to the interface named at open. The kernel detaches the descriptor when its
-    /// interface is destroyed and never re-attaches it; `BIOCSETIF` from that state is the
+    /// Re-attach to `interface`, the one named at open. The kernel detaches the descriptor when
+    /// its interface is destroyed and never re-attaches it; `BIOCSETIF` from that state is the
     /// initial attach path and resets the kernel buffer. Same fd, so the reactor's watch stays
     /// valid.
     ///
     /// # Errors
     /// The attach ioctl failure while no interface bears the name, or an unsupported link type.
-    pub(crate) fn rebind(&mut self) -> io::Result<()> {
-        self.link_type = attach(&self.fd, &self.name)?;
+    pub(crate) fn rebind(&mut self, interface: &Interface) -> io::Result<()> {
+        self.link_type = attach(&self.fd, &interface.name)?;
         // The kernel reset its buffer at the re-attach; match it.
         self.filled = 0;
         self.offset = 0;

@@ -2,8 +2,6 @@ use std::net::Ipv4Addr;
 
 use super::*;
 #[cfg(target_os = "linux")]
-use crate::capture::Capture;
-#[cfg(target_os = "linux")]
 use crate::net::LinkType;
 use crate::reflector::NoRewrite;
 use crate::test_support::{loopback_lock, open_loopback_or_skip};
@@ -390,13 +388,10 @@ fn make_session_drops_at_the_session_cap() {
 #[cfg_attr(miri, ignore = "needs a real capture device")]
 fn a_search_without_a_source_mac_opens_a_session() {
     let _serial = loopback_lock();
-    let Some(target_cap) = open_loopback_or_skip() else {
+    let mut dispatcher = PacketDispatcher::new();
+    let Some(target) = open_loopback_or_skip(&mut dispatcher) else {
         return;
     };
-    let mut dispatcher = PacketDispatcher::new();
-    let target = dispatcher
-        .add_capture(target_cap)
-        .expect("add the loopback capture");
     let mut reactor = Reactor::new().expect("reactor");
     let mut reflector = SearchReflector::new(
         CaptureKey::from_u64(999),
@@ -431,7 +426,7 @@ fn a_session_listens_where_its_search_copies_come_from() -> std::io::Result<()> 
     };
     assert!(tun.add_address("fe80::1/64") && tun.add_address("fd00:99::1/64"));
     let mut dispatcher = PacketDispatcher::new();
-    let target = dispatcher.add_capture(Capture::open(&tun.name)?)?;
+    let target = dispatcher.open_capture(&tun.name)?;
     let mut reactor = Reactor::new()?;
     let peer: IpAddr = "fd00:99::2".parse().unwrap();
     let mut reflector = SearchReflector::new(
@@ -482,13 +477,10 @@ fn a_failed_reflect_rolls_back_the_session_registration() {
     // make_session makes the response registration before reflecting; if the reflect then fails, that
     // registration must be rolled back, not leaked. A real loopback target lets make_session succeed;
     // an oversized payload then makes build_udp reject the reflect deterministically.
-    let Some(target_cap) = open_loopback_or_skip() else {
+    let mut dispatcher = PacketDispatcher::new();
+    let Some(target) = open_loopback_or_skip(&mut dispatcher) else {
         return;
     };
-    let mut dispatcher = PacketDispatcher::new();
-    let target = dispatcher
-        .add_capture(target_cap)
-        .expect("add the loopback capture");
     let mut reactor = Reactor::new().expect("reactor");
     let mut reflector = SearchReflector::new(
         CaptureKey::from_u64(999), // synthetic source: no reply comes back in this test

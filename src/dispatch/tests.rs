@@ -1,7 +1,7 @@
 use super::lifecycle::RECONCILE_RETRY;
 use super::*;
 use crate::interface::LOOPBACK_IFACE;
-use crate::test_support::{Capability, loopback_lock, open_or_skip, skip};
+use crate::test_support::{Capability, loopback_lock, open_capture_or_skip, skip};
 use std::cell::{Cell, RefCell};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::rc::Rc;
@@ -451,18 +451,16 @@ impl PacketHandler for Echo {
 #[cfg_attr(miri, ignore = "needs a real capture device")]
 fn routes_a_captured_packet_to_a_matching_reflector() -> io::Result<()> {
     let _serial = loopback_lock();
-    let Some(ingress_cap) = open_or_skip(LOOPBACK_IFACE)? else {
+    let mut dispatcher = PacketDispatcher::new();
+    let Some(ingress) = open_capture_or_skip(&mut dispatcher, LOOPBACK_IFACE)? else {
         return Ok(());
     };
-    let Some(egress_cap) = open_or_skip(LOOPBACK_IFACE)? else {
+    let Some(egress) = open_capture_or_skip(&mut dispatcher, LOOPBACK_IFACE)? else {
         return Ok(());
     };
 
     let (_receiver, target, sender) = probe_rig()?;
 
-    let mut dispatcher = PacketDispatcher::new();
-    let ingress = dispatcher.add_capture(ingress_cap)?;
-    let egress = dispatcher.add_capture(egress_cap)?;
     // The egress capture resolves to its interface's address, the seam reflectors read.
     assert_eq!(
         dispatcher
@@ -525,7 +523,7 @@ fn group_sends_fan_out_to_the_peers_of_a_raw_ip_link() -> io::Result<()> {
         return Ok(());
     };
     let mut dispatcher = PacketDispatcher::new();
-    let egress = dispatcher.add_capture(Capture::open(&tun.name)?)?;
+    let egress = dispatcher.open_capture(&tun.name)?;
     let peers: [IpAddr; 3] = [
         "10.99.200.2".parse().unwrap(),
         "10.99.200.3".parse().unwrap(),
@@ -568,7 +566,7 @@ fn overlapping_peer_lists_deliver_to_each_peer_once() -> io::Result<()> {
         return Ok(());
     };
     let mut dispatcher = PacketDispatcher::new();
-    let egress = dispatcher.add_capture(Capture::open(&tun.name)?)?;
+    let egress = dispatcher.open_capture(&tun.name)?;
     let peer = |host: u8| IpAddr::V4(Ipv4Addr::new(10, 99, 200, host));
     let (x, y, z) = (peer(2), peer(3), peer(4));
     let group: SocketAddr = "239.255.90.90:9003".parse().unwrap();
@@ -603,7 +601,7 @@ fn peers_whose_frames_share_a_checksum_each_get_a_copy() -> io::Result<()> {
         return Ok(());
     };
     let mut dispatcher = PacketDispatcher::new();
-    let egress = dispatcher.add_capture(Capture::open(&tun.name)?)?;
+    let egress = dispatcher.open_capture(&tun.name)?;
     let peers: [IpAddr; 2] = ["10.0.1.2".parse().unwrap(), "10.1.1.1".parse().unwrap()];
     let group: SocketAddr = "239.255.90.90:9003".parse().unwrap();
     let source: SocketAddr = "192.0.2.7:40001".parse().unwrap();
@@ -632,6 +630,7 @@ fn peers_whose_frames_share_a_checksum_each_get_a_copy() -> io::Result<()> {
 fn a_unicast_mdns_answer_from_a_peer_goes_to_the_group() -> io::Result<()> {
     use std::io::Write as _;
 
+    use crate::interface::Interface;
     use crate::net::frame;
     use crate::net::mdns::{MDNS_GROUP_V4, MDNS_PORT};
     use crate::reflector::{InterfaceMap, mdns};
@@ -642,8 +641,8 @@ fn a_unicast_mdns_answer_from_a_peer_goes_to_the_group() -> io::Result<()> {
     };
     assert!(tun.add_address("10.99.200.1/24"));
     let mut dispatcher = PacketDispatcher::without_group_joins();
-    let source = dispatcher.add_capture(Capture::open(LOOPBACK_IFACE)?)?;
-    let target = dispatcher.add_capture(Capture::open(&tun.name)?)?;
+    let source = dispatcher.open_capture(LOOPBACK_IFACE)?;
+    let target = dispatcher.open_capture(&tun.name)?;
     let mut interfaces = InterfaceMap::default();
     interfaces.insert(LOOPBACK_IFACE.to_owned(), source);
     interfaces.insert(tun.name.clone(), target);
@@ -659,7 +658,7 @@ fn a_unicast_mdns_answer_from_a_peer_goes_to_the_group() -> io::Result<()> {
     .reflectors
     .remove(0);
     mdns::build(&entry, &interfaces, &mut dispatcher).expect("build the mDNS reflector");
-    let mut observer = Capture::open(LOOPBACK_IFACE)?;
+    let mut observer = Capture::open(&Interface::open(LOOPBACK_IFACE)?)?;
 
     // A DNS header with QR set: a response with no records.
     let answer = [0, 0, 0x84, 0, 0, 0, 0, 0, 0, 0, 0, 0];
@@ -712,6 +711,7 @@ fn a_unicast_mdns_answer_from_a_peer_goes_to_the_group() -> io::Result<()> {
 fn an_mdns_answer_goes_to_the_source_peers() -> io::Result<()> {
     use std::io::Write as _;
 
+    use crate::interface::Interface;
     use crate::net::frame;
     use crate::net::mdns::{MDNS_GROUP_V4, MDNS_PORT};
     use crate::reflector::{InterfaceMap, mdns};
@@ -722,8 +722,8 @@ fn an_mdns_answer_goes_to_the_source_peers() -> io::Result<()> {
     };
     assert!(tun.add_address("10.99.201.1/24"));
     let mut dispatcher = PacketDispatcher::without_group_joins();
-    let source = dispatcher.add_capture(Capture::open(LOOPBACK_IFACE)?)?;
-    let target = dispatcher.add_capture(Capture::open(&tun.name)?)?;
+    let source = dispatcher.open_capture(LOOPBACK_IFACE)?;
+    let target = dispatcher.open_capture(&tun.name)?;
     let mut interfaces = InterfaceMap::default();
     interfaces.insert(LOOPBACK_IFACE.to_owned(), source);
     interfaces.insert(tun.name.clone(), target);
@@ -740,7 +740,7 @@ fn an_mdns_answer_goes_to_the_source_peers() -> io::Result<()> {
     .reflectors
     .remove(0);
     mdns::build(&entry, &interfaces, &mut dispatcher).expect("build the mDNS reflector");
-    let mut observer = Capture::open(LOOPBACK_IFACE)?;
+    let mut observer = Capture::open(&Interface::open(LOOPBACK_IFACE)?)?;
 
     // A DNS header with QR set: a response with no records, sent to the group.
     let answer = [0, 0, 0x84, 0, 0, 0, 0, 0, 0, 0, 0, 0];
@@ -916,7 +916,7 @@ fn a_peer_without_an_endpoint_costs_only_its_own_copy() -> io::Result<()> {
     let endpoint = UdpSocket::bind(WgPeers::ENDPOINT)?;
     endpoint.set_read_timeout(Some(Duration::from_secs(2)))?;
     let mut dispatcher = PacketDispatcher::new();
-    let egress = dispatcher.add_capture(Capture::open(&wg.name)?)?;
+    let egress = dispatcher.open_capture(&wg.name)?;
     let group: SocketAddr = "239.255.90.90:9003".parse().unwrap();
     let source = DatagramSource::Egress { port: 40000 };
 
@@ -1311,14 +1311,13 @@ impl PacketHandler for Reentrant {
 #[cfg_attr(miri, ignore = "needs a real capture device")]
 fn reentrant_drain_on_the_same_ingress_hits_the_guard() -> io::Result<()> {
     let _serial = loopback_lock();
-    let Some(ingress_cap) = open_or_skip(LOOPBACK_IFACE)? else {
+    let mut dispatcher = PacketDispatcher::new();
+    let Some(ingress) = open_capture_or_skip(&mut dispatcher, LOOPBACK_IFACE)? else {
         return Ok(());
     };
 
     let (_receiver, target, sender) = probe_rig()?;
 
-    let mut dispatcher = PacketDispatcher::new();
-    let ingress = dispatcher.add_capture(ingress_cap)?;
     let calls = Rc::new(RefCell::new(0u32));
     dispatcher.register(
         ingress,
@@ -1384,18 +1383,16 @@ impl PacketHandler for CrossDrainer {
 #[cfg_attr(miri, ignore = "needs a real capture device")]
 fn reentrant_drain_on_another_ingress_trips_the_assert() -> io::Result<()> {
     let _serial = loopback_lock();
-    let Some(cap_a) = open_or_skip(LOOPBACK_IFACE)? else {
+    let mut dispatcher = PacketDispatcher::new();
+    let Some(a) = open_capture_or_skip(&mut dispatcher, LOOPBACK_IFACE)? else {
         return Ok(());
     };
-    let Some(cap_b) = open_or_skip(LOOPBACK_IFACE)? else {
+    let Some(b) = open_capture_or_skip(&mut dispatcher, LOOPBACK_IFACE)? else {
         return Ok(());
     };
 
     let (_receiver, target, sender) = probe_rig()?;
 
-    let mut dispatcher = PacketDispatcher::new();
-    let a = dispatcher.add_capture(cap_a)?;
-    let b = dispatcher.add_capture(cap_b)?;
     dispatcher.register(
         a,
         Filter {
@@ -1437,18 +1434,16 @@ fn reentrant_drain_on_another_ingress_trips_the_assert() -> io::Result<()> {
 #[cfg_attr(miri, ignore = "needs a real capture device")]
 fn reactor_drives_the_dispatcher_to_route_a_packet() -> io::Result<()> {
     let _serial = loopback_lock();
-    let Some(ingress_cap) = open_or_skip(LOOPBACK_IFACE)? else {
+    let mut dispatcher = PacketDispatcher::new();
+    let Some(ingress) = open_capture_or_skip(&mut dispatcher, LOOPBACK_IFACE)? else {
         return Ok(());
     };
-    let Some(egress_cap) = open_or_skip(LOOPBACK_IFACE)? else {
+    let Some(egress) = open_capture_or_skip(&mut dispatcher, LOOPBACK_IFACE)? else {
         return Ok(());
     };
 
     let (_receiver, target, sender) = probe_rig()?;
 
-    let mut dispatcher = PacketDispatcher::new();
-    let ingress = dispatcher.add_capture(ingress_cap)?;
-    let egress = dispatcher.add_capture(egress_cap)?;
     let seen = Rc::new(RefCell::new(Vec::new()));
     dispatcher.register(
         ingress,
@@ -1543,14 +1538,13 @@ impl PacketHandler for MidDrainProbe {
 #[cfg_attr(miri, ignore = "needs a real capture device")]
 fn ingress_resolves_and_drops_while_taken_out() -> io::Result<()> {
     let _serial = loopback_lock();
-    let Some(ingress_cap) = open_or_skip(LOOPBACK_IFACE)? else {
+    let mut dispatcher = PacketDispatcher::new();
+    let Some(ingress) = open_capture_or_skip(&mut dispatcher, LOOPBACK_IFACE)? else {
         return Ok(());
     };
 
     let (_receiver, target, sender) = probe_rig()?;
 
-    let mut dispatcher = PacketDispatcher::new();
-    let ingress = dispatcher.add_capture(ingress_cap)?;
     let result = Rc::new(RefCell::new(None));
     dispatcher.register(
         ingress,
