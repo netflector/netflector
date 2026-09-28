@@ -82,7 +82,7 @@ impl InterfaceTable {
         key
     }
 
-    /// Join `group` on `interface` and record it for the replay on later address changes.
+    /// Join `group` on `interface` and record it for the rebuild's replay.
     ///
     /// # Errors
     /// The joiner's OS error; see [`MulticastJoiner::join`].
@@ -257,12 +257,7 @@ impl InterfaceTable {
         else {
             return Ok(None);
         };
-        let change = entry.interface.refresh()?;
-        // A deferred join (no address of its family yet) may be viable now.
-        if let Some(ifindex) = NonZeroU32::new(entry.interface.ifindex) {
-            entry.joiner.rejoin(ifindex);
-        }
-        Ok(Some(change))
+        entry.interface.refresh().map(Some)
     }
 
     /// Every interface whose kernel identity no longer matches the cache: the identity moved
@@ -390,20 +385,13 @@ impl InterfaceTable {
         }
     }
 
-    /// Re-resolve every interface in place (the overflow response); a per-interface failure is
-    /// returned, not fatal.
+    /// Re-resolve every interface in place (an overflow, the periodic re-read); a per-interface
+    /// failure is returned, not fatal.
     pub(super) fn refresh_all(&mut self) -> Vec<(u32, io::Result<AddressChange>)> {
-        let results: Vec<(u32, io::Result<AddressChange>)> = self
-            .entries
+        self.entries
             .iter_mut()
             .map(|entry| (entry.interface.ifindex, entry.interface.refresh()))
-            .collect();
-        for entry in &mut self.entries {
-            if let Some(ifindex) = NonZeroU32::new(entry.interface.ifindex) {
-                entry.joiner.rejoin(ifindex);
-            }
-        }
-        results
+            .collect()
     }
 
     pub(super) fn capture_watches(&self) -> Vec<(RawFd, u64)> {
@@ -666,6 +654,35 @@ mod tests {
             "a parked interface's joiner stays socket-less through the overflow refresh"
         );
         Ok(())
+    }
+
+    // On a destroyed interface's dead index a retry would only fail.
+    #[test]
+    #[cfg_attr(miri, ignore = "resolves a real interface")]
+    fn refresh_by_ifindex_joins_nothing() -> io::Result<()> {
+        let (mut table, key) = loopback_with_a_pending_join()?;
+        let ifindex = table.entries[key.0 as usize].interface.ifindex;
+        table.refresh_by_ifindex(ifindex)?;
+        assert!(table.entries[key.0 as usize].joiner.test_socketless());
+        Ok(())
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "resolves a real interface")]
+    fn refresh_all_joins_nothing() -> io::Result<()> {
+        let (mut table, key) = loopback_with_a_pending_join()?;
+        table.refresh_all();
+        assert!(table.entries[key.0 as usize].joiner.test_socketless());
+        Ok(())
+    }
+
+    fn loopback_with_a_pending_join() -> io::Result<(InterfaceTable, InterfaceKey)> {
+        let mut table = InterfaceTable::new();
+        let key = table.find_or_add_interface(&InterfaceName::loopback())?;
+        table.entries[key.0 as usize]
+            .joiner
+            .record(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)));
+        Ok((table, key))
     }
 
     #[test]

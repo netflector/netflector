@@ -12,7 +12,8 @@ use crate::libcex::{GroupReq, MCAST_JOIN_GROUP};
 use crate::sys::{open_socket, setsockopt, sockaddr_for};
 
 /// How a [`rejoin`](MulticastJoiner::rejoin) landed; the three sum to the desired-group count.
-/// Only a deferral (no address of its family yet) has a known trigger that resolves it.
+/// Only a deferral (the index already names no interface) has a known resolution: the next
+/// reconcile.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub(crate) struct RejoinCounts {
     pub(crate) joined: usize,
@@ -70,9 +71,9 @@ impl MulticastJoiner {
     /// memberships by `(group, ifindex)`.
     ///
     /// # Errors
-    /// The OS error. `EADDRNOTAVAIL` (no address of that family yet) is deferrable:
-    /// [`rejoin`](Self::rejoin) retries on the next address event. Any other error is marked
-    /// reported: the caller's log is the report, and the replay repeats it at debug.
+    /// The OS error. A [deferrable](join_deferrable) one is left to the reconcile, which
+    /// re-joins on the interface's new index. Any other error is marked reported: the caller's
+    /// log is the report, and the replay repeats it at debug.
     pub(crate) fn join(&mut self, group: IpAddr, ifindex: NonZeroU32) -> io::Result<()> {
         if !self.joins {
             return Ok(());
@@ -96,8 +97,8 @@ impl MulticastJoiner {
         self.v6 = None;
     }
 
-    /// Re-attempt every recorded membership. A deferrable failure logs at debug (its address
-    /// event is coming); anything else warns once per failure episode and logs info when it
+    /// Re-attempt every recorded membership. A deferrable failure logs at debug (the next
+    /// reconcile retries it); anything else warns once per failure episode and logs info when it
     /// finally joins. `NonZeroU32`: `MCAST_JOIN_GROUP` on index 0 lets the kernel pick an
     /// arbitrary interface by route lookup, so callers skip explicitly while parked.
     pub(crate) fn rejoin(&mut self, ifindex: NonZeroU32) -> RejoinCounts {
@@ -182,8 +183,8 @@ pub(crate) fn join_capped(e: &io::Error) -> bool {
     matches!(e.raw_os_error(), Some(libc::ENOBUFS | libc::ETOOMANYREFS))
 }
 
-/// `EADDRNOTAVAIL`: the interface has no address of the group's family yet; the address event
-/// that supplies one resolves it.
+/// `EADDRNOTAVAIL`: on the BSDs, the index names no interface any more; the reconcile re-joins
+/// when it returns. Linux reports a dead index as `ENODEV`, which this doesn't cover.
 pub(crate) fn join_deferrable(e: &io::Error) -> bool {
     e.raw_os_error() == Some(libc::EADDRNOTAVAIL)
 }
@@ -218,8 +219,8 @@ mod tests {
     #[test]
     fn only_eaddrnotavail_is_a_deferrable_join() {
         let of = io::Error::from_raw_os_error;
-        assert!(join_deferrable(&of(libc::EADDRNOTAVAIL))); // an address event will fix it
-        assert!(!join_deferrable(&of(libc::ENODEV))); // nothing in particular will
+        assert!(join_deferrable(&of(libc::EADDRNOTAVAIL)));
+        assert!(!join_deferrable(&of(libc::ENODEV)));
         assert!(!join_deferrable(&of(libc::EINVAL)));
     }
 

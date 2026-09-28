@@ -290,11 +290,11 @@ impl PacketDispatcher {
         self.registrations.remove(key.0);
     }
 
-    /// Join `group` on the interface behind `capture`; the group is re-joined on the interface's
-    /// later address changes.
+    /// Join `group` on the interface behind `capture`; the reconcile re-joins it on a recreated
+    /// interface.
     ///
     /// # Errors
-    /// The join's OS error; [`join_deferrable`] tells a missing-address deferral from a hard
+    /// The join's OS error; [`join_deferrable`] tells an interface already gone from a hard
     /// failure.
     pub(crate) fn join_group(&mut self, capture: CaptureKey, group: IpAddr) -> io::Result<()> {
         let Some(interface) = self.table.interface_of(capture) else {

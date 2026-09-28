@@ -88,23 +88,7 @@ impl InterfacePair {
     fn create() -> Option<Self> {
         use std::sync::atomic::{AtomicU8, Ordering};
         static NEXT_SUBNET: AtomicU8 = AtomicU8::new(1);
-        // The fixture is built on ifconfig shell-outs, and a plain std::process::Command spawn
-        // SIGSEGVs in a statically-linked (+crt-static) binary on FreeBSD since rustc 1.96:
-        // std resolves `environ` via dlsym (null without a dynamic symbol table) and
-        // posix_spawn dereferences it to capture the inherited env -- the same std bug
-        // sys::process_env works around for the daemon's config path. FreeBSD coverage comes
-        // from the dynamic (debug) lane; the static lane keeps proving the +crt-static build
-        // for the rest of the suite.
-        if cfg!(all(target_os = "freebsd", target_feature = "crt-static")) {
-            skip(
-                Capability::Pair,
-                "process spawning crashes static FreeBSD binaries",
-            );
-            return None;
-        }
-        // SAFETY: geteuid takes no arguments and cannot fail.
-        if unsafe { libc::geteuid() } != 0 {
-            skip(Capability::Pair, "interface creation requires root");
+        if !can_create_interfaces() {
             return None;
         }
         // Held through create + settle so no parallel pair test creates an interface concurrently
@@ -412,6 +396,92 @@ impl Drop for InterfacePair {
         #[cfg(target_os = "freebsd")]
         run(&format!("ifconfig {} destroy", self.inject)); // removes both ends
     }
+}
+
+/// A freshly created interface, down and with no address of either family. `Drop` destroys it.
+struct BareInterface {
+    name: InterfaceName,
+}
+
+impl BareInterface {
+    fn create() -> Option<Self> {
+        if !can_create_interfaces() {
+            return None;
+        }
+        let Some(name) = Self::create_platform() else {
+            skip(Capability::Pair, "could not create an interface");
+            return None;
+        };
+        Some(Self {
+            name: name.parse().expect("the kernel assigned a valid name"),
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn create_platform() -> Option<String> {
+        let name = format!("nfbare{}", std::process::id() % 100_000);
+        run(&format!("ip link add {name} type veth peer name {name}p")).then_some(name)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn create_platform() -> Option<String> {
+        run_capture("ifconfig feth create")
+    }
+
+    #[cfg(target_os = "freebsd")]
+    fn create_platform() -> Option<String> {
+        run_capture("ifconfig epair create")
+    }
+
+    /// macOS joins a group only on an interface with the group's address family attached, which
+    /// an address does and its removal leaves in place.
+    #[cfg(target_os = "macos")]
+    fn attach_families(&self) -> bool {
+        let name = &self.name;
+        run(&format!(
+            "ifconfig {name} inet 192.0.2.1/32 && ifconfig {name} inet 192.0.2.1 -alias && \
+             ifconfig {name} inet6 fe80::1 prefixlen 64 && \
+             for a in $(ifconfig {name} | awk '$1 == \"inet6\" {{ sub(/%.*/, \"\", $2); print $2 }}'); \
+             do ifconfig {name} inet6 \"$a\" -alias; done"
+        ))
+    }
+
+    fn destroy(&self) {
+        #[cfg(target_os = "linux")]
+        run(&format!("ip link del {}", self.name));
+        #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+        run(&format!("ifconfig {} destroy", self.name));
+    }
+}
+
+impl Drop for BareInterface {
+    fn drop(&mut self) {
+        self.destroy();
+    }
+}
+
+/// Root, and a binary that can spawn the platform tooling; skips with a note otherwise.
+fn can_create_interfaces() -> bool {
+    // The fixtures are built on ifconfig shell-outs, and a plain std::process::Command spawn
+    // SIGSEGVs in a statically-linked (+crt-static) binary on FreeBSD since rustc 1.96:
+    // std resolves `environ` via dlsym (null without a dynamic symbol table) and
+    // posix_spawn dereferences it to capture the inherited env -- the same std bug
+    // sys::process_env works around for the daemon's config path. FreeBSD coverage comes
+    // from the dynamic (debug) lane; the static lane keeps proving the +crt-static build
+    // for the rest of the suite.
+    if cfg!(all(target_os = "freebsd", target_feature = "crt-static")) {
+        skip(
+            Capability::Pair,
+            "process spawning crashes static FreeBSD binaries",
+        );
+        return false;
+    }
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    if unsafe { libc::geteuid() } != 0 {
+        skip(Capability::Pair, "interface creation requires root");
+        return false;
+    }
+    true
 }
 
 /// True once `name` is administratively up with a running link layer. `getifaddrs` is portable
@@ -1015,5 +1085,41 @@ fn pair_joins_multicast_groups_idempotently() -> io::Result<()> {
     joiner.join(mdns_v6, inject_ifindex)?;
     joiner.join(mdns_v4, inject_ifindex)?;
     joiner.join(mdns_v6, inject_ifindex)?;
+    Ok(())
+}
+
+// What the join logic relies on: a join by index needs no address, even on a down interface, and
+// an index that names no interface fails with a per-platform errno.
+#[test]
+fn a_join_needs_no_address_and_fails_only_on_a_dead_index() -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    const DEAD_INDEX: i32 = libc::ENODEV;
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    const DEAD_INDEX: i32 = libc::EADDRNOTAVAIL;
+    // The destroy frees a kernel-assigned name, as in InterfacePair::recreate.
+    let _serialize = PAIR_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(bare) = BareInterface::create() else {
+        return Ok(());
+    };
+    #[cfg(target_os = "macos")]
+    assert!(
+        bare.attach_families(),
+        "could not attach the address families"
+    );
+    let addrs = Interface::open(&bare.name)?.addrs;
+    assert!(!addrs.has_v4() && !addrs.has_v6());
+    let ifindex = NonZeroU32::new(if_index(&bare.name).expect("the interface exists"))
+        .expect("an ifindex is nonzero");
+    let groups: [IpAddr; 2] = ["224.0.0.251".parse().unwrap(), "ff02::fb".parse().unwrap()];
+    for group in groups {
+        MulticastJoiner::new().join(group, ifindex)?;
+    }
+    bare.destroy();
+    for group in groups {
+        let err = MulticastJoiner::new()
+            .join(group, ifindex)
+            .expect_err("the index names no interface");
+        assert_eq!(err.raw_os_error(), Some(DEAD_INDEX), "{group}");
+    }
     Ok(())
 }

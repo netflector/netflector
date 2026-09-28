@@ -179,7 +179,7 @@ pub(crate) enum BuildError {
     RequiredFamilyUnavailable { interface: String, family: IpFamily },
     #[error("macs can never match on interface \"{0}\": its link carries no MAC addresses")]
     MacsUnmatchable(String),
-    /// For a reason no later event clears; a deferrable failure is retried instead.
+    /// For a reason no later event clears; a deferrable failure is left to the reconcile.
     #[error("cannot join {group} on interface \"{interface}\": {reason}")]
     GroupJoin {
         group: IpAddr,
@@ -340,7 +340,8 @@ fn group_addrs(family: AddressFamily, port: u16, v4: Ipv4Addr, v6: &[Ipv6Addr]) 
     groups
 }
 
-/// A [deferrable](join_deferrable) failure only logs: it retries on the next address change.
+/// A [deferrable](join_deferrable) failure only logs: the interface is already gone, and the
+/// reconcile re-joins when it returns.
 ///
 /// # Errors
 /// [`BuildError::GroupJoin`].
@@ -355,7 +356,7 @@ fn require_group_join(
         Ok(()) => log::debug!("{protocol}: joined {group} on {interface}"),
         Err(e) if join_deferrable(&e) => {
             log::debug!(
-                "{protocol}: join {group} on {interface} deferred (no address of its family yet): {e}"
+                "{protocol}: join {group} on {interface} deferred (the interface is gone): {e}"
             );
         }
         Err(e) => {

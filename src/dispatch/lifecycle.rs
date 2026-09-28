@@ -253,20 +253,18 @@ impl InterfaceLifecycle {
                 }
             }
             match table.rebind_interface(stale.key, stale.cur) {
-                // Both are retried on every address event, but only a deferral has a trigger to
-                // promise.
                 Ok(counts) => {
                     if counts.failed > 0 {
                         log::warn!(
                             "{} group membership(s) on {name} did not re-join; that traffic is \
-                             not reflected until they do",
+                             not reflected",
                             counts.failed
                         );
                     }
                     if counts.deferred > 0 {
                         log::warn!(
-                            "{} group membership(s) on {name} not re-joined yet; retrying \
-                             on its next address event",
+                            "{} group membership(s) on {name} not re-joined yet: the interface \
+                             is gone again; retrying when it returns",
                             counts.deferred
                         );
                     }
