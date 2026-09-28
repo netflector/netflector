@@ -534,6 +534,64 @@ fn routes_a_captured_packet_to_a_matching_reflector() -> io::Result<()> {
     Ok(())
 }
 
+// A renamed interface parks under its old name while its capture stays bound to the kernel
+// interface, as this loopback capture does.
+#[test]
+#[cfg_attr(miri, ignore = "needs a real capture device")]
+fn a_parked_ingress_routes_nothing_until_it_returns() -> io::Result<()> {
+    let _serial = loopback_lock();
+    let mut reactor = Reactor::new()?;
+    let mut dispatcher = PacketDispatcher::new();
+    let Some(ingress) = open_capture_or_skip(&mut dispatcher, &InterfaceName::loopback())? else {
+        return Ok(());
+    };
+    let (_receiver, target, sender) = probe_rig()?;
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    dispatcher.register(
+        ingress,
+        Filter {
+            dst_port: Some(target.port().into()),
+            ..Filter::default()
+        },
+        Box::new(Recorder { seen: seen.clone() }),
+    );
+    let key = dispatcher
+        .table
+        .interface_of(ingress)
+        .expect("the capture has an interface");
+    dispatcher
+        .table
+        .set_test_name(key, &"nf-gone0".parse().unwrap());
+    dispatcher.reconcile_interfaces(&mut reactor);
+    assert!(dispatcher.table.any_absent());
+
+    sender.send_to(b"parked", target)?;
+    pump_until(
+        1,
+        || !seen.borrow().is_empty(),
+        || dispatcher.drain_and_route(ingress, &mut reactor),
+    );
+    assert!(seen.borrow().is_empty(), "a parked ingress routed a frame");
+
+    dispatcher
+        .table
+        .set_test_name(key, &InterfaceName::loopback());
+    dispatcher.reconcile_interfaces(&mut reactor);
+    sender.send_to(b"returned", target)?;
+    pump_until(
+        2,
+        || !seen.borrow().is_empty(),
+        || dispatcher.drain_and_route(ingress, &mut reactor),
+    );
+    let seen = seen.borrow();
+    assert!(!seen.is_empty(), "routing did not resume");
+    assert!(
+        seen.iter().all(|payload| payload == b"returned"),
+        "the frame that arrived while parked was routed late"
+    );
+    Ok(())
+}
+
 /// Every `sood` datagram out of the tun's far end within a second: source, destination, TTL.
 #[cfg(target_os = "linux")]
 fn sood_deliveries(

@@ -421,6 +421,9 @@ impl PacketDispatcher {
         };
         let link = capture.link_type(); // hoisted: next_frame's borrow would pin `capture`
         let fd = capture.as_raw_fd();
+        // A rename parks the entry but keeps the kernel interface, so the capture still reads.
+        // Its frames are drained, since the wait is level-triggered, but never routed.
+        let parked = self.table.ifindex_of(ingress) == Some(0);
         let mut drained = 0u32;
         let mut oversized = 0u64;
         loop {
@@ -447,6 +450,10 @@ impl PacketDispatcher {
                     break;
                 }
             };
+            if parked {
+                drained += 1;
+                continue;
+            }
             match Packet::parse(link, frame) {
                 Ok(packet) => {
                     log::trace!(
