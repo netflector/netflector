@@ -46,6 +46,17 @@ struct InterfaceEntry {
     joiner: MulticastJoiner,
 }
 
+impl InterfaceEntry {
+    /// Re-resolve the interface, then retry the joins waiting for its address family.
+    fn refresh(&mut self) -> io::Result<AddressChange> {
+        let change = self.interface.refresh();
+        if let Some(ifindex) = NonZeroU32::new(self.interface.ifindex) {
+            self.joiner.retry_waiting(ifindex);
+        }
+        change
+    }
+}
+
 pub(super) struct InterfaceTable {
     entries: Vec<InterfaceEntry>,
     captures: Vec<CaptureEntry>,
@@ -257,7 +268,7 @@ impl InterfaceTable {
         else {
             return Ok(None);
         };
-        entry.interface.refresh().map(Some)
+        entry.refresh().map(Some)
     }
 
     /// Every interface whose kernel identity no longer matches the cache: the identity moved
@@ -390,7 +401,7 @@ impl InterfaceTable {
     pub(super) fn refresh_all(&mut self) -> Vec<(u32, io::Result<AddressChange>)> {
         self.entries
             .iter_mut()
-            .map(|entry| (entry.interface.ifindex, entry.interface.refresh()))
+            .map(|entry| (entry.interface.ifindex, entry.refresh()))
             .collect()
     }
 
@@ -434,6 +445,13 @@ mod tests {
             ifindex: u32,
         ) {
             self.entries[interface.0 as usize].interface.ifindex = ifindex;
+        }
+
+        /// Whether a join on `interface` waits for its address family, and whether one failed.
+        #[cfg(target_os = "macos")]
+        pub(in crate::dispatch) fn test_join_state(&self, interface: InterfaceKey) -> (bool, bool) {
+            let joiner = &self.entries[interface.0 as usize].joiner;
+            (joiner.test_waiting(), joiner.test_reported())
         }
 
         /// Rename an entry out from under its kernel interface, standing in for a vanished
@@ -656,7 +674,8 @@ mod tests {
         Ok(())
     }
 
-    // On a destroyed interface's dead index a retry would only fail.
+    // A refresh retries only a join waiting for its address family: on a destroyed interface's
+    // dead index any other retry would only fail.
     #[test]
     #[cfg_attr(miri, ignore = "resolves a real interface")]
     fn refresh_by_ifindex_joins_nothing() -> io::Result<()> {

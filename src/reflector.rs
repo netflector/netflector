@@ -24,6 +24,7 @@ use thiserror::Error;
 use crate::config::{AddressFamily, PeerList, Reflector};
 use crate::dispatch::{
     CaptureKey, DatagramSource, MessageType, PacketDispatcher, join_capped, join_deferrable,
+    join_waits_for_family,
 };
 use crate::interface::{InterfaceAddresses, InterfaceName};
 use crate::linear_map::LinearMap;
@@ -179,7 +180,8 @@ pub(crate) enum BuildError {
     RequiredFamilyUnavailable { interface: String, family: IpFamily },
     #[error("macs can never match on interface \"{0}\": its link carries no MAC addresses")]
     MacsUnmatchable(String),
-    /// For a reason no later event clears; a deferrable failure is left to the reconcile.
+    /// For a reason no later event clears; a deferrable failure is left to the reconcile, and one
+    /// waiting for the interface's address family to a refresh.
     #[error("cannot join {group} on interface \"{interface}\": {reason}")]
     GroupJoin {
         group: IpAddr,
@@ -323,7 +325,16 @@ fn open_pair(
             (source, &reflector.source_if),
             (target, &reflector.target_if),
         ] {
-            require_group_join(dispatcher, capture, group.ip(), protocol, interface)?;
+            // Both sides have a required family's address, so only a default entry's
+            // best-effort IPv6 groups can wait.
+            require_group_join(
+                dispatcher,
+                capture,
+                group.ip(),
+                protocol,
+                interface,
+                log::Level::Info,
+            )?;
         }
     }
     Ok((source, target))
@@ -341,7 +352,8 @@ fn group_addrs(family: AddressFamily, port: u16, v4: Ipv4Addr, v6: &[Ipv6Addr]) 
 }
 
 /// A [deferrable](join_deferrable) failure only logs: the interface is already gone, and the
-/// reconcile re-joins when it returns.
+/// reconcile re-joins when it returns. So does one [waiting for the interface's address
+/// family](join_waits_for_family), at `wait_log_level`, which a refresh retries.
 ///
 /// # Errors
 /// [`BuildError::GroupJoin`].
@@ -351,9 +363,21 @@ fn require_group_join(
     group: IpAddr,
     protocol: &str,
     interface: &str,
+    wait_log_level: log::Level,
 ) -> Result<(), BuildError> {
     match dispatcher.join_group(capture, group) {
         Ok(()) => log::debug!("{protocol}: joined {group} on {interface}"),
+        Err(e) if join_waits_for_family(&e, group) => {
+            let family = if group.is_ipv4() {
+                IpFamily::V4
+            } else {
+                IpFamily::V6
+            };
+            log::log!(
+                wait_log_level,
+                "{protocol}: joining {group} on {interface} once it has an {family} address ({e})"
+            );
+        }
         Err(e) if join_deferrable(&e) => {
             log::debug!(
                 "{protocol}: join {group} on {interface} deferred (the interface is gone): {e}"
@@ -461,6 +485,7 @@ mod tests {
             not_a_group,
             "test",
             LOOPBACK_IFACE,
+            log::Level::Info,
         );
         assert!(matches!(
             result,

@@ -19,7 +19,7 @@ mod pair_tests;
 pub(crate) use self::counters::{MessageType, Outcome};
 pub(crate) use self::datagram::DatagramSource;
 pub(crate) use self::dial_context::{DialContext, DialProxyKey};
-pub(crate) use self::multicast::{join_capped, join_deferrable};
+pub(crate) use self::multicast::{join_capped, join_deferrable, join_waits_for_family};
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -295,7 +295,7 @@ impl PacketDispatcher {
     ///
     /// # Errors
     /// The join's OS error; [`join_deferrable`] tells an interface already gone from a hard
-    /// failure.
+    /// failure, [`join_waits_for_family`] one without the group's address family yet.
     pub(crate) fn join_group(&mut self, capture: CaptureKey, group: IpAddr) -> io::Result<()> {
         let Some(interface) = self.table.interface_of(capture) else {
             log::warn!("join_group: capture {capture:?} unknown; group {group} not joined");

@@ -38,12 +38,14 @@ pub(crate) fn build(
 
     let groups = udp.groups.as_deref().unwrap_or(&[]);
     for group in groups {
+        // Unlike a best-effort default family, a relay group is one the user named.
         require_group_join(
             dispatcher,
             ingress,
             *group,
             "UDP relay",
             &reflector.source_if,
+            log::Level::Warn,
         )?;
     }
 

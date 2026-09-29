@@ -404,11 +404,14 @@ struct BareInterface {
 }
 
 impl BareInterface {
-    fn create() -> Option<Self> {
+    /// `unit` names the macOS feth: each test keeps its own, because a destroyed feth's name gets
+    /// the same kernel interface back, with what it last held, including memberships
+    /// mDNSResponder took. Linux and FreeBSD name theirs by process and kernel.
+    fn create(unit: u16) -> Option<Self> {
         if !can_create_interfaces() {
             return None;
         }
-        let Some(name) = Self::create_platform() else {
+        let Some(name) = Self::create_platform(unit) else {
             skip(Capability::Pair, "could not create an interface");
             return None;
         };
@@ -418,18 +421,19 @@ impl BareInterface {
     }
 
     #[cfg(target_os = "linux")]
-    fn create_platform() -> Option<String> {
+    fn create_platform(_unit: u16) -> Option<String> {
         let name = format!("nfbare{}", std::process::id() % 100_000);
         run(&format!("ip link add {name} type veth peer name {name}p")).then_some(name)
     }
 
     #[cfg(target_os = "macos")]
-    fn create_platform() -> Option<String> {
-        run_capture("ifconfig feth create")
+    fn create_platform(unit: u16) -> Option<String> {
+        let name = format!("feth{unit}");
+        run(&format!("ifconfig {name} create")).then_some(name)
     }
 
     #[cfg(target_os = "freebsd")]
-    fn create_platform() -> Option<String> {
+    fn create_platform(_unit: u16) -> Option<String> {
         run_capture("ifconfig epair create")
     }
 
@@ -1098,7 +1102,7 @@ fn a_join_needs_no_address_and_fails_only_on_a_dead_index() -> io::Result<()> {
     const DEAD_INDEX: i32 = libc::EADDRNOTAVAIL;
     // The destroy frees a kernel-assigned name, as in InterfacePair::recreate.
     let _serialize = PAIR_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-    let Some(bare) = BareInterface::create() else {
+    let Some(bare) = BareInterface::create(900) else {
         return Ok(());
     };
     #[cfg(target_os = "macos")]
@@ -1121,5 +1125,73 @@ fn a_join_needs_no_address_and_fails_only_on_a_dead_index() -> io::Result<()> {
             .expect_err("the index names no interface");
         assert_eq!(err.raw_os_error(), Some(DEAD_INDEX), "{group}");
     }
+    Ok(())
+}
+
+// Groups nothing on the host holds, so an existing membership can't make a join succeed early.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_join_waits_for_the_address_family_and_a_refresh_retries_it() -> io::Result<()> {
+    use super::multicast::join_waits_for_family;
+
+    let _serialize = PAIR_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(bare) = BareInterface::create(901) else {
+        return Ok(());
+    };
+    let mut table = InterfaceTable::new();
+    let key = table.find_or_add_interface(&bare.name)?;
+    for group in ["239.255.77.77", "ff02::77"] {
+        let group: IpAddr = group.parse().unwrap();
+        let err = table
+            .join_on(key, group)
+            .expect_err("the interface has neither address family");
+        assert!(join_waits_for_family(&err, group), "{group}: {err}");
+    }
+    assert_eq!(table.test_join_state(key), (true, false));
+    assert!(
+        run(&format!("ifconfig {} inet 192.0.2.2/32", bare.name))
+            && run(&format!(
+                "ifconfig {} inet6 fe80::2 prefixlen 64",
+                bare.name
+            ))
+    );
+    table.refresh_by_ifindex(if_index(&bare.name).expect("the interface exists"))?;
+    assert_eq!(table.test_join_state(key), (false, false));
+    Ok(())
+}
+
+// The case that stopped startup: a default entry on a macOS interface with IPv4 but no IPv6.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_default_mdns_entry_builds_on_an_interface_without_ipv6() -> io::Result<()> {
+    use crate::interface::LOOPBACK_IFACE;
+    use crate::reflector::{InterfaceMap, mdns};
+    use crate::test_support::loopback_lock;
+
+    use super::PacketDispatcher;
+
+    let _serialize = PAIR_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let _loopback = loopback_lock();
+    let Some(bare) = BareInterface::create(902) else {
+        return Ok(());
+    };
+    assert!(run(&format!("ifconfig {} inet 192.0.2.3/32", bare.name)));
+    let mut dispatcher = PacketDispatcher::new();
+    let mut interfaces = InterfaceMap::default();
+    for name in [bare.name.clone(), InterfaceName::loopback()] {
+        let key = dispatcher.open_capture(&name)?;
+        interfaces.insert(name, key);
+    }
+    let entry = crate::config::Config::from_sources(
+        Some(&format!(
+            "[reflectors.a]\nsource_if = \"{}\"\ntarget_if = \"{LOOPBACK_IFACE}\"\nmdns = true\n",
+            bare.name
+        )),
+        std::iter::empty(),
+    )
+    .expect("a valid configuration")
+    .reflectors
+    .remove(0);
+    mdns::build(&entry, &interfaces, &mut dispatcher).expect("the IPv6 groups wait");
     Ok(())
 }

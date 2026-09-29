@@ -268,6 +268,13 @@ impl InterfaceLifecycle {
                             counts.deferred
                         );
                     }
+                    if counts.waiting > 0 {
+                        log::info!(
+                            "{} group membership(s) on {name} wait until it has an address of \
+                             their family",
+                            counts.waiting
+                        );
+                    }
                 }
                 Err(e) => {
                     log::warn!("re-resolving {name} failed: {e}; will retry");

@@ -11,20 +11,24 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use crate::libcex::{GroupReq, MCAST_JOIN_GROUP};
 use crate::sys::{open_socket, setsockopt, sockaddr_for};
 
-/// How a [`rejoin`](MulticastJoiner::rejoin) landed; the three sum to the desired-group count.
-/// Only a deferral (the index already names no interface) has a known resolution: the next
-/// reconcile.
+/// How a [`rejoin`](MulticastJoiner::rejoin) landed; the four sum to the desired-group count. A
+/// deferral (the index already names no interface) resolves at the next reconcile, a waiting
+/// group at the refresh after the interface gets its address family.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub(crate) struct RejoinCounts {
     pub(crate) joined: usize,
     pub(crate) deferred: usize,
+    pub(crate) waiting: usize,
     pub(crate) failed: usize,
 }
 
 /// `reported`: the current failure episode has been logged; cleared when the group joins.
+/// `waiting`: refused until the interface has the group's address family; every refresh retries
+/// it.
 struct Desired {
     group: IpAddr,
     reported: bool,
+    waiting: bool,
 }
 
 /// One interface's memberships: a socket per family, opened on first join. The caller passes the
@@ -63,6 +67,7 @@ impl MulticastJoiner {
         self.desired.push(Desired {
             group,
             reported: false,
+            waiting: false,
         });
         self.desired.len() - 1
     }
@@ -72,18 +77,20 @@ impl MulticastJoiner {
     ///
     /// # Errors
     /// The OS error. A [deferrable](join_deferrable) one is left to the reconcile, which
-    /// re-joins on the interface's new index. Any other error is marked reported: the caller's
-    /// log is the report, and the replay repeats it at debug.
+    /// re-joins on the interface's new index, and one [waiting for the interface's address
+    /// family](join_waits_for_family) to the next refresh. Any other error is marked reported:
+    /// the caller's log is the report, and the replay repeats it at debug.
     pub(crate) fn join(&mut self, group: IpAddr, ifindex: NonZeroU32) -> io::Result<()> {
         if !self.joins {
             return Ok(());
         }
         let index = self.record(group);
         let result = self.apply(group, ifindex);
-        if let Err(e) = &result
-            && !join_deferrable(e)
-        {
-            self.desired[index].reported = true;
+        match &result {
+            Ok(()) => self.desired[index].waiting = false,
+            Err(e) if join_waits_for_family(e, group) => self.desired[index].waiting = true,
+            Err(e) if !join_deferrable(e) => self.desired[index].reported = true,
+            Err(_) => {}
         }
         result
     }
@@ -98,16 +105,36 @@ impl MulticastJoiner {
     }
 
     /// Re-attempt every recorded membership. A deferrable failure logs at debug (the next
-    /// reconcile retries it); anything else warns once per failure episode and logs info when it
-    /// finally joins. `NonZeroU32`: `MCAST_JOIN_GROUP` on index 0 lets the kernel pick an
-    /// arbitrary interface by route lookup, so callers skip explicitly while parked.
+    /// reconcile retries it), as does one waiting for the interface's address family (the next
+    /// refresh does); anything else warns once per failure episode and logs info when it finally
+    /// joins. `NonZeroU32`: `MCAST_JOIN_GROUP` on index 0 lets the kernel pick an arbitrary
+    /// interface by route lookup, so callers skip explicitly while parked.
     pub(crate) fn rejoin(&mut self, ifindex: NonZeroU32) -> RejoinCounts {
+        self.replay(ifindex, false)
+    }
+
+    /// Re-attempt the memberships waiting for the interface's address family, as
+    /// [`rejoin`](Self::rejoin) would.
+    pub(crate) fn retry_waiting(&mut self, ifindex: NonZeroU32) {
+        self.replay(ifindex, true);
+    }
+
+    fn replay(&mut self, ifindex: NonZeroU32, only_waiting: bool) -> RejoinCounts {
         let mut counts = RejoinCounts::default();
         for i in 0..self.desired.len() {
+            if only_waiting && !self.desired[i].waiting {
+                continue;
+            }
             let group = self.desired[i].group;
             match self.apply(group, ifindex) {
                 Ok(()) => {
                     counts.joined += 1;
+                    if std::mem::take(&mut self.desired[i].waiting) {
+                        log::info!(
+                            "joined {group} on ifindex {ifindex}: the interface has that address \
+                             family now"
+                        );
+                    }
                     if self.desired[i].reported {
                         self.desired[i].reported = false;
                         log::info!(
@@ -116,12 +143,23 @@ impl MulticastJoiner {
                         );
                     }
                 }
+                Err(e) if join_waits_for_family(&e, group) => {
+                    if !self.desired[i].waiting {
+                        self.desired[i].waiting = true;
+                        log::debug!(
+                            "join of {group} on ifindex {ifindex} waits for the interface's \
+                             address family: {e}"
+                        );
+                    }
+                    counts.waiting += 1;
+                }
                 Err(e) if join_deferrable(&e) => {
                     log::debug!("re-join of {group} on ifindex {ifindex} deferred: {e}");
                     counts.deferred += 1;
                 }
                 Err(e) => {
                     counts.failed += 1;
+                    self.desired[i].waiting = false;
                     if self.desired[i].reported {
                         log::debug!("re-join of {group} on ifindex {ifindex} still failing: {e}");
                     } else {
@@ -189,6 +227,18 @@ pub(crate) fn join_deferrable(e: &io::Error) -> bool {
     e.raw_os_error() == Some(libc::EADDRNOTAVAIL)
 }
 
+/// macOS refuses a join until the interface has the group's address family, which the first
+/// address of that family attaches: `EAFNOSUPPORT`, or `EINVAL` for an IPv6 group on an interface
+/// IPv6 was never attached to. Linux and FreeBSD join without it.
+pub(crate) fn join_waits_for_family(e: &io::Error, group: IpAddr) -> bool {
+    cfg!(target_os = "macos")
+        && match e.raw_os_error() {
+            Some(libc::EAFNOSUPPORT) => true,
+            Some(libc::EINVAL) => group.is_ipv6(),
+            _ => false,
+        }
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
@@ -217,6 +267,36 @@ mod tests {
     }
 
     #[test]
+    fn a_join_waits_for_its_address_family_only_on_macos() {
+        let of = io::Error::from_raw_os_error;
+        let v4 = IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251));
+        let v6 = IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb));
+        let macos = cfg!(target_os = "macos");
+        assert_eq!(join_waits_for_family(&of(libc::EAFNOSUPPORT), v4), macos);
+        assert_eq!(join_waits_for_family(&of(libc::EAFNOSUPPORT), v6), macos);
+        assert_eq!(join_waits_for_family(&of(libc::EINVAL), v6), macos);
+        assert!(!join_waits_for_family(&of(libc::EINVAL), v4));
+        assert!(!join_waits_for_family(&of(libc::EADDRNOTAVAIL), v6));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "resolves a real interface")]
+    fn retry_waiting_replays_only_the_waiting_groups() {
+        let mut joiner = MulticastJoiner::new();
+        let ifindex = loopback_ifindex();
+        joiner.record(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)));
+        joiner.retry_waiting(ifindex);
+        assert!(
+            joiner.test_socketless(),
+            "a group not waiting is left alone"
+        );
+        joiner.desired[0].waiting = true;
+        joiner.retry_waiting(ifindex);
+        assert!(!joiner.test_socketless(), "the waiting group is retried");
+        assert!(!joiner.test_waiting());
+    }
+
+    #[test]
     fn only_eaddrnotavail_is_a_deferrable_join() {
         let of = io::Error::from_raw_os_error;
         assert!(join_deferrable(&of(libc::EADDRNOTAVAIL)));
@@ -229,6 +309,15 @@ mod tests {
         /// from the interface table's parked-interface tests, hence `pub(in crate::dispatch)`.
         pub(in crate::dispatch) fn test_socketless(&self) -> bool {
             self.v4.is_none() && self.v6.is_none()
+        }
+
+        pub(in crate::dispatch) fn test_waiting(&self) -> bool {
+            self.desired.iter().any(|desired| desired.waiting)
+        }
+
+        #[cfg(target_os = "macos")]
+        pub(in crate::dispatch) fn test_reported(&self) -> bool {
+            self.desired.iter().any(|desired| desired.reported)
         }
     }
 
