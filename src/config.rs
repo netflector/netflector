@@ -15,7 +15,7 @@ mod value;
 
 pub(crate) use self::error::ConfigError;
 pub(crate) use self::value::{
-    AddressFamily, GroupList, LogLevel, PeerList, PortList, ReflectorName,
+    AddressFamily, GroupList, LogLevel, PeerList, PortList, Principal, ReflectorName, RunAs,
 };
 
 use std::net::IpAddr;
@@ -229,6 +229,8 @@ impl TryFrom<(String, RawReflector)> for Reflector {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Config {
+    /// The account to run as once the captures are open; `None` keeps the starting account.
+    pub(crate) user: Option<RunAs>,
     pub(crate) debug_memory_interval: Option<Duration>,
     pub(crate) counter_interval: Option<Duration>,
     pub(crate) reflectors: Vec<Reflector>,
@@ -314,6 +316,7 @@ impl TryFrom<RawConfig> for Config {
         check_conflicts(&reflectors)?;
 
         Ok(Config {
+            user: raw.user,
             debug_memory_interval: interval_from(
                 raw.debug_memory_interval_secs,
                 "debug_memory_interval_secs",

@@ -50,6 +50,71 @@ impl<'de> Deserialize<'de> for LogLevel {
     }
 }
 
+/// One side of a [`RunAs`]: a name to look up, or a number taken as is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Principal {
+    Name(String),
+    Id(u32),
+}
+
+impl Principal {
+    fn parse(text: &str) -> Option<Self> {
+        if text.is_empty() || text.contains(':') {
+            return None;
+        }
+        Some(match text.parse() {
+            Ok(id) => Self::Id(id),
+            Err(_) => Self::Name(text.to_owned()),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("expected USER or USER:GROUP, each a name or a number")]
+pub(crate) struct ParseRunAsError;
+
+/// The account `user` names. Parsing checks only the form; the account is looked up at startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunAs {
+    user: Principal,
+    group: Option<Principal>,
+}
+
+impl RunAs {
+    pub(crate) fn user(&self) -> &Principal {
+        &self.user
+    }
+
+    pub(crate) fn group(&self) -> Option<&Principal> {
+        self.group.as_ref()
+    }
+}
+
+impl FromStr for RunAs {
+    type Err = ParseRunAsError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (user, group) = match s.split_once(':') {
+            Some((user, group)) => (user, Some(group)),
+            None => (s, None),
+        };
+        Ok(Self {
+            user: Principal::parse(user).ok_or(ParseRunAsError)?,
+            group: group
+                .map(|group| Principal::parse(group).ok_or(ParseRunAsError))
+                .transpose()?,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for RunAs {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum AddressFamily {
     #[default]
@@ -208,6 +273,34 @@ pub(crate) type PeerList = UniqueList<Peers>;
 mod tests {
     use super::*;
     use crate::unique_list::ListError;
+
+    #[test]
+    fn a_spec_is_a_user_and_an_optional_group_by_name_or_number() {
+        assert_eq!(
+            "netflector".parse::<RunAs>().unwrap(),
+            RunAs {
+                user: Principal::Name("netflector".to_owned()),
+                group: None,
+            }
+        );
+        assert_eq!(
+            "65534:65534".parse::<RunAs>().unwrap(),
+            RunAs {
+                user: Principal::Id(65534),
+                group: Some(Principal::Id(65534)),
+            }
+        );
+        assert_eq!(
+            "netflector:nogroup".parse::<RunAs>().unwrap(),
+            RunAs {
+                user: Principal::Name("netflector".to_owned()),
+                group: Some(Principal::Name("nogroup".to_owned())),
+            }
+        );
+        for bad in ["", ":", "user:", ":group", "a:b:c"] {
+            assert_eq!(bad.parse::<RunAs>(), Err(ParseRunAsError), "{bad:?}");
+        }
+    }
 
     #[test]
     fn peer_list_takes_unicast_addresses_only() {

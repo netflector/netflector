@@ -85,13 +85,15 @@ class NativeBackend(Backend):
         # Keep the fabric and logs, but don't leave root daemons running unwatched.
         self._kill_procs()
 
-    def _spawn(self, role: str, command: list[str]) -> None:
+    def _spawn(self, role: str, command: list[str], extra_env: dict[str, str] | None = None) -> None:
         self.remove(role)
         print(f"+ {format_command(command)}", flush=True)
         # Scrub NETFLECTOR_* so the daemon sees only its config file, as it would in the docker
         # backend's clean container env -- a stray host NETFLECTOR_LOG_LEVEL (or worse, an env
-        # reflector entry) must not alter the system under test.
+        # reflector entry) must not alter the system under test. What the harness means to set
+        # goes back in after the scrub.
         env = {key: value for key, value in os.environ.items() if not key.startswith("NETFLECTOR_")}
+        env.update(extra_env or {})
         out = open(self.logdir / f"{role}.out", "wb")
         err = open(self.logdir / f"{role}.err", "wb")
         try:
@@ -101,7 +103,8 @@ class NativeBackend(Backend):
             err.close()
 
     def start_netflector(self, config_path: Path) -> None:
-        self._spawn("netflector", self._netflector_command(config_path))
+        extra_env = {"NETFLECTOR_USER": self.args.user} if self.args.user else None
+        self._spawn("netflector", self._netflector_command(config_path), extra_env)
 
     def start_probe(
         self, role: str, segment: str, ifname: str, probe_args: list[str], *,

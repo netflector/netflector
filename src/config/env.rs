@@ -6,7 +6,7 @@ use std::str::FromStr;
 
 use super::error::{ConfigError, ParseBoolError, ParseValueError, RequiredField};
 use super::raw::{RawConfig, RawReflector};
-use super::value::{AddressFamily, GroupList, LogLevel, PeerList, PortList, ReflectorName};
+use super::value::{AddressFamily, GroupList, LogLevel, PeerList, PortList, ReflectorName, RunAs};
 use crate::interface::InterfaceName;
 use crate::net::mac::MacSet;
 use crate::net::mdns::services::ServiceList;
@@ -112,6 +112,7 @@ impl PartialReflector {
 pub(super) fn parse_env(
     vars: impl IntoIterator<Item = (String, String)>,
 ) -> Result<RawConfig, ConfigError> {
+    let mut user = None;
     let mut debug_memory_interval_secs = None;
     let mut counters_interval_secs = None;
     let mut partials: BTreeMap<String, PartialReflector> = BTreeMap::new();
@@ -126,6 +127,11 @@ pub(super) fn parse_env(
                 // Validated here so `--check-config` rejects a bad level; the value itself is
                 // read by `log_level_from_env` before the full parse.
                 env_value::<LogLevel>(&value, &key)?;
+                continue;
+            }
+            "USER" => {
+                log::trace!("env {key} = {value}");
+                user = Some(env_value::<RunAs>(&value, &key)?);
                 continue;
             }
             "DEBUG_MEMORY_INTERVAL_SECS" => {
@@ -166,6 +172,7 @@ pub(super) fn parse_env(
     }
     Ok(RawConfig {
         _log_level: None,
+        user,
         debug_memory_interval_secs,
         counters_interval_secs,
         reflectors,
@@ -443,6 +450,7 @@ mod tests {
     fn env_overrides_file_globals() {
         let toml = r#"
             log_level = "info"
+            user = "netflector"
             debug_memory_interval_secs = 10
             [reflectors.tv]
             source_if = "a"
@@ -451,6 +459,7 @@ mod tests {
         "#;
         let vars = env(&[
             ("NETFLECTOR_LOG_LEVEL", "error"),
+            ("NETFLECTOR_USER", "65534:65534"),
             ("NETFLECTOR_DEBUG_MEMORY_INTERVAL_SECS", "20"),
         ]);
         assert_eq!(
@@ -462,6 +471,7 @@ mod tests {
             cfg.debug_memory_interval,
             Some(std::time::Duration::from_secs(20))
         );
+        assert_eq!(cfg.user, Some("65534:65534".parse().unwrap()));
     }
 
     #[test]
@@ -567,6 +577,19 @@ mod tests {
     }
 
     #[test]
+    fn user_is_still_an_entry_tag() {
+        let cfg = from_env(&[
+            ("NETFLECTOR_USER", "65534:65534"),
+            ("NETFLECTOR_USER_SOURCE_IF", "a"),
+            ("NETFLECTOR_USER_TARGET_IF", "b"),
+            ("NETFLECTOR_USER_MDNS", "true"),
+        ])
+        .unwrap();
+        assert_eq!(cfg.user, Some("65534:65534".parse().unwrap()));
+        assert_eq!(cfg.reflectors[0].name.as_str(), "user");
+    }
+
+    #[test]
     fn env_unknown_param_rejected() {
         assert!(matches!(
             from_env(&[
@@ -611,6 +634,15 @@ mod tests {
             from_env(&[("NETFLECTOR_COUNTERS_INTERVAL_SECS", "soon")]).unwrap_err(),
             ConfigError::EnvBadValue {
                 source: ParseValueError::Integer(_),
+                ..
+            }
+        ));
+        // The account's form is checked with the rest of the config; the account itself is
+        // looked up only at startup.
+        assert!(matches!(
+            from_env(&[("NETFLECTOR_USER", "a:b:c")]).unwrap_err(),
+            ConfigError::EnvBadValue {
+                source: ParseValueError::RunAs(_),
                 ..
             }
         ));

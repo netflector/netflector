@@ -90,10 +90,30 @@ re-injects reflected ones through that same socket (the sender doesn't bind a po
 privileges are involved). mDNS, SSDP, and WSD additionally join their multicast group(s) on it, which
 needs no privilege beyond opening the socket. That capture socket drives the requirements below.
 
+#### Dropping root
+
+Only opening the captures needs root. Set `user` (`NETFLECTOR_USER` in the environment) to `USER` or
+`USER:GROUP`, each a name or a number, and netflector started as root switches to that account once
+its captures are open. A user without a group takes its account's group; root is refused.
+
+Give netflector an account of its own rather than `nobody`: processes running as one uid can signal
+each other. The Docker image has no account database, so there give a numeric `UID:GID` that
+nothing else on the host uses. `--check-config` checks only the form of `user`; the account is
+looked up at startup.
+
+On Linux netflector then keeps no capability, except `CAP_NET_RAW` where the kernel still needs it
+to pin DIAL connections to their interface (before 5.7, unless backported). It tries the pin at
+startup and logs which way it went. Where `CAP_NET_RAW` stays, a compromised process could still
+open captures on any interface; with no DIAL entry the drop is complete. A start as the account with
+file capabilities (`setcap`, below) sheds them the same way. The switch needs `CAP_SETUID` and
+`CAP_SETGID`; where a container runtime withholds them, netflector exits at startup, so leave `user`
+unset there.
+
 #### Linux
 
-Capture and injection use `AF_PACKET`; the DIAL proxy's TCP connect pins its interface with
-`SO_BINDTODEVICE`. Both require `CAP_NET_RAW`. Either run as root or grant the capability once:
+Capture and injection use `AF_PACKET`, which requires `CAP_NET_RAW`. So does the DIAL proxy's
+interface pin (`SO_BINDTODEVICE`) on kernels before 5.7. Either run as root (and set `user` to drop
+it once the captures are open, see [Dropping root](#dropping-root)), or grant the capability once:
 
 ```sh
 sudo setcap cap_net_raw=eip /path/to/netflector
@@ -119,7 +139,9 @@ Capture and injection use BPF (`/dev/bpf*`), like macOS. FreeBSD has no `IP_BOUN
 proxy's connect pins its interface by binding the source address; no port privileges are needed. BPF
 devices are root-only by default, so out of the box netflector must run as root. To run
 unprivileged, grant a group read/write on `/dev/bpf*` with a devfs ruleset (`/etc/devfs.rules` +
-`devfs_system_ruleset` in `/etc/rc.conf`) and add the user to that group.
+`devfs_system_ruleset` in `/etc/rc.conf`) and add the user to that group. Or start it as root with
+`user` set: it drops to that account once its captures are open and holds only those, where a devfs
+group can capture on every interface.
 
 ### Run in Docker
 
@@ -167,6 +189,10 @@ docker run -d --name netflector --restart unless-stopped \
     -v /path/to/config.toml:/etc/netflector/config.toml:ro \
     ghcr.io/netflector/netflector:latest /etc/netflector/config.toml
 ```
+
+To drop root inside the container, add `-e NETFLECTOR_USER=UID:GID` (numeric, since the image has no
+account database) together with `--cap-add SETUID --cap-add SETGID`, which the `--cap-drop ALL`
+recipes above drop (see [Dropping root](#dropping-root)).
 
 #### On MikroTik RouterOS
 
@@ -238,12 +264,15 @@ pkg install os-netflector
 `config.toml` contains optional top-level settings plus at least one reflector entry. Entries are tables
 under `reflectors`, keyed by name (`[reflectors.<name>]`, the name being the label used in logs), each
 describing one `source_if` → `target_if` bridge that enables one or more of the protocols. The
-top-level settings are `log_level`, `debug_memory_interval_secs`, and `counters_interval_secs` (the
-summaries the latter enables are described under [Diagnostics](#diagnostics)):
+top-level settings are `log_level`, `user`, `debug_memory_interval_secs`, and
+`counters_interval_secs` (the summaries the latter enables are described under
+[Diagnostics](#diagnostics)):
 
 ```toml
 log_level = "info"                 # optional; one of off | error | warn | info | debug | trace (default: info)
                                    # release builds compile trace out, where it behaves as debug
+user = "netflector"                # optional; the account to run as once the captures are open, USER or USER:GROUP,
+                                   # each a name or a number (see Dropping root); absent keeps the starting account
 debug_memory_interval_secs = 0     # optional; seconds between memory diagnostic reports; 0 disables (default 0)
                                    # reports peak RSS everywhere, current RSS on Linux only
 counters_interval_secs = 0         # optional; seconds between per-interface packet-counter summaries; 0 disables (default 0)
@@ -294,8 +323,9 @@ then optional; with none, the environment is the whole configuration. Variables 
   `SOURCE_PEERS`, `TARGET_PEERS`, `MACS`, `WOL`, `MDNS`, `MDNS_SERVICES`, `SSDP`, `WSD`, `DIAL`, `WOL_PORTS`,
   `ADDRESS_FAMILY`, `BIDIRECTIONAL`, `UDP_PORTS`, `UDP_GROUPS`, `UDP_BROADCAST`), case-insensitive.
 
-The globals are `NETFLECTOR_LOG_LEVEL`, `NETFLECTOR_DEBUG_MEMORY_INTERVAL_SECS`, and
-`NETFLECTOR_COUNTERS_INTERVAL_SECS`, so `LOG`, `DEBUG`, and `COUNTERS` are reserved tags. Booleans are
+The globals are `NETFLECTOR_LOG_LEVEL`, `NETFLECTOR_USER`, `NETFLECTOR_DEBUG_MEMORY_INTERVAL_SECS`, and
+`NETFLECTOR_COUNTERS_INTERVAL_SECS`; `LOG`, `DEBUG`, and `COUNTERS` are reserved tags, since those globals
+would otherwise read as `<TAG>_<PARAM>`. Booleans are
 `true`/`false` or `1`/`0`; `WOL_PORTS`, `UDP_PORTS`, `UDP_GROUPS`, `SOURCE_PEERS`, `TARGET_PEERS`,
 `MDNS_SERVICES` and `MACS` are comma-separated (`7,9` / `B0:...,C4:...`). The `[reflectors.tv]` entry above looks like
 this in the environment:
@@ -313,7 +343,7 @@ NETFLECTOR_TV_WSD=true
 ```
 
 When a file and environment variables are both given they are merged: each contributes entries to one
-combined configuration, and each global variable (`NETFLECTOR_LOG_LEVEL`,
+combined configuration, and each global variable (`NETFLECTOR_LOG_LEVEL`, `NETFLECTOR_USER`,
 `NETFLECTOR_DEBUG_MEMORY_INTERVAL_SECS`, `NETFLECTOR_COUNTERS_INTERVAL_SECS`) overrides its file
 counterpart. The
 [duplicate detection](#duplicate-detection) below applies across both

@@ -26,7 +26,11 @@ configuration.
 The daemon runs in the foreground and logs to standard error with UTC
 timestamps.
 It opens raw captures on the configured interfaces, so it normally runs as
-root.
+root; with the
+.Ic user
+setting
+.Pq Xr netflector.toml 5
+it switches to that account once they are open.
 .Pp
 .Nm
 adapts to interface changes at runtime, with no restart needed.

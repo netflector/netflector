@@ -53,7 +53,7 @@ exec docker run --rm \
     -v netflector-cargo-registry:/usr/local/cargo/registry \
     -v netflector-rustup:/usr/local/rustup \
     -e CARGO_TARGET_DIR=/linux-target \
-    -e NETFLECTOR_TEST_REQUIRE="${NETFLECTOR_TEST_REQUIRE-capture,membership,pair,tun,ipv6,monitor,wireguard}" \
+    -e NETFLECTOR_TEST_REQUIRE="${NETFLECTOR_TEST_REQUIRE-capture,membership,pair,tun,ipv6,monitor,wireguard,drop}" \
     -w /netflector \
     "$IMAGE" \
     cargo "$@"
