@@ -28,6 +28,8 @@ EXPECT_NONE_FLIGHT_SECONDS = 1.5
 PROBE_STOP_GRACE_SECONDS = 5
 # A substring of the line the daemon logs immediately before entering its event loop.
 NETFLECTOR_READY_LOG = "running; press Ctrl-C or send SIGTERM to stop"
+# Logged just before the ready line when the user setting switched the account.
+NETFLECTOR_DROPPED_LOG = "dropped root: running as uid"
 RECEIVER_READY_LOG = "receiver ready: UDP socket bound"
 CONTAINER_READY_TIMEOUT_SECONDS = 15.0
 # Every resource a run creates is named with this prefix, so a sweep can find what a killed run left.

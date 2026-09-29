@@ -71,6 +71,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-join", action="store_true",
         help="run netflector with --no-join (native backend); for a fabric whose kernel cannot join "
              "groups but delivers their frames regardless, such as qemu-user")
+    parser.add_argument("--user", metavar="USER[:GROUP]",
+        help="run netflector with the user setting (NETFLECTOR_USER), so every case runs after "
+             "the privilege drop; a case fails if the drop is not logged")
     parser.add_argument("--keep-on-failure", action="store_true", help="leave resources behind after a failure")
     parser.add_argument("--keep-stale", action="store_true",
         help="skip the preflight sweep, keeping what an earlier --keep-on-failure run left behind")

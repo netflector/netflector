@@ -114,6 +114,7 @@ class DockerBackend(Backend):
                 "NET_RAW",
                 "--mount",
                 f"type=bind,source={config_path},target=/etc/netflector/config.toml,readonly",
+                *(["--env", f"NETFLECTOR_USER={self.args.user}"] if self.args.user else []),
                 self.args.image,
                 "/etc/netflector/config.toml",
             ]

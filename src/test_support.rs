@@ -32,6 +32,9 @@ pub(crate) enum Capability {
     /// A `WireGuard` interface: root and wg(8).
     #[cfg(any(target_os = "freebsd", target_os = "linux"))]
     WireGuard,
+    /// A real account switch, run in a child process: root, and a test binary that can spawn
+    /// itself.
+    Drop,
 }
 
 impl Capability {
@@ -46,6 +49,7 @@ impl Capability {
             Self::Monitor => "monitor",
             #[cfg(any(target_os = "freebsd", target_os = "linux"))]
             Self::WireGuard => "wireguard",
+            Self::Drop => "drop",
         }
     }
 
@@ -60,6 +64,7 @@ impl Capability {
             "monitor" => Self::Monitor,
             #[cfg(any(target_os = "freebsd", target_os = "linux"))]
             "wireguard" => Self::WireGuard,
+            "drop" => Self::Drop,
             _ => return None,
         })
     }

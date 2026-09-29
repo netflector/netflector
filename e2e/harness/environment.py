@@ -12,6 +12,7 @@ from harness.settings import (
     CONTAINER_READY_TIMEOUT_SECONDS,
     E2E_DIR,
     E2E_RESOURCE_PREFIX,
+    NETFLECTOR_DROPPED_LOG,
     NETFLECTOR_READY_LOG,
     NETFLECTOR_SOURCE_IFNAME,
     NETFLECTOR_TARGET_IFNAME,
@@ -109,6 +110,15 @@ class Environment:
 
     def wait_for_netflector(self) -> None:
         self.wait_for_log("netflector", NETFLECTOR_READY_LOG, "netflector")
+        if self.args.user:
+            # The drop is logged before the ready line, so a run that skipped it fails here
+            # rather than passing as root.
+            out, err = self.backend.logs("netflector")
+            if NETFLECTOR_DROPPED_LOG not in f"{out}{err}":
+                raise RuntimeError(
+                    f"netflector became ready without dropping root ({NETFLECTOR_DROPPED_LOG!r} "
+                    f"not logged) although --user {self.args.user} was given"
+                )
 
     def wait_for_result(self, role: str = "receiver") -> None:
         exit_code = self.backend.wait(role)

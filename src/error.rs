@@ -7,6 +7,7 @@ use std::io;
 use thiserror::Error;
 
 use crate::config::ConfigError;
+use crate::privileges::PrivilegeError;
 use crate::reflector::BuildError;
 
 /// Crate-wide result alias.
@@ -29,6 +30,8 @@ enum ErrorKind {
     Capture { iface: String, source: io::Error },
     #[error("reflector \"{name}\": {source}")]
     Reflector { name: String, source: BuildError },
+    #[error("user: {0}")]
+    Privileges(#[from] PrivilegeError),
     /// Where the blanket `From<io::Error>` lands; the reactor is the only raw `io::Error`
     /// source.
     #[error("reactor: {0}")]
@@ -72,6 +75,12 @@ impl From<ConfigError> for Error {
 impl From<io::Error> for Error {
     fn from(source: io::Error) -> Self {
         Self(ErrorKind::Reactor(source))
+    }
+}
+
+impl From<PrivilegeError> for Error {
+    fn from(source: PrivilegeError) -> Self {
+        Self(ErrorKind::Privileges(source))
     }
 }
 

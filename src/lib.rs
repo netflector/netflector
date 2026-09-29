@@ -12,6 +12,7 @@ mod linear_map;
 mod logging;
 mod memory_report;
 mod net;
+mod privileges;
 mod reactor;
 mod reflector;
 mod sys;
@@ -104,6 +105,8 @@ fn reflect(path: Option<&Path>, join_groups: bool) -> Result<()> {
         );
         PacketDispatcher::without_group_joins()
     };
+    // Resolved before any capture opens, so a mistyped account fails at once.
+    let credentials = config.user.as_ref().map(privileges::resolve).transpose()?;
     let interfaces = open_captures(&config, &mut dispatcher)?;
     for reflector in &config.reflectors {
         log_mtu_info(reflector, &interfaces, &dispatcher);
@@ -136,12 +139,35 @@ fn reflect(path: Option<&Path>, join_groups: bool) -> Result<()> {
         config.debug_memory_interval,
         std::time::Instant::now(),
     )));
+    // Nothing after this needs root: a recreated interface is re-attached to its capture.
+    if let Some(credentials) = credentials {
+        drop_privileges(credentials, &config)?;
+    }
     log::info!("running; press Ctrl-C or send SIGTERM to stop");
     reactor.run()?;
     if config.debug_memory_interval.is_some() {
         memory_report::log_report();
     }
     log::info!("stopped");
+    Ok(())
+}
+
+/// Switch to the `user` account and log how it went. Any DIAL entry's target interface will do for
+/// the probe: the kernel's rule is the same for every interface.
+fn drop_privileges(credentials: privileges::Credentials, config: &Config) -> Result<()> {
+    let dial = config
+        .reflectors
+        .iter()
+        .find(|reflector| reflector.ssdp.is_some_and(|ssdp| ssdp.dial))
+        .map(|reflector| &reflector.target_if);
+    let outcome = privileges::drop_to(credentials, dial)?;
+    log::info!(
+        "{} as uid {} gid {}{}",
+        outcome.switch.describe(),
+        credentials.uid,
+        credentials.gid,
+        outcome.dial_pin.describe()
+    );
     Ok(())
 }
 

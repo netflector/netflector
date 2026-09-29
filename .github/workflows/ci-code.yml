@@ -70,7 +70,7 @@ jobs:
         run: ci/freebsd-vm.sh wait
       - name: cargo test
         env:
-          NETFLECTOR_TEST_REQUIRE: capture,membership,pair,ipv6,monitor,wireguard
+          NETFLECTOR_TEST_REQUIRE: capture,membership,pair,ipv6,monitor,wireguard,drop
         run: |
           triple='${{ matrix.arch.triple }}'
           prefix="CARGO_TARGET_$(echo "$triple" | tr 'a-z-' 'A-Z_')"
@@ -144,11 +144,15 @@ jobs:
         run: ci/freebsd-vm.sh wait
       - name: Install python3 in the VM
         run: ci/freebsd-vm.sh run 'pkg install -y python3 && python3 --version'
+      # One row runs every case after the privilege drop, as an account looked up by name.
+      - name: Create the account to drop to
+        if: matrix.os == 15 && matrix.arch.name == 'amd64' && matrix.linkage.name == 'static'
+        run: ci/freebsd-vm.sh run 'pw useradd netflector -d /nonexistent -s /usr/sbin/nologin'
       - name: Run the e2e suite in the VM
         run: |
           ci/freebsd-vm.sh run 'mkdir -p /root/netflector'
           ci/freebsd-vm.sh push e2e target/${{ matrix.arch.triple }}/release/netflector /root/netflector/
-          ci/freebsd-vm.sh run 'cd /root/netflector && python3 e2e/run.py --backend native --binary ./netflector'
+          ci/freebsd-vm.sh run 'cd /root/netflector && python3 e2e/run.py --backend native --binary ./netflector ${{ (matrix.os == 15 && matrix.arch.name == 'amd64' && matrix.linkage.name == 'static') && '--user netflector' || '' }}'
       - name: VM console log
         if: always()
         run: ci/freebsd-vm.sh console
@@ -288,8 +292,9 @@ jobs:
           load: true
           cache-from: type=gha,scope=${{ matrix.arch.name }}
           cache-to: type=gha,mode=max,scope=${{ matrix.arch.name }}
+      # amd64 runs every case after the privilege drop, by number: the image has no account database.
       - name: Run e2e
-        run: python3 e2e/run.py --skip-build --image netflector:e2e
+        run: python3 e2e/run.py --skip-build --image netflector:e2e ${{ matrix.arch.name == 'amd64' && '--user 65534:65534' || '' }}
 
   # The same e2e suite without Docker: netns + veth segments and plain processes. The glibc lanes
   # run a release binary built directly on the runner -- the from-source configuration. The 64-bit
@@ -358,13 +363,18 @@ jobs:
         run: |
           triple='${{ matrix.target.triple }}'
           cargo build --release --locked ${triple:+--target "$triple"}
+      # Static musl runs every case after the privilege drop, as an account looked up by name.
+      - name: Create the account to drop to
+        if: matrix.target.name == 'linux-amd64-musl'
+        run: sudo useradd --system --no-create-home --shell /usr/sbin/nologin netflector
       # qemu-user has no MCAST_JOIN_GROUP; the veth fabric delivers the groups' frames to the
       # capture without a membership, so the emulated lanes run the daemon with --no-join.
       - name: Run e2e natively
         run: |
           triple='${{ matrix.target.triple }}'
           sudo python3 e2e/run.py --backend native --binary "target/${triple:+$triple/}release/netflector" \
-            ${{ matrix.target.emulated && '--no-join' || '' }}
+            ${{ matrix.target.emulated && '--no-join' || '' }} \
+            ${{ matrix.target.name == 'linux-amd64-musl' && '--user netflector' || '' }}
 
   # The unit suite under Miri, for every shipped target. Valgrind (below) catches accesses that are
   # actually invalid; it is blind to UB that performs no invalid access -- an unaligned read the hardware
@@ -546,7 +556,7 @@ jobs:
       - name: cargo test (root)
         if: ${{ !matrix.target.emulated }}
         env:
-          NETFLECTOR_TEST_REQUIRE: ${{ startsWith(matrix.target.name, 'macos') && 'capture,membership,pair,ipv6,monitor' || 'capture,membership,pair,tun,ipv6,monitor,wireguard' }}
+          NETFLECTOR_TEST_REQUIRE: ${{ startsWith(matrix.target.name, 'macos') && 'capture,membership,pair,ipv6,monitor,drop' || 'capture,membership,pair,tun,ipv6,monitor,wireguard,drop' }}
         run: |
           # Not -E: sudo-rs (the default sudo since Ubuntu 25.10) ignores it. HOME is where the
           # rustup shim finds the toolchain.
@@ -599,7 +609,7 @@ jobs:
         run: rustc -V && cargo -V && valgrind --version
       - name: cargo test (under memcheck)
         env:
-          NETFLECTOR_TEST_REQUIRE: capture,membership,pair,tun,ipv6,monitor,wireguard
+          NETFLECTOR_TEST_REQUIRE: capture,membership,pair,tun,ipv6,monitor,wireguard,drop
         run: |
           export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-fds=yes --num-callers=30 --error-exitcode=1'
           sudo --preserve-env=HOME,CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER,NETFLECTOR_TEST_REQUIRE "$(command -v cargo)" test --locked
