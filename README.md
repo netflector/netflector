@@ -53,7 +53,7 @@ pinned in `ci/freebsd14.env` and running on that release or newer.
 ## Run
 
 ```sh
-netflector [--check-config] [--no-join] [--] [config.toml]
+netflector [--check-config] [--no-join] [--user USER[:GROUP]] [--] [config.toml]
 ```
 
 Configuration comes from a TOML file, from environment variables, or from both. With a path argument
@@ -70,6 +70,10 @@ volumes.
 - `--no-join`: Do not join multicast groups. Group traffic then reaches netflector only where the
   link delivers it without a membership, as an emulated or promiscuous fabric does. A warning is
   logged at startup.
+- `--user USER[:GROUP]`: Started as root, switch to this account, by name or number, once every
+  capture is open (see [Runtime privileges](#runtime-privileges)). A USER without a GROUP takes its
+  account's group; root is refused as a target. With `--check-config` the account is checked, not
+  switched to.
 - `-V`, `--version`: Print the version and exit.
 - `-h`, `--help`: Print the usage and exit.
 - `--`: End of options. Needed only for a config file whose name begins with a dash.
@@ -89,6 +93,16 @@ netflector opens one L2 packet-capture socket per interface: it both observes in
 re-injects reflected ones through that same socket (the sender doesn't bind a port, so no port
 privileges are involved). mDNS, SSDP, and WSD additionally join their multicast group(s) on it, which
 needs no privilege beyond opening the socket. That capture socket drives the requirements below.
+
+Started as root, `--user` switches the process to an ordinary account once every capture is open,
+before it reflects anything: supplementary groups cleared, then the group, then the user, and
+netflector refuses to run if root could still be regained. Nothing later needs root, because a
+recreated interface is re-attached to the capture already held, not reopened. The one exception is
+DIAL on Linux kernels before 5.7, whose per-connection `SO_BINDTODEVICE` still needs `CAP_NET_RAW`;
+leave `--user` off there if you use DIAL. Started as that account already (a group granted the BPF
+devices, or `CAP_NET_RAW` on Linux), `--user` changes nothing and only confirms the account. Static
+builds (the release binaries and the Docker image) resolve names from `/etc/passwd` and `/etc/group`
+only; elsewhere give numbers, `UID:GID`.
 
 #### Linux
 
@@ -119,7 +133,9 @@ Capture and injection use BPF (`/dev/bpf*`), like macOS. FreeBSD has no `IP_BOUN
 proxy's connect pins its interface by binding the source address; no port privileges are needed. BPF
 devices are root-only by default, so out of the box netflector must run as root. To run
 unprivileged, grant a group read/write on `/dev/bpf*` with a devfs ruleset (`/etc/devfs.rules` +
-`devfs_system_ruleset` in `/etc/rc.conf`) and add the user to that group.
+`devfs_system_ruleset` in `/etc/rc.conf`) and add the user to that group. Or start it as root with
+`--user`: it drops to that account once its captures are open and holds only those, where a devfs
+group can capture on every interface.
 
 ### Run in Docker
 
@@ -156,6 +172,9 @@ docker run --rm \
     -e NETFLECTOR_TV_MDNS=true \
     ghcr.io/netflector/netflector:latest
 ```
+
+`--user` inside the container needs a numeric `UID:GID`, since the image carries no account
+database, and the `SETUID` and `SETGID` capabilities, which this recipe drops.
 
 To use a config file instead of (or alongside) the environment, mount it and pass its path as the
 argument. This form also shows running it as a service, `-d` with a restart policy:

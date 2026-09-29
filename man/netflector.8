@@ -8,6 +8,7 @@
 .Nm
 .Op Fl -check-config
 .Op Fl -no-join
+.Op Fl -user Ar user Ns Op : Ns Ar group
 .Op Fl -
 .Op Ar config
 .Nm
@@ -25,8 +26,9 @@ configuration.
 .Pp
 The daemon runs in the foreground and logs to standard error with UTC
 timestamps.
-It opens raw captures on the configured interfaces, so it normally runs as
-root.
+It opens raw captures on the configured interfaces, so it starts as root; with
+.Fl -user
+it gives root up once they are open.
 .Pp
 .Nm
 adapts to interface changes at runtime, with no restart needed.
@@ -60,6 +62,33 @@ Group traffic then reaches
 only where the link delivers it without a membership, as an emulated or
 promiscuous fabric does.
 A warning is logged at startup.
+.It Fl -user Ar user Ns Op : Ns Ar group
+Started as root, switch to this account once every capture is open,
+supplementary groups cleared;
+.Nm
+refuses to run if root could be regained after the switch.
+Each part is a name or a number; a
+.Ar user
+without a
+.Ar group
+takes its account's group, and root is refused.
+Nothing after startup needs root: a recreated interface is re-attached to the
+capture already held, not reopened.
+The exception is DIAL on Linux kernels before 5.7, whose
+.Dv SO_BINDTODEVICE
+needs
+.Dv CAP_NET_RAW .
+Started as that account already,
+.Fl -user
+changes nothing.
+Static builds resolve names from
+.Pa /etc/passwd
+and
+.Pa /etc/group
+only.
+With
+.Fl -check-config ,
+the account is checked, not switched to.
 .It Fl V , Fl -version
 Print the version and exit.
 .It Fl h , Fl -help

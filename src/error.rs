@@ -7,6 +7,7 @@ use std::io;
 use thiserror::Error;
 
 use crate::config::ConfigError;
+use crate::privileges::{ParseRunAsError, PrivilegeError};
 use crate::reflector::BuildError;
 
 /// Crate-wide result alias.
@@ -29,6 +30,8 @@ enum ErrorKind {
     Capture { iface: String, source: io::Error },
     #[error("reflector \"{name}\": {source}")]
     Reflector { name: String, source: BuildError },
+    #[error("--user: {0}")]
+    Privileges(#[from] PrivilegeError),
     /// Where the blanket `From<io::Error>` lands; the reactor is the only raw `io::Error`
     /// source.
     #[error("reactor: {0}")]
@@ -75,6 +78,12 @@ impl From<io::Error> for Error {
     }
 }
 
+impl From<PrivilegeError> for Error {
+    fn from(source: PrivilegeError) -> Self {
+        Self(ErrorKind::Privileges(source))
+    }
+}
+
 impl From<UsageError> for Error {
     fn from(source: UsageError) -> Self {
         Self(ErrorKind::Usage(source))
@@ -88,4 +97,11 @@ pub(crate) enum UsageError {
     TooManyArgs(String),
     #[error("unknown option \"{0}\"; try `netflector --help`")]
     UnknownOption(String),
+    #[error("{0} needs a value; try `netflector --help`")]
+    MissingValue(&'static str),
+    #[error("--user \"{value}\": {source}")]
+    BadUser {
+        value: String,
+        source: ParseRunAsError,
+    },
 }

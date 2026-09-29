@@ -13,6 +13,7 @@ mod linear_map;
 mod logging;
 mod memory_report;
 mod net;
+mod privileges;
 mod reactor;
 mod reflector;
 mod sys;
@@ -29,6 +30,7 @@ use std::path::Path;
 use self::cli::Invocation;
 use self::config::Config;
 use self::dispatch::PacketDispatcher;
+use self::privileges::RunAs;
 use self::reactor::Reactor;
 use self::reflector::InterfaceMap;
 
@@ -47,17 +49,23 @@ pub fn run(args: &[OsString]) -> Result<()> {
             println!("netflector {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        Invocation::CheckConfig(path) => check_config(path),
-        Invocation::Run { path, join_groups } => reflect(path, join_groups),
+        Invocation::CheckConfig { path, user } => check_config(path, user.as_ref()),
+        Invocation::Run {
+            path,
+            join_groups,
+            user,
+        } => reflect(path, join_groups, user.as_ref()),
     }
 }
 
 /// Parses and validates only: no capture is opened and no interface resolved, so it runs
 /// unprivileged on a host without the configured interfaces (and cannot report a missing one).
-/// The log level is left alone so `log_level = "off"` cannot swallow the answer.
-fn check_config(path: Option<&Path>) -> Result<()> {
+/// A `--user` account is resolved and checked, not switched to. The log level is left alone so
+/// `log_level = "off"` cannot swallow the answer.
+fn check_config(path: Option<&Path>, user: Option<&RunAs>) -> Result<()> {
     let toml_text = path.map(config::read_config_file).transpose()?;
     let config = Config::from_sources(toml_text.as_deref(), sys::process_env())?;
+    user.map(RunAs::resolve).transpose()?;
     let count = config.reflectors.len();
     println!(
         "config ok: {count} reflector{}",
@@ -68,7 +76,7 @@ fn check_config(path: Option<&Path>) -> Result<()> {
 
 /// # Errors
 /// Configuration loading or validation, capture setup, or the reactor.
-fn reflect(path: Option<&Path>, join_groups: bool) -> Result<()> {
+fn reflect(path: Option<&Path>, join_groups: bool, user: Option<&RunAs>) -> Result<()> {
     let toml_text = path.map(config::read_config_file).transpose()?;
     // Not std::env::vars: it segfaults in statically linked FreeBSD binaries (see process_env).
     let env = sys::process_env();
@@ -106,6 +114,8 @@ fn reflect(path: Option<&Path>, join_groups: bool) -> Result<()> {
         );
         PacketDispatcher::without_group_joins()
     };
+    // Resolved before any capture opens, so a mistyped account fails at once.
+    let credentials = user.map(RunAs::resolve).transpose()?;
     let interfaces = open_captures(&config, &mut dispatcher)?;
     for reflector in &config.reflectors {
         log_mtu_info(reflector, &interfaces, &dispatcher);
@@ -138,6 +148,22 @@ fn reflect(path: Option<&Path>, join_groups: bool) -> Result<()> {
         config.debug_memory_interval,
         std::time::Instant::now(),
     )));
+    // Root was for opening the captures. Everything after runs on the descriptors they hold (a
+    // recreated interface is re-attached, not reopened), so the reactor needs no privilege.
+    if let Some(credentials) = credentials {
+        match privileges::drop_to(credentials)? {
+            privileges::Switch::Dropped => log::info!(
+                "dropped root: running as uid {} gid {}",
+                credentials.uid,
+                credentials.gid
+            ),
+            privileges::Switch::AlreadyThatAccount => log::info!(
+                "already running as uid {} gid {}: --user changed nothing",
+                credentials.uid,
+                credentials.gid
+            ),
+        }
+    }
     log::info!("running; press Ctrl-C or send SIGTERM to stop");
     reactor.run()?;
     if config.debug_memory_interval.is_some() {
