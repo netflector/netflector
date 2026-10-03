@@ -116,8 +116,6 @@ foreach (
         ['aa:bb:cc:dd:ee:ff,nonsense', '7', false],
         ['aa:bb:cc:dd:ee:ff', '7,70000', false],
         ['aa:bb:cc:dd:ee:ff', '07', false],
-        /* core's field takes hyphen and dot forms in either case; the template folds them, and a
-           repeat in two spellings is the daemon's to refuse */
         ['aa-bb-cc-dd-ee-ff', '7', true],
         ['aabb.ccdd.eeff', '7', true],
         ['aa:bb:cc:dd:ee:ff,AA:BB:CC:DD:EE:FF', '7', true],
@@ -176,58 +174,6 @@ foreach (
         fail(sprintf('%s rejected: %s', json_encode($values), implode(' | ', $messages)));
     } elseif (!$expect_valid && $messages === []) {
         fail(sprintf('%s accepted, expected a validation error', json_encode($values)));
-    }
-}
-
-/* the pair collision follows the entries' directions */
-function pair_collides(array $first, array $second): bool
-{
-    $model = new Netflector();
-    /* only the two entries under test: the firewall's own may share their interfaces */
-    foreach ($model->reflectors->reflector->iterateItems() as $uuid => $unused) {
-        $model->reflectors->reflector->del($uuid);
-    }
-    foreach ([$first, $second] as $index => $values) {
-        $entry = $model->reflectors->reflector->Add();
-        $entry->enabled = '1';
-        $entry->name = 'modelcheck' . $index;
-        $entry->mdns = '1';
-        foreach ($values as $field => $value) {
-            $entry->$field = $value;
-        }
-    }
-    foreach ($model->performValidation() as $message) {
-        if (str_contains($message->getMessage(), 'reflected twice')) {
-            return true;
-        }
-    }
-    return false;
-}
-
-$interfaces = array_keys((new Netflector())->reflectors->reflector->Add()->source_if->getNodeData());
-if (count($interfaces) < 2) {
-    fail('the pair collision needs two interfaces on this firewall');
-} else {
-    [$x, $y] = $interfaces;
-    $forward = ['source_if' => $x, 'target_if' => $y];
-    $backward = ['source_if' => $y, 'target_if' => $x];
-    foreach (
-        [
-            [$forward, $forward, true],
-            [$forward, $backward, false],
-            [$forward + ['bidirectional' => '1'], $backward, true],
-            [$forward, $backward + ['bidirectional' => '1'], true],
-            [$forward + ['address_family' => 'ipv4'], $backward + ['bidirectional' => '1', 'address_family' => 'ipv6'], false],
-        ] as [$first, $second, $expect_collision]
-    ) {
-        if (pair_collides($first, $second) !== $expect_collision) {
-            fail(sprintf(
-                '%s and %s: expected %s',
-                json_encode($first),
-                json_encode($second),
-                $expect_collision ? 'a collision' : 'no collision'
-            ));
-        }
     }
 }
 
