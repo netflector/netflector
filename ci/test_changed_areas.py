@@ -26,10 +26,13 @@ class ChangedAreas(unittest.TestCase):
 
     def test_pipeline_files_run_their_pipeline_alone(self) -> None:
         self.assertEqual(ca.areas(["dist/opnsense/net/netflector/Makefile"]), only("opnsense"))
+        self.assertEqual(ca.areas(["ci/modelcheck.php"]), only("opnsense"))
         for pin in ca.PACKAGE_PINS:
             self.assertEqual(ca.areas([pin]), only("opnsense"), pin)
         self.assertEqual(ca.areas(["dist/freebsd/net/netflector/Makefile"]), only("port"))
         self.assertEqual(ca.areas([".github/workflows/ci-supply-chain.yml"]), only("supply-chain"))
+        self.assertEqual(ca.areas(["deny.toml"]), only("supply-chain"))
+        self.assertEqual(ca.areas(["ci/supply-chain.env"]), only("supply-chain"))
 
     def test_shared_files_run_every_consumer(self) -> None:
         self.assertEqual(ca.areas(["ci/platforms.toml"]), only("code", "opnsense", "port"))

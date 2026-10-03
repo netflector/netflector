@@ -27,6 +27,7 @@ OPNSENSE = CATALOG + (
     "ci/freebsd-plugin-package.sh",
     "ci/freebsd-to-opnsense.sh",
     "ci/opnsense-exercise.sh",
+    "ci/modelcheck.php",
     # Shared with the code lanes, which never reach its OPNsense-only paths (the cloud-init
     # seed and the extra NIC), so the pipeline runs on it as well.
     "ci/freebsd-vm.sh",
@@ -60,11 +61,14 @@ CODE_IGNORES = (
     ".github/workflows/ci-opnsense.yml",
     ".github/workflows/ci-supply-chain.yml",
     "ci/supply-chain-pin.sh",
+    "ci/supply-chain.env",
+    "deny.toml",
     *PACKAGE_PINS,
     "ci/freebsd-port-package.sh",
     "ci/freebsd-plugin-package.sh",
     "ci/freebsd-to-opnsense.sh",
     "ci/opnsense-exercise.sh",
+    "ci/modelcheck.php",
     "ci/pkg-published.sh",
 )
 
