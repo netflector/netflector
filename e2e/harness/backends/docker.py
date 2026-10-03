@@ -115,6 +115,7 @@ class DockerBackend(Backend):
                 "--mount",
                 f"type=bind,source={config_path},target=/etc/netflector/config.toml,readonly",
                 self.args.image,
+                *(["--user", self.args.user] if self.args.user else []),
                 "/etc/netflector/config.toml",
             ]
         )

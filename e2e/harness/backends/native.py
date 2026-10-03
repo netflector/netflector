@@ -61,6 +61,8 @@ class NativeBackend(Backend):
 
     def _netflector_args(self, config_path: Path) -> list[str]:
         flags = ["--no-join"] if self.args.no_join else []
+        if self.args.user:
+            flags += ["--user", self.args.user]
         return [str(self.args.binary), *flags, str(config_path)]
 
     def _teardown_fabric(self) -> None:
