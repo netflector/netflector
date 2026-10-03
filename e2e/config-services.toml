@@ -1,0 +1,9 @@
+log_level = "debug"
+
+# An mDNS reflector scoped to one service type, for the mdns_services cases: a lone reflector on
+# the pair, so it can't conflict with the unscoped "discovery" one in config.toml.
+[reflectors.printers]
+source_if = "nf_source"
+target_if = "nf_target"
+mdns = true
+mdns_services = ["_ipp._tcp"]

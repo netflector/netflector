@@ -9,6 +9,7 @@ use crate::config::Reflector;
 use crate::dispatch::{CaptureKey, MessageType, PacketDispatcher};
 use crate::interface::InterfaceAddresses;
 use crate::net::MAX_UDP_PAYLOAD_LEN;
+use crate::net::packet::Packet;
 use crate::net::ssdp::{
     MSEARCH_MX_DEFAULT, SSDP_GROUP_V4, SSDP_GROUP_V6_LINK_LOCAL, SSDP_GROUP_V6_SITE_LOCAL,
     SSDP_PORT, SSDP_TTL, SsdpKind, advertises_only_unreachable, classify, parse_msearch_mx,
@@ -18,7 +19,7 @@ use crate::reactor::Reactor;
 
 use super::dial::{ProxyPlacement, rewrite_location};
 use super::{
-    BuildError, InterfaceMap, ReplyRewrite, SearchProtocol, Verdict, build_pair,
+    BuildError, InterfaceMap, ReplyRewrite, Rewrite, SearchProtocol, Verdict, build_pair,
     directional_verdict,
 };
 
@@ -44,11 +45,11 @@ impl DialRewrite {
 impl ReplyRewrite for DialRewrite {
     fn rewrite<'a>(
         &'a mut self,
-        payload: &[u8],
+        packet: &Packet,
         egress: CaptureKey,
         dispatcher: &mut PacketDispatcher,
         reactor: &mut Reactor,
-    ) -> Option<&'a [u8]> {
+    ) -> Rewrite<'a> {
         let (Some(source), Some(target)) = (
             dispatcher
                 .egress_addrs(egress)
@@ -58,7 +59,7 @@ impl ReplyRewrite for DialRewrite {
                 .and_then(InterfaceAddresses::v4),
         ) else {
             log::debug!("SSDP: source or target has no IPv4; DIAL rewrite skipped");
-            return None;
+            return Rewrite::Verbatim;
         };
         let (ctx, target_iface) = dispatcher.dial_context(self.target);
         let placement = ProxyPlacement {
@@ -69,11 +70,17 @@ impl ReplyRewrite for DialRewrite {
             target_iface,
         };
         self.scratch.clear();
-        if rewrite_location(ctx, reactor, payload, placement, &mut self.scratch) {
-            Some(self.scratch.pending())
+        if rewrite_location(ctx, reactor, packet.payload, placement, &mut self.scratch) {
+            Rewrite::Replaced(self.scratch.pending())
         } else {
-            None
+            Rewrite::Verbatim
         }
+    }
+
+    /// The rewritten LOCATION names our own egress-side listener, reachable from that link
+    /// whatever its address class.
+    fn keeps_advertised_addresses(&self) -> bool {
+        false
     }
 }
 

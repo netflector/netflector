@@ -9,6 +9,7 @@ use super::raw::{RawConfig, RawReflector};
 use super::value::{AddressFamily, GroupList, LogLevel, PeerList, PortList, ReflectorName};
 use crate::interface::InterfaceName;
 use crate::net::mac::MacSet;
+use crate::net::mdns::services::ServiceList;
 
 /// A reflector's fields as they arrive, one `NETFLECTOR_<tag>_<param>` variable at a time.
 #[derive(Debug, Default)]
@@ -21,6 +22,7 @@ struct PartialReflector {
     macs: Option<MacSet>,
     wol: Option<bool>,
     mdns: Option<bool>,
+    mdns_services: Option<ServiceList>,
     ssdp: Option<bool>,
     dial: Option<bool>,
     wsd: Option<bool>,
@@ -62,6 +64,7 @@ impl PartialReflector {
             "address_family" => put(&mut self.address_family, env_value(value, var)?, param, var),
             "wol" => put(&mut self.wol, env_bool(value, var)?, param, var),
             "mdns" => put(&mut self.mdns, env_bool(value, var)?, param, var),
+            "mdns_services" => put(&mut self.mdns_services, env_value(value, var)?, param, var),
             "ssdp" => put(&mut self.ssdp, env_bool(value, var)?, param, var),
             "dial" => put(&mut self.dial, env_bool(value, var)?, param, var),
             "wsd" => put(&mut self.wsd, env_bool(value, var)?, param, var),
@@ -92,6 +95,7 @@ impl PartialReflector {
             macs: self.macs,
             wol: self.wol.unwrap_or(false),
             mdns: self.mdns.unwrap_or(false),
+            mdns_services: self.mdns_services,
             ssdp: self.ssdp.unwrap_or(false),
             dial: self.dial.unwrap_or(false),
             wsd: self.wsd.unwrap_or(false),
@@ -235,7 +239,7 @@ mod tests {
         assert_eq!(r.name.as_str(), "tv");
         assert_eq!(r.source_if.as_str(), "lan");
         assert_eq!(r.target_if.as_str(), "iot");
-        assert!(r.mdns);
+        assert!(r.mdns.is_some());
     }
 
     #[test]
@@ -275,7 +279,7 @@ mod tests {
         );
         let r = &cfg.reflectors[0];
         assert!(r.wol.is_some());
-        assert!(!r.mdns);
+        assert!(r.mdns.is_none());
     }
 
     #[test]
@@ -365,6 +369,33 @@ mod tests {
             .map(|p| p.get())
             .collect();
         assert_eq!(ports, [7, 9, 4000]);
+    }
+
+    #[test]
+    fn env_mdns_services_csv() {
+        let cfg = from_env(&[
+            ("NETFLECTOR_TV_SOURCE_IF", "a"),
+            ("NETFLECTOR_TV_TARGET_IF", "b"),
+            ("NETFLECTOR_TV_MDNS", "true"),
+            ("NETFLECTOR_TV_MDNS_SERVICES", "_ipp._tcp, _hap._udp"),
+        ])
+        .unwrap();
+        let services: Vec<String> = cfg.reflectors[0]
+            .mdns
+            .as_ref()
+            .and_then(|mdns| mdns.services.as_deref())
+            .unwrap()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(services, ["_ipp._tcp", "_hap._udp"]);
+        assert!(matches!(
+            from_env(&[("NETFLECTOR_TV_MDNS_SERVICES", "ipp")]).unwrap_err(),
+            ConfigError::EnvBadValue {
+                source: ParseValueError::Services(_),
+                ..
+            }
+        ));
     }
 
     #[test]

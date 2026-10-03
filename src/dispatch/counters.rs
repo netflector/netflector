@@ -59,11 +59,13 @@ impl fmt::Display for MessageType {
 }
 
 /// Fold precedence for [`Outcome`], worst to best (the derived `Ord` follows declaration order):
-/// a failed reflect outranks a correct non-forward.
+/// a failed reflect outranks a correct non-forward. A refusal outranks the other leg's skip of the
+/// same packet, but not a failure on another entry.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 enum Disposition {
     Filtered,
     Skipped,
+    Refused,
     Stalled,
     Dropped,
     Reflected,
@@ -82,6 +84,8 @@ pub(crate) enum Outcome {
     Reflected(MessageType),
     /// The wrong direction for this leg: not ours to forward.
     Skipped(MessageType),
+    /// The right direction, refused by the entry's policy (`mdns_services`).
+    Refused(MessageType),
     /// The right direction, but not re-emitted: a send error, a cap, a suppression.
     Dropped(MessageType),
     /// The right direction, but the egress has no source address of the family yet.
@@ -96,6 +100,7 @@ impl Outcome {
             Self::Reflected(_) => Disposition::Reflected,
             Self::Dropped(_) => Disposition::Dropped,
             Self::Stalled(_) => Disposition::Stalled,
+            Self::Refused(_) => Disposition::Refused,
             Self::Skipped(_) => Disposition::Skipped,
             Self::Filtered => Disposition::Filtered,
         }
@@ -103,7 +108,11 @@ impl Outcome {
 
     fn message_type(self) -> Option<MessageType> {
         match self {
-            Self::Reflected(t) | Self::Skipped(t) | Self::Dropped(t) | Self::Stalled(t) => Some(t),
+            Self::Reflected(t)
+            | Self::Skipped(t)
+            | Self::Refused(t)
+            | Self::Dropped(t)
+            | Self::Stalled(t) => Some(t),
             Self::Filtered => None,
         }
     }
@@ -112,6 +121,7 @@ impl Outcome {
         match self {
             Self::Reflected(_) => Self::Reflected(message_type),
             Self::Skipped(_) => Self::Skipped(message_type),
+            Self::Refused(_) => Self::Refused(message_type),
             Self::Dropped(_) => Self::Dropped(message_type),
             Self::Stalled(_) => Self::Stalled(message_type),
             Self::Filtered => Self::Filtered,
@@ -147,6 +157,7 @@ impl Outcome {
 struct TypeCounters {
     reflected: u64,
     skipped: u64,
+    refused: u64,
     dropped: u64,
     stalled: u64,
 }
@@ -156,6 +167,7 @@ impl TypeCounters {
         let parts: Vec<String> = [
             ("reflected", self.reflected),
             ("skipped", self.skipped),
+            ("refused", self.refused),
             ("dropped", self.dropped),
             ("stalled", self.stalled),
         ]
@@ -184,6 +196,7 @@ impl CaptureCounters {
         match outcome {
             Outcome::Reflected(t) => self.types[t as usize].reflected += 1,
             Outcome::Skipped(t) => self.types[t as usize].skipped += 1,
+            Outcome::Refused(t) => self.types[t as usize].refused += 1,
             Outcome::Dropped(t) => self.types[t as usize].dropped += 1,
             Outcome::Stalled(t) => self.types[t as usize].stalled += 1,
             Outcome::Filtered => self.filtered += 1,
@@ -255,6 +268,10 @@ mod tests {
             self.filtered
         }
 
+        fn refused(&self, ty: MessageType) -> u64 {
+            self.types[ty as usize].refused
+        }
+
         /// The echo count, for the dispatcher's echo-drop test.
         pub(crate) fn echoed(&self) -> u64 {
             self.echoed
@@ -294,7 +311,11 @@ mod tests {
     fn disposition_orders_worst_to_best() {
         use Disposition::*;
         assert!(
-            Reflected > Dropped && Dropped > Stalled && Stalled > Skipped && Skipped > Filtered
+            Reflected > Dropped
+                && Dropped > Stalled
+                && Stalled > Refused
+                && Refused > Skipped
+                && Skipped > Filtered
         );
     }
 
@@ -306,8 +327,11 @@ mod tests {
         c.record(Outcome::Skipped(MessageType::MdnsQuery));
         c.record(Outcome::Dropped(MessageType::SsdpSearch));
         c.record(Outcome::Stalled(MessageType::SsdpSearch));
+        c.record(Outcome::Refused(MessageType::MdnsResponse));
         c.record(Outcome::Filtered);
         assert_eq!(c.typed(MessageType::MdnsQuery), (2, 1, 0, 0));
+        assert_eq!(c.typed(MessageType::MdnsResponse), (0, 0, 0, 0));
+        assert_eq!(c.refused(MessageType::MdnsResponse), 1);
         assert_eq!(c.typed(MessageType::SsdpSearch), (0, 0, 1, 1));
         assert_eq!(c.typed(MessageType::WakeOnLan), (0, 0, 0, 0));
         assert_eq!(c.filtered(), 1);
@@ -365,12 +389,16 @@ mod tests {
         c.record(Outcome::Reflected(MessageType::MdnsQuery));
         c.record(Outcome::Reflected(MessageType::MdnsQuery));
         c.record(Outcome::Skipped(MessageType::MdnsQuery));
+        c.record(Outcome::Refused(MessageType::MdnsResponse));
         c.record(Outcome::Dropped(MessageType::SsdpSearch));
         c.record(Outcome::Filtered);
         // Only touched types and sub-counts appear, in declaration order, then the filtered total.
         assert_eq!(
             c.format_nonzero().as_deref(),
-            Some("mDNS query reflected=2 skipped=1; SSDP search dropped=1; filtered=1"),
+            Some(
+                "mDNS query reflected=2 skipped=1; mDNS response refused=1; SSDP search dropped=1; \
+                 filtered=1"
+            ),
         );
     }
 
@@ -394,6 +422,20 @@ mod tests {
         assert_eq!(
             Outcome::Skipped(Q).combine(Outcome::Filtered).0,
             Outcome::Skipped(Q)
+        );
+        // A refusal is not hidden by the mirrored leg's skip, nor does it hide a failure or a
+        // reflect on another entry.
+        assert_eq!(
+            Outcome::Skipped(Q).combine(Outcome::Refused(Q)).0,
+            Outcome::Refused(Q)
+        );
+        assert_eq!(
+            Outcome::Refused(Q).combine(Outcome::Stalled(Q)).0,
+            Outcome::Stalled(Q)
+        );
+        assert_eq!(
+            Outcome::Refused(Q).combine(Outcome::Reflected(Q)).0,
+            Outcome::Reflected(Q)
         );
     }
 
