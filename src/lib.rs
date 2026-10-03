@@ -69,7 +69,6 @@ fn check_config(path: Option<&Path>) -> Result<()> {
 /// Configuration loading or validation, capture setup, or the reactor.
 fn reflect(path: Option<&Path>, join_groups: bool) -> Result<()> {
     let toml_text = path.map(config::read_config_file).transpose()?;
-    // Not std::env::vars: it segfaults in statically linked FreeBSD binaries (see process_env).
     let env = sys::process_env();
 
     // Log level first, so the full parse below logs at the configured verbosity.

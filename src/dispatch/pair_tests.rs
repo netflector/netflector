@@ -461,22 +461,8 @@ impl Drop for BareInterface {
     }
 }
 
-/// Root, and a binary that can spawn the platform tooling; skips with a note otherwise.
+/// Root; skips with a note otherwise.
 fn can_create_interfaces() -> bool {
-    // The fixtures are built on ifconfig shell-outs, and a plain std::process::Command spawn
-    // SIGSEGVs in a statically-linked (+crt-static) binary on FreeBSD since rustc 1.96:
-    // std resolves `environ` via dlsym (null without a dynamic symbol table) and
-    // posix_spawn dereferences it to capture the inherited env -- the same std bug
-    // sys::process_env works around for the daemon's config path. FreeBSD coverage comes
-    // from the dynamic (debug) lane; the static lane keeps proving the +crt-static build
-    // for the rest of the suite.
-    if cfg!(all(target_os = "freebsd", target_feature = "crt-static")) {
-        skip(
-            Capability::Pair,
-            "process spawning crashes static FreeBSD binaries",
-        );
-        return false;
-    }
     // SAFETY: geteuid takes no arguments and cannot fail.
     if unsafe { libc::geteuid() } != 0 {
         skip(Capability::Pair, "interface creation requires root");

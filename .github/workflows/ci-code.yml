@@ -70,9 +70,7 @@ jobs:
         run: ci/freebsd-vm.sh wait
       - name: cargo test
         env:
-          # The static build cannot spawn processes (see the pair fixture), so the interface
-          # fixtures skip there.
-          NETFLECTOR_TEST_REQUIRE: ${{ matrix.profile.name == 'release-static' && 'capture,membership,ipv6,monitor' || 'capture,membership,pair,ipv6,monitor,wireguard' }}
+          NETFLECTOR_TEST_REQUIRE: capture,membership,pair,ipv6,monitor,wireguard
         run: |
           triple='${{ matrix.arch.triple }}'
           prefix="CARGO_TARGET_$(echo "$triple" | tr 'a-z-' 'A-Z_')"

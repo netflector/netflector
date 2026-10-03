@@ -455,36 +455,6 @@ fn set_nonblock(fd: RawFd) -> io::Result<()> {
 }
 
 /// The process environment as UTF-8 key/value pairs; non-UTF-8 entries are skipped.
-///
-/// Walks the crt1-provided `environ` itself instead of calling `std::env::vars`: std resolves
-/// `environ` via `dlsym(RTLD_DEFAULT, ..)`, which is null in a statically linked binary, and
-/// the shipped static binary segfaulted on startup. Rust 1.99 ships the upstream fix; drop
-/// this at that bump.
-#[cfg(target_os = "freebsd")]
-pub(crate) fn process_env() -> Vec<(String, String)> {
-    unsafe extern "C" {
-        static mut environ: *mut *const libc::c_char;
-    }
-    let mut entries = Vec::new();
-    // SAFETY: crt1 points `environ` at the null-terminated environment before
-    // `main` and libc's setenv keeps it valid; the process is single-threaded
-    // (project invariant), so the table cannot change mid-walk; each entry is
-    // a valid C string.
-    unsafe {
-        let mut entry = environ;
-        while !entry.is_null() && !(*entry).is_null() {
-            let bytes = std::ffi::CStr::from_ptr(*entry).to_bytes();
-            if let Some((key, value)) = str::from_utf8(bytes).ok().and_then(|s| s.split_once('=')) {
-                entries.push((key.to_owned(), value.to_owned()));
-            }
-            entry = entry.add(1);
-        }
-    }
-    entries
-}
-
-/// The process environment as UTF-8 key/value pairs; non-UTF-8 entries are skipped.
-#[cfg(not(target_os = "freebsd"))]
 pub(crate) fn process_env() -> Vec<(String, String)> {
     std::env::vars_os()
         .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))

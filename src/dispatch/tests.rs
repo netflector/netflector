@@ -881,17 +881,9 @@ fn an_mdns_answer_goes_to_the_source_peers() -> io::Result<()> {
     Ok(())
 }
 
-/// `false`, with a note, where a `WireGuard` fixture can't run: not root, or the static FreeBSD
-/// build, whose process spawning crashes (see the pair tests).
+/// `false`, with a note, where a `WireGuard` fixture can't run: not root.
 #[cfg(any(target_os = "freebsd", target_os = "linux"))]
 fn wg_can_run() -> bool {
-    if cfg!(all(target_os = "freebsd", target_feature = "crt-static")) {
-        skip(
-            Capability::WireGuard,
-            "process spawning crashes static FreeBSD binaries",
-        );
-        return false;
-    }
     // SAFETY: geteuid takes no arguments and cannot fail.
     if unsafe { libc::geteuid() } != 0 {
         skip(Capability::WireGuard, "interface creation requires root");
