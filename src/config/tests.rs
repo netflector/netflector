@@ -41,7 +41,7 @@ fn minimal_reflector_uses_defaults() {
     assert_eq!(r.name.as_str(), "discovery");
     assert_eq!(r.source_if.as_str(), "lan");
     assert_eq!(r.target_if.as_str(), "iot");
-    assert!(r.mdns);
+    assert!(r.mdns.is_some());
     assert!(r.macs.is_none());
     assert_eq!(r.address_family, AddressFamily::Default);
     assert!(r.wol.is_none());
@@ -62,7 +62,7 @@ fn wsd_reflector_parses() {
     .unwrap();
     let r = &cfg.reflectors[0];
     assert!(r.wsd);
-    assert!(!r.mdns);
+    assert!(r.mdns.is_none());
     assert!(r.wol.is_none());
     assert!(r.ssdp.is_none());
     assert!(!r.bidirectional);
@@ -310,7 +310,7 @@ fn bidirectional_reflector_parses_and_reverses() {
     assert_eq!(reversed.source_if, r.target_if);
     assert_eq!(reversed.target_if, r.source_if);
     assert_eq!(reversed.name, r.name);
-    assert!(reversed.mdns);
+    assert!(reversed.mdns.is_some());
 }
 
 #[test]
@@ -343,7 +343,7 @@ fn full_reflector_parses() {
     assert_eq!(macs.len(), 1);
     assert_eq!(macs[0].to_string(), "b0:37:95:c5:60:be");
     let wol = r.wol.as_ref().unwrap();
-    assert!(r.mdns);
+    assert!(r.mdns.is_some());
     let ssdp = r.ssdp.unwrap();
     assert!(ssdp.dial);
     assert_eq!(
@@ -655,6 +655,77 @@ fn wol_ports_without_wol() {
             wol_ports = [7]
         "#;
     assert!(matches!(err(text), ConfigError::WolPortsWithoutWol { .. }));
+}
+
+#[test]
+fn mdns_services_scope_the_mdns_reflector() {
+    let cfg = from_toml(
+        r#"
+            [reflectors.x]
+            source_if = "lan"
+            target_if = "iot"
+            mdns = true
+            mdns_services = ["_ipp._tcp", "_AirPlay._TCP"]
+            bidirectional = true
+        "#,
+    )
+    .unwrap();
+    let r = &cfg.reflectors[0];
+    let services: Vec<String> = r
+        .mdns
+        .as_ref()
+        .and_then(|mdns| mdns.services.as_deref())
+        .unwrap()
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(services, ["_ipp._tcp", "_airplay._tcp"]);
+    // Both legs of a bidirectional entry carry the list.
+    assert_eq!(r.reversed().mdns, r.mdns);
+}
+
+#[test]
+fn mdns_without_services_reflects_every_service() {
+    let cfg = from_toml(
+        r#"
+            [reflectors.x]
+            source_if = "a"
+            target_if = "b"
+            mdns = true
+        "#,
+    )
+    .unwrap();
+    assert!(cfg.reflectors[0].mdns.as_ref().unwrap().services.is_none());
+}
+
+#[test]
+fn mdns_services_without_mdns() {
+    let text = r#"
+            [reflectors.x]
+            source_if = "a"
+            target_if = "b"
+            ssdp = true
+            mdns_services = ["_ipp._tcp"]
+        "#;
+    assert!(matches!(
+        err(text),
+        ConfigError::MdnsServicesWithoutMdns { .. }
+    ));
+}
+
+#[test]
+fn mdns_services_must_be_service_types() {
+    for list in [
+        r#"["_ipp._tcp.example"]"#,
+        "[]",
+        r#"["_ipp._tcp", "_IPP._tcp"]"#,
+    ] {
+        let text = format!(
+            "[reflectors.x]\nsource_if = \"a\"\ntarget_if = \"b\"\nmdns = true\n\
+             mdns_services = {list}\n"
+        );
+        assert!(matches!(err(&text), ConfigError::Parse(_)), "{list}");
+    }
 }
 
 #[test]

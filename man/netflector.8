@@ -188,6 +188,12 @@ Re-emitted on the other interface.
 .It Sy skipped
 Recognized, but arrived in a direction the entry does not relay.
 This is normal; it is also what keeps reflected packets from looping.
+.It Sy refused
+Recognized and in the direction the entry relays, but refused by its
+.Ic mdns_services
+list
+.Pq Xr netflector.toml 5 .
+This is normal on an entry with a list.
 .It Sy dropped
 Should have been reflected, but was not: a send error, a resource cap, or a
 message advertising only unreachable addresses (link-local, loopback,

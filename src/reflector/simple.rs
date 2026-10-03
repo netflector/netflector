@@ -1,5 +1,5 @@
 //! The shared stateless reflector: classify the payload and, if it's a message for this leg,
-//! re-emit it on the egress, verbatim or through a [`ReplyRewrite`]. What differs per protocol
+//! re-emit it on the egress, verbatim or as a [`ReplyRewrite`] decides. What differs per protocol
 //! enters as the [`Classify`] gate and the [`Emit`] policy. The stateful search directions use
 //! `SearchReflector` instead.
 
@@ -11,7 +11,7 @@ use crate::logging::log_rate;
 use crate::net::packet::Packet;
 use crate::reactor::Reactor;
 
-use super::{Delivery, NoRewrite, ReplyRewrite, Verdict, WARN_WINDOW, egress_sources};
+use super::{Delivery, NoRewrite, ReplyRewrite, Rewrite, Verdict, WARN_WINDOW, egress_sources};
 
 /// A leg's ingress gate: is this packet a message for it?
 pub(crate) trait Classify {
@@ -157,7 +157,8 @@ pub(crate) struct SimpleReflector<C> {
     classify: C,
     emit: Emit,
     rewrite: Box<dyn ReplyRewrite>,
-    /// The unreachable-advertisement check, consulted only for payloads `rewrite` left untouched.
+    /// The unreachable-advertisement check, run on the payload that goes out unless `rewrite`
+    /// replaced it and opted out (DIAL's, which names our own listener).
     suppress: fn(&[u8]) -> bool,
 }
 
@@ -192,6 +193,17 @@ impl<C: Classify> SimpleReflector<C> {
         self
     }
 
+    fn unrecognized(&self, packet: &Packet) -> Outcome {
+        log::debug!(
+            "{}: dropping unrecognized payload ({} B) to {} from {}",
+            self.name,
+            packet.payload.len(),
+            packet.dest,
+            packet.source
+        );
+        Outcome::Filtered
+    }
+
     fn destination(&self, packet: &Packet, dispatcher: &PacketDispatcher) -> Option<SocketAddr> {
         match &self.delivery {
             Delivery::Unicast { to, .. } => Some(*to),
@@ -217,16 +229,7 @@ impl<C: Classify> PacketHandler for SimpleReflector<C> {
             Verdict::Reflect(message_type) => message_type,
             Verdict::Skip(message_type) => return Outcome::Skipped(message_type),
             Verdict::Excluded => return Outcome::Filtered,
-            Verdict::Junk => {
-                log::debug!(
-                    "{}: dropping unrecognized payload ({} B) to {} from {}",
-                    self.name,
-                    packet.payload.len(),
-                    packet.dest,
-                    packet.source
-                );
-                return Outcome::Filtered;
-            }
+            Verdict::Junk => return self.unrecognized(packet),
         };
 
         let Some(dest) = self.destination(packet, dispatcher) else {
@@ -251,14 +254,22 @@ impl<C: Classify> PacketHandler for SimpleReflector<C> {
             return Outcome::Stalled(message_type);
         }
 
-        let rewritten = self
-            .rewrite
-            .rewrite(packet.payload, self.egress, dispatcher, reactor);
-
-        // A rewritten payload is exempt: it now names our own egress-side listener, reachable from
-        // that link whatever its address class. Only an untouched payload still advertises the far
-        // link's addresses.
-        if rewritten.is_none() && (self.suppress)(packet.payload) {
+        // A DIAL rewrite is exempt from the unreachable-advertisement gate: its payload now names
+        // our own egress-side listener, reachable from that link whatever its address class. An
+        // untouched payload, or one a rewrite only trimmed, still advertises the far link's
+        // addresses, so the gate reads what goes out.
+        let keeps_addresses = self.rewrite.keeps_advertised_addresses();
+        let (payload, checked) =
+            match self
+                .rewrite
+                .rewrite(packet, self.egress, dispatcher, reactor)
+            {
+                Rewrite::Verbatim => (packet.payload, true),
+                Rewrite::Replaced(payload) => (payload, keeps_addresses),
+                Rewrite::Refused => return Outcome::Refused(message_type),
+                Rewrite::Unreadable => return self.unrecognized(packet),
+            };
+        if checked && (self.suppress)(payload) {
             log::debug!(
                 "{}: suppressing {} from {}: advertises only unreachable addresses",
                 self.name,
@@ -267,7 +278,6 @@ impl<C: Classify> PacketHandler for SimpleReflector<C> {
             );
             return Outcome::Dropped(message_type);
         }
-        let payload = rewritten.unwrap_or(packet.payload);
 
         match self.delivery.send(
             dispatcher,
@@ -559,5 +569,66 @@ mod tests {
         );
         // And the exempt payload completed the reflect: it was sent, not merely spared the gate.
         assert_eq!(outcome, Outcome::Reflected(MessageType::MdnsResponse));
+    }
+
+    /// A rewrite that answers every payload with one fixed decision.
+    struct FixedRewrite(Rewrite<'static>);
+
+    impl ReplyRewrite for FixedRewrite {
+        fn rewrite<'a>(
+            &'a mut self,
+            _: &Packet,
+            _: CaptureKey,
+            _: &mut PacketDispatcher,
+            _: &mut Reactor,
+        ) -> Rewrite<'a> {
+            self.0
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "needs a real capture device")]
+    fn a_rewrite_that_drops_says_why_in_the_outcome() {
+        let _serial = loopback_lock();
+        // A refusal is the entry's policy, counted apart from a failed send; an unreadable
+        // payload is junk.
+        for (rewrite, outcome) in [
+            (
+                Rewrite::Refused,
+                Outcome::Refused(MessageType::MdnsResponse),
+            ),
+            (Rewrite::Unreadable, Outcome::Filtered),
+        ] {
+            let Some((mut reflector, mut dispatcher, mut reactor)) =
+                reflector_over_loopback(Box::new(FixedRewrite(rewrite)), |_| false)
+            else {
+                return;
+            };
+            assert_eq!(
+                reflector.on_packet(&group_packet(), &mut dispatcher, &mut reactor),
+                outcome
+            );
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "needs a real capture device")]
+    fn a_rewrite_keeping_the_advertised_addresses_is_still_suppressed() {
+        // The gate reads the payload that would go out, not the captured one.
+        fn suppress_trimmed(payload: &[u8]) -> bool {
+            payload == b"TRIMMED"
+        }
+        let _serial = loopback_lock();
+        // The default `keeps_advertised_addresses`: a rewrite that only removed records.
+        let Some((mut reflector, mut dispatcher, mut reactor)) = reflector_over_loopback(
+            Box::new(FixedRewrite(Rewrite::Replaced(b"TRIMMED"))),
+            suppress_trimmed,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            reflector.on_packet(&group_packet(), &mut dispatcher, &mut reactor),
+            Outcome::Dropped(MessageType::MdnsResponse)
+        );
     }
 }

@@ -31,6 +31,7 @@ use crate::linear_map::LinearMap;
 use crate::logging::WARN_WINDOW;
 use crate::net::LinkType;
 use crate::net::mac::{MacAddr, MacSet};
+use crate::net::packet::Packet;
 use crate::reactor::Reactor;
 
 /// A classifier's verdict on a captured payload. `Reflect`/`Skip` carry the message's own
@@ -104,19 +105,37 @@ impl Delivery {
     }
 }
 
-/// Transforms a payload before re-emit (the SSDP DIAL `LOCATION` rewrite). Returns the rewrite,
-/// held in the implementor's own scratch, or `None` to forward `payload` verbatim; the caller also
-/// reads `None` as "still advertising the device's own addresses" for the unreachable-advertisement
-/// suppression.
+/// What a [`ReplyRewrite`] makes of a payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Rewrite<'a> {
+    /// Forward the captured payload as it is.
+    Verbatim,
+    /// Forward this instead, held in the rewrite's own scratch.
+    Replaced(&'a [u8]),
+    /// Do not forward it: the entry's policy refuses it. The rewrite logged why.
+    Refused,
+    /// Do not forward it: not a message the rewrite can read.
+    Unreadable,
+}
+
+/// Decides each payload a leg is about to re-emit: forward it as captured, replace it (the SSDP
+/// DIAL `LOCATION` rewrite, the mDNS allow-list's trim), or drop it (the allow-list's refusal).
 /// A trait rather than a closure: the `Fn` traits can't express that lending signature.
 pub(crate) trait ReplyRewrite {
     fn rewrite<'a>(
         &'a mut self,
-        payload: &[u8],
+        packet: &Packet,
         egress: CaptureKey,
         dispatcher: &mut PacketDispatcher,
         reactor: &mut Reactor,
-    ) -> Option<&'a [u8]>;
+    ) -> Rewrite<'a>;
+
+    /// Whether a payload this rewrite replaced still advertises the far link's own addresses, so
+    /// the unreachable-advertisement check applies to it as to a verbatim one. Fails closed: a
+    /// rewrite that splices in our own listener, as DIAL's does, opts out.
+    fn keeps_advertised_addresses(&self) -> bool {
+        true
+    }
 }
 
 pub(crate) struct NoRewrite;
@@ -124,12 +143,12 @@ pub(crate) struct NoRewrite;
 impl ReplyRewrite for NoRewrite {
     fn rewrite<'a>(
         &'a mut self,
-        _payload: &[u8],
+        _packet: &Packet,
         _egress: CaptureKey,
         _dispatcher: &mut PacketDispatcher,
         _reactor: &mut Reactor,
-    ) -> Option<&'a [u8]> {
-        None
+    ) -> Rewrite<'a> {
+        Rewrite::Verbatim
     }
 }
 
