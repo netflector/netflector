@@ -69,25 +69,35 @@ impl fmt::Display for MacAddr {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
-#[error("expected six colon-separated hex octets")]
+#[error("expected a MAC address such as aa:bb:cc:dd:ee:ff, aa-bb-cc-dd-ee-ff or aabb.ccdd.eeff")]
 pub(crate) struct ParseMacAddrError;
 
 impl FromStr for MacAddr {
     type Err = ParseMacAddrError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (separator, group_len) = if s.contains('.') {
+            ('.', 4)
+        } else if s.contains('-') {
+            ('-', 2)
+        } else {
+            (':', 2)
+        };
         let mut bytes = [0u8; 6];
-        let mut parts = s.split(':');
-        for slot in &mut bytes {
-            let part = parts.next().ok_or(ParseMacAddrError)?;
+        let mut groups = s.split(separator);
+        for chunk in bytes.chunks_exact_mut(group_len / 2) {
+            let group = groups.next().ok_or(ParseMacAddrError)?;
             // The hex-digit guard is load-bearing: `u8::from_str_radix` accepts a leading '+', so
             // the length check alone would admit "+a".
-            if part.len() != 2 || !part.bytes().all(|b| b.is_ascii_hexdigit()) {
+            if group.len() != group_len || !group.bytes().all(|b| b.is_ascii_hexdigit()) {
                 return Err(ParseMacAddrError);
             }
-            *slot = u8::from_str_radix(part, 16).map_err(|_| ParseMacAddrError)?;
+            for (i, slot) in chunk.iter_mut().enumerate() {
+                let octet = group.get(2 * i..2 * i + 2).ok_or(ParseMacAddrError)?;
+                *slot = u8::from_str_radix(octet, 16).map_err(|_| ParseMacAddrError)?;
+            }
         }
-        if parts.next().is_some() {
+        if groups.next().is_some() {
             return Err(ParseMacAddrError);
         }
         Ok(MacAddr(bytes))
@@ -140,13 +150,21 @@ mod tests {
     }
 
     #[test]
+    fn mac_parses_hyphen_and_dot_forms() {
+        let colon = "b0:37:95:c5:60:be".parse::<MacAddr>().unwrap();
+        assert_eq!("B0-37-95-C5-60-BE".parse::<MacAddr>(), Ok(colon));
+        assert_eq!("b0-37-95-C5-60-bE".parse::<MacAddr>(), Ok(colon));
+        assert_eq!("b037.95c5.60be".parse::<MacAddr>(), Ok(colon));
+        assert_eq!("B037.95C5.60bE".parse::<MacAddr>(), Ok(colon));
+    }
+
+    #[test]
     fn mac_rejects_sign_prefixed_octets() {
         // u8::from_str_radix accepts a leading '+', so without an explicit hex-digit guard each "+x"
         // octet would parse and a fully sign-prefixed MAC would be admitted.
-        assert_eq!(
-            "+a:+b:+c:+d:+e:+f".parse::<MacAddr>(),
-            Err(ParseMacAddrError)
-        );
+        for s in ["+a:+b:+c:+d:+e:+f", "+a-+b-+c-+d-+e-+f", "+abc.+abc.+abc"] {
+            assert_eq!(s.parse::<MacAddr>(), Err(ParseMacAddrError), "{s:?}");
+        }
     }
 
     #[test]
@@ -209,6 +227,17 @@ mod tests {
             "1:2:3:4:5:6",          // one-digit octets
             "100:02:03:04:05:06",   // three-digit octet
             "01::03:04:05:06",      // empty octet
+            "01-02-03",             // too few
+            "01-02-03-04-05-06-07", // too many
+            "0102.0304",            // too few
+            "0102.0304.0506.0708",  // too many
+            "102.0304.0506",        // three-digit group
+            "0102..0506",           // empty group
+            "0102.0304.0506.",      // trailing separator
+            "01-02-03:04:05:06",    // mixed separators
+            "0102.0304-0506",       // mixed separators
+            "0102:0304:0506",       // dotted groups, colon-separated
+            "010203040506",         // no separator
         ] {
             assert_eq!(s.parse::<MacAddr>(), Err(ParseMacAddrError), "{s:?}");
         }
@@ -242,6 +271,10 @@ mod tests {
     fn mac_set_rejects_duplicates_and_bad_and_empty() {
         assert!(matches!(
             "aa:bb:cc:dd:ee:01,aa:bb:cc:dd:ee:01".parse::<MacSet>(),
+            Err(ListError::Duplicate { .. })
+        ));
+        assert!(matches!(
+            "aa:bb:cc:dd:ee:01,AA-BB-CC-DD-EE-01".parse::<MacSet>(),
             Err(ListError::Duplicate { .. })
         ));
         assert!(matches!(

@@ -93,6 +93,12 @@ Optional list of MAC addresses limiting the entry to specific devices on
 .Ic target_if :
 only the listed devices are reflected or woken, across every protocol the
 entry enables.
+Each address is written as
+.Ql aa:bb:cc:dd:ee:ff ,
+.Ql aa-bb-cc-dd-ee-ff
+or
+.Ql aabb.ccdd.eeff ,
+in upper or lower case.
 Omit it to cover the whole segment.
 An empty list is rejected, as is a list on an mDNS/SSDP/WSD entry whose
 .Ic target_if

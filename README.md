@@ -325,8 +325,8 @@ rejected at startup.
 SSDP, and WSD because a device's NIC MAC is both the target of its Wake-on-LAN magic packet and the L2
 source of its mDNS/SSDP/WSD advertisements. A single device is just a one-entry list
 (`macs = ["B0:37:95:C5:60:BE"]`); list several to scope one entry to a set of devices
-(`macs = ["B0:37:95:C5:60:BE", "C4:9D:8F:11:22:33"]`). Below, "the allow-set" means the configured
-devices:
+(`macs = ["B0:37:95:C5:60:BE", "C4:9D:8F:11:22:33"]`). The hyphen (`B0-37-95-C5-60-BE`) and dotted
+(`b037.95c5.60be`) forms work too. Below, "the allow-set" means the configured devices:
 
 - **WoL** re-emits only magic packets whose payload targets a device in the allow-set.
 - **mDNS / SSDP / WSD** relay, in the target→source direction, only frames whose L2 source MAC is in the
