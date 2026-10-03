@@ -74,7 +74,13 @@ jobs:
           done <<< "$abis"
           [ "$(ci/pkg-published.sh "$probe" 9.9.9)" = true ] \
             || { echo "::error::complete catalogue not reported as published"; exit 1; }
-          rm "$probe/opnsense/$(echo "$abis" | tail -1)/latest/netflector-9.9.9.pkg"
+          while read -r abi; do
+            mkdir -p "$probe/opnsense/$abi/archive"
+            mv "$probe/opnsense/$abi/latest/netflector-9.9.9.pkg" "$probe/opnsense/$abi/archive/"
+          done <<< "$abis"
+          [ "$(ci/pkg-published.sh "$probe" 9.9.9)" = true ] \
+            || { echo "::error::archived version not reported as published"; exit 1; }
+          rm "$probe/opnsense/$(echo "$abis" | tail -1)/archive/netflector-9.9.9.pkg"
           [ "$(ci/pkg-published.sh "$probe" 9.9.9)" = false ] \
             || { echo "::error::half-finished publish reported as published"; exit 1; }
 
@@ -122,13 +128,15 @@ jobs:
           if [ -n "$revision" ] && [ "$revision" != 0 ]; then
             version="${version}_${revision}"
           fi
-          url="https://netflector.github.io/pkg/opnsense/${{ matrix.abi }}/latest/netflector-${version}.pkg"
+          base="https://netflector.github.io/pkg/opnsense/${{ matrix.abi }}"
+          pkg="netflector-${version}.pkg"
           # PRs always build from the port: this pipeline is the only one that fires on
           # ci/freebsd-port-package.sh, and once the pinned version is published the fetch
           # succeeds and the script never runs. A publish prefers the published package and
           # falls back to the port only in the pair state, as build-daemon-pkgs.yml does.
           if [ '${{ github.event_name }}' = pull_request ] \
-              || ! ci/freebsd-vm.sh run "fetch -qo /root/netflector.pkg '$url'"; then
+              || ! ci/freebsd-vm.sh run "fetch -qo /root/netflector.pkg '$base/latest/$pkg' \
+                                         || fetch -qo /root/netflector.pkg '$base/archive/$pkg'"; then
             echo "building the daemon ${version} from the port"
             ci/freebsd-port-package.sh
             ci/freebsd-vm.sh run 'cp /usr/ports/net/netflector/work/pkg/netflector-*.pkg /root/netflector.pkg'

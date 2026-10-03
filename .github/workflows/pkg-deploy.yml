@@ -1,10 +1,13 @@
 # The shared publish logic: take whatever package artifacts the caller built
 # (daemon set, plugin, or both), advance netflector/pkg by exactly one commit,
-# and let Pages serve it. Trees keep every version ever published -- filenames
-# carry versions, `pkg install netflector` resolves the newest, an explicit
-# netflector-X.Y.Z pins -- so placing packages is add-only. Signing is at the
-# catalogue level: `pkg repo` signs packagesite, which carries every package's
-# SHA256, so one signature per tree covers daemon and plugin alike.
+# and let Pages serve it. A tree's latest/ holds only the newest version of each
+# package: pkg resolves a repo package's dependencies by name, so with several
+# netflector versions in one catalogue every os-netflector entry reports a
+# "duplicate dependency listing". Superseded packages move to archive/ beside
+# it, which pkg repo does not index; they stay fetchable for `pkg add <url>`.
+# Signing is at the catalogue level: `pkg repo` signs packagesite, which carries
+# every package's SHA256, so one signature per tree covers daemon and plugin
+# alike.
 #
 # The gate runs on real OPNsense, one VM per supported release, each consuming
 # its own ABI tree: opnsense-bootstrap converts the stock FreeBSD VM of the
@@ -121,11 +124,13 @@ jobs:
           ci/freebsd-vm.sh push repo.key /tmp/repo.key
           rm repo.key
           ci/freebsd-vm.sh push pkg-repo/opnsense /repo
+          ci/freebsd-vm.sh push ci/pkg-archive-superseded.sh /tmp/pkg-archive-superseded.sh
           ci/freebsd-vm.sh run '
             set -e
             chmod 400 /tmp/repo.key
             openssl rsa -in /tmp/repo.key -pubout -out /tmp/repo.pub 2>/dev/null
             for tree in /repo/FreeBSD:*/latest; do
+              sh /tmp/pkg-archive-superseded.sh "$tree"
               pkg repo "$tree" /tmp/repo.key
             done
           '

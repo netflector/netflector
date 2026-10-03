@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Is a daemon version already in the published catalogue? Prints true or false on
-# stdout, and a found/missing line per tree on stderr.
+# Is a daemon version already published, in a tree's catalogue or archived beside
+# it? Prints true or false on stdout, and a found/missing line per tree on stderr.
 #
 #   ci/pkg-published.sh <pkg-repo-clone> <version>   # e.g. ... pkg-repo 0.13.2_1
 #   ci/pkg-published.sh --abis                       # the trees it would probe
@@ -33,7 +33,8 @@ abis=$(served_abis)
 found=0
 missing=0
 while read -r abi; do
-    if [ -e "$repo/opnsense/$abi/latest/netflector-${version}.pkg" ]; then
+    if [ -e "$repo/opnsense/$abi/latest/netflector-${version}.pkg" ] \
+        || [ -e "$repo/opnsense/$abi/archive/netflector-${version}.pkg" ]; then
         printf '  %-24s found\n' "$abi" >&2
         found=$((found + 1))
     else

@@ -120,7 +120,9 @@ jobs:
             ci/freebsd-vm.sh push daemon-pkg/*.pkg /tmp/netflector.pkg
             ci/freebsd-vm.sh run 'pkg add /tmp/netflector.pkg'
           else
-            ci/freebsd-vm.sh run 'pkg add https://netflector.github.io/pkg/opnsense/FreeBSD:${{ matrix.os }}:amd64/latest/netflector-${{ needs.guard.outputs.port }}.pkg'
+            base='https://netflector.github.io/pkg/opnsense/FreeBSD:${{ matrix.os }}:amd64'
+            pkg='netflector-${{ needs.guard.outputs.port }}.pkg'
+            ci/freebsd-vm.sh run "pkg add $base/latest/$pkg || pkg add $base/archive/$pkg"
           fi
       - name: Build the plugin package
         run: ci/freebsd-plugin-package.sh '${{ matrix.plugins_branch }}'
