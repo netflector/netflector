@@ -234,7 +234,7 @@ mod tests {
     fn free_tail_mut_is_empty_when_full_of_live_bytes() {
         let mut b = StreamBuffer::with_capacity(4);
         b.append(b"abcd").unwrap();
-        assert!(b.free_tail_mut().is_empty()); // no consumed prefix to reclaim
+        assert_eq!(b.free_tail_mut(), []); // no consumed prefix to reclaim
     }
 
     #[test]

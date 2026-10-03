@@ -32,7 +32,7 @@ fn reconcile_repairs_a_moved_identity_and_arms_the_slow_tick() -> io::Result<()>
     let real =
         crate::interface::if_index(&InterfaceName::loopback()).expect("loopback has an ifindex");
     dispatcher.table.set_test_ifindex(key, real + 1000);
-    assert!(!dispatcher.table.stale_interfaces().is_empty());
+    assert_ne!(dispatcher.table.stale_interfaces(), []);
 
     dispatcher.reconcile_interfaces(&mut reactor);
 

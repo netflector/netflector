@@ -512,7 +512,7 @@ mod tests {
         let mut buf = [0u8; 64];
         let n = frame::ethernet_ipv4_udp(mac, mac, src, dst, 64, &[], &mut buf).unwrap();
         let packet = Packet::parse(LinkType::Ethernet, &buf[..n]).unwrap();
-        assert!(packet.payload.is_empty());
+        assert_eq!(packet.payload, []);
     }
 
     /// Build a valid Ethernet IPv6 UDP frame into `buf`, returning its length. The

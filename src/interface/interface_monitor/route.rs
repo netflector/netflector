@@ -151,7 +151,7 @@ mod tests {
         let buf = message(libc::RTM_ADD, 5, 20);
         let mut seen = Vec::new();
         for_each_change(&buf, &mut |e| seen.push(e));
-        assert!(seen.is_empty());
+        assert_eq!(seen, []);
     }
 
     #[test]
@@ -163,7 +163,7 @@ mod tests {
         buf[3] = u8::try_from(libc::RTM_NEWADDR).unwrap();
         let mut seen = Vec::new();
         for_each_change(&buf, &mut |e| seen.push(e));
-        assert!(seen.is_empty());
+        assert_eq!(seen, []);
     }
 
     #[test]
@@ -173,7 +173,7 @@ mod tests {
         let buf = message(libc::RTM_NEWADDR, 0, 20);
         let mut seen = Vec::new();
         for_each_change(&buf, &mut |e| seen.push(e));
-        assert!(seen.is_empty());
+        assert_eq!(seen, []);
     }
 
     #[test]
@@ -182,6 +182,6 @@ mod tests {
         buf[0..2].copy_from_slice(&9999u16.to_ne_bytes()); // msglen past the datagram
         let mut seen = Vec::new();
         for_each_change(&buf, &mut |e| seen.push(e));
-        assert!(seen.is_empty());
+        assert_eq!(seen, []);
     }
 }

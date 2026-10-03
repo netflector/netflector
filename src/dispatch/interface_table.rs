@@ -710,7 +710,7 @@ mod tests {
         let a = table.add_test_capture(); // both link InterfaceKey(0)
         let b = table.add_test_capture();
         assert_eq!(table.captures_of(InterfaceKey(0)), [a, b]);
-        assert!(table.captures_of(InterfaceKey(1)).is_empty());
+        assert_eq!(table.captures_of(InterfaceKey(1)), []);
         // Capture-less slots (drained, or test entries with no fd) and out-of-range keys
         // report Ok(false) -- a signal for the caller to log, not an error and not a success.
         assert!(matches!(table.rebind_capture(a), Ok(false)));
