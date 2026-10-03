@@ -138,6 +138,28 @@ Boolean, default
 Relaying is multicast only: a querier that requests a unicast answer, by
 setting the QU bit or by asking from an ephemeral source port, is answered off
 the group, and that answer is not relayed.
+.It Ic mdns_services
+DNS-SD service types to reflect, each
+.Ql _ Ns Ar service Ns ._tcp
+or
+.Ql _ Ns Ar service Ns ._udp ,
+case-insensitive, a trailing
+.Ql .local
+accepted.
+Omitted, every service is reflected.
+A query is relayed unless every question names a service outside the list.
+A response with nothing refused is relayed as it is.
+Otherwise the refused records are removed, and the response is relayed when an
+answer naming an allowed service remains, or when it has answers and none names
+a service, as in a hostname answer; any other response is dropped.
+Records that name no service, such as address records and reverse lookups,
+are not removed from a relayed response.
+A refusal counts as
+.Sy refused
+.Pq Xr netflector 8 .
+Valid only when
+.Ic mdns
+is enabled.
 .It Ic ssdp
 Enable SSDP reflection.
 Boolean, default
@@ -228,7 +250,7 @@ parameter overrides it.
 .Ic NAME ,
 or any entry field:
 .Ic SOURCE_IF , TARGET_IF , SOURCE_PEERS , TARGET_PEERS , MACS , WOL , MDNS ,
-.Ic SSDP , WSD , DIAL , WOL_PORTS , ADDRESS_FAMILY , BIDIRECTIONAL , UDP_PORTS ,
+.Ic MDNS_SERVICES , SSDP , WSD , DIAL , WOL_PORTS , ADDRESS_FAMILY , BIDIRECTIONAL , UDP_PORTS ,
 .Ic UDP_GROUPS , UDP_BROADCAST .
 Case-insensitive.
 .El
@@ -247,7 +269,7 @@ Booleans are
 .Cm true Ns / Ns Cm false
 or
 .Cm 1 Ns / Ns Cm 0 ;
-.Ic MACS , WOL_PORTS , UDP_PORTS ,
+.Ic MACS , MDNS_SERVICES , WOL_PORTS , UDP_PORTS ,
 and
 .Ic UDP_GROUPS
 are comma-separated.

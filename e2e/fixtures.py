@@ -38,6 +38,71 @@ MDNS_RESPONSE_LINK_LOCAL_HEX = (
     "01780000010001000000780004a9fe0102"  # A x. -> 169.254.1.2
     "017800001c0001000000780010fe800000000000000000000000000001"  # AAAA x. -> fe80::1
 )
+
+
+def _dns_name_hex(name: str) -> str:
+    """`name` in DNS wire form, uncompressed."""
+    wire = b"".join(bytes([len(label)]) + label.encode() for label in name.split("."))
+    return (wire + b"\x00").hex()
+
+
+def _ptr_record_hex(owner: str, target: str) -> str:
+    """A PTR record, class IN with the cache-flush bit clear, TTL 120."""
+    rdata = _dns_name_hex(target)
+    return _dns_name_hex(owner) + "000c0001" + "00000078" + f"{len(rdata) // 2:04x}" + rdata
+
+
+def _a_record_hex(owner: str, address: str) -> str:
+    """An A record, class IN with the cache-flush bit clear, TTL 120."""
+    rdata = bytes(int(octet) for octet in address.split(".")).hex()
+    return _dns_name_hex(owner) + "00010001" + "00000078" + "0004" + rdata
+
+
+def _response_hex(answers: list[str], additional: list[str]) -> str:
+    """A response carrying the records given (in hex) as answers and as additional data."""
+    counts = f"0000{len(answers):04x}0000{len(additional):04x}"
+    return "0000" "8400" + counts + "".join(answers) + "".join(additional)
+
+
+def _mdns_hex(qr: bool, questions: list[str], answers: list[tuple[str, str]]) -> str:
+    """A header, a PTR question per name, then a PTR answer per (owner, target)."""
+    header = "0000" + ("8400" if qr else "0000") + f"{len(questions):04x}{len(answers):04x}00000000"
+    asked = "".join(_dns_name_hex(name) + "000c0001" for name in questions)
+    return header + asked + "".join(_ptr_record_hex(owner, target) for owner, target in answers)
+
+
+# The mdns_services allow-list (config-services.toml admits _ipp._tcp only). A mixed response is
+# re-emitted with the refused record removed: its header count drops to 1 and the allowed record
+# follows unchanged, since the original carries no compression pointer to remap.
+_IPP_ANSWER = ("_ipp._tcp.local", "Laser._ipp._tcp.local")
+_HAP_ANSWER = ("_hap._tcp.local", "Lock._hap._tcp.local")
+MDNS_QUERY_IPP_HEX = _mdns_hex(False, ["_ipp._tcp.local"], [])
+MDNS_QUERY_HAP_HEX = _mdns_hex(False, ["_hap._tcp.local"], [])
+MDNS_RESPONSE_IPP_HEX = _mdns_hex(True, [], [_IPP_ANSWER])
+MDNS_RESPONSE_HAP_HEX = _mdns_hex(True, [], [_HAP_ANSWER])
+MDNS_RESPONSE_HAP_IPP_HEX = _mdns_hex(True, [], [_HAP_ANSWER, _IPP_ANSWER])
+# The same two answers with the allowed owner compressed: `_ipp`, then a pointer to `_tcp.local`
+# inside the refused record's owner (offset 17: the 12-byte header, then the `_hap` label). The trim
+# drops that record, so the pointer cannot stand: the owner is spelled out, and the result is the
+# uncompressed allowed response.
+_IPP_TARGET_HEX = _dns_name_hex(_IPP_ANSWER[1])
+MDNS_RESPONSE_HAP_IPP_COMPRESSED_HEX = (
+    "0000" "8400" "0000" "0002" "0000" "0000"
+    + _ptr_record_hex(*_HAP_ANSWER)
+    + "045f697070" "c011"  # _ipp -> _tcp.local in the first owner
+    + "000c0001" "00000078" + f"{len(_IPP_TARGET_HEX) // 2:04x}" + _IPP_TARGET_HEX
+)
+# A response's answers decide it. A hostname answer carrying a refused service as additional data
+# keeps its answer and loses the extra; an announcement whose only service is refused is dropped,
+# the address record beside it included.
+_PRINTER_A = _a_record_hex("printer.local", "192.0.2.9")
+MDNS_RESPONSE_HOSTNAME_HEX = _response_hex([_PRINTER_A], [])
+MDNS_RESPONSE_HOSTNAME_HAP_EXTRA_HEX = _response_hex([_PRINTER_A], [_ptr_record_hex(*_HAP_ANSWER)])
+MDNS_RESPONSE_HAP_ANNOUNCEMENT_HEX = _response_hex(
+    [_ptr_record_hex(*_HAP_ANSWER), _a_record_hex("lock.local", "192.0.2.10")], []
+)
+
+
 # --- SSDP (UPnP discovery, HTTPU): multicast group 239.255.255.250 / ff02::c on UDP 1900. ---
 SSDP_GROUP_V4 = "239.255.255.250"
 SSDP_GROUP_V6 = "ff02::c"

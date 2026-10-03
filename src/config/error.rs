@@ -12,6 +12,7 @@ use super::value::{
 };
 use crate::interface::{InterfaceName, ParseInterfaceNameError};
 use crate::net::mac::MacAddr;
+use crate::net::mdns::services::ServiceType;
 use crate::unique_list::ListError;
 
 /// Value-level TOML errors (wrong type, bad port, unparseable MAC) arrive as
@@ -79,6 +80,9 @@ pub(crate) enum ConfigError {
 
     #[error("reflector \"{name}\" sets wol_ports but does not enable wol")]
     WolPortsWithoutWol { name: ReflectorName },
+
+    #[error("reflector \"{name}\" sets mdns_services but does not enable mdns")]
+    MdnsServicesWithoutMdns { name: ReflectorName },
 
     #[error(
         "reflector \"{name}\" lists macs but enables only the UDP relay, which does not apply them"
@@ -176,6 +180,9 @@ pub(crate) enum ParseValueError {
     AddressFamily(#[from] ParseAddressFamilyError),
     #[error(transparent)]
     Macs(#[from] ListError<MacAddr>),
+    /// Boxed: a service type is 64 bytes inline, which would bloat every config `Result`.
+    #[error(transparent)]
+    Services(Box<ListError<ServiceType>>),
     #[error(transparent)]
     Interface(#[from] ParseInterfaceNameError),
     #[error(transparent)]
@@ -188,6 +195,12 @@ pub(crate) enum ParseValueError {
     Bool(#[from] ParseBoolError),
     #[error(transparent)]
     Integer(#[from] std::num::ParseIntError),
+}
+
+impl From<ListError<ServiceType>> for ParseValueError {
+    fn from(error: ListError<ServiceType>) -> Self {
+        Self::Services(Box::new(error))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]

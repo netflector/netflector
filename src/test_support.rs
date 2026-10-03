@@ -170,12 +170,84 @@ pub(crate) struct ReplaceRewrite;
 impl crate::reflector::ReplyRewrite for ReplaceRewrite {
     fn rewrite<'a>(
         &'a mut self,
-        _: &[u8],
+        _: &crate::net::packet::Packet,
         _: crate::dispatch::CaptureKey,
         _: &mut crate::dispatch::PacketDispatcher,
         _: &mut Reactor,
-    ) -> Option<&'a [u8]> {
-        Some(b"REWRITTEN")
+    ) -> crate::reflector::Rewrite<'a> {
+        crate::reflector::Rewrite::Replaced(b"REWRITTEN")
+    }
+
+    /// Stands in for DIAL's rewrite, which names our own listener.
+    fn keeps_advertised_addresses(&self) -> bool {
+        false
+    }
+}
+
+/// DNS messages in wire form, uncompressed, for the mDNS tests.
+pub(crate) mod dns {
+    pub(crate) const TYPE_A: u16 = 1;
+    pub(crate) const TYPE_PTR: u16 = 12;
+    pub(crate) const TYPE_TXT: u16 = 16;
+
+    /// `text` in wire form; empty labels (a trailing dot) are skipped.
+    pub(crate) fn name(text: &str) -> Vec<u8> {
+        let mut wire = Vec::new();
+        for label in text.split('.').filter(|label| !label.is_empty()) {
+            wire.push(u8::try_from(label.len()).unwrap());
+            wire.extend_from_slice(label.as_bytes());
+        }
+        wire.push(0);
+        wire
+    }
+
+    /// A header for a response (`qr`) or query with `qd` questions and `an` answers.
+    pub(crate) fn header(qr: bool, qd: usize, an: usize) -> Vec<u8> {
+        let mut m = vec![0u8; 12];
+        m[2] = if qr { 0x84 } else { 0 };
+        m[4..6].copy_from_slice(&u16::try_from(qd).unwrap().to_be_bytes());
+        m[6..8].copy_from_slice(&u16::try_from(an).unwrap().to_be_bytes());
+        m
+    }
+
+    /// A query asking a PTR question for each of `names`.
+    pub(crate) fn query(names: &[&str]) -> Vec<u8> {
+        let mut m = header(false, names.len(), 0);
+        for n in names {
+            m.extend(name(n));
+            m.extend_from_slice(&TYPE_PTR.to_be_bytes());
+            m.extend_from_slice(&[0x00, 0x01]);
+        }
+        m
+    }
+
+    /// A response whose answer section holds `records`: `(owner, type, rdata)`, IN, TTL 120.
+    pub(crate) fn response(records: &[(&str, u16, Vec<u8>)]) -> Vec<u8> {
+        response_with_additional(records, &[])
+    }
+
+    /// A response with `answers` in the answer section and `additional` in the additional one.
+    pub(crate) fn response_with_additional(
+        answers: &[(&str, u16, Vec<u8>)],
+        additional: &[(&str, u16, Vec<u8>)],
+    ) -> Vec<u8> {
+        let mut m = header(true, 0, answers.len());
+        m[10..12].copy_from_slice(&u16::try_from(additional.len()).unwrap().to_be_bytes());
+        for (owner, rtype, rdata) in answers.iter().chain(additional) {
+            m.extend(name(owner));
+            m.extend_from_slice(&rtype.to_be_bytes());
+            m.extend_from_slice(&[0x80, 0x01, 0, 0, 0, 120]);
+            m.extend_from_slice(&u16::try_from(rdata.len()).unwrap().to_be_bytes());
+            m.extend_from_slice(rdata);
+        }
+        m
+    }
+
+    /// SRV rdata for port 631 on `target`.
+    pub(crate) fn srv(target: &str) -> Vec<u8> {
+        let mut rdata = vec![0, 0, 0, 0, 0x02, 0x77];
+        rdata.extend(name(target));
+        rdata
     }
 }
 
