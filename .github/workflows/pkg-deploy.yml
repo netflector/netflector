@@ -226,7 +226,11 @@ jobs:
       # from our signed repo.
       - name: Install and exercise the pair
         run: |
-          ci/freebsd-vm.sh run 'pkg install -y os-netflector'
+          ci/freebsd-vm.sh run 'pkg install -y os-netflector' 2>&1 | tee install.log
+          if grep -q 'duplicate dependency' install.log; then
+            echo "::error::pkg reports a duplicate dependency: a catalogue lists a package more than once"
+            exit 1
+          fi
           ci/opnsense-exercise.sh
       - name: VM console log
         if: always()
