@@ -10,7 +10,6 @@ use std::time::{Duration, Instant};
 use libc::{c_int, socklen_t};
 
 use super::{InterfaceAddresses, V6Pick, v6_rank};
-use crate::libcex::nl_align;
 use crate::net::mac::MacAddr;
 use crate::sys::{IoStatus, blocking_socket};
 
@@ -78,6 +77,11 @@ pub(super) fn read_at<T: Pod>(buf: &[u8], off: usize) -> Option<T> {
     // SAFETY: the bound check guarantees a full `T` lies within `buf`; `read_unaligned` imposes
     // no alignment requirement, and `Pod` makes every bit pattern a valid `T`.
     Some(unsafe { ptr::read_unaligned(buf.as_ptr().add(off).cast::<T>()) })
+}
+
+pub(super) fn nl_align(len: usize) -> usize {
+    usize::try_from(libc::NLMSG_ALIGN(len))
+        .expect("NLMSG_ALIGN of an in-buffer length is non-negative")
 }
 
 /// `if_name` is for tracing only; the dumps filter by `ifindex`. A 0 `ifindex` skips the dumps.
@@ -449,14 +453,6 @@ mod tests {
         m[size_of::<libc::nlmsghdr>()..size_of::<libc::nlmsghdr>() + body.len()]
             .copy_from_slice(body);
         m
-    }
-
-    #[test]
-    fn nl_align_rounds_up_to_four() {
-        assert_eq!(nl_align(0), 0);
-        assert_eq!(nl_align(1), 4);
-        assert_eq!(nl_align(4), 4);
-        assert_eq!(nl_align(5), 8);
     }
 
     #[test]

@@ -8,7 +8,6 @@ use std::net::IpAddr;
 use std::num::NonZeroU32;
 use std::os::fd::{AsRawFd, OwnedFd};
 
-use crate::libcex::{GroupReq, MCAST_JOIN_GROUP};
 use crate::sys::{open_socket, setsockopt, sockaddr_for};
 
 /// How a [`rejoin`](MulticastJoiner::rejoin) landed; the four sum to the desired-group count. A
@@ -188,11 +187,11 @@ impl MulticastJoiner {
         };
         // Zeroed, not a field literal: `setsockopt` reads the padding after `gr_interface` too.
         // SAFETY: `group_req` is plain data; all-zero is valid.
-        let mut req: GroupReq = unsafe { std::mem::zeroed() };
+        let mut req: libc::group_req = unsafe { std::mem::zeroed() };
         req.gr_interface = ifindex.get();
         // `gr_interface` selects the interface, so the group sockaddr carries no scope id.
         req.gr_group = sockaddr_for(group, 0, 0).0;
-        match setsockopt(fd, level, MCAST_JOIN_GROUP, &req) {
+        match setsockopt(fd, level, libc::MCAST_JOIN_GROUP, &req) {
             Err(e) if !already_member(&e) => Err(e),
             _ => Ok(()),
         }

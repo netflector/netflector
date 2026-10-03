@@ -16,7 +16,6 @@ use libc::{c_uint, c_ulong, c_void};
 use super::Read;
 use super::filter::{BpfInsn, DLT_NULL_UDP_FILTER, ETHERNET_UDP_FILTER};
 use crate::interface::{Interface, InterfaceName};
-use crate::libcex::bpf_wordalign;
 use crate::logging::{WARN_WINDOW, log_rate};
 use crate::net::LinkType;
 use crate::sys::{IoStatus, check};
@@ -220,7 +219,7 @@ fn parse_record(record: &[u8]) -> io::Result<(Record, usize)> {
     if frame_end > record.len() {
         return Err(io::Error::other("BPF frame extends past batch end"));
     }
-    let advance = bpf_wordalign(frame_end);
+    let advance = libc::BPF_WORDALIGN(frame_end);
     if advance == 0 {
         // Would stall the drain loop forever; the kernel never emits one.
         return Err(io::Error::other("BPF record did not advance"));
@@ -321,7 +320,6 @@ mod tests {
     use std::mem::offset_of;
 
     use super::*;
-    use crate::libcex::BPF_ALIGN;
     use crate::test_support::{Capability, loopback_lock, open_or_skip, skip};
 
     /// Append one synthetic BPF record (header + frame + word-align padding) to
@@ -336,7 +334,7 @@ mod tests {
         header[offset_of!(libc::bpf_hdr, bh_hdrlen)..][..2].copy_from_slice(&hdrlen.to_ne_bytes());
         batch.extend_from_slice(&header);
         batch.extend(std::iter::repeat_n(fill, caplen as usize));
-        while !batch.len().is_multiple_of(BPF_ALIGN) {
+        while !batch.len().is_multiple_of(libc::BPF_ALIGNMENT) {
             batch.push(0);
         }
     }

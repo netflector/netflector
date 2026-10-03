@@ -8,7 +8,6 @@ mod config;
 mod dispatch;
 mod error;
 mod interface;
-mod libcex;
 mod linear_map;
 mod logging;
 mod memory_report;

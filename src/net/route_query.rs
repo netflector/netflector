@@ -10,7 +10,6 @@ use std::time::{Duration, Instant};
 
 use libc::{c_int, c_void};
 
-use crate::libcex::RtMsgHdr;
 use crate::sys::{IoStatus, blocking_socket};
 
 /// Ample for one routing message: a fixed header plus a few small sockaddrs.
@@ -34,13 +33,13 @@ const REQUEST_SEQ: c_int = 1;
 /// `RTA_DST` needs only this.
 #[repr(C)]
 struct RouteRequest {
-    hdr: RtMsgHdr,
+    hdr: libc::rt_msghdr,
     dst: libc::sockaddr_in,
 }
 
 // A trailing sockaddr occupies `SA_SIZE` bytes: `sa_len` rounded up to a multiple of `sizeof(long)`.
 // A 16-byte `sockaddr_in` is already a multiple, so a plain field lands where the cursor would.
-const _: () = assert!(size_of::<RouteRequest>() == size_of::<RtMsgHdr>() + 16);
+const _: () = assert!(size_of::<RouteRequest>() == size_of::<libc::rt_msghdr>() + 16);
 
 /// The index of the interface the kernel would route `dst` through.
 ///
@@ -83,17 +82,16 @@ fn open_route_socket() -> io::Result<OwnedFd> {
 /// `RTA_DST` alone, without `RTA_NETMASK`, selects the longest-prefix match: the lookup a forwarded
 /// packet gets rather than an exact-match one.
 fn build_request(dst: Ipv4Addr) -> RouteRequest {
+    let mut hdr = libc::rt_msghdr::default();
+    hdr.rtm_msglen =
+        u16::try_from(size_of::<RouteRequest>()).expect("the request fits a u16 length");
+    hdr.rtm_version = u8::try_from(libc::RTM_VERSION).expect("RTM_VERSION fits a u8");
+    hdr.rtm_type = u8::try_from(libc::RTM_GET).expect("RTM_GET fits a u8");
+    hdr.rtm_addrs = libc::RTA_DST;
+    hdr.rtm_pid = our_pid();
+    hdr.rtm_seq = REQUEST_SEQ;
     RouteRequest {
-        hdr: RtMsgHdr {
-            msglen: u16::try_from(size_of::<RouteRequest>())
-                .expect("the request fits a u16 length"),
-            version: u8::try_from(libc::RTM_VERSION).expect("RTM_VERSION fits a u8"),
-            msg_type: u8::try_from(libc::RTM_GET).expect("RTM_GET fits a u8"),
-            addrs: libc::RTA_DST,
-            pid: our_pid(),
-            seq: REQUEST_SEQ,
-            ..RtMsgHdr::default()
-        },
+        hdr,
         dst: libc::sockaddr_in {
             sin_len: u8::try_from(size_of::<libc::sockaddr_in>())
                 .expect("sockaddr_in fits a u8 length"),
@@ -127,34 +125,34 @@ fn read_reply(fd: RawFd, dst: Ipv4Addr) -> io::Result<u32> {
                 "the routing socket did not answer which interface reaches {dst}"
             )));
         };
-        if n < size_of::<RtMsgHdr>() {
+        if n < size_of::<libc::rt_msghdr>() {
             skipped += 1;
             continue;
         }
         // SAFETY: `buf` holds at least a whole header, checked above. Unaligned because the read
-        // landed in a byte buffer, and `RtMsgHdr` is plain data with no invalid bit patterns.
-        let hdr = unsafe { buf.as_ptr().cast::<RtMsgHdr>().read_unaligned() };
+        // landed in a byte buffer, and `rt_msghdr` is plain data with no invalid bit patterns.
+        let hdr = unsafe { buf.as_ptr().cast::<libc::rt_msghdr>().read_unaligned() };
         if !is_our_reply(&hdr) {
             skipped += 1;
             continue;
         }
-        if hdr.errno != 0 {
-            return Err(io::Error::from_raw_os_error(hdr.errno));
+        if hdr.rtm_errno != 0 {
+            return Err(io::Error::from_raw_os_error(hdr.rtm_errno));
         }
-        if hdr.flags & (libc::RTF_REJECT | libc::RTF_BLACKHOLE) != 0 {
+        if hdr.rtm_flags & (libc::RTF_REJECT | libc::RTF_BLACKHOLE) != 0 {
             return Err(io::Error::other(format!(
                 "the route to {dst} discards traffic"
             )));
         }
-        return Ok(u32::from(hdr.index));
+        return Ok(u32::from(hdr.rtm_index));
     }
 }
 
-fn is_our_reply(hdr: &RtMsgHdr) -> bool {
-    hdr.version == u8::try_from(libc::RTM_VERSION).expect("RTM_VERSION fits a u8")
-        && hdr.msg_type == u8::try_from(libc::RTM_GET).expect("RTM_GET fits a u8")
-        && hdr.pid == our_pid()
-        && hdr.seq == REQUEST_SEQ
+fn is_our_reply(hdr: &libc::rt_msghdr) -> bool {
+    hdr.rtm_version == u8::try_from(libc::RTM_VERSION).expect("RTM_VERSION fits a u8")
+        && hdr.rtm_type == u8::try_from(libc::RTM_GET).expect("RTM_GET fits a u8")
+        && hdr.rtm_pid == our_pid()
+        && hdr.rtm_seq == REQUEST_SEQ
 }
 
 fn our_pid() -> c_int {
@@ -178,14 +176,13 @@ mod tests {
 
     /// A header matching every field [`is_our_reply`] keys on. Each rejection test below changes
     /// exactly one of them, so it exercises its own clause rather than tripping an earlier one.
-    fn our_reply() -> RtMsgHdr {
-        RtMsgHdr {
-            version: u8::try_from(libc::RTM_VERSION).unwrap(),
-            msg_type: u8::try_from(libc::RTM_GET).unwrap(),
-            pid: our_pid(),
-            seq: REQUEST_SEQ,
-            ..RtMsgHdr::default()
-        }
+    fn our_reply() -> libc::rt_msghdr {
+        let mut hdr = libc::rt_msghdr::default();
+        hdr.rtm_version = u8::try_from(libc::RTM_VERSION).unwrap();
+        hdr.rtm_type = u8::try_from(libc::RTM_GET).unwrap();
+        hdr.rtm_pid = our_pid();
+        hdr.rtm_seq = REQUEST_SEQ;
+        hdr
     }
 
     #[test]
@@ -196,10 +193,8 @@ mod tests {
     #[test]
     fn skips_another_process_reply() {
         // Every routing socket sees every reply, including other processes' RTM_GETs.
-        let hdr = RtMsgHdr {
-            pid: our_pid() + 1,
-            ..our_reply()
-        };
+        let mut hdr = our_reply();
+        hdr.rtm_pid = our_pid() + 1;
         assert!(!is_our_reply(&hdr));
     }
 
@@ -207,38 +202,30 @@ mod tests {
     fn skips_a_kernel_broadcast() {
         // What actually shares the socket with us: an unsolicited announcement, carrying its own
         // message type and seq 0.
-        let hdr = RtMsgHdr {
-            msg_type: u8::try_from(libc::RTM_NEWADDR).unwrap(),
-            seq: 0,
-            ..our_reply()
-        };
+        let mut hdr = our_reply();
+        hdr.rtm_type = u8::try_from(libc::RTM_NEWADDR).unwrap();
+        hdr.rtm_seq = 0;
         assert!(!is_our_reply(&hdr));
     }
 
     #[test]
     fn skips_another_message_type() {
-        let hdr = RtMsgHdr {
-            msg_type: u8::try_from(libc::RTM_DELADDR).unwrap(),
-            ..our_reply()
-        };
+        let mut hdr = our_reply();
+        hdr.rtm_type = u8::try_from(libc::RTM_DELADDR).unwrap();
         assert!(!is_our_reply(&hdr));
     }
 
     #[test]
     fn skips_a_foreign_sequence() {
-        let hdr = RtMsgHdr {
-            seq: REQUEST_SEQ + 1,
-            ..our_reply()
-        };
+        let mut hdr = our_reply();
+        hdr.rtm_seq = REQUEST_SEQ + 1;
         assert!(!is_our_reply(&hdr));
     }
 
     #[test]
     fn skips_another_protocol_version() {
-        let hdr = RtMsgHdr {
-            version: u8::try_from(libc::RTM_VERSION).unwrap() - 1,
-            ..our_reply()
-        };
+        let mut hdr = our_reply();
+        hdr.rtm_version = u8::try_from(libc::RTM_VERSION).unwrap() - 1;
         assert!(!is_our_reply(&hdr));
     }
 }

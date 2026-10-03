@@ -6,9 +6,8 @@ use std::os::fd::{AsRawFd, OwnedFd};
 
 use libc::socklen_t;
 
-use super::super::rtnetlink::read_at;
+use super::super::rtnetlink::{nl_align, read_at};
 use super::InterfaceEvent;
-use crate::libcex::nl_align;
 use crate::sys::{check, open_socket};
 
 /// One message per datagram, never a coalesced dump; the largest, an `RTM_NEWLINK` with the

@@ -17,12 +17,9 @@ use crate::capture::{Capture, Read};
 use crate::interface::{Interface, InterfaceAddresses, InterfaceName, Ipv6Scope, if_index};
 use crate::net::packet::Packet;
 use crate::sys::setsockopt;
-use crate::test_support::{Capability, skip};
 #[cfg(target_os = "linux")]
-use crate::{
-    libcex::{GroupReq, MCAST_JOIN_GROUP},
-    sys::sockaddr_for,
-};
+use crate::sys::sockaddr_for;
+use crate::test_support::{Capability, skip};
 
 use super::datagram::{DatagramSource, build_udp, ethernet_dst};
 use super::interface_table::InterfaceTable;
@@ -951,10 +948,10 @@ fn subscribe(fd: &OwnedFd, group: IpAddr, ifindex: u32) -> io::Result<()> {
     // Zero first, as the production joiner does: setsockopt reads the whole struct, padding
     // included.
     // SAFETY: `group_req` is plain data; all-zero is valid.
-    let mut request: GroupReq = unsafe { std::mem::zeroed() };
+    let mut request: libc::group_req = unsafe { std::mem::zeroed() };
     request.gr_interface = ifindex;
     request.gr_group = sockaddr_for(group, 0, 0).0;
-    setsockopt(fd.as_raw_fd(), level, MCAST_JOIN_GROUP, &request)
+    setsockopt(fd.as_raw_fd(), level, libc::MCAST_JOIN_GROUP, &request)
 }
 
 /// A raw socket observing every `protocol` packet the stack accepts, with a short read timeout
