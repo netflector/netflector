@@ -1,7 +1,6 @@
 //! The dispatcher's interface table: every interface with its multicast joiner, and every capture
 //! linked to its interface, all addressed by `Copy` index keys.
 
-use std::hash::{DefaultHasher, Hasher};
 use std::io;
 use std::net::IpAddr;
 use std::num::NonZeroU32;
@@ -36,7 +35,7 @@ struct CaptureEntry {
     capture: Option<Capture>,
     interface: InterfaceKey,
     counters: CaptureCounters,
-    /// The packet last sent here (numbered from 1) and a hash of each frame sent for it.
+    /// The packet last sent here (numbered from 1) and the digest of each datagram sent for it.
     sent_packet: u64,
     sent: Vec<u64>,
 }
@@ -127,19 +126,19 @@ impl InterfaceTable {
         Ok(self.add_interface(Interface::open(name)?))
     }
 
-    pub(super) fn was_sent(&self, egress: CaptureKey, packet: u64, frame: &[u8]) -> bool {
+    pub(super) fn was_sent(&self, egress: CaptureKey, packet: u64, digest: u64) -> bool {
         self.captures
             .get(egress.0 as usize)
-            .is_some_and(|entry| entry.sent_packet == packet && entry.sent.contains(&hash(frame)))
+            .is_some_and(|entry| entry.sent_packet == packet && entry.sent.contains(&digest))
     }
 
-    pub(super) fn record_sent(&mut self, egress: CaptureKey, packet: u64, frame: &[u8]) {
+    pub(super) fn record_sent(&mut self, egress: CaptureKey, packet: u64, digest: u64) {
         if let Some(entry) = self.captures.get_mut(egress.0 as usize) {
             if entry.sent_packet != packet {
                 entry.sent_packet = packet;
                 entry.sent.clear();
             }
-            entry.sent.push(hash(frame));
+            entry.sent.push(digest);
         }
     }
 
@@ -182,6 +181,13 @@ impl InterfaceTable {
         self.entries
             .get(interface.0 as usize)
             .map(|entry| &entry.interface.name)
+    }
+
+    /// For logs; `?` for an unknown key.
+    pub(super) fn capture_name(&self, capture: CaptureKey) -> &str {
+        self.interface_of(capture)
+            .and_then(|interface| self.interface_name(interface))
+            .map_or("?", |name| name)
     }
 
     pub(super) fn interface_index(&self, interface: InterfaceKey) -> Option<u32> {
@@ -420,12 +426,6 @@ impl InterfaceTable {
     }
 }
 
-fn hash(frame: &[u8]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    hasher.write(frame);
-    hasher.finish()
-}
-
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
@@ -514,26 +514,26 @@ mod tests {
     // the changed fields (`None` for an unwatched index). Resolution is unprivileged (no capture
     // needed), so this exercises the monitor's refresh path without CAP_NET_RAW.
     #[test]
-    fn was_sent_remembers_every_frame_of_the_packet_being_routed() {
+    fn was_sent_remembers_every_datagram_of_the_packet_being_routed() {
         let mut table = InterfaceTable::new();
         let egress = table.add_test_capture();
         let other = table.add_test_capture();
         // Nothing recorded yet: a failed send leaves it that way, so a retry goes out.
-        assert!(!table.was_sent(egress, 1, b"first"));
-        table.record_sent(egress, 1, b"first");
-        table.record_sent(egress, 1, b"second");
-        assert!(table.was_sent(egress, 1, b"first"));
-        assert!(table.was_sent(egress, 1, b"second"));
-        // Another egress, other bytes, or the next packet: not a sent frame.
-        assert!(!table.was_sent(other, 1, b"first"));
-        assert!(!table.was_sent(egress, 1, b"third"));
-        assert!(!table.was_sent(egress, 2, b"first"));
-        // The next packet's first frame clears the previous packet's.
-        table.record_sent(egress, 2, b"third");
-        assert!(table.was_sent(egress, 2, b"third"));
-        assert!(!table.was_sent(egress, 1, b"first"));
-        assert!(!table.was_sent(CaptureKey::from_u64(999), 2, b"third"));
-        table.record_sent(CaptureKey::from_u64(999), 2, b"third"); // an unknown key is a no-op
+        assert!(!table.was_sent(egress, 1, 0xf1));
+        table.record_sent(egress, 1, 0xf1);
+        table.record_sent(egress, 1, 0xf2);
+        assert!(table.was_sent(egress, 1, 0xf1));
+        assert!(table.was_sent(egress, 1, 0xf2));
+        // Another egress, another digest, or the next packet: not a sent datagram.
+        assert!(!table.was_sent(other, 1, 0xf1));
+        assert!(!table.was_sent(egress, 1, 0xf3));
+        assert!(!table.was_sent(egress, 2, 0xf1));
+        // The next packet's first datagram clears the previous packet's.
+        table.record_sent(egress, 2, 0xf3);
+        assert!(table.was_sent(egress, 2, 0xf3));
+        assert!(!table.was_sent(egress, 1, 0xf1));
+        assert!(!table.was_sent(CaptureKey::from_u64(999), 2, 0xf3));
+        table.record_sent(CaptureKey::from_u64(999), 2, 0xf3); // an unknown key is a no-op
     }
 
     #[test]

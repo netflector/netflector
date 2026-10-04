@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::interface::{InterfaceAddresses, Ipv6Scope};
 use crate::net::LinkType;
-use crate::net::frame::{self, FrameError};
+use crate::net::frame::{FrameError, LinkHeader, UdpFrames};
 use crate::net::mac::MacAddr;
 
 /// Each case is one the reflector's family and MAC gating makes unreachable in practice; they
@@ -26,7 +26,7 @@ pub(super) enum DatagramError {
     Frame(#[from] FrameError),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum DatagramSource {
     /// The egress's own address of the destination's family, at `port`.
     Egress {
@@ -51,19 +51,20 @@ pub(super) fn ethernet_dst(
 }
 
 /// A link without L2 addresses (BSD `DLT_NULL`, a Linux raw IP tunnel) ignores `dst_mac` and
-/// needs no source MAC.
+/// needs no source MAC. An IPv4 datagram takes the low 16 bits of `id`.
 // The whole wire spec; bundling any of it would obscure more than the arg count costs.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn build_udp(
+pub(super) fn build_udp<'a>(
     addrs: &InterfaceAddresses,
     link: LinkType,
     dst: SocketAddr,
     dst_mac: MacAddr,
     source: DatagramSource,
     ttl: u8,
-    payload: &[u8],
-    scratch: &mut [u8],
-) -> Result<usize, DatagramError> {
+    id: u32,
+    payload: &'a [u8],
+    mtu: usize,
+) -> Result<UdpFrames<'a>, DatagramError> {
     match dst {
         SocketAddr::V4(dst) => {
             let src = match source {
@@ -75,21 +76,10 @@ pub(super) fn build_udp(
                     return Err(DatagramError::SourceFamilyMismatch);
                 }
             };
-            match link {
-                LinkType::Ethernet => Ok(frame::ethernet_ipv4_udp(
-                    dst_mac,
-                    addrs.mac().ok_or(DatagramError::NoSourceMac)?,
-                    src,
-                    dst,
-                    ttl,
-                    payload,
-                    scratch,
-                )?),
-                #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-                LinkType::DltNull => Ok(frame::dlt_null_ipv4_udp(src, dst, ttl, payload, scratch)?),
-                #[cfg(target_os = "linux")]
-                LinkType::RawIp => Ok(frame::ipv4_udp(src, dst, ttl, payload, scratch)?),
-            }
+            let [.., id_hi, id_lo] = id.to_be_bytes();
+            let id = u16::from_be_bytes([id_hi, id_lo]);
+            let link = link_header(addrs, link, dst_mac)?;
+            Ok(UdpFrames::ipv4(link, src, dst, ttl, id, payload, mtu)?)
         }
         SocketAddr::V6(dst) => {
             let src = match source {
@@ -105,23 +95,27 @@ pub(super) fn build_udp(
                     return Err(DatagramError::SourceFamilyMismatch);
                 }
             };
-            match link {
-                LinkType::Ethernet => Ok(frame::ethernet_ipv6_udp(
-                    dst_mac,
-                    addrs.mac().ok_or(DatagramError::NoSourceMac)?,
-                    src,
-                    dst,
-                    ttl,
-                    payload,
-                    scratch,
-                )?),
-                #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-                LinkType::DltNull => Ok(frame::dlt_null_ipv6_udp(src, dst, ttl, payload, scratch)?),
-                #[cfg(target_os = "linux")]
-                LinkType::RawIp => Ok(frame::ipv6_udp(src, dst, ttl, payload, scratch)?),
-            }
+            let link = link_header(addrs, link, dst_mac)?;
+            Ok(UdpFrames::ipv6(link, src, dst, ttl, id, payload, mtu)?)
         }
     }
+}
+
+fn link_header(
+    addrs: &InterfaceAddresses,
+    link: LinkType,
+    dst_mac: MacAddr,
+) -> Result<LinkHeader, DatagramError> {
+    Ok(match link {
+        LinkType::Ethernet => LinkHeader::Ethernet {
+            dst: dst_mac,
+            src: addrs.mac().ok_or(DatagramError::NoSourceMac)?,
+        },
+        #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+        LinkType::DltNull => LinkHeader::DltNull,
+        #[cfg(target_os = "linux")]
+        LinkType::RawIp => LinkHeader::RawIp,
+    })
 }
 
 #[cfg(test)]
@@ -129,6 +123,31 @@ mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     use super::*;
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_frame(
+        addrs: &InterfaceAddresses,
+        link: LinkType,
+        dst: SocketAddr,
+        dst_mac: MacAddr,
+        source: DatagramSource,
+        ttl: u8,
+        payload: &[u8],
+        scratch: &mut [u8],
+    ) -> Result<usize, DatagramError> {
+        let frames = build_udp(
+            addrs,
+            link,
+            dst,
+            dst_mac,
+            source,
+            ttl,
+            0,
+            payload,
+            usize::MAX,
+        )?;
+        Ok(frames.write(0, scratch)?)
+    }
 
     /// A fully-populated egress: a MAC, v4, a link-local v6, and a routable v6.
     fn full_addrs() -> InterfaceAddresses {
@@ -146,7 +165,7 @@ mod tests {
         let addrs = full_addrs();
         let dst = SocketAddr::from((Ipv6Addr::new(0xff05, 0, 0, 0, 0, 0, 0, 0x0c), 1900));
         let mut scratch = [0u8; 2048];
-        let n = build_udp(
+        let n = build_frame(
             &addrs,
             LinkType::Ethernet,
             dst,
@@ -179,7 +198,7 @@ mod tests {
         let dst = SocketAddr::from((Ipv4Addr::BROADCAST, 9003));
         let captured: SocketAddr = "192.0.2.7:40001".parse().unwrap();
         let mut scratch = [0u8; 2048];
-        let n = build_udp(
+        let n = build_frame(
             &addrs,
             LinkType::Ethernet,
             dst,
@@ -195,7 +214,7 @@ mod tests {
         assert!(n > 36);
         // A source of the other family cannot be framed.
         assert_eq!(
-            build_udp(
+            build_frame(
                 &addrs,
                 LinkType::Ethernet,
                 dst,
@@ -252,7 +271,7 @@ mod tests {
         let addrs = full_addrs();
         let dst = SocketAddr::from((Ipv4Addr::BROADCAST, 9));
         let mut scratch = [0u8; 2048];
-        let n = build_udp(
+        let n = build_frame(
             &addrs,
             LinkType::Ethernet,
             dst,
@@ -275,7 +294,7 @@ mod tests {
         let group = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
         let dst = SocketAddr::from((group, 9));
         let mut scratch = [0u8; 2048];
-        build_udp(
+        build_frame(
             &addrs,
             LinkType::Ethernet,
             dst,
@@ -299,7 +318,7 @@ mod tests {
         let searcher_mac = MacAddr::from([0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f]);
         let dst = SocketAddr::from((Ipv4Addr::new(192, 168, 0, 5), 9));
         let mut scratch = [0u8; 2048];
-        let n = build_udp(
+        let n = build_frame(
             &addrs,
             LinkType::Ethernet,
             dst,
@@ -328,7 +347,7 @@ mod tests {
         let dst = SocketAddr::from((Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1), 9));
         let mut scratch = [0u8; 2048];
         assert_eq!(
-            build_udp(
+            build_frame(
                 &v4_only,
                 LinkType::Ethernet,
                 dst,
@@ -353,7 +372,7 @@ mod tests {
         let dst = SocketAddr::from((Ipv4Addr::BROADCAST, 9));
         let mut scratch = [0u8; 2048];
         assert_eq!(
-            build_udp(
+            build_frame(
                 &no_mac,
                 LinkType::Ethernet,
                 dst,
@@ -374,7 +393,7 @@ mod tests {
         let dst = SocketAddr::from((Ipv4Addr::BROADCAST, 9));
         let mut tiny = [0u8; 16];
         assert!(matches!(
-            build_udp(
+            build_frame(
                 &full_addrs(),
                 LinkType::Ethernet,
                 dst,
@@ -402,7 +421,7 @@ mod tests {
         );
         let dst = SocketAddr::from((Ipv4Addr::BROADCAST, 9));
         let mut scratch = [0u8; 2048];
-        build_udp(
+        build_frame(
             &no_mac,
             LinkType::DltNull,
             dst,

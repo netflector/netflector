@@ -237,8 +237,8 @@ fn read_mac(bytes: &[u8]) -> Result<MacAddr, ParseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::net::frame;
     use crate::net::mac::MacAddr;
+    use crate::test_support::frame;
     use std::net::{SocketAddrV4, SocketAddrV6};
 
     // Round-trip: what the frame builder writes, the parser reads back. The two are

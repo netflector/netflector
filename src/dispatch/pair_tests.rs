@@ -570,9 +570,12 @@ fn build_injected(
             port: INJECT_SRC_PORT,
         },
         64,
+        0,
         payload,
-        scratch,
+        usize::MAX,
     )
+    .expect("plan the injected frame")
+    .write(0, scratch)
     .expect("build the injected frame")
 }
 
@@ -867,6 +870,66 @@ fn pair_injected_v6_multicast_reaches_a_joined_udp_socket() -> io::Result<()> {
     )?;
 
     let mut buffer = [0u8; 64];
+    let (length, _) = receiver.recv_from(&mut buffer)?;
+    assert_eq!(&buffer[..length], payload);
+    Ok(())
+}
+
+/// Inject a datagram fragmented at `mtu` through the production builder and send path.
+fn inject_fragmented(
+    addrs: &InterfaceAddresses,
+    injector: &Capture,
+    dst: SocketAddr,
+    payload: &[u8],
+    mtu: usize,
+) -> io::Result<()> {
+    let frames = build_udp(
+        addrs,
+        injector.link_type(),
+        dst,
+        ethernet_dst(dst.ip(), None).expect("broadcast/multicast destination"),
+        DatagramSource::Egress {
+            port: INJECT_SRC_PORT,
+        },
+        64,
+        0x5eed,
+        payload,
+        mtu,
+    )
+    .expect("plan the injected frames");
+    assert!(frames.count() > 1, "{} bytes fit one frame", payload.len());
+    let mut scratch = [0u8; 2048];
+    for index in 0..frames.count() {
+        let n = frames.write(index, &mut scratch).expect("build a fragment");
+        injector.send(&scratch[..n])?;
+    }
+    Ok(())
+}
+
+// The peer's own IPv6 stack reassembles the fragments into one datagram for a UDP socket, so this
+// holds the Fragment headers, offsets and checksum on the wire to a real kernel.
+#[test]
+fn pair_fragments_reassemble_in_the_peer_kernel() -> io::Result<()> {
+    let Some(pair) = InterfacePair::create() else {
+        return Ok(());
+    };
+    let iface = Interface::open(&pair.inject)?;
+    let injector = Capture::open(&iface)?;
+
+    let receiver = UdpSocket::bind(SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)))?;
+    let all_nodes = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
+    receiver.join_multicast_v6(
+        &all_nodes,
+        if_index(&pair.receive).expect("receive ifindex"),
+    )?;
+    receiver.set_read_timeout(Some(WAIT_BUDGET))?;
+    let port = receiver.local_addr()?.port();
+
+    let payload: Vec<u8> = (0..3000).map(|i| u8::try_from(i % 251).unwrap()).collect();
+    let dst = SocketAddr::from((all_nodes, port));
+    inject_fragmented(&iface.addrs, &injector, dst, &payload, 1280)?;
+
+    let mut buffer = [0u8; 4096];
     let (length, _) = receiver.recv_from(&mut buffer)?;
     assert_eq!(&buffer[..length], payload);
     Ok(())

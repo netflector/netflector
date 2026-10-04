@@ -476,7 +476,7 @@ fn a_failed_reflect_rolls_back_the_session_registration() {
     let _serial = loopback_lock();
     // make_session makes the response registration before reflecting; if the reflect then fails, that
     // registration must be rolled back, not leaked. A real loopback target lets make_session succeed;
-    // an oversized payload then makes build_udp reject the reflect deterministically.
+    // a payload past the UDP length field then makes build_udp reject the reflect deterministically.
     let mut dispatcher = PacketDispatcher::new();
     let Some(target) = open_loopback_or_skip(&mut dispatcher) else {
         return;
@@ -491,13 +491,14 @@ fn a_failed_reflect_rolls_back_the_session_registration() {
         no_rewrite(),
     );
     let before = dispatcher.registration_count();
+    let unsendable = vec![0u8; 65_508];
     let packet = Packet {
         source: "10.0.0.1:5".parse().unwrap(),
         dest: "239.255.255.250:1900".parse().unwrap(),
         ttl: TEST_TTL,
         dst_mac: None,
         src_mac: Some(MacAddr::from([0x02, 0, 0, 0, 0, 1])),
-        payload: &[0u8; 4096], // too large to build, so the reflect fails and rolls back
+        payload: &unsendable,
     };
     let outcome = reflector.on_packet(&packet, &mut dispatcher, &mut reactor);
     assert!(matches!(outcome, Outcome::Dropped(_)));

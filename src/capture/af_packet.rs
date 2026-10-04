@@ -322,9 +322,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::net::frame;
     use crate::net::mac::MacAddr;
-    use crate::test_support::{Tun, loopback_lock, open_or_skip};
+    use crate::test_support::{Tun, frame, loopback_lock, open_or_skip};
 
     /// How long a live tun test waits for a packet to cross the device.
     const WAIT_BUDGET: Duration = Duration::from_secs(2);

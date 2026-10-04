@@ -256,6 +256,113 @@ pub(crate) mod dns {
     }
 }
 
+/// Whole-datagram frames, as the egress builds one that fits the MTU, with identification 0.
+pub(crate) mod frame {
+    use std::net::{SocketAddrV4, SocketAddrV6};
+
+    use crate::net::frame::{FrameError, LinkHeader, UdpFrames};
+    use crate::net::mac::MacAddr;
+
+    fn ipv4(
+        link: LinkHeader,
+        src: SocketAddrV4,
+        dst: SocketAddrV4,
+        ttl: u8,
+        payload: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, FrameError> {
+        UdpFrames::ipv4(link, src, dst, ttl, 0, payload, usize::MAX)?.write(0, out)
+    }
+
+    fn ipv6(
+        link: LinkHeader,
+        src: SocketAddrV6,
+        dst: SocketAddrV6,
+        hop_limit: u8,
+        payload: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, FrameError> {
+        UdpFrames::ipv6(link, src, dst, hop_limit, 0, payload, usize::MAX)?.write(0, out)
+    }
+
+    pub(crate) fn ethernet_ipv4_udp(
+        dst_mac: MacAddr,
+        src_mac: MacAddr,
+        src: SocketAddrV4,
+        dst: SocketAddrV4,
+        ttl: u8,
+        payload: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, FrameError> {
+        let link = LinkHeader::Ethernet {
+            dst: dst_mac,
+            src: src_mac,
+        };
+        ipv4(link, src, dst, ttl, payload, out)
+    }
+
+    pub(crate) fn ethernet_ipv6_udp(
+        dst_mac: MacAddr,
+        src_mac: MacAddr,
+        src: SocketAddrV6,
+        dst: SocketAddrV6,
+        hop_limit: u8,
+        payload: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, FrameError> {
+        let link = LinkHeader::Ethernet {
+            dst: dst_mac,
+            src: src_mac,
+        };
+        ipv6(link, src, dst, hop_limit, payload, out)
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    pub(crate) fn dlt_null_ipv4_udp(
+        src: SocketAddrV4,
+        dst: SocketAddrV4,
+        ttl: u8,
+        payload: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, FrameError> {
+        ipv4(LinkHeader::DltNull, src, dst, ttl, payload, out)
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    pub(crate) fn dlt_null_ipv6_udp(
+        src: SocketAddrV6,
+        dst: SocketAddrV6,
+        hop_limit: u8,
+        payload: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, FrameError> {
+        ipv6(LinkHeader::DltNull, src, dst, hop_limit, payload, out)
+    }
+
+    /// The bare datagram a Linux raw IP link carries.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn ipv4_udp(
+        src: SocketAddrV4,
+        dst: SocketAddrV4,
+        ttl: u8,
+        payload: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, FrameError> {
+        ipv4(LinkHeader::RawIp, src, dst, ttl, payload, out)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn ipv6_udp(
+        src: SocketAddrV6,
+        dst: SocketAddrV6,
+        hop_limit: u8,
+        payload: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, FrameError> {
+        ipv6(LinkHeader::RawIp, src, dst, hop_limit, payload, out)
+    }
+}
+
 /// A tun device attached to this process: its kernel side is a raw IP link, `far_end` the other
 /// side, where a packet written arrives on the link and one sent on the link comes out. Gone
 /// when the file closes. For the raw IP link tests.
