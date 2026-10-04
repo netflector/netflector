@@ -480,9 +480,10 @@ debug level.
 netflector reads untagged Ethernet frames carrying IPv4 or IPv6 UDP, and the bare IP packets of a
 link that has no Ethernet header: a loopback, or a WireGuard or tun tunnel (Linux 5.8 or later).
 Other link types are refused at startup. A priority-tagged frame (VLAN ID 0) counts as untagged.
-Frames tagged for a VLAN are ignored and IPv6 extension headers are not parsed, so configure the
-VLAN as its own interface (`vlan10`, `em0.10`) and name that as the entry's
-`source_if` / `target_if` rather than the trunk.
+Frames tagged for a VLAN are ignored, so configure the VLAN as its own interface (`vlan10`,
+`em0.10`) and name that as the entry's `source_if` / `target_if` rather than the trunk. A datagram
+that arrives as IP fragments is reassembled, up to 9000 bytes, and one larger than the outgoing
+interface's MTU leaves as fragments. Of the IPv6 extension headers only a Fragment header is read.
 
 For SSDP, multicast reflection delivers **passive** discovery: devices' periodic `NOTIFY ssdp:alive`
 advertisements reach the source segment so clients see them. **Active** discovery works end to end as
@@ -640,8 +641,9 @@ reflected but was not: a send error, a resource cap, or the advertisement suppre
 (the egress had no source address of the packet's family yet). Interface-wide: `filtered`
 (unrecognized traffic on the group), `echoed` (netflector's own re-emits handed back by the link,
 as a hairpin bridge port or an access point re-broadcasting a station's multicast does; dropped
-before routing), `oversized` (received frames too large to forward) and `recoveries` (the interface
-was destroyed and recreated, and its capture re-bound). `netflector(8)` carries the full
+before routing), `oversized` (received frames too large to forward), `unreassembled` (fragmented
+datagrams given up on: a fragment that never arrived, overlapping fragments, or past the 9000-byte
+limit) and `recoveries` (the interface was destroyed and recreated, and its capture re-bound). `netflector(8)` carries the full
 definitions.
 
 ## Developing

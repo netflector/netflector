@@ -186,7 +186,7 @@ The counter summary, logged periodically when enabled and on
 .Dv SIGUSR1 ,
 counts per interface what happened to each packet, by message type
 .Pq e.g. Ql mDNS query reflected=42 skipped=10; filtered=2 :
-.Bl -tag -width "recoveries"
+.Bl -tag -width "unreassembled"
 .It Sy reflected
 Re-emitted on the other interface.
 .It Sy skipped
@@ -220,6 +220,9 @@ The host's own multicast is never reflected: the capture ignores outgoing
 frames, and this drop catches the echo a link may hand back.
 .It Sy oversized
 Received frames too large to forward, dropped before parsing.
+.It Sy unreassembled
+Fragmented datagrams given up on: a fragment that never arrived, fragments
+that overlap, or a datagram past the 9000-byte reassembly limit.
 .It Sy recoveries
 Times the interface was destroyed and recreated, and its capture re-bound.
 .El
