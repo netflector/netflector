@@ -3,6 +3,8 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
+use super::UDP_HEADER_SIZE;
+
 /// The checksum field (bytes 10-11) is summed as zero, so it needn't be pre-zeroed.
 ///
 /// # Panics
@@ -14,41 +16,52 @@ pub(crate) fn ipv4_header(header: &[u8]) -> u16 {
     fold(sum)
 }
 
-/// `udp` is the header plus payload; its checksum field (bytes 6-7) is summed as zero. A computed
-/// `0x0000` is returned as `0xffff` (RFC 768).
+/// The header's checksum field (bytes 6-7) is summed as zero. A computed `0x0000` is returned as
+/// `0xffff` (RFC 768).
 ///
 /// # Panics
-/// `udp` shorter than the 8-byte UDP header.
+/// A datagram longer than a UDP length field can state.
 #[must_use]
-pub(crate) fn udp_v4(src: Ipv4Addr, dst: Ipv4Addr, udp: &[u8]) -> u16 {
+pub(crate) fn udp_v4(
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    header: [u8; UDP_HEADER_SIZE],
+    payload: &[u8],
+) -> u16 {
     // Pseudo-header: src(4) dst(4) zero(1) protocol(1) length(2).
     let mut pseudo = [0u8; 12];
     pseudo[0..4].copy_from_slice(&src.octets());
     pseudo[4..8].copy_from_slice(&dst.octets());
     pseudo[9] = super::IP_PROTO_UDP;
-    pseudo[10..12].copy_from_slice(&udp_length(udp).to_be_bytes());
-    udp_checksum(&pseudo, udp)
+    pseudo[10..12].copy_from_slice(&udp_length(payload).to_be_bytes());
+    udp_checksum(&pseudo, header, payload)
 }
 
 /// As [`udp_v4`] with the IPv6 pseudo-header.
 ///
 /// # Panics
-/// `udp` shorter than the 8-byte UDP header.
+/// A datagram longer than a UDP length field can state.
 #[must_use]
-pub(crate) fn udp_v6(src: Ipv6Addr, dst: Ipv6Addr, udp: &[u8]) -> u16 {
+pub(crate) fn udp_v6(
+    src: Ipv6Addr,
+    dst: Ipv6Addr,
+    header: [u8; UDP_HEADER_SIZE],
+    payload: &[u8],
+) -> u16 {
     // Pseudo-header: src(16) dst(16) length(4) zero(3) next_header(1).
     let mut pseudo = [0u8; 40];
     pseudo[0..16].copy_from_slice(&src.octets());
     pseudo[16..32].copy_from_slice(&dst.octets());
-    pseudo[32..36].copy_from_slice(&u32::from(udp_length(udp)).to_be_bytes());
+    pseudo[32..36].copy_from_slice(&u32::from(udp_length(payload)).to_be_bytes());
     pseudo[39] = super::IP_PROTO_UDP;
-    udp_checksum(&pseudo, udp)
+    udp_checksum(&pseudo, header, payload)
 }
 
-fn udp_checksum(pseudo: &[u8], udp: &[u8]) -> u16 {
+/// The header is an even length, so the payload's words stay aligned.
+fn udp_checksum(pseudo: &[u8], header: [u8; UDP_HEADER_SIZE], payload: &[u8]) -> u16 {
     let sum = sum_words(pseudo, 0);
-    let sum = sum_words(&udp[..6], sum);
-    let sum = sum_words(&udp[8..], sum);
+    let sum = sum_words(&header[..6], sum);
+    let sum = sum_words(payload, sum);
     match fold(sum) {
         0 => 0xffff,
         checksum => checksum,
@@ -75,8 +88,8 @@ fn fold(sum: u32) -> u16 {
     !u16::try_from(sum).expect("two folds reduce the accumulator below 2^16")
 }
 
-fn udp_length(udp: &[u8]) -> u16 {
-    u16::try_from(udp.len()).expect("UDP datagram length fits in u16")
+fn udp_length(payload: &[u8]) -> u16 {
+    u16::try_from(UDP_HEADER_SIZE + payload.len()).expect("UDP datagram length fits in u16")
 }
 
 #[cfg(test)]
@@ -114,8 +127,8 @@ mod tests {
     fn udp_v4_matches_hand_computed_vector() {
         let src = Ipv4Addr::new(192, 168, 0, 1);
         let dst = Ipv4Addr::new(192, 168, 0, 199);
-        let udp = [0x12, 0x34, 0x56, 0x78, 0x00, 0x08, 0x00, 0x00];
-        assert_eq!(udp_v4(src, dst, &udp), 0x1519);
+        let header = [0x12, 0x34, 0x56, 0x78, 0x00, 0x08, 0x00, 0x00];
+        assert_eq!(udp_v4(src, dst, header, &[]), 0x1519);
     }
 
     #[test]
@@ -123,11 +136,11 @@ mod tests {
         let src = Ipv4Addr::new(192, 168, 0, 1);
         let dst = Ipv4Addr::new(192, 168, 0, 199);
         // Odd-length datagram (1-byte payload) also exercises the odd tail.
-        let mut udp = [0x12, 0x34, 0x56, 0x78, 0x00, 0x09, 0x00, 0x00, 0xaa];
-        let zeroed = udp_v4(src, dst, &udp);
-        udp[6] = 0xde;
-        udp[7] = 0xad;
-        assert_eq!(udp_v4(src, dst, &udp), zeroed);
+        let mut header = [0x12, 0x34, 0x56, 0x78, 0x00, 0x09, 0x00, 0x00];
+        let zeroed = udp_v4(src, dst, header, &[0xaa]);
+        header[6] = 0xde;
+        header[7] = 0xad;
+        assert_eq!(udp_v4(src, dst, header, &[0xaa]), zeroed);
     }
 
     #[test]
@@ -135,43 +148,43 @@ mod tests {
         // Crafted so the folded sum is 0xffff and the complement (0) is remapped
         // to 0xffff per RFC 768.
         let zero = Ipv4Addr::UNSPECIFIED;
-        assert_eq!(udp_v4(zero, zero, &[0xff, 0xe6, 0, 0, 0, 0, 0, 0]), 0xffff);
+        assert_eq!(
+            udp_v4(zero, zero, [0xff, 0xe6, 0, 0, 0, 0, 0, 0], &[]),
+            0xffff
+        );
     }
 
     #[test]
     fn udp_v6_matches_hand_computed_vector() {
         let src = Ipv6Addr::LOCALHOST; // ::1
         let dst = Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 2); // ::2
-        let udp = [0x12, 0x34, 0x56, 0x78, 0x00, 0x08, 0x00, 0x00];
-        assert_eq!(udp_v6(src, dst, &udp), 0x972f);
+        let header = [0x12, 0x34, 0x56, 0x78, 0x00, 0x08, 0x00, 0x00];
+        assert_eq!(udp_v6(src, dst, header, &[]), 0x972f);
     }
 
     #[test]
     fn udp_v6_ignores_the_checksum_field() {
         let src = Ipv6Addr::LOCALHOST;
         let dst = Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 2);
-        let mut udp = [0x12, 0x34, 0x56, 0x78, 0x00, 0x09, 0x00, 0x00, 0xaa];
-        let zeroed = udp_v6(src, dst, &udp);
-        udp[6] = 0xde;
-        udp[7] = 0xad;
-        assert_eq!(udp_v6(src, dst, &udp), zeroed);
+        let mut header = [0x12, 0x34, 0x56, 0x78, 0x00, 0x09, 0x00, 0x00];
+        let zeroed = udp_v6(src, dst, header, &[0xaa]);
+        header[6] = 0xde;
+        header[7] = 0xad;
+        assert_eq!(udp_v6(src, dst, header, &[0xaa]), zeroed);
     }
 
     #[test]
     fn udp_v6_zero_checksum_maps_to_ffff() {
         let zero = Ipv6Addr::UNSPECIFIED;
-        assert_eq!(udp_v6(zero, zero, &[0xff, 0xe6, 0, 0, 0, 0, 0, 0]), 0xffff);
+        assert_eq!(
+            udp_v6(zero, zero, [0xff, 0xe6, 0, 0, 0, 0, 0, 0], &[]),
+            0xffff
+        );
     }
 
     #[test]
     #[should_panic(expected = "out of range")]
     fn ipv4_header_panics_on_a_short_header() {
         let _ = ipv4_header(&[0u8; 11]);
-    }
-
-    #[test]
-    #[should_panic(expected = "out of range")]
-    fn udp_panics_on_a_short_datagram() {
-        let _ = udp_v4(Ipv4Addr::UNSPECIFIED, Ipv4Addr::UNSPECIFIED, &[0u8; 7]);
     }
 }

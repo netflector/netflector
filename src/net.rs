@@ -31,6 +31,7 @@ pub(crate) enum LinkType {
 }
 
 const IP_PROTO_UDP: u8 = 17;
+const IPV6_NEXT_FRAGMENT: u8 = 44;
 
 /// Ethernet link header: dst MAC(6) + src MAC(6) + ethertype(2).
 const ETHERNET_HEADER_SIZE: usize = 14;
@@ -40,15 +41,20 @@ const DLT_NULL_HEADER_SIZE: usize = 4;
 /// IPv4 without options (the minimum); the IPv6 base header and UDP header are fixed.
 const IPV4_HEADER_SIZE: usize = 20;
 const IPV6_HEADER_SIZE: usize = 40;
+const IPV6_FRAGMENT_HEADER_SIZE: usize = 8;
 const UDP_HEADER_SIZE: usize = 8;
+
+/// Fragment offsets count in these units, and every fragment but the last carries a multiple of
+/// them.
+pub(crate) const FRAGMENT_UNIT: usize = 8;
 
 /// The largest frame the daemon builds, captures or forwards; every frame-path buffer is sized
 /// from it. Clears a 1514-byte Ethernet frame (the FCS is stripped before capture) with headroom
 /// for a baby-jumbo MTU; true 9000-byte jumbo is out of reach.
 pub(crate) const MAX_FRAME_LEN: usize = 2048;
 
-/// The largest UDP payload that still fits [`MAX_FRAME_LEN`] under the worst-case header stack.
-/// IPv6 is fixed at 40: the builders emit no extension headers.
+/// The largest UDP payload that still fits one [`MAX_FRAME_LEN`] frame under the worst-case
+/// header stack. IPv6 is fixed at 40: an unfragmented datagram carries no extension header.
 pub(crate) const MAX_UDP_PAYLOAD_LEN: usize =
     MAX_FRAME_LEN - (ETHERNET_HEADER_SIZE + IPV6_HEADER_SIZE + UDP_HEADER_SIZE);
 

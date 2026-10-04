@@ -1,20 +1,27 @@
-//! The egress path: assembling a UDP datagram for an interface into one reused frame buffer and
-//! injecting it, each distinct frame once per routed packet.
+//! The egress path: assembling a UDP datagram for an interface and injecting it through one
+//! reused frame buffer, as IP fragments past the MTU, each distinct datagram once per routed
+//! packet.
 
+use std::hash::{BuildHasher, DefaultHasher, Hash, Hasher, RandomState};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 
 use crate::capture::Capture;
 use crate::interface::InterfaceAddresses;
 use crate::logging::{WARN_WINDOW, log_rate};
+use crate::net::MAX_MTU;
+use crate::net::frame::UdpFrames;
 use crate::net::mac::MacAddr;
 
 use super::CaptureKey;
 use super::datagram::{DatagramSource, build_udp, ethernet_dst};
 use super::interface_table::InterfaceTable;
 
+/// For an interface whose MTU is unreadable: IPv6's minimum link MTU.
+const FALLBACK_MTU: usize = 1280;
+
 /// The L2 destination is separate: derived from `dst` for a group send, given for a unicast one.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Hash)]
 pub(super) struct Datagram<'a> {
     pub(super) dst: SocketAddr,
     pub(super) source: DatagramSource,
@@ -28,14 +35,20 @@ pub(super) struct Egress {
     packet: u64,
     /// A send outside routing (a timer, a session) is never a duplicate.
     routing: bool,
+    /// The IP identification of the next datagram.
+    next_id: u32,
 }
 
 impl Egress {
     pub(super) fn new() -> Self {
+        // A random start, so a restart doesn't reuse identifications a receiver may still hold
+        // fragments under. std keys `RandomState` from the OS.
+        let seed = RandomState::new().hash_one(());
         Self {
             scratch: vec![0u8; crate::net::MAX_FRAME_LEN].into_boxed_slice(),
             packet: 0,
             routing: false,
+            next_id: u32::try_from(seed >> 32).expect("the high half of a u64 fits a u32"),
         }
     }
 
@@ -49,7 +62,7 @@ impl Egress {
     }
 
     /// # Errors
-    /// A send failure, or a frame that can't be built from the egress's current state.
+    /// A send failure, or a datagram that can't be built from the egress's current state.
     pub(super) fn send_udp(
         &mut self,
         table: &mut InterfaceTable,
@@ -57,8 +70,12 @@ impl Egress {
         dst_mac: MacAddr,
         datagram: Datagram<'_>,
     ) -> io::Result<()> {
-        if let Some(len) = self.build_frame(table, egress, dst_mac, datagram)? {
-            self.send_built(table, egress, len)?;
+        let digest = digest(dst_mac, datagram);
+        if self.already_sent(table, egress, digest) {
+            return Ok(());
+        }
+        if let Some(frames) = self.plan(table, egress, dst_mac, datagram)? {
+            self.transmit(table, egress, &frames, digest)?;
         }
         Ok(())
     }
@@ -93,27 +110,33 @@ impl Egress {
         peers: &[IpAddr],
         datagram: Datagram<'_>,
     ) -> io::Result<()> {
+        // No neighbour resolution: each copy travels in a broadcast frame and only the addressed
+        // host keeps it.
+        let dst_mac = MacAddr::broadcast();
         let mut delivered = false;
         let mut failure = None;
         let dst = datagram.dst;
         for &peer in peers.iter().filter(|peer| peer.is_ipv4() == dst.is_ipv4()) {
-            // No neighbour resolution: the copy travels in a broadcast frame and only the
-            // addressed host keeps it.
             let copy = Datagram {
                 dst: SocketAddr::new(peer, dst.port()),
                 ..datagram
             };
-            let Some(len) = self.build_frame(table, egress, MacAddr::broadcast(), copy)? else {
+            let digest = digest(dst_mac, copy);
+            if self.already_sent(table, egress, digest) {
+                delivered = true;
+                continue;
+            }
+            let Some(frames) = self.plan(table, egress, dst_mac, copy)? else {
                 return Ok(());
             };
-            match self.send_built(table, egress, len) {
-                Ok(_) => delivered = true,
+            match self.transmit(table, egress, &frames, digest) {
+                Ok(()) => delivered = true,
                 Err(e) => {
                     log_rate!(
                         log::Level::Warn,
                         WARN_WINDOW,
                         "{}: cannot send to peer {peer}: {e}",
-                        egress_name(table, egress)
+                        table.capture_name(egress)
                     );
                     failure = Some(e);
                 }
@@ -125,15 +148,25 @@ impl Egress {
         }
     }
 
+    /// A datagram equal to one already sent for this packet: two entries whose legs coincide
+    /// (per-device entries on one pair) both relay it.
+    fn already_sent(&self, table: &InterfaceTable, egress: CaptureKey, digest: u64) -> bool {
+        let sent = self.routing && table.was_sent(egress, self.packet, digest);
+        if sent {
+            log::trace!("egress {egress:?}: an equal datagram already went out for this packet");
+        }
+        sent
+    }
+
     /// `None` (logged): the egress is unknown or taken out for its drain. The latter needs
     /// `egress == ingress`, which no reflector configures (A -> B, never A -> A).
-    fn build_frame(
+    fn plan<'a>(
         &mut self,
         table: &InterfaceTable,
         egress: CaptureKey,
         dst_mac: MacAddr,
-        datagram: Datagram<'_>,
-    ) -> io::Result<Option<usize>> {
+        datagram: Datagram<'a>,
+    ) -> io::Result<Option<UdpFrames<'a>>> {
         let (Some(addrs), Some(link)) = (
             table.egress_addrs(egress).copied(),
             table.capture(egress).map(Capture::link_type),
@@ -141,6 +174,8 @@ impl Egress {
             log::warn!("egress {egress:?} unavailable (drained or unknown); datagram dropped");
             return Ok(None);
         };
+        let id = self.next_id;
+        self.next_id = id.wrapping_add(1);
         build_udp(
             &addrs,
             link,
@@ -148,32 +183,32 @@ impl Egress {
             dst_mac,
             datagram.source,
             datagram.ttl,
+            id,
             datagram.payload,
-            &mut self.scratch,
+            frame_mtu(table.mtu_of(egress)),
         )
         .map(Some)
         .map_err(io::Error::other)
     }
 
-    /// Skip a frame equal to one already sent for this packet: two entries whose legs coincide
-    /// (per-device entries on one pair) both relay it. Recorded only once sent, so a failed send
-    /// leaves the second to try.
-    fn send_built(
+    /// Recorded only once every frame is out, so a failed send leaves the second entry to try.
+    fn transmit(
         &mut self,
         table: &mut InterfaceTable,
         egress: CaptureKey,
-        len: usize,
-    ) -> io::Result<bool> {
-        let frame = &self.scratch[..len];
-        if self.routing && table.was_sent(egress, self.packet, frame) {
-            log::trace!("egress {egress:?}: an equal frame already went out for this packet");
-            return Ok(false);
+        frames: &UdpFrames<'_>,
+        digest: u64,
+    ) -> io::Result<()> {
+        for index in 0..frames.count() {
+            let len = frames
+                .write(index, &mut self.scratch)
+                .map_err(io::Error::other)?;
+            send(table, egress, &self.scratch[..len])?;
         }
-        send(table, egress, frame)?;
         if self.routing {
-            table.record_sent(egress, self.packet, frame);
+            table.record_sent(egress, self.packet, digest);
         }
-        Ok(true)
+        Ok(())
     }
 }
 
@@ -189,11 +224,17 @@ pub(super) fn send(table: &InterfaceTable, egress: CaptureKey, frame: &[u8]) -> 
     }
 }
 
-fn egress_name(table: &InterfaceTable, egress: CaptureKey) -> &str {
-    table
-        .interface_of(egress)
-        .and_then(|interface| table.interface_name(interface))
-        .map_or("?", |name| name)
+/// Everything a datagram's frames are built from on one egress, for the per-packet dedupe: the
+/// frames themselves differ in their identification.
+fn digest(dst_mac: MacAddr, datagram: Datagram<'_>) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    (dst_mac, datagram).hash(&mut hasher);
+    hasher.finish()
+}
+
+fn frame_mtu(mtu: Option<u32>) -> usize {
+    mtu.map_or(FALLBACK_MTU, |mtu| usize::try_from(mtu).unwrap_or(MAX_MTU))
+        .min(MAX_MTU)
 }
 
 /// Re-word `EMSGSIZE` to name the frame, the interface and its MTU; the bare "Message too long"

@@ -727,9 +727,9 @@ fn a_unicast_mdns_answer_from_a_peer_goes_to_the_group() -> io::Result<()> {
     use std::io::Write as _;
 
     use crate::interface::{Interface, LOOPBACK_IFACE};
-    use crate::net::frame;
     use crate::net::mdns::{MDNS_GROUP_V4, MDNS_PORT};
     use crate::reflector::{InterfaceMap, mdns};
+    use crate::test_support::frame;
 
     let _serial = loopback_lock();
     let Some(mut tun) = crate::test_support::Tun::create() else {
@@ -808,9 +808,9 @@ fn an_mdns_answer_goes_to_the_source_peers() -> io::Result<()> {
     use std::io::Write as _;
 
     use crate::interface::{Interface, LOOPBACK_IFACE};
-    use crate::net::frame;
     use crate::net::mdns::{MDNS_GROUP_V4, MDNS_PORT};
     use crate::reflector::{InterfaceMap, mdns};
+    use crate::test_support::frame;
 
     let _serial = loopback_lock();
     let Some(mut tun) = crate::test_support::Tun::create() else {

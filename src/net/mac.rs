@@ -11,7 +11,7 @@ use thiserror::Error;
 use crate::unique_list::{ListRule, UniqueList};
 
 /// A 48-bit IEEE 802 MAC address.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct MacAddr([u8; 6]);
 
 impl MacAddr {
