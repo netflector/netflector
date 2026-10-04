@@ -579,6 +579,76 @@ mod tests {
         Ok(())
     }
 
+    // Fragments of either family pass the DLT_NULL classifier. lo0's own fragments come at its
+    // 16384-byte MTU, past the capture limit, so the test injects its own; FreeBSD loops them
+    // back to the capture.
+    #[cfg(target_os = "freebsd")]
+    #[test]
+    #[cfg_attr(miri, ignore = "needs a real capture device")]
+    fn loopback_captures_injected_fragments() -> io::Result<()> {
+        use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+
+        use crate::net::frame::{LinkHeader, UdpFrames};
+
+        let _serial = loopback_lock();
+        let Some(mut capture) = open_or_skip(&InterfaceName::loopback())? else {
+            return Ok(());
+        };
+        let payload = [0x7a; 1000];
+        let mut datagrams = vec![UdpFrames::ipv4(
+            LinkHeader::DltNull,
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 40000),
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 40001),
+            64,
+            1,
+            &payload,
+            600,
+        )];
+        if std::net::UdpSocket::bind("[::1]:0").is_ok() {
+            datagrams.push(UdpFrames::ipv6(
+                LinkHeader::DltNull,
+                SocketAddrV6::new(Ipv6Addr::LOCALHOST, 40000, 0, 0),
+                SocketAddrV6::new(Ipv6Addr::LOCALHOST, 40001, 0, 0),
+                64,
+                1,
+                &payload,
+                600,
+            ));
+        } else {
+            skip(Capability::Ipv6, "::1 unavailable");
+        }
+        for datagram in datagrams {
+            let datagram = datagram.expect("plan the datagram");
+            assert!(datagram.count() > 1);
+            for index in 0..datagram.count() {
+                let mut frame = [0u8; 1024];
+                let n = datagram.write(index, &mut frame).expect("build a fragment");
+                capture.send(&frame[..n])?;
+                assert!(
+                    captures_frame(&mut capture, &frame[..n])?,
+                    "did not capture fragment {index} of an IPv{} datagram on lo0",
+                    frame[4] >> 4
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `capture` yields a frame equal to `want` within a short window.
+    #[cfg(target_os = "freebsd")]
+    fn captures_frame(capture: &mut Capture, want: &[u8]) -> io::Result<bool> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            while let Some(read) = capture.next_frame()? {
+                if matches!(read, Read::Frame(frame) if frame == want) {
+                    return Ok(true);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        Ok(false)
+    }
+
     /// Inject `frame` on `cap`'s interface and assert the bound `receiver` gets
     /// `probe` within a short window. Shared by both the IPv4 and IPv6 probes.
     #[cfg(target_os = "freebsd")]
