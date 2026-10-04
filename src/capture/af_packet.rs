@@ -322,6 +322,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+    use crate::net::frame::{LinkHeader, UdpFrames};
     use crate::net::mac::MacAddr;
     use crate::test_support::{Tun, frame, loopback_lock, open_or_skip};
 
@@ -403,6 +404,56 @@ mod tests {
                 packet[0] >> 4,
                 tun.name
             );
+        }
+        Ok(())
+    }
+
+    // Fragments of either family pass the raw IP classifier.
+    #[test]
+    #[cfg_attr(miri, ignore = "needs a real capture device")]
+    fn a_tun_link_captures_fragments() -> io::Result<()> {
+        let Some(mut tun) = Tun::create() else {
+            return Ok(());
+        };
+        let mut capture = Capture::open(&Interface::open(&tun.name)?)?;
+        let payload = [0x7a; 1000];
+        let datagrams = [
+            UdpFrames::ipv4(
+                LinkHeader::RawIp,
+                SocketAddrV4::new(Ipv4Addr::new(10, 99, 200, 2), 40000),
+                SocketAddrV4::new(Ipv4Addr::new(10, 99, 200, 1), 40001),
+                64,
+                1,
+                &payload,
+                600,
+            ),
+            UdpFrames::ipv6(
+                LinkHeader::RawIp,
+                SocketAddrV6::new("fd00:99::2".parse().unwrap(), 40000, 0, 0),
+                SocketAddrV6::new("fd00:99::1".parse().unwrap(), 40001, 0, 0),
+                64,
+                1,
+                &payload,
+                600,
+            ),
+        ];
+        for datagram in datagrams {
+            let datagram = datagram.expect("plan the datagram");
+            assert!(datagram.count() > 1);
+            for index in 0..datagram.count() {
+                let mut packet = vec![0u8; 2048];
+                let n = datagram
+                    .write(index, &mut packet)
+                    .expect("build a fragment");
+                packet.truncate(n);
+                tun.far_end.write_all(&packet)?;
+                assert!(
+                    captures(&mut capture, &packet)?,
+                    "did not capture fragment {index} of an IPv{} datagram on {}",
+                    packet[0] >> 4,
+                    tun.name
+                );
+            }
         }
         Ok(())
     }
