@@ -360,6 +360,42 @@ WSD_RESOLVEMATCHES_HEX = (
     .encode()
     .hex()
 )
+
+# An MFP's discovery messages, listing print and scan types, scopes and addresses: past one
+# 1500-byte frame, so they cross each link as IP fragments.
+def _wsd_mfp_message(action: str, message_id: str, body: str) -> str:
+    types = " ".join(
+        ["wsdp:Device", "wprt:PrintDeviceType", "wscn:ScanDeviceType", "wfax:FaxDeviceType"]
+        + [f"vnd:Service{index:02d}Type" for index in range(30)]
+    )
+    scopes = " ".join(f"http://scopes.invalid/mfp/floor-2/room-{index:03d}" for index in range(20))
+    xaddrs = " ".join(f"http://mfp.invalid:{8000 + index}/wsd" for index in range(10))
+    match = (
+        "<a:EndpointReference><a:Address>urn:uuid:mfp-0001</a:Address></a:EndpointReference>"
+        f"<d:Types>{types}</d:Types><d:Scopes>{scopes}</d:Scopes>"
+        f"<d:XAddrs>{xaddrs}</d:XAddrs><d:MetadataVersion>1</d:MetadataVersion>"
+    )
+    message = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"'
+        ' xmlns:a="http://schemas.xmlsoap.org/ws/2004/08/addressing"'
+        ' xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery">'
+        "<s:Header>"
+        f"<a:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/{action}</a:Action>"
+        f"<a:MessageID>urn:uuid:{message_id}</a:MessageID>"
+        "</s:Header>"
+        f"<s:Body>{body.format(match=match)}</s:Body></s:Envelope>"
+    ).encode()
+    assert 2000 < len(message) < 4096, len(message)
+    return message.hex()
+
+
+WSD_PROBEMATCHES_FRAGMENTED_HEX = _wsd_mfp_message(
+    "ProbeMatches",
+    "match-mfp-0001",
+    "<d:ProbeMatches><d:ProbeMatch>{match}</d:ProbeMatch></d:ProbeMatches>",
+)
+WSD_HELLO_FRAGMENTED_HEX = _wsd_mfp_message("Hello", "hello-mfp-0001", "<d:Hello>{match}</d:Hello>")
 RELAY_PORT = 9003
 RELAY_ONE_WAY_PORT = 9004
 RELAY_UNLISTED_PORT = 9005

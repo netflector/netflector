@@ -11,8 +11,10 @@ from fixtures import (
     SSDP_GROUP_V6,
     SSDP_GROUP_V6_SITE,
     WSD_GROUP_V4,
+    WSD_GROUP_V6,
     WSD_PORT,
     WSD_PROBE_HEX,
+    WSD_PROBEMATCHES_FRAGMENTED_HEX,
     WSD_PROBEMATCHES_HEX,
     WSD_RESOLVE_HEX,
     WSD_RESOLVEMATCHES_HEX,
@@ -47,6 +49,21 @@ ROUNDTRIP_CASES = [
         reply_hex=WSD_PROBEMATCHES_HEX,
         config="config-wsd.toml",
         evict_log="evicted WSD session",
+    ),
+    # A ProbeMatches past one frame, as an MFP sends: it reaches netflector as IP fragments and
+    # leaves as fragments again.
+    *(
+        RoundTripCase(
+            name=f"wsd_probe_roundtrip_fragmented_reply{suffix}",
+            family=family,
+            group=group,
+            port=WSD_PORT,
+            probe_hex=WSD_PROBE_HEX,
+            reply_hex=WSD_PROBEMATCHES_FRAGMENTED_HEX,
+            config="config-wsd.toml",
+            evict_log="evicted WSD session",
+        )
+        for family, group, suffix in [(4, WSD_GROUP_V4, ""), (6, WSD_GROUP_V6, "_ipv6")]
     ),
     # Searches from the target segment with the device on the source: the sessions a bidirectional
     # entry's second leg opens, reserving its port on the source side.
