@@ -15,15 +15,17 @@ use std::time::{Duration, Instant};
 
 use crate::capture::{Capture, Read};
 use crate::interface::{Interface, InterfaceAddresses, InterfaceName, Ipv6Scope, if_index};
-use crate::net::packet::Packet;
+use crate::net::packet::Parsed;
 use crate::sys::setsockopt;
 #[cfg(target_os = "linux")]
 use crate::sys::sockaddr_for;
 use crate::test_support::{Capability, skip};
 
+use super::CaptureKey;
 use super::datagram::{DatagramSource, build_udp, ethernet_dst};
 use super::interface_table::InterfaceTable;
 use super::multicast::MulticastJoiner;
+use super::reassembly::Reassembler;
 
 const INJECT_SRC_PORT: u16 = 40000;
 const INJECT_DST_PORT: u16 = 40009;
@@ -535,8 +537,8 @@ fn capture_injected(peer: &mut Capture, dest: IpAddr) -> io::Result<Option<Captu
         match peer.next_frame()? {
             Some(Read::Oversized) => {}
             Some(Read::Frame(frame)) => {
-                let Ok(packet) = Packet::parse(link, frame) else {
-                    continue; // unrelated non-UDP or malformed traffic
+                let Ok(Parsed::Datagram(packet)) = Parsed::parse(link, frame) else {
+                    continue; // unrelated non-UDP, fragmented or malformed traffic
                 };
                 if packet.source.port() == INJECT_SRC_PORT && packet.dest.ip() == dest {
                     return Ok(Some(CapturedDatagram {
@@ -932,6 +934,57 @@ fn pair_fragments_reassemble_in_the_peer_kernel() -> io::Result<()> {
     let mut buffer = [0u8; 4096];
     let (length, _) = receiver.recv_from(&mut buffer)?;
     assert_eq!(&buffer[..length], payload);
+    Ok(())
+}
+
+// Fragments of either family pass the peer's capture filter, and reassembly gives back the
+// datagram that was sent.
+#[test]
+fn pair_captured_fragments_reassemble() -> io::Result<()> {
+    let Some(pair) = InterfacePair::create() else {
+        return Ok(());
+    };
+    let iface = Interface::open(&pair.inject)?;
+    let injector = Capture::open(&iface)?;
+    let mut peer = Capture::open(&Interface::open(&pair.receive)?)?;
+    let link = peer.link_type();
+    let payload: Vec<u8> = (0..3000).map(|i| u8::try_from(i % 241).unwrap()).collect();
+
+    for dst in [
+        SocketAddr::from((Ipv4Addr::BROADCAST, INJECT_DST_PORT)),
+        SocketAddr::from((Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1), INJECT_DST_PORT)),
+    ] {
+        inject_fragmented(&iface.addrs, &injector, dst, &payload, 1280)?;
+        let mut reassembler = Reassembler::new();
+        let deadline = Instant::now() + WAIT_BUDGET;
+        let done = loop {
+            assert!(
+                Instant::now() < deadline,
+                "no reassembled datagram to {dst}"
+            );
+            let Some(read) = peer.next_frame()? else {
+                std::thread::sleep(POLL_SLICE);
+                continue;
+            };
+            let Read::Frame(frame) = read else {
+                continue;
+            };
+            let Ok(Parsed::Fragment(fragment)) = Parsed::parse(link, frame) else {
+                continue;
+            };
+            if fragment.header.dest != dst.ip() {
+                continue;
+            }
+            let ingress = CaptureKey::from_u64(0);
+            if let Some(done) = reassembler.offer(ingress, &fragment, true, Instant::now()) {
+                break done;
+            }
+        };
+        let packet = done.packet().expect("a valid reassembled datagram");
+        assert_eq!(packet.source.port(), INJECT_SRC_PORT);
+        assert_eq!(packet.dest, dst);
+        assert_eq!(packet.payload, payload);
+    }
     Ok(())
 }
 

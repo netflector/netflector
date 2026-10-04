@@ -1,5 +1,5 @@
-//! RFC 1071 Internet checksum for the egress path: an injected frame bypasses the kernel stack, so
-//! its IPv4 header and UDP checksums are filled by hand. The capture path never verifies checksums.
+//! RFC 1071 Internet checksum. An injected frame bypasses the kernel stack, so its IPv4 header and
+//! UDP checksums are filled by hand. The capture path verifies only a reassembled datagram's.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 

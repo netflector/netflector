@@ -250,6 +250,12 @@ impl InterfaceTable {
         self.captures[capture.0 as usize].counters.record_echo();
     }
 
+    pub(super) fn record_unreassembled(&mut self, capture: CaptureKey) {
+        self.captures[capture.0 as usize]
+            .counters
+            .record_unreassembled();
+    }
+
     pub(super) fn counter_rows(&self) -> impl Iterator<Item = (&str, &CaptureCounters)> {
         self.captures.iter().filter_map(move |entry| {
             Some((

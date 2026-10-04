@@ -3,6 +3,8 @@ use std::net::Ipv4Addr;
 use super::*;
 #[cfg(target_os = "linux")]
 use crate::net::LinkType;
+#[cfg(target_os = "linux")]
+use crate::net::packet::Parsed;
 use crate::reflector::NoRewrite;
 use crate::test_support::{loopback_lock, open_loopback_or_skip};
 
@@ -459,7 +461,7 @@ fn a_session_listens_where_its_search_copies_come_from() -> std::io::Result<()> 
         let Some(bytes) = tun.next_packet(deadline)? else {
             panic!("the search copy never reached the far end");
         };
-        if let Ok(parsed) = Packet::parse(LinkType::RawIp, &bytes)
+        if let Ok(Parsed::Datagram(parsed)) = Parsed::parse(LinkType::RawIp, &bytes)
             && parsed.payload == b"M-SEARCH"
         {
             break (parsed.source, parsed.dest);
