@@ -6,6 +6,7 @@ from fixtures import (
     WSD_BYE_HEX,
     WSD_GROUP_V4,
     WSD_GROUP_V6,
+    WSD_HELLO_FRAGMENTED_HEX,
     WSD_HELLO_HEX,
     WSD_HELLO_LINK_LOCAL_XADDRS_HEX,
     WSD_HELLO_MIXED_XADDRS_HEX,
@@ -41,6 +42,23 @@ WSD_CASES = [
         group=WSD_GROUP_V6,
         family=6,
         direction="reverse",
+    ),
+    # A Hello past one frame crosses both links as IP fragments.
+    *(
+        TestCase(
+            name=f"reflects_fragmented_wsd_hello{suffix}",
+            config="config-wsd.toml",
+            send_port=WSD_PORT,
+            receive_port=WSD_PORT,
+            expect_mac=None,
+            timeout_seconds=5.0,
+            send_payload_hex=WSD_HELLO_FRAGMENTED_HEX,
+            expect_payload_hex=WSD_HELLO_FRAGMENTED_HEX,
+            group=group,
+            family=family,
+            direction="reverse",
+        )
+        for family, group, suffix in [(4, WSD_GROUP_V4, ""), (6, WSD_GROUP_V6, "_ipv6")]
     ),
     # Bye relays through the same announcement path as Hello (both classify as an announcement).
     TestCase(
