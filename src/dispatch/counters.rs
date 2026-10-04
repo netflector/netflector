@@ -189,6 +189,8 @@ pub(crate) struct CaptureCounters {
     recoveries: u64,
     /// Received frames too large to forward, dropped before parsing.
     oversized: u64,
+    /// Fragmented datagrams given up on: lost fragments, an overlap, past the size limit.
+    unreassembled: u64,
 }
 
 impl CaptureCounters {
@@ -215,6 +217,10 @@ impl CaptureCounters {
         self.echoed += 1;
     }
 
+    pub(crate) fn record_unreassembled(&mut self) {
+        self.unreassembled += 1;
+    }
+
     /// e.g. `recoveries=1; mDNS query reflected=42 skipped=10; filtered=2`; `None` when idle.
     fn format_nonzero(&self) -> Option<String> {
         let mut parts: Vec<String> = Vec::new();
@@ -239,6 +245,9 @@ impl CaptureCounters {
         }
         if self.oversized > 0 {
             parts.push(format!("oversized={}", self.oversized));
+        }
+        if self.unreassembled > 0 {
+            parts.push(format!("unreassembled={}", self.unreassembled));
         }
         (!parts.is_empty()).then(|| parts.join("; "))
     }

@@ -12,6 +12,7 @@ mod egress;
 mod interface_table;
 mod lifecycle;
 mod multicast;
+mod reassembly;
 
 #[cfg(test)]
 mod pair_tests;
@@ -30,15 +31,17 @@ use std::time::{Duration, Instant};
 use crate::capture::{Capture, Read};
 use crate::config::AddressFamily;
 use crate::interface::{InterfaceAddresses, InterfaceName};
+use crate::logging::{WARN_WINDOW, log_rate};
 use crate::net::LinkType;
 use crate::net::mac::{MacAddr, MacSet};
-use crate::net::packet::Packet;
+use crate::net::packet::{Fragment, Packet, Parsed};
 use crate::reactor::{Arena, ControlEvent, Handler, HandlerSlot, Key, Reactor, ReadyEvent};
 
 use self::counters::log_counters;
 use self::egress::{Datagram, Egress};
 use self::interface_table::InterfaceTable;
 use self::lifecycle::{Changes, InterfaceLifecycle};
+use self::reassembly::{Loss, Lost, MAX_DATAGRAM_LEN, Reassembler};
 
 /// Frames drained per readable event before yielding, so a flooded interface can't starve the
 /// others. BPF finishes its current userland batch past this: the wait won't re-fire for
@@ -212,6 +215,7 @@ pub(crate) struct PacketDispatcher {
     lifecycle: InterfaceLifecycle,
     dial: DialContext,
     egress: Egress,
+    reassembly: Reassembler,
     report: Option<CounterReport>,
 }
 
@@ -233,6 +237,7 @@ impl PacketDispatcher {
             lifecycle: InterfaceLifecycle::new(),
             dial: DialContext::new(),
             egress: Egress::new(),
+            reassembly: Reassembler::new(),
             report: None,
         }
     }
@@ -454,8 +459,8 @@ impl PacketDispatcher {
                 drained += 1;
                 continue;
             }
-            match Packet::parse(link, frame) {
-                Ok(packet) => {
+            match Parsed::parse(link, frame) {
+                Ok(Parsed::Datagram(packet)) => {
                     log::trace!(
                         "fd {fd}: routing {} -> {} ({} B)",
                         packet.source,
@@ -463,6 +468,9 @@ impl PacketDispatcher {
                         packet.payload.len()
                     );
                     self.route(ingress, &packet, reactor);
+                }
+                Ok(Parsed::Fragment(fragment)) => {
+                    self.reassemble_and_route(ingress, &fragment, reactor);
                 }
                 Err(e) => log::trace!("fd {fd}: skip unparsable frame: {e}"),
             }
@@ -477,6 +485,54 @@ impl PacketDispatcher {
         if !self.table.restore(ingress, capture) {
             log::warn!("drain_and_route: ingress {ingress:?} vanished mid-drain; capture dropped");
         }
+    }
+
+    fn reassemble_and_route(
+        &mut self,
+        ingress: CaptureKey,
+        fragment: &Fragment,
+        reactor: &mut Reactor,
+    ) {
+        let wanted = fragment
+            .headers()
+            .is_none_or(|packet| self.would_route(ingress, &packet));
+        let done = self
+            .reassembly
+            .offer(ingress, fragment, wanted, Instant::now());
+        for lost in self.reassembly.drain_lost() {
+            self.table.record_unreassembled(lost.ingress);
+            log_lost(&lost, self.table.capture_name(lost.ingress));
+        }
+        let Some(done) = done else {
+            return;
+        };
+        match done.packet() {
+            Ok(packet) => {
+                log::trace!(
+                    "{ingress:?}: reassembled {} -> {} ({} B)",
+                    packet.source,
+                    packet.dest,
+                    packet.payload.len()
+                );
+                self.route(ingress, &packet, reactor);
+            }
+            Err(e) => {
+                self.table.record_unreassembled(ingress);
+                log::debug!(
+                    "{}: dropping a reassembled datagram from {}: {e}",
+                    self.table.capture_name(ingress),
+                    fragment.header.source
+                );
+            }
+        }
+        self.reassembly.recycle(done);
+    }
+
+    fn would_route(&self, ingress: CaptureKey, packet: &Packet) -> bool {
+        let ingress_addrs = self.table.egress_addrs(ingress);
+        self.registrations
+            .iter()
+            .any(|(_, reg)| reg.ingress == ingress && reg.filter.matches(packet, ingress_addrs))
     }
 
     fn route(&mut self, ingress: CaptureKey, packet: &Packet, reactor: &mut Reactor) {
@@ -682,6 +738,28 @@ fn is_own_echo(src_mac: Option<MacAddr>, own_mac: Option<MacAddr>) -> bool {
         (Some(src), Some(own)) => src == own && !own.is_unspecified(),
         _ => false,
     }
+}
+
+/// Only a datagram past the size limit warns: its sender will keep sending them. The other
+/// losses are ordinary on a lossy link.
+fn log_lost(lost: &Lost, if_name: &str) {
+    let Lost { source, dest, .. } = lost;
+    let why = match lost.loss {
+        Loss::TooLarge { end } => {
+            log_rate!(
+                log::Level::Warn,
+                WARN_WINDOW,
+                "{if_name}: dropping a fragmented datagram from {source} to {dest}: {end}+ bytes, \
+                 past the {MAX_DATAGRAM_LEN}-byte reassembly limit"
+            );
+            return;
+        }
+        Loss::Inconsistent => "its fragments overlap or disagree on its length",
+        Loss::Malformed => "a fragment is malformed",
+        Loss::Expired => "a fragment never arrived",
+        Loss::Evicted => "newer fragmented datagrams took its slot",
+    };
+    log::debug!("{if_name}: dropping a fragmented datagram from {source} to {dest}: {why}");
 }
 
 #[cfg(test)]
