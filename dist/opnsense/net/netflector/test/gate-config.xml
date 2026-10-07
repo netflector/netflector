@@ -103,6 +103,7 @@
           <wol>1</wol>
           <wol_ports>7,9</wol_ports>
           <mdns>1</mdns>
+          <mdns_services>_ipp._tcp,_AirPlay._tcp.local</mdns_services>
           <ssdp>1</ssdp>
           <dial>1</dial>
           <wsd>0</wsd>

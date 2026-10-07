@@ -131,7 +131,7 @@ foreach (
     }
 }
 
-/* the relay's and the peers' fields, and the one rule between them */
+/* the relay's, the peers' and the mDNS services' fields, and the rules between them */
 function entry_messages(array $values): array
 {
     $model = new Netflector();
@@ -144,7 +144,7 @@ function entry_messages(array $values): array
     $messages = [];
     foreach ($model->performValidation() as $message) {
         $field = substr(strrchr($message->getField(), '.'), 1);
-        if (str_starts_with($field, 'udp_') || str_ends_with($field, '_peers')) {
+        if (str_starts_with($field, 'udp_') || str_ends_with($field, '_peers') || str_starts_with($field, 'mdns')) {
             $messages[] = $field . ': ' . $message->getMessage();
         }
     }
@@ -167,6 +167,16 @@ foreach (
         [['target_peers' => '10.10.10.0/24'], false],
         [['source_peers' => 'phone.example'], false],
         [['target_peers' => 'any'], false],
+        [['mdns' => '1', 'mdns_services' => '_ipp._tcp,_AirPlay._TCP.local,_hap._udp.'], true],
+        [['mdns' => '1', 'mdns_services' => '_ipp._tcp,_ipp._tcp'], true],
+        [['mdns' => '1', 'mdns_services' => '_ipp._tcp,printer.local'], false],
+        [['mdns' => '1', 'mdns_services' => '_ipp._sctp'], false],
+        [['mdns' => '1', 'mdns_services' => '_ipp._tcp.example'], false],
+        [['mdns' => '1', 'mdns_services' => '_dns-sd._udp'], false],
+        /* the daemon ignores case, .local and a trailing dot, and refuses the repeat */
+        [['mdns' => '1', 'mdns_services' => '_ipp._tcp,_IPP._tcp.local.'], false],
+        /* services without mDNS */
+        [['mdns_services' => '_ipp._tcp'], false],
     ] as [$values, $expect_valid]
 ) {
     $messages = entry_messages($values);
@@ -175,6 +185,12 @@ foreach (
     } elseif (!$expect_valid && $messages === []) {
         fail(sprintf('%s accepted, expected a validation error', json_encode($values)));
     }
+}
+
+/* the refusal names the service type to fix */
+$named = implode(' | ', entry_messages(['mdns' => '1', 'mdns_services' => '_ipp._tcp,printer.local,_hap._tcp']));
+if (!str_contains($named, '[printer.local]')) {
+    fail(sprintf('the mdns_services refusal does not name printer.local: %s', $named));
 }
 
 if ($failures === 0) {
