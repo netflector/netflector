@@ -50,7 +50,7 @@ jobs:
         id: snapshot
         run: echo "sha=$(git -C pkg-repo rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - name: Download the built packages
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: incoming
       - name: Place packages into the ABI trees
@@ -190,7 +190,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Download the signed trees
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: signed-trees
       - name: Unpack the signed trees
@@ -257,7 +257,7 @@ jobs:
           path: pkg-repo
           ssh-key: ${{ secrets.PKG_REPO_DEPLOY_KEY }}
       - name: Download the signed trees
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: signed-trees
       - name: Unpack the signed trees
