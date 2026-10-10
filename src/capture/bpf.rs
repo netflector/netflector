@@ -8,6 +8,7 @@
 //! backend filters first.
 
 use std::io;
+use std::num::NonZeroU32;
 use std::ops::Range;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
@@ -90,7 +91,7 @@ impl Capture {
     /// attachment when the interface is destroyed and per-attachment ioctls then fail; a
     /// recreated interface (same name, even a reused index) never re-attaches, so this catches
     /// recreation where an index comparison can't.
-    pub(crate) fn attached(&self, _ifindex: u32) -> bool {
+    pub(crate) fn attached(&self, _ifindex: NonZeroU32) -> bool {
         let mut dlt: c_uint = 0;
         // SAFETY: BIOCGDLT writes a `c_uint`.
         unsafe { ioctl(&self.fd, libc::BIOCGDLT, &mut dlt) }.is_ok()

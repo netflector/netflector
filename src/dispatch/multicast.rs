@@ -59,7 +59,7 @@ pub(crate) struct Target<'a> {
 impl Target<'_> {
     /// Whether the name still resolves to the index.
     fn is_live(&self) -> io::Result<bool> {
-        if_index_checked(self.name).map(|current| current == Some(self.ifindex.get()))
+        if_index_checked(self.name).map(|current| current == Some(self.ifindex))
     }
 }
 
@@ -449,9 +449,7 @@ pub(in crate::dispatch) mod tests {
     }
 
     fn loopback_target(name: &InterfaceName) -> Target<'_> {
-        let ifindex = crate::interface::if_index(name)
-            .and_then(NonZeroU32::new)
-            .expect("loopback must resolve to an index");
+        let ifindex = crate::interface::if_index(name).expect("loopback must resolve to an index");
         Target { name, ifindex }
     }
 
@@ -805,7 +803,7 @@ pub(in crate::dispatch) mod tests {
     #[test]
     fn an_interface_without_iff_multicast_waits() {
         let name: InterfaceName = "stf0".parse().unwrap();
-        let Some(ifindex) = crate::interface::if_index(&name).and_then(NonZeroU32::new) else {
+        let Some(ifindex) = crate::interface::if_index(&name) else {
             return;
         };
         let target = Target {

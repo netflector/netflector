@@ -2,6 +2,7 @@
 //! layer is the resolver's, [`super::super::rtnetlink`].
 
 use std::io;
+use std::num::NonZeroU32;
 use std::os::fd::{AsRawFd, OwnedFd};
 
 use libc::socklen_t;
@@ -101,13 +102,13 @@ pub(super) fn sender_ok(src: &libc::sockaddr_storage, len: socklen_t) -> bool {
 /// Kernel indices are >= 1; a 0 is malformed and dropped with a warn.
 fn report(
     index: u32,
-    event: fn(u32) -> InterfaceEvent,
+    event: fn(NonZeroU32) -> InterfaceEvent,
     on_change: &mut impl FnMut(InterfaceEvent),
 ) {
-    if index == 0 {
+    let Some(index) = NonZeroU32::new(index) else {
         log::warn!("interface monitor: dropping a change with no valid interface index");
         return;
-    }
+    };
     let event = event(index);
     log::trace!("interface monitor: {event:?}");
     on_change(event);
@@ -116,6 +117,10 @@ fn report(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn nonzero(index: u32) -> NonZeroU32 {
+        NonZeroU32::new(index).unwrap()
+    }
 
     /// A netlink message: a `nlmsghdr` (len, type) followed by `body`, length-padded.
     fn message(msg_type: u16, body: &[u8]) -> Vec<u8> {
@@ -173,7 +178,13 @@ mod tests {
         buf.extend(message(libc::RTM_DELLINK, &ifinfomsg(9)));
         let mut seen = Vec::new();
         for_each_change(&buf, &mut |e| seen.push(e));
-        assert_eq!(seen, [InterfaceEvent::Address(7), InterfaceEvent::Link(9)]);
+        assert_eq!(
+            seen,
+            [
+                InterfaceEvent::Address(nonzero(7)),
+                InterfaceEvent::Link(nonzero(9))
+            ]
+        );
     }
 
     #[test]
@@ -224,6 +235,6 @@ mod tests {
         buf[second..second + 4].copy_from_slice(&u32::MAX.to_ne_bytes());
         let mut seen = Vec::new();
         for_each_change(&buf, &mut |e| seen.push(e));
-        assert_eq!(seen, [InterfaceEvent::Address(7)]);
+        assert_eq!(seen, [InterfaceEvent::Address(nonzero(7))]);
     }
 }

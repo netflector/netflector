@@ -24,6 +24,7 @@ pub(crate) use self::multicast::{JoinError, Wanted};
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::num::NonZeroU32;
 use std::ops::Deref;
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::{Duration, Instant};
@@ -258,11 +259,14 @@ impl PacketDispatcher {
     /// open.
     pub(crate) fn open_capture(&mut self, name: &InterfaceName) -> io::Result<CaptureKey> {
         let key = self.table.open_capture(name)?;
-        let ifindex = self
+        if let Some(ifindex) = self
             .table
             .interface_of(key)
-            .and_then(|interface| self.table.interface_index(interface));
-        self.lifecycle.saw_interface(ifindex.unwrap_or(0));
+            .and_then(|interface| self.table.interface_index(interface))
+            .and_then(NonZeroU32::new)
+        {
+            self.lifecycle.saw_interface(ifindex);
+        }
         log::debug!("watching {name} as capture {key:?}");
         Ok(key)
     }

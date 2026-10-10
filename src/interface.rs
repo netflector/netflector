@@ -6,6 +6,7 @@
 use std::fmt;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::num::NonZeroU32;
 
 use crate::net::mac::MacAddr;
 
@@ -151,7 +152,7 @@ impl Interface {
     pub(crate) fn open(name: &InterfaceName) -> io::Result<Self> {
         let mut iface = Self {
             name: name.clone(),
-            ifindex: if_index(name).unwrap_or(0),
+            ifindex: if_index(name).map_or(0, NonZeroU32::get),
             addrs: InterfaceAddresses::default(),
             mtu: None,
             #[cfg(any(target_os = "macos", target_os = "freebsd"))]
@@ -203,7 +204,7 @@ impl Interface {
 
 /// `None` if `name` names no interface or the lookup itself failed. A caller that acts
 /// destructively on absence wants [`if_index_checked`] instead.
-pub(crate) fn if_index(name: &InterfaceName) -> Option<u32> {
+pub(crate) fn if_index(name: &InterfaceName) -> Option<NonZeroU32> {
     if_index_checked(name).ok().flatten()
 }
 
@@ -213,11 +214,10 @@ pub(crate) fn if_index(name: &InterfaceName) -> Option<u32> {
 /// # Errors
 /// Only the resource errnos. Anything else still reads as absent, so an unlisted errno can't
 /// mask a removed interface.
-pub(crate) fn if_index_checked(name: &InterfaceName) -> io::Result<Option<u32>> {
+pub(crate) fn if_index_checked(name: &InterfaceName) -> io::Result<Option<NonZeroU32>> {
     let c_name = name.to_c_array();
     // SAFETY: `c_name` is NUL-terminated and outlives the call.
-    let index = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
-    if index != 0 {
+    if let Some(index) = NonZeroU32::new(unsafe { libc::if_nametoindex(c_name.as_ptr()) }) {
         return Ok(Some(index));
     }
     let err = io::Error::last_os_error();
@@ -228,11 +228,11 @@ pub(crate) fn if_index_checked(name: &InterfaceName) -> io::Result<Option<u32>> 
 }
 
 #[cfg(target_os = "freebsd")]
-pub(crate) fn if_name(index: u32) -> Option<String> {
+pub(crate) fn if_name(index: NonZeroU32) -> Option<String> {
     let mut buf = [0u8; libc::IF_NAMESIZE];
     // SAFETY: `buf` is IF_NAMESIZE bytes, the size `if_indextoname` documents it writes into; it
     // returns NULL on failure without writing.
-    let name = unsafe { libc::if_indextoname(index, buf.as_mut_ptr().cast()) };
+    let name = unsafe { libc::if_indextoname(index.get(), buf.as_mut_ptr().cast()) };
     if name.is_null() {
         return None;
     }
@@ -508,7 +508,7 @@ mod tests {
     fn a_name_that_resolves_to_nothing_is_absent_not_an_error() {
         assert!(matches!(
             if_index_checked(&InterfaceName::loopback()),
-            Ok(Some(index)) if index != 0
+            Ok(Some(_))
         ));
         assert!(matches!(
             if_index_checked(&"nf-absent0".parse().unwrap()),

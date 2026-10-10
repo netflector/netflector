@@ -7,6 +7,7 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+#[cfg(target_os = "linux")]
 use std::num::NonZeroU32;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::process::Command;
@@ -864,7 +865,7 @@ fn pair_injected_v6_multicast_reaches_a_joined_udp_socket() -> io::Result<()> {
     let all_nodes = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
     receiver.join_multicast_v6(
         &all_nodes,
-        if_index(&pair.receive).expect("receive ifindex"),
+        if_index(&pair.receive).expect("receive ifindex").get(),
     )?;
     receiver.set_read_timeout(Some(WAIT_BUDGET))?;
     let port = receiver.local_addr()?.port();
@@ -928,7 +929,7 @@ fn pair_fragments_reassemble_in_the_peer_kernel() -> io::Result<()> {
     let all_nodes = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
     receiver.join_multicast_v6(
         &all_nodes,
-        if_index(&pair.receive).expect("receive ifindex"),
+        if_index(&pair.receive).expect("receive ifindex").get(),
     )?;
     receiver.set_read_timeout(Some(WAIT_BUDGET))?;
     let port = receiver.local_addr()?.port();
@@ -1048,7 +1049,7 @@ fn pair_sources_v6_multicast_by_destination_scope() -> io::Result<()> {
 /// what it wants to see. The BSDs deliver raw packets by protocol alone -- and macOS rejects
 /// `MCAST_JOIN_GROUP` on raw sockets outright -- so there this is neither needed nor possible.
 #[cfg(target_os = "linux")]
-fn subscribe(fd: &OwnedFd, group: IpAddr, ifindex: u32) -> io::Result<()> {
+fn subscribe(fd: &OwnedFd, group: IpAddr, ifindex: NonZeroU32) -> io::Result<()> {
     let level = match group {
         IpAddr::V4(_) => libc::IPPROTO_IP,
         IpAddr::V6(_) => libc::IPPROTO_IPV6,
@@ -1057,7 +1058,7 @@ fn subscribe(fd: &OwnedFd, group: IpAddr, ifindex: u32) -> io::Result<()> {
     // included.
     // SAFETY: `group_req` is plain data; all-zero is valid.
     let mut request: libc::group_req = unsafe { std::mem::zeroed() };
-    request.gr_interface = ifindex;
+    request.gr_interface = ifindex.get();
     request.gr_group = sockaddr_for(group, 0, 0).0;
     setsockopt(fd.as_raw_fd(), level, libc::MCAST_JOIN_GROUP, &request)
 }
@@ -1187,8 +1188,7 @@ fn join_all(name: &InterfaceName, groups: &[IpAddr]) -> Memberships {
 }
 
 fn target(name: &InterfaceName) -> Target<'_> {
-    let ifindex = NonZeroU32::new(if_index(name).expect("the interface exists"))
-        .expect("an ifindex is nonzero");
+    let ifindex = if_index(name).expect("the interface exists");
     Target { name, ifindex }
 }
 

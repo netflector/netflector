@@ -6,6 +6,7 @@
 //! backend binds first and relies on `BIOCSETF` flushing the kernel buffer.
 
 use std::io;
+use std::num::NonZeroU32;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
 use libc::{c_int, c_void};
@@ -87,7 +88,7 @@ impl Capture {
     /// Whether the socket is still bound to the live interface `ifindex`. The kernel resets the
     /// bound index to -1 when the interface is unregistered, so a destroyed or recreated
     /// interface compares unequal.
-    pub(crate) fn attached(&self, ifindex: u32) -> bool {
+    pub(crate) fn attached(&self, ifindex: NonZeroU32) -> bool {
         // SAFETY: an all-zero sockaddr_ll is a valid out-param; the kernel fills it up to `len`.
         let mut addr: libc::sockaddr_ll = unsafe { core::mem::zeroed() };
         let mut len = socklen_of::<libc::sockaddr_ll>();
@@ -99,7 +100,7 @@ impl Capture {
                 &raw mut len,
             )
         };
-        rc == 0 && u32::try_from(addr.sll_ifindex).is_ok_and(|bound| bound == ifindex)
+        rc == 0 && u32::try_from(addr.sll_ifindex).is_ok_and(|bound| bound == ifindex.get())
     }
 
     pub(crate) fn link_type(&self) -> LinkType {

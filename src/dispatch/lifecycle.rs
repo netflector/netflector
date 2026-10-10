@@ -4,6 +4,7 @@
 //! current interface (or parks it absent) and re-binds its captures in place. Each of them ends
 //! by attempting the groups the interface has not joined.
 
+use std::num::NonZeroU32;
 use std::os::fd::RawFd;
 use std::time::{Duration, Instant};
 
@@ -47,7 +48,7 @@ pub(super) struct InterfaceLifecycle {
     monitor: Option<InterfaceMonitor>,
     /// The largest kernel ifindex seen. Where indexes are monotonic, an unknown-index Link event
     /// at or below this is churn on an unwatched interface, not a creation.
-    max_seen_ifindex: u32,
+    max_seen_ifindex: Option<NonZeroU32>,
     next_reconcile: Instant,
     next_recheck: Instant,
 }
@@ -58,7 +59,7 @@ impl InterfaceLifecycle {
     pub(super) fn new() -> Self {
         Self {
             monitor: open_monitor(),
-            max_seen_ifindex: 0,
+            max_seen_ifindex: None,
             next_reconcile: Instant::now() + RECONCILE_TICK,
             next_recheck: Instant::now() + RECHECK_INTERVAL,
         }
@@ -68,8 +69,8 @@ impl InterfaceLifecycle {
         self.monitor.as_ref().map(InterfaceMonitor::as_raw_fd)
     }
 
-    pub(super) fn saw_interface(&mut self, ifindex: u32) {
-        self.max_seen_ifindex = self.max_seen_ifindex.max(ifindex);
+    pub(super) fn saw_interface(&mut self, ifindex: NonZeroU32) {
+        self.max_seen_ifindex = self.max_seen_ifindex.max(Some(ifindex));
     }
 
     pub(super) fn next_reconcile(&self) -> Instant {
@@ -123,7 +124,7 @@ impl InterfaceLifecycle {
             return Changes::default();
         };
         // ifindex -> saw a Link event
-        let mut changed: LinearMap<u32, bool> = LinearMap::new();
+        let mut changed: LinearMap<NonZeroU32, bool> = LinearMap::new();
         let mut overflow = false;
         if let Err(e) = monitor.drain(|event| match event {
             InterfaceEvent::Overflow => overflow = true,
@@ -149,7 +150,7 @@ impl InterfaceLifecycle {
         // slip past.
         let prior_ceiling = self.max_seen_ifindex;
         for (ifindex, _) in changed.iter() {
-            self.max_seen_ifindex = self.max_seen_ifindex.max(*ifindex);
+            self.max_seen_ifindex = self.max_seen_ifindex.max(Some(*ifindex));
         }
         let mut want_reconcile = overflow;
         let mut v4_moved: Vec<u32> = Vec::new();
@@ -185,11 +186,11 @@ impl InterfaceLifecycle {
                     Ok(Some(change)) => {
                         log::debug!("re-resolved interface (ifindex {ifindex}) after a change");
                         if change.v4 {
-                            v4_moved.push(*ifindex);
+                            v4_moved.push(ifindex.get());
                         }
                         // A bare Link event (carrier, MTU, flags) must not clear sessions.
                         if change.v4 || change.v6 {
-                            touched.push(*ifindex);
+                            touched.push(ifindex.get());
                         }
                         // A detached capture says the index is another interface's now: the
                         // reconcile joins after it re-binds.
@@ -205,7 +206,7 @@ impl InterfaceLifecycle {
                         // indexes, so any Link event reconciles; macOS has no lifecycle events,
                         // so any unknown-index event does.
                         let creation = if InterfaceMonitor::INDEXES_MONOTONIC {
-                            *is_link && *ifindex > prior_ceiling
+                            *is_link && Some(*ifindex) > prior_ceiling
                         } else {
                             *is_link
                         };
@@ -219,8 +220,8 @@ impl InterfaceLifecycle {
                         log::warn!(
                             "re-resolving ifindex {ifindex} failed: {e}; evicting its proxies"
                         );
-                        v4_moved.push(*ifindex);
-                        touched.push(*ifindex);
+                        v4_moved.push(ifindex.get());
+                        touched.push(ifindex.get());
                         want_reconcile = true;
                     }
                 }

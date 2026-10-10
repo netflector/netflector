@@ -5,6 +5,7 @@
 
 use std::io;
 use std::net::Ipv4Addr;
+use std::num::NonZeroU32;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::time::{Duration, Instant};
 
@@ -46,7 +47,7 @@ const _: () = assert!(size_of::<RouteRequest>() == size_of::<libc::rt_msghdr>() 
 /// # Errors
 /// No route, a route that discards traffic, or a routing-socket failure; the caller refuses the
 /// connect on any.
-pub(crate) fn egress_ifindex(dst: Ipv4Addr) -> io::Result<u32> {
+pub(crate) fn egress_ifindex(dst: Ipv4Addr) -> io::Result<NonZeroU32> {
     let sock = open_route_socket()?;
     let request = build_request(dst);
     // SAFETY: `request` is a live, fully initialized `RouteRequest` of exactly this size.
@@ -106,7 +107,7 @@ fn build_request(dst: Ipv4Addr) -> RouteRequest {
 }
 
 /// Read past the kernel's broadcasts to our own reply.
-fn read_reply(fd: RawFd, dst: Ipv4Addr) -> io::Result<u32> {
+fn read_reply(fd: RawFd, dst: Ipv4Addr) -> io::Result<NonZeroU32> {
     let mut buf = [0u8; READ_BUF];
     let deadline = Instant::now() + REPLY_DEADLINE;
     // Counted so the deadline message can tell a flooded socket from a silent one.
@@ -144,7 +145,8 @@ fn read_reply(fd: RawFd, dst: Ipv4Addr) -> io::Result<u32> {
                 "the route to {dst} discards traffic"
             )));
         }
-        return Ok(u32::from(hdr.rtm_index));
+        return NonZeroU32::new(u32::from(hdr.rtm_index))
+            .ok_or_else(|| io::Error::other(format!("the route to {dst} names no interface")));
     }
 }
 
