@@ -20,11 +20,11 @@ use crate::net::packet::Parsed;
 use crate::sys::setsockopt;
 #[cfg(target_os = "linux")]
 use crate::sys::sockaddr_for;
-use crate::test_support::{Capability, skip};
+use crate::test_support::{Capability, open_capture, open_interface, skip};
 
 use super::CaptureKey;
 use super::datagram::{DatagramSource, build_udp, ethernet_dst};
-use super::interface_table::InterfaceTable;
+use super::interface_table::{InterfaceTable, Moved, Presence, Stepped};
 use super::multicast::tests::{BEST_EFFORT, REQUIRED};
 use super::multicast::{JoinError, Memberships, Target, Wait};
 use super::reassembly::Reassembler;
@@ -120,7 +120,7 @@ impl InterfacePair {
             self.inject,
             self.receive
         );
-        let mut inject = Interface::open(&self.inject).expect("resolve the inject interface");
+        let (mut inject, _) = open_interface(&self.inject).expect("resolve the inject interface");
         assert!(
             wait_for_source(&mut inject, |iface| {
                 iface.addrs.has_v4()
@@ -136,7 +136,8 @@ impl InterfacePair {
             "{} never resolved its v4 + link-local + routable v6 plan",
             self.inject
         );
-        let mut receive = Interface::open(&self.receive).expect("resolve the receive interface");
+        let (mut receive, _) =
+            open_interface(&self.receive).expect("resolve the receive interface");
         assert!(
             wait_for_source(&mut receive, |iface| iface.addrs.has_v4()
                 && iface.addrs.has_v6()),
@@ -519,7 +520,9 @@ fn wait_for_source(iface: &mut Interface, ready: impl Fn(&Interface) -> bool) ->
             return false;
         }
         std::thread::sleep(POLL_SLICE);
-        iface.refresh().ok();
+        if let Some(ifindex) = if_index(&iface.name) {
+            iface.refresh(ifindex).ok();
+        }
     }
 }
 
@@ -625,9 +628,9 @@ fn pair_injected_broadcast_is_captured_on_the_peer() -> io::Result<()> {
     let Some(pair) = InterfacePair::create() else {
         return Ok(());
     };
-    let iface = Interface::open(&pair.inject)?;
-    let injector = Capture::open(&iface)?;
-    let mut peer = Capture::open(&Interface::open(&pair.receive)?)?;
+    let (iface, ifindex) = open_interface(&pair.inject)?;
+    let injector = Capture::open(&iface, ifindex)?;
+    let mut peer = open_capture(&pair.receive)?;
 
     let payload = b"pair-broadcast";
     let dst = SocketAddr::from((Ipv4Addr::BROADCAST, INJECT_DST_PORT));
@@ -648,9 +651,9 @@ fn pair_capture_drops_vlan_tagged_frames() -> io::Result<()> {
     let Some(pair) = InterfacePair::create() else {
         return Ok(());
     };
-    let iface = Interface::open(&pair.inject)?;
-    let injector = Capture::open(&iface)?;
-    let mut peer = Capture::open(&Interface::open(&pair.receive)?)?;
+    let (iface, ifindex) = open_interface(&pair.inject)?;
+    let injector = Capture::open(&iface, ifindex)?;
+    let mut peer = open_capture(&pair.receive)?;
     let dst = SocketAddr::from((Ipv4Addr::BROADCAST, INJECT_DST_PORT));
 
     let tagged_payload = b"pair-vlan-30";
@@ -680,9 +683,9 @@ fn pair_capture_takes_priority_tagged_frames() -> io::Result<()> {
     let Some(pair) = InterfacePair::create() else {
         return Ok(());
     };
-    let iface = Interface::open(&pair.inject)?;
-    let injector = Capture::open(&iface)?;
-    let mut peer = Capture::open(&Interface::open(&pair.receive)?)?;
+    let (iface, ifindex) = open_interface(&pair.inject)?;
+    let injector = Capture::open(&iface, ifindex)?;
+    let mut peer = open_capture(&pair.receive)?;
     let dst = SocketAddr::from((Ipv4Addr::BROADCAST, INJECT_DST_PORT));
 
     let payload = b"pair-priority-5";
@@ -705,7 +708,7 @@ fn pair_capture_rebinds_after_interface_recreation() -> io::Result<()> {
     let Some(pair) = InterfacePair::create() else {
         return Ok(());
     };
-    let mut peer = Capture::open(&Interface::open(&pair.receive)?)?;
+    let mut peer = open_capture(&pair.receive)?;
     let index = if_index(&pair.receive).expect("receive ifindex");
     assert!(peer.attached(index), "a fresh capture reports attached");
 
@@ -716,15 +719,15 @@ fn pair_capture_rebinds_after_interface_recreation() -> io::Result<()> {
         "a capture on the destroyed interface reports detached"
     );
 
-    peer.rebind(&Interface::open(&pair.receive)?)?;
+    peer.rebind(&open_interface(&pair.receive)?.0, index)?;
     assert!(
         peer.attached(index),
         "the re-bound capture reports attached"
     );
 
     // Delivery is live again: inject on the recreated far end, capture on the re-bound fd.
-    let iface = Interface::open(&pair.inject)?;
-    let injector = Capture::open(&iface)?;
+    let (iface, ifindex) = open_interface(&pair.inject)?;
+    let injector = Capture::open(&iface, ifindex)?;
     let payload = b"pair-rebind";
     let dst = SocketAddr::from((Ipv4Addr::BROADCAST, INJECT_DST_PORT));
     inject(&iface.addrs, &injector, dst, payload)?;
@@ -738,12 +741,11 @@ fn pair_capture_rebinds_after_interface_recreation() -> io::Result<()> {
 // the pair at once -- the path the periodic reconcile follows (the only detection macOS has, its
 // recreated ifnet keeping the index). Both interfaces sit in the table with a capture each, and a
 // baseline injection proves delivery works first. After the pair is destroyed and recreated under
-// its names, stale_interfaces flags BOTH entries through the captures' attached() probe -- the half
-// the unprivileged unit test leaves vacuous, and the only half that fires when the index is reused.
-// rebind_interface re-points each entry, rebind_capture re-attaches each fd in place, converge
-// joins the groups on fresh sockets, and a second injection -- sent on the
-// re-bound injector, observed on the re-bound receiver -- proves delivery resumed through the very
-// captures that were stranded.
+// its names, a step re-binds BOTH entries: the name lookup or the captures' attached() probe, the
+// half the unprivileged unit test leaves vacuous and the only one that fires when the index is
+// reused, says each moved. The step re-attaches each fd in place and joins the groups on fresh
+// sockets, and a second injection -- sent on the re-bound injector, observed on the re-bound
+// receiver -- proves delivery resumed through the very captures that were stranded.
 #[test]
 fn pair_interface_table_recovers_after_interface_recreation() -> io::Result<()> {
     let Some(pair) = InterfacePair::create() else {
@@ -764,10 +766,13 @@ fn pair_interface_table_recovers_after_interface_recreation() -> io::Result<()> 
             )
             .expect("the receive side joins");
     }
-    assert!(
-        table.stale_interfaces().is_empty(),
-        "a freshly-built table is healthy"
-    );
+    for interface in table.interfaces() {
+        assert_eq!(
+            table.step(interface, Instant::now()),
+            Stepped::default(),
+            "a freshly-built table is healthy"
+        );
+    }
 
     // Baseline: delivery works through both captures before any recreation. The frame's source
     // addresses come from the table's own resolved copy of the inject interface -- no second open.
@@ -797,35 +802,21 @@ fn pair_interface_table_recovers_after_interface_recreation() -> io::Result<()> 
 
     pair.recreate();
 
-    // Both interfaces are stranded. On a reused index only the attached() probe catches it; either
-    // way both entries are flagged.
-    let stale = table.stale_interfaces();
-    assert_eq!(
-        stale.len(),
-        2,
-        "both recreated interfaces are flagged stale"
-    );
-
-    // Drive the production recovery for each: re-point it, re-attach its capture fd in place,
-    // then join its groups on fresh sockets (only the receive side wants any).
-    for s in &stale {
-        table.rebind_interface(s.key, s.cur)?;
-        assert!(table.test_memberships(s.key).test_socketless());
-        for capture in table.captures_of(s.key) {
-            assert!(
-                table.rebind_capture(capture)?,
-                "the capture re-bound in place"
-            );
-        }
-        assert_eq!(table.converge(s.key, Instant::now()), Ok(()));
+    // Both interfaces are stranded. On a reused index only the attached() probe catches it.
+    for interface in table.interfaces() {
+        assert_eq!(
+            table.step(interface, Instant::now()),
+            Stepped {
+                moved: Some(Moved::Rebound),
+                retry_soon: false,
+            },
+            "the recreated interface is bound again"
+        );
+        assert!(matches!(table.presence_of(interface), Presence::Present(_)));
     }
     assert!(
         table.test_memberships(receive_key).test_all_joined(),
         "the recreated interface holds its groups again"
-    );
-    assert!(
-        table.stale_interfaces().is_empty(),
-        "the rebuild cleared all staleness"
     );
 
     // Delivery resumes through the very captures that were stranded: sent on the re-bound injector
@@ -858,8 +849,8 @@ fn pair_injected_v6_multicast_reaches_a_joined_udp_socket() -> io::Result<()> {
     let Some(pair) = InterfacePair::create() else {
         return Ok(());
     };
-    let iface = Interface::open(&pair.inject)?;
-    let injector = Capture::open(&iface)?;
+    let (iface, ifindex) = open_interface(&pair.inject)?;
+    let injector = Capture::open(&iface, ifindex)?;
 
     let receiver = UdpSocket::bind(SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)))?;
     let all_nodes = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
@@ -922,8 +913,8 @@ fn pair_fragments_reassemble_in_the_peer_kernel() -> io::Result<()> {
     let Some(pair) = InterfacePair::create() else {
         return Ok(());
     };
-    let iface = Interface::open(&pair.inject)?;
-    let injector = Capture::open(&iface)?;
+    let (iface, ifindex) = open_interface(&pair.inject)?;
+    let injector = Capture::open(&iface, ifindex)?;
 
     let receiver = UdpSocket::bind(SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)))?;
     let all_nodes = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
@@ -951,9 +942,9 @@ fn pair_captured_fragments_reassemble() -> io::Result<()> {
     let Some(pair) = InterfacePair::create() else {
         return Ok(());
     };
-    let iface = Interface::open(&pair.inject)?;
-    let injector = Capture::open(&iface)?;
-    let mut peer = Capture::open(&Interface::open(&pair.receive)?)?;
+    let (iface, ifindex) = open_interface(&pair.inject)?;
+    let injector = Capture::open(&iface, ifindex)?;
+    let mut peer = open_capture(&pair.receive)?;
     let link = peer.link_type();
     let payload: Vec<u8> = (0..3000).map(|i| u8::try_from(i % 241).unwrap()).collect();
 
@@ -1003,9 +994,9 @@ fn pair_sources_v6_multicast_by_destination_scope() -> io::Result<()> {
     let Some(pair) = InterfacePair::create() else {
         return Ok(());
     };
-    let iface = Interface::open(&pair.inject)?;
-    let injector = Capture::open(&iface)?;
-    let mut peer = Capture::open(&Interface::open(&pair.receive)?)?;
+    let (iface, ifindex) = open_interface(&pair.inject)?;
+    let injector = Capture::open(&iface, ifindex)?;
+    let mut peer = open_capture(&pair.receive)?;
     let payload = b"pair-scope";
 
     let site_group = Ipv6Addr::new(0xff05, 0, 0, 0, 0, 0, 0, 0x0c);
@@ -1206,7 +1197,7 @@ fn a_join_needs_no_address_and_a_dead_index_is_gone() -> io::Result<()> {
         bare.attach_families(),
         "could not attach the address families"
     );
-    let addrs = Interface::open(&bare.name)?.addrs;
+    let addrs = open_interface(&bare.name)?.0.addrs;
     assert!(!addrs.has_v4() && !addrs.has_v6());
     let groups: [IpAddr; 2] = ["224.0.0.251".parse().unwrap(), "ff02::fb".parse().unwrap()];
     let dead = target(&bare.name);

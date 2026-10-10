@@ -7,13 +7,12 @@ use std::io;
 use std::net::IpAddr;
 use std::num::NonZeroU32;
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::interface::{InterfaceName, if_index_checked};
 use crate::sys::{open_socket, setsockopt, sockaddr_for};
 
-const RETRY_FLOOR: Duration = Duration::from_secs(1);
-const RETRY_CEILING: Duration = Duration::from_secs(30);
+use super::retry_delay;
 
 /// Why a live interface takes no membership as it is. Re-reading the interface retries the join.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -332,13 +331,6 @@ impl Memberships {
     }
 }
 
-/// 1 s doubling to 30 s.
-fn retry_delay(attempts: u32) -> Duration {
-    1u32.checked_shl(attempts)
-        .and_then(|factor| RETRY_FLOOR.checked_mul(factor))
-        .map_or(RETRY_CEILING, |delay| delay.min(RETRY_CEILING))
-}
-
 /// What a refused `MCAST_JOIN_GROUP` means. `live` says whether the interface still exists, and
 /// runs only for the errnos a dead index shares with a live interface. An errno listed nowhere
 /// here is a failure the caller retries.
@@ -403,6 +395,7 @@ pub(crate) fn join_unsupported(err: &JoinError) -> bool {
 #[cfg(test)]
 pub(in crate::dispatch) mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::time::Duration;
 
     use super::*;
     use crate::test_support::{Capability, skip};
@@ -430,6 +423,15 @@ pub(in crate::dispatch) mod tests {
 
         pub(in crate::dispatch) fn test_all_joined(&self) -> bool {
             self.groups.iter().all(|group| group.state == State::Joined)
+        }
+
+        /// As if `group` had failed once, due its retry at `retry_at`.
+        pub(in crate::dispatch) fn test_fail(&mut self, group: IpAddr, retry_at: Instant) {
+            let index = self.add(group, BEST_EFFORT);
+            self.groups[index].state = State::Failed {
+                attempts: 0,
+                retry_at,
+            };
         }
 
         pub(in crate::dispatch) fn test_waiting(&self, group: IpAddr) -> Option<Wait> {
@@ -576,13 +578,6 @@ pub(in crate::dispatch) mod tests {
     }
 
     #[test]
-    fn the_retry_delay_doubles_from_one_second_to_thirty() {
-        let seconds: Vec<u64> = (0..7).map(|n| retry_delay(n).as_secs()).collect();
-        assert_eq!(seconds, [1, 2, 4, 8, 16, 30, 30]);
-        assert_eq!(retry_delay(u32::MAX), RETRY_CEILING);
-    }
-
-    #[test]
     #[cfg_attr(miri, ignore = "resolves a real interface")]
     fn kernel_accepts_a_join_on_loopback() {
         // The full MCAST_JOIN_GROUP FFI against the kernel: per-OS const, group_req layout,
@@ -701,7 +696,10 @@ pub(in crate::dispatch) mod tests {
             retry_at: start + Duration::from_secs(seconds),
         };
         assert_eq!(memberships.state_of(NOT_A_GROUP), after(0, 1));
-        assert_eq!(memberships.next_retry(), Some(start + RETRY_FLOOR));
+        assert_eq!(
+            memberships.next_retry(),
+            Some(start + Duration::from_secs(1))
+        );
 
         assert_eq!(
             memberships.converge(target, start + Duration::from_millis(999)),

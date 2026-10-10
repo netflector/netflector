@@ -3,11 +3,12 @@
 
 use std::fmt;
 use std::io;
+use std::num::NonZeroU32;
 use std::sync::LazyLock;
 
 use crate::capture::Capture;
 use crate::dispatch::{CaptureKey, PacketDispatcher};
-use crate::interface::{Interface, InterfaceName};
+use crate::interface::{Interface, InterfaceName, if_index_checked};
 use crate::reactor::{Handler, Reactor, ReadyEvent};
 
 /// Something a test needs from the host and not every host offers. A test that finds one missing
@@ -107,13 +108,33 @@ pub(crate) fn skip(cap: Capability, reason: impl fmt::Display) {
     eprintln!("skip {cap}: {reason}");
 }
 
+/// Resolve `name` and read its addresses, as startup does.
+///
+/// # Errors
+/// [`io::ErrorKind::NotFound`] for a name no interface bears, or a resolution failure.
+pub(crate) fn open_interface(name: &InterfaceName) -> io::Result<(Interface, NonZeroU32)> {
+    let ifindex = if_index_checked(name)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("interface {name} not found"),
+        )
+    })?;
+    Ok((Interface::open(name, ifindex)?, ifindex))
+}
+
+/// A capture on `name`, opened as startup opens one.
+///
+/// # Errors
+/// As [`open_interface`], or the capture failing to open.
+pub(crate) fn open_capture(name: &InterfaceName) -> io::Result<Capture> {
+    let (interface, ifindex) = open_interface(name)?;
+    Capture::open(&interface, ifindex)
+}
+
 /// Open a capture on `if_name`, or `Ok(None)` (skip) when the host can't: no BPF access /
 /// `CAP_NET_RAW`, or the interface is absent. Other errors propagate for the caller to `?`.
 pub(crate) fn open_or_skip(if_name: &InterfaceName) -> io::Result<Option<Capture>> {
-    skip_unless_captured(
-        if_name,
-        Interface::open(if_name).and_then(|interface| Capture::open(&interface)),
-    )
+    skip_unless_captured(if_name, open_capture(if_name))
 }
 
 /// [`open_or_skip`] into `dispatcher`, which keeps the capture.

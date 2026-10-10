@@ -337,7 +337,8 @@ impl PacketDispatcher {
         (&mut self.dial, target_iface)
     }
 
-    /// The kernel ifindex behind `capture`; `None` while its interface is parked absent.
+    /// The kernel ifindex behind `capture`; `None` while its interface is not bound: parked, or
+    /// its re-bind failed.
     pub(crate) fn capture_ifindex(&self, capture: CaptureKey) -> Option<NonZeroU32> {
         self.table.ifindex_of(capture)
     }
@@ -433,9 +434,10 @@ impl PacketDispatcher {
         };
         let link = capture.link_type(); // hoisted: next_frame's borrow would pin `capture`
         let fd = capture.as_raw_fd();
-        // A rename parks the entry but keeps the kernel interface, so the capture still reads.
-        // Its frames are drained, since the wait is level-triggered, but never routed.
-        let parked = self.table.ifindex_of(ingress).is_none();
+        // A capture can still read while its interface is not bound: a rename keeps the kernel
+        // interface, a failed re-bind can keep the old attachment. Its frames are drained, since
+        // the wait is level-triggered, but never routed.
+        let bound = self.table.ifindex_of(ingress).is_some();
         let mut drained = 0u32;
         let mut oversized = 0u64;
         loop {
@@ -462,7 +464,7 @@ impl PacketDispatcher {
                     break;
                 }
             };
-            if parked {
+            if !bound {
                 drained += 1;
                 continue;
             }
@@ -661,9 +663,9 @@ impl PacketDispatcher {
     fn reconcile_interfaces(&mut self, reactor: &mut Reactor) {
         for rebuilt in self.lifecycle.reconcile(&mut self.table, Instant::now()) {
             let reason = if rebuilt.removed {
-                "after its interface was removed"
+                "after its interface was unbound"
             } else {
-                "after its interface was recreated"
+                "after its interface was re-bound"
             };
             self.dial
                 .evict_on_interface_change(reactor, &rebuilt.captures, reason);
@@ -739,6 +741,15 @@ impl Handler for PacketDispatcher {
             ControlEvent::Dump => log_counters(self.table.counter_rows()),
         }
     }
+}
+
+/// The wait before retrying something that failed `attempts` times before: 1 s doubling to 30 s.
+fn retry_delay(attempts: u32) -> Duration {
+    const FLOOR: Duration = Duration::from_secs(1);
+    const CEILING: Duration = Duration::from_secs(30);
+    1u32.checked_shl(attempts)
+        .and_then(|factor| FLOOR.checked_mul(factor))
+        .map_or(CEILING, |delay| delay.min(CEILING))
 }
 
 /// The all-zero address is exempt: Linux reports it as a loopback's hardware address, so it

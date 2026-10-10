@@ -37,7 +37,7 @@ impl Capture {
     /// # Errors
     /// No free BPF device, an unbindable interface, a link type neither Ethernet nor
     /// `DLT_NULL`, or a failed setup ioctl.
-    pub(crate) fn open(interface: &Interface) -> io::Result<Self> {
+    pub(crate) fn open(interface: &Interface, _ifindex: NonZeroU32) -> io::Result<Self> {
         let fd = open_bpf_device()?;
 
         let link_type = attach(&fd, interface)?;
@@ -74,7 +74,7 @@ impl Capture {
     ///
     /// # Errors
     /// The attach ioctl failure while no interface bears the name, or an unsupported link type.
-    pub(crate) fn rebind(&mut self, interface: &Interface) -> io::Result<()> {
+    pub(crate) fn rebind(&mut self, interface: &Interface, _ifindex: NonZeroU32) -> io::Result<()> {
         self.link_type = attach(&self.fd, interface)?;
         // The kernel reset its buffer at the re-attach; match it.
         self.filled = 0;
