@@ -31,15 +31,15 @@ pub(crate) struct Capture {
 }
 
 impl Capture {
-    /// Open an `AF_PACKET` capture bound to `interface`.
+    /// Open an `AF_PACKET` capture bound to `interface`, at `ifindex`.
     ///
     /// # Errors
     /// An unknown interface, a hardware type neither Ethernet nor raw IP, or a failed
     /// socket/filter/bind.
-    pub(crate) fn open(interface: &Interface) -> io::Result<Self> {
+    pub(crate) fn open(interface: &Interface, ifindex: NonZeroU32) -> io::Result<Self> {
         // Protocol 0: nothing is captured until the bind.
         let fd = open_socket(libc::AF_PACKET, libc::SOCK_RAW, 0)?;
-        let link_type = attach(&fd, interface)?;
+        let link_type = attach(&fd, interface, ifindex)?;
         log::debug!(
             "opened AF_PACKET capture on {} (fd {}, {link_type:?})",
             interface.name,
@@ -53,14 +53,13 @@ impl Capture {
         })
     }
 
-    /// Re-attach to `interface`, the one named at open, after it was recreated. Same fd, so the
-    /// reactor's watch stays valid.
+    /// Re-attach to `interface`, the one named at open, after it was recreated at `ifindex`.
+    /// Same fd, so the reactor's watch stays valid.
     ///
     /// # Errors
-    /// [`io::ErrorKind::NotFound`] while no interface bears the name; otherwise the attach
-    /// failure.
-    pub(crate) fn rebind(&mut self, interface: &Interface) -> io::Result<()> {
-        self.link_type = attach(&self.fd, interface)?;
+    /// The attach failure.
+    pub(crate) fn rebind(&mut self, interface: &Interface, ifindex: NonZeroU32) -> io::Result<()> {
+        self.link_type = attach(&self.fd, interface, ifindex)?;
         // The kernel parked ENETDOWN on the socket when the old interface died; consume it so
         // the first post-rebind recv surfaces frames, not the stale failure.
         match crate::sys::so_error(self.fd.as_raw_fd()) {
@@ -198,8 +197,8 @@ impl AsRawFd for Capture {
 }
 
 /// The filter goes in before the bind, so no frame is ever delivered unfiltered.
-fn attach(fd: &OwnedFd, interface: &Interface) -> io::Result<LinkType> {
-    let addr = link_addr(interface)?;
+fn attach(fd: &OwnedFd, interface: &Interface, ifindex: NonZeroU32) -> io::Result<LinkType> {
+    let addr = link_addr(ifindex)?;
     let link_type = link_type_of(fd, &interface.name)?;
     install_filter(fd, link_type)?;
     bind_interface(fd, addr)?;
@@ -264,13 +263,7 @@ fn drop_outgoing_filter(classifier: &[BpfInsn]) -> Vec<BpfInsn> {
         .collect()
 }
 
-fn link_addr(interface: &Interface) -> io::Result<libc::sockaddr_ll> {
-    let Some(ifindex) = interface.ifindex else {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("interface {} not found", interface.name),
-        ));
-    };
+fn link_addr(ifindex: NonZeroU32) -> io::Result<libc::sockaddr_ll> {
     // SAFETY: all-zero is a valid `sockaddr_ll`: integer and byte-array fields only.
     let mut addr: libc::sockaddr_ll = unsafe { core::mem::zeroed() };
     addr.sll_family = u16::try_from(libc::AF_PACKET).expect("AF_PACKET fits u16");
@@ -325,7 +318,7 @@ mod tests {
     use super::*;
     use crate::net::frame::{LinkHeader, UdpFrames};
     use crate::net::mac::MacAddr;
-    use crate::test_support::{Tun, frame, loopback_lock, open_or_skip};
+    use crate::test_support::{Tun, frame, loopback_lock, open_capture, open_or_skip};
 
     /// How long a live tun test waits for a packet to cross the device.
     const WAIT_BUDGET: Duration = Duration::from_secs(2);
@@ -395,7 +388,7 @@ mod tests {
         let Some(mut tun) = Tun::create() else {
             return Ok(());
         };
-        let mut capture = Capture::open(&Interface::open(&tun.name)?)?;
+        let mut capture = open_capture(&tun.name)?;
         assert_eq!(capture.link_type(), LinkType::RawIp);
         for packet in bare_datagrams(b"netflector-tun-in") {
             tun.far_end.write_all(&packet)?;
@@ -416,7 +409,7 @@ mod tests {
         let Some(mut tun) = Tun::create() else {
             return Ok(());
         };
-        let mut capture = Capture::open(&Interface::open(&tun.name)?)?;
+        let mut capture = open_capture(&tun.name)?;
         let payload = [0x7a; 1000];
         let datagrams = [
             UdpFrames::ipv4(
@@ -467,7 +460,7 @@ mod tests {
         let Some(tun) = Tun::create() else {
             return Ok(());
         };
-        let capture = Capture::open(&Interface::open(&tun.name)?)?;
+        let capture = open_capture(&tun.name)?;
         for packet in bare_datagrams(b"netflector-tun-out") {
             capture.send(&packet)?;
             assert!(

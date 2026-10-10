@@ -174,6 +174,13 @@ impl Egress {
             log::warn!("egress {egress:?} unavailable (drained or unknown); datagram dropped");
             return Ok(None);
         };
+        // A parked or unbound interface's capture can still be attached to some interface.
+        if table.ifindex_of(egress).is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                format!("interface {} is not bound", table.capture_name(egress)),
+            ));
+        }
         let id = self.next_id;
         self.next_id = id.wrapping_add(1);
         build_udp(

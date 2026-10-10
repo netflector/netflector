@@ -85,19 +85,14 @@ pub(super) fn nl_align(len: usize) -> usize {
         .expect("NLMSG_ALIGN of an in-buffer length is non-negative")
 }
 
-/// `if_name` is for tracing only; the dumps filter by `ifindex`. No `ifindex` skips the dumps.
+/// `if_name` is for tracing only; the dumps filter by `ifindex`.
 ///
 /// # Errors
 /// A failed netlink socket, request or reply.
 pub(super) fn resolve(
     if_name: &str,
-    ifindex: Option<NonZeroU32>,
+    ifindex: NonZeroU32,
 ) -> io::Result<(InterfaceAddresses, Option<u32>)> {
-    let Some(ifindex) = ifindex else {
-        log::debug!("{if_name}: no kernel ifindex; skipping the address dump");
-        return Ok((InterfaceAddresses::default(), None));
-    };
-
     let sock = netlink_socket()?;
     let mut addrs = InterfaceAddresses::default();
     let mut mtu = None;

@@ -1,5 +1,5 @@
-//! The dispatcher's interface table: every interface with its group memberships, and every
-//! capture linked to its interface, all addressed by `Copy` index keys.
+//! The dispatcher's interface table: every interface with its presence and group memberships,
+//! and every capture linked to its interface, all addressed by `Copy` index keys.
 
 use std::io;
 use std::net::IpAddr;
@@ -12,22 +12,49 @@ use crate::interface::{
     AddressChange, Interface, InterfaceAddresses, InterfaceName, if_index_checked,
 };
 
-use super::CaptureKey;
 use super::counters::{CaptureCounters, Outcome};
 use super::multicast::{Gone, JoinError, Memberships, Target, Wanted};
+use super::{CaptureKey, retry_delay};
 
 /// A `Copy` index into the table's interface entries; insert-only, so stable.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) struct InterfaceKey(u32);
 
-/// A stale entry from [`stale_interfaces`](InterfaceTable::stale_interfaces).
+/// What an interface's captures are bound to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) struct StaleInterface {
-    pub(super) key: InterfaceKey,
-    /// The cached identity; `None` while parked absent.
-    pub(super) cached: Option<NonZeroU32>,
-    /// What the name resolves to now; `None` for nothing.
-    pub(super) cur: Option<NonZeroU32>,
+pub(super) enum Presence {
+    /// Bound to the interface at this index: its frames route, its addresses source sends, its
+    /// groups are joined.
+    Present(NonZeroU32),
+    /// The name resolves to nothing. A capture bound to a renamed interface still reads; its
+    /// frames are dropped.
+    Parked,
+    /// The name resolves, but binding to it failed. Treated as parked until a retry binds it.
+    Unbound(Unbound),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) struct Unbound {
+    pub(super) ifindex: NonZeroU32,
+    attempts: u32,
+    next_try: Instant,
+}
+
+/// How a [`step`](InterfaceTable::step) changed what an interface's captures read.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Moved {
+    /// Bound to a recreated or returned interface.
+    Rebound,
+    /// No longer bound to anything.
+    Removed,
+}
+
+/// What a [`step`](InterfaceTable::step) did.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(super) struct Stepped {
+    pub(super) moved: Option<Moved>,
+    /// Something could not be settled; step again soon rather than at the slow tick.
+    pub(super) retry_soon: bool,
 }
 
 /// `capture` is `None` while taken out for its drain; the rest stays resident, so addresses
@@ -43,26 +70,40 @@ struct CaptureEntry {
 
 struct InterfaceEntry {
     interface: Interface,
+    presence: Presence,
     /// `None`: `--no-join`.
     memberships: Option<Memberships>,
 }
 
 impl InterfaceEntry {
-    /// `None` while parked absent, or with `--no-join`.
-    fn join_target(&mut self) -> Option<(&mut Memberships, Target<'_>)> {
-        let ifindex = self.interface.ifindex?;
+    fn ifindex(&self) -> Option<NonZeroU32> {
+        match self.presence {
+            Presence::Present(ifindex) => Some(ifindex),
+            Presence::Parked | Presence::Unbound(_) => None,
+        }
+    }
+
+    /// See [`Memberships::converge`]. Only a present interface joins.
+    fn converge(&mut self, now: Instant) -> Result<(), Gone> {
+        let (Presence::Present(ifindex), Some(memberships)) =
+            (self.presence, self.memberships.as_mut())
+        else {
+            return Ok(());
+        };
         let target = Target {
             name: &self.interface.name,
             ifindex,
         };
-        Some((self.memberships.as_mut()?, target))
+        memberships.converge(target, now)
     }
 
-    /// See [`Memberships::converge`].
-    fn converge(&mut self, now: Instant) -> Result<(), Gone> {
-        self.join_target().map_or(Ok(()), |(memberships, target)| {
-            memberships.converge(target, now)
-        })
+    /// Unbind: the memberships go with their sockets, and the addresses are forgotten.
+    fn release(&mut self, presence: Presence) {
+        self.presence = presence;
+        if let Some(memberships) = &mut self.memberships {
+            memberships.rebase();
+        }
+        self.interface.forget();
     }
 }
 
@@ -89,19 +130,7 @@ impl InterfaceTable {
         }
     }
 
-    /// Startup-only.
-    fn add_interface(&mut self, interface: Interface) -> InterfaceKey {
-        let key =
-            InterfaceKey(u32::try_from(self.entries.len()).expect("interface count fits a u32"));
-        let memberships = self.join_groups.then(Memberships::new);
-        self.entries.push(InterfaceEntry {
-            interface,
-            memberships,
-        });
-        key
-    }
-
-    /// Want `group` on `interface` and join it. A parked interface joins it when it returns.
+    /// Want `group` on `interface` and join it. One not bound joins it once bound.
     ///
     /// # Errors
     /// See [`Memberships::join`].
@@ -114,13 +143,21 @@ impl InterfaceTable {
     ) -> Result<(), JoinError> {
         // Startup-only with a fresh key, so the index is in range.
         let entry = &mut self.entries[interface.0 as usize];
-        if let Some((memberships, target)) = entry.join_target() {
-            memberships.join(group, wanted, target, now)
-        } else {
-            if let Some(memberships) = &mut entry.memberships {
-                memberships.add(group, wanted);
+        let Some(memberships) = &mut entry.memberships else {
+            return Ok(());
+        };
+        match entry.presence {
+            Presence::Present(ifindex) => {
+                let target = Target {
+                    name: &entry.interface.name,
+                    ifindex,
+                };
+                memberships.join(group, wanted, target, now)
             }
-            Ok(())
+            Presence::Parked | Presence::Unbound(_) => {
+                memberships.add(group, wanted);
+                Ok(())
+            }
         }
     }
 
@@ -156,8 +193,11 @@ impl InterfaceTable {
             .min()
     }
 
+    /// Startup-only.
+    ///
     /// # Errors
-    /// A resolution syscall failure when first opening the interface.
+    /// [`io::ErrorKind::NotFound`] for a name no interface bears, or a resolution syscall
+    /// failure.
     pub(super) fn find_or_add_interface(
         &mut self,
         name: &InterfaceName,
@@ -171,7 +211,20 @@ impl InterfaceTable {
                 u32::try_from(index).expect("interface count fits a u32"),
             ));
         }
-        Ok(self.add_interface(Interface::open(name)?))
+        let ifindex = if_index_checked(name)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("interface {name} not found"),
+            )
+        })?;
+        let key =
+            InterfaceKey(u32::try_from(self.entries.len()).expect("interface count fits a u32"));
+        self.entries.push(InterfaceEntry {
+            interface: Interface::open(name, ifindex)?,
+            presence: Presence::Present(ifindex),
+            memberships: self.join_groups.then(Memberships::new),
+        });
+        Ok(key)
     }
 
     pub(super) fn was_sent(&self, egress: CaptureKey, packet: u64, digest: u64) -> bool {
@@ -193,10 +246,17 @@ impl InterfaceTable {
     /// Startup-only. The capture opens from the interface record, resolved once per name.
     ///
     /// # Errors
-    /// A resolution syscall failure, or the capture failing to open.
+    /// A name no interface bears, a resolution syscall failure, or the capture failing to open.
     pub(super) fn open_capture(&mut self, name: &InterfaceName) -> io::Result<CaptureKey> {
         let interface = self.find_or_add_interface(name)?;
-        let capture = Capture::open(&self.entries[interface.0 as usize].interface)?;
+        let entry = &self.entries[interface.0 as usize];
+        let ifindex = entry.ifindex().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("interface {name} not found"),
+            )
+        })?;
+        let capture = Capture::open(&entry.interface, ifindex)?;
         let key = CaptureKey(u32::try_from(self.captures.len()).expect("capture count fits a u32"));
         self.captures.push(CaptureEntry {
             capture: Some(capture),
@@ -220,7 +280,7 @@ impl InterfaceTable {
             .map(|entry| &entry.interface.addrs)
     }
 
-    /// `None` for an unknown capture, or while its interface is parked absent.
+    /// `None` for an unknown capture, or while its interface is not bound.
     pub(super) fn ifindex_of(&self, capture: CaptureKey) -> Option<NonZeroU32> {
         self.interface_index(self.interface_of(capture)?)
     }
@@ -238,11 +298,11 @@ impl InterfaceTable {
             .map_or("?", |name| name)
     }
 
-    /// `None` for an unknown key, or while the interface is parked absent.
+    /// `None` for an unknown key, or while the interface is not bound.
     pub(super) fn interface_index(&self, interface: InterfaceKey) -> Option<NonZeroU32> {
         self.entries
             .get(interface.0 as usize)
-            .and_then(|entry| entry.interface.ifindex)
+            .and_then(InterfaceEntry::ifindex)
     }
 
     pub(super) fn egress_addrs(&self, capture: CaptureKey) -> Option<&InterfaceAddresses> {
@@ -285,10 +345,6 @@ impl InterfaceTable {
         self.captures[capture.0 as usize].counters.record(outcome);
     }
 
-    pub(super) fn record_recovery(&mut self, capture: CaptureKey) {
-        self.captures[capture.0 as usize].counters.record_recovery();
-    }
-
     pub(super) fn record_oversized(&mut self, capture: CaptureKey, n: u64) {
         self.captures[capture.0 as usize]
             .counters
@@ -314,55 +370,75 @@ impl InterfaceTable {
         })
     }
 
-    /// The interface at kernel index `ifindex`; `None` for one we don't watch.
-    pub(super) fn key_by_ifindex(&self, ifindex: NonZeroU32) -> Option<InterfaceKey> {
-        self.entries
-            .iter()
-            .position(|entry| entry.interface.ifindex == Some(ifindex))
+    pub(super) fn interfaces(&self) -> impl Iterator<Item = InterfaceKey> + use<> {
+        (0..self.entries.len())
             .map(|index| InterfaceKey(u32::try_from(index).expect("interface count fits a u32")))
     }
 
-    /// Re-resolve `interface` in place.
+    /// The bound interface at kernel index `ifindex`; `None` for one we don't watch.
+    pub(super) fn key_by_ifindex(&self, ifindex: NonZeroU32) -> Option<InterfaceKey> {
+        self.entries
+            .iter()
+            .position(|entry| entry.ifindex() == Some(ifindex))
+            .map(|index| InterfaceKey(u32::try_from(index).expect("interface count fits a u32")))
+    }
+
+    /// Make an interface that failed to bind to `ifindex` due for its retry now: an event on that
+    /// index may be the change that lets it bind. Returns whether an interface was waiting on it.
+    pub(super) fn wake_unbound(&mut self, ifindex: NonZeroU32, now: Instant) -> bool {
+        let mut woke = false;
+        for entry in &mut self.entries {
+            if let Presence::Unbound(unbound) = &mut entry.presence
+                && unbound.ifindex == ifindex
+            {
+                unbound.next_try = now;
+                woke = true;
+            }
+        }
+        woke
+    }
+
+    /// Make every interface that failed to bind due for its retry now: an overflow may have lost
+    /// the event that lets one bind.
+    pub(super) fn wake_all_unbound(&mut self, now: Instant) {
+        for entry in &mut self.entries {
+            if let Presence::Unbound(unbound) = &mut entry.presence {
+                unbound.next_try = now;
+            }
+        }
+    }
+
+    /// Re-resolve the bound `interface` in place.
     ///
     /// # Errors
     /// A resolution syscall failure.
     pub(super) fn refresh(&mut self, interface: InterfaceKey) -> io::Result<AddressChange> {
         // Keys come from this table, so the index is in range.
-        self.entries[interface.0 as usize].interface.refresh()
+        let entry = &mut self.entries[interface.0 as usize];
+        match entry.presence {
+            Presence::Present(ifindex) => entry.interface.refresh(ifindex),
+            Presence::Parked | Presence::Unbound(_) => Ok(AddressChange::default()),
+        }
     }
 
-    /// Every interface whose kernel identity no longer matches the cache: the identity moved
-    /// (caught by the name lookup), or a capture's binding died behind an unchanged identity
-    /// (an index reused by the recreation, caught by the
-    /// [`attached`](crate::capture::Capture::attached) probe). A parked entry (no index, name
-    /// still resolving to nothing) is quiescent, not stale.
-    pub(super) fn stale_interfaces(&self) -> Vec<StaleInterface> {
+    /// Re-resolve every bound interface in place (an overflow, the periodic re-read); a
+    /// per-interface failure is returned, not fatal.
+    pub(super) fn refresh_all(&mut self) -> Vec<(InterfaceKey, io::Result<AddressChange>)> {
         self.entries
-            .iter()
+            .iter_mut()
             .enumerate()
             .filter_map(|(index, entry)| {
-                let key = InterfaceKey(u32::try_from(index).expect("interface count fits a u32"));
-                let cached = entry.interface.ifindex;
-                // A failed lookup says nothing; reading it as absent would park a healthy entry.
-                // Skip until the next tick.
-                let cur = if_index_checked(&entry.interface.name).ok()?;
-                let dead_capture = |ifindex| {
-                    self.captures.iter().any(|c| {
-                        c.interface == key
-                            && c.capture.as_ref().is_some_and(|cap| !cap.attached(ifindex))
-                    })
+                let Presence::Present(ifindex) = entry.presence else {
+                    return None;
                 };
-                (cur != cached || cur.is_some_and(dead_capture)).then_some(StaleInterface {
-                    key,
-                    cached,
-                    cur,
-                })
+                let key = InterfaceKey(u32::try_from(index).expect("interface count fits a u32"));
+                Some((key, entry.interface.refresh(ifindex)))
             })
             .collect()
     }
 
     /// Whether every capture on `interface` is still attached to its index (vacuously true while
-    /// parked): catches an index reused by a recreation as its first events arrive.
+    /// not bound): catches an index reused by a recreation as its first events arrive.
     pub(super) fn probe(&self, interface: InterfaceKey) -> bool {
         let Some(ifindex) = self.interface_index(interface) else {
             return true;
@@ -376,42 +452,179 @@ impl InterfaceTable {
         })
     }
 
-    /// Whether any interface is parked absent.
-    pub(super) fn any_absent(&self) -> bool {
+    /// Whether any interface is parked absent: its return may come with no event at all.
+    pub(super) fn any_parked(&self) -> bool {
         self.entries
             .iter()
-            .any(|entry| entry.interface.ifindex.is_none())
+            .any(|entry| entry.presence == Presence::Parked)
     }
 
-    /// Re-point interface `key` at kernel index `cur` (`None` = parked absent), re-resolve its
-    /// addresses and drop its memberships with their sockets. The refresh still runs while
-    /// absent, so the addresses clear and the egress gate closes. The ifindex is written first:
-    /// the Linux resolver keys its dumps by it. The captures re-bind
-    /// ([`rebind_capture`](Self::rebind_capture)) and the groups join again
-    /// ([`converge`](Self::converge)) separately, in that order: the captures' probe then
-    /// vouches for the interface the groups joined on.
-    ///
-    /// # Errors
-    /// A resolution syscall failure. The identity is rolled back so the entry stays visibly
-    /// stale and the retry re-runs the rebuild; committed, it would scan as healthy while
-    /// carrying the old interface's addresses.
-    pub(super) fn rebind_interface(
-        &mut self,
-        key: InterfaceKey,
-        cur: Option<NonZeroU32>,
-    ) -> io::Result<()> {
-        // Keys come from this table's own scan, so the index is in range.
-        let entry = &mut self.entries[key.0 as usize];
-        let previous = entry.interface.ifindex;
-        entry.interface.ifindex = cur;
+    /// When the earliest interface that failed to bind is due its retry.
+    pub(super) fn next_bind_retry(&self) -> Option<Instant> {
+        self.entries
+            .iter()
+            .filter_map(|entry| match entry.presence {
+                Presence::Unbound(unbound) => Some(unbound.next_try),
+                Presence::Present(_) | Presence::Parked => None,
+            })
+            .min()
+    }
+
+    /// Bring `interface` in line with what its name resolves to now: park it when the name
+    /// resolves to nothing, bind it when it resolves to an interface other than the bound one
+    /// (or the same index with its captures detached, a recreation that reused it), and retry a
+    /// failed bind once due.
+    pub(super) fn step(&mut self, interface: InterfaceKey, now: Instant) -> Stepped {
+        // Keys come from this table, so the index is in range.
+        let entry = &self.entries[interface.0 as usize];
+        let name = &entry.interface.name;
+        let cur = match if_index_checked(name) {
+            Ok(cur) => cur,
+            Err(e) => {
+                // Says nothing about the interface; reading it as absent would park a healthy one.
+                log::debug!("looking up {name} failed: {e}; retrying");
+                return Stepped {
+                    moved: None,
+                    retry_soon: true,
+                };
+            }
+        };
+        match (entry.presence, cur) {
+            (Presence::Parked, None) => Stepped::default(),
+            (Presence::Present(was), None) => {
+                log::info!(
+                    "interface {name} is gone (was ifindex {was}); parking until it returns"
+                );
+                self.entries[interface.0 as usize].release(Presence::Parked);
+                Stepped {
+                    moved: Some(Moved::Removed),
+                    retry_soon: false,
+                }
+            }
+            (Presence::Unbound(_), None) => {
+                log::info!("interface {name} is gone; parking until it returns");
+                self.entries[interface.0 as usize].presence = Presence::Parked;
+                Stepped::default()
+            }
+            (Presence::Present(bound), Some(cur)) if cur == bound && self.probe(interface) => {
+                Stepped::default()
+            }
+            (Presence::Unbound(unbound), Some(cur))
+                if cur == unbound.ifindex && now < unbound.next_try =>
+            {
+                Stepped::default()
+            }
+            (_, Some(cur)) => self.bind(interface, cur, now),
+        }
+    }
+
+    /// All or nothing: the interface is read, every capture re-bound with the kind of link the
+    /// read found, and only then are its addresses adopted and its groups joined, so the captures'
+    /// probe vouches for the interface the groups join on.
+    fn bind(&mut self, interface: InterfaceKey, ifindex: NonZeroU32, now: Instant) -> Stepped {
+        let entry = &mut self.entries[interface.0 as usize];
+        let was = entry.presence;
+        let name = &entry.interface.name;
+        match was {
+            Presence::Present(bound) => {
+                log::info!(
+                    "interface {name}: recreated (ifindex {bound} -> {ifindex}); re-binding"
+                );
+            }
+            Presence::Parked => {
+                log::info!("interface {name}: returned as ifindex {ifindex}; re-binding");
+            }
+            Presence::Unbound(unbound) if unbound.ifindex == ifindex => {
+                log::debug!("interface {name}: retrying the bind to ifindex {ifindex}");
+            }
+            Presence::Unbound(unbound) => {
+                log::info!(
+                    "interface {name}: recreated (ifindex {} -> {ifindex}); re-binding",
+                    unbound.ifindex
+                );
+            }
+        }
         if let Some(memberships) = &mut entry.memberships {
             memberships.rebase();
         }
-        let refreshed = entry.interface.refresh();
-        if refreshed.is_err() {
-            entry.interface.ifindex = previous;
+        // Adopted last, the addresses of a bind that fails again log no gain on each retry.
+        let bound = entry.interface.read(ifindex).and_then(|reading| {
+            #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+            self.entries[interface.0 as usize]
+                .interface
+                .take_link(&reading);
+            self.rebind_captures(interface, ifindex)?;
+            self.entries[interface.0 as usize].interface.adopt(&reading);
+            Ok(())
+        });
+        self.settle_bind(interface, ifindex, was, bound, now)
+    }
+
+    fn settle_bind(
+        &mut self,
+        interface: InterfaceKey,
+        ifindex: NonZeroU32,
+        was: Presence,
+        bound: io::Result<()>,
+        now: Instant,
+    ) -> Stepped {
+        let entry = &mut self.entries[interface.0 as usize];
+        let name = &entry.interface.name;
+        if let Err(e) = bound {
+            let attempts = match was {
+                Presence::Unbound(unbound) if unbound.ifindex == ifindex => {
+                    unbound.attempts.saturating_add(1)
+                }
+                Presence::Present(_) | Presence::Parked | Presence::Unbound(_) => 0,
+            };
+            let delay = retry_delay(attempts);
+            if attempts == 0 {
+                log::warn!(
+                    "binding {name} to ifindex {ifindex} failed; retrying in {}s: {e}",
+                    delay.as_secs()
+                );
+            } else {
+                log::debug!("binding {name} to ifindex {ifindex} still fails: {e}");
+            }
+            entry.release(Presence::Unbound(Unbound {
+                ifindex,
+                attempts,
+                next_try: now + delay,
+            }));
+            return Stepped {
+                moved: matches!(was, Presence::Present(_)).then_some(Moved::Removed),
+                retry_soon: false,
+            };
         }
-        refreshed.map(|_| ())
+        entry.presence = Presence::Present(ifindex);
+        log::info!("interface {name}: recovery complete");
+        for capture in &mut self.captures {
+            if capture.interface == interface {
+                capture.counters.record_recovery();
+            }
+        }
+        Stepped {
+            moved: Some(Moved::Rebound),
+            // Gone again already: the next pass parks it.
+            retry_soon: self.converge(interface, now).is_err(),
+        }
+    }
+
+    /// Re-bind every capture on `interface` in place: same fd, same slot, so held keys and the
+    /// reactor's watch stay valid.
+    fn rebind_captures(&mut self, interface: InterfaceKey, ifindex: NonZeroU32) -> io::Result<()> {
+        let record = &self.entries[interface.0 as usize].interface;
+        for entry in &mut self.captures {
+            if entry.interface != interface {
+                continue;
+            }
+            match &mut entry.capture {
+                Some(capture) => capture.rebind(record, ifindex)?,
+                // Only a drain takes one out, and the drain never steps.
+                None => log::warn!("a capture on {} is missing from its rebuild", record.name),
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn captures_of(&self, interface: InterfaceKey) -> Vec<CaptureKey> {
@@ -420,38 +633,6 @@ impl InterfaceTable {
             .enumerate()
             .filter(|(_, entry)| entry.interface == interface)
             .map(|(index, _)| CaptureKey(u32::try_from(index).expect("capture count fits a u32")))
-            .collect()
-    }
-
-    /// Re-bind the capture behind `key` in place: same fd, same slot, so held keys and the
-    /// reactor's watch stay valid. `Ok(false)`: no capture in the slot. A failed re-bind retries
-    /// when the `attached` probe re-flags the entry.
-    ///
-    /// # Errors
-    /// The re-bind syscall failure.
-    pub(super) fn rebind_capture(&mut self, key: CaptureKey) -> io::Result<bool> {
-        match self.captures.get_mut(key.0 as usize) {
-            Some(CaptureEntry {
-                capture: Some(capture),
-                interface,
-                ..
-            }) => capture
-                .rebind(&self.entries[interface.0 as usize].interface)
-                .map(|()| true),
-            _ => Ok(false),
-        }
-    }
-
-    /// Re-resolve every interface in place (an overflow, the periodic re-read); a per-interface
-    /// failure is returned, not fatal.
-    pub(super) fn refresh_all(&mut self) -> Vec<(InterfaceKey, io::Result<AddressChange>)> {
-        self.entries
-            .iter_mut()
-            .enumerate()
-            .map(|(index, entry)| {
-                let key = InterfaceKey(u32::try_from(index).expect("interface count fits a u32"));
-                (key, entry.interface.refresh())
-            })
             .collect()
     }
 
@@ -473,23 +654,38 @@ impl InterfaceTable {
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::time::Duration;
 
     use super::*;
     use crate::dispatch::MessageType;
     use crate::dispatch::multicast::join_unsupported;
     use crate::dispatch::multicast::tests::BEST_EFFORT;
-    use crate::interface::if_index;
+    use crate::interface::{LOOPBACK_IFACE, if_index};
     use crate::test_support::{Capability, skip};
 
     impl InterfaceTable {
-        /// Overwrite an entry's cached identity, standing in for the kernel recreating the
-        /// interface out from under the table. For the dispatcher's reconcile tests.
-        pub(in crate::dispatch) fn set_test_ifindex(
+        /// Overwrite an entry's presence, standing in for the kernel recreating the interface
+        /// out from under the table. For the dispatcher's reconcile tests.
+        pub(in crate::dispatch) fn set_test_presence(
             &mut self,
             interface: InterfaceKey,
-            ifindex: Option<NonZeroU32>,
+            presence: Presence,
         ) {
-            self.entries[interface.0 as usize].interface.ifindex = ifindex;
+            self.entries[interface.0 as usize].presence = presence;
+        }
+
+        pub(in crate::dispatch) fn presence_of(&self, interface: InterfaceKey) -> Presence {
+            self.entries[interface.0 as usize].presence
+        }
+
+        pub(in crate::dispatch) fn test_memberships_mut(
+            &mut self,
+            interface: InterfaceKey,
+        ) -> &mut Memberships {
+            self.entries[interface.0 as usize]
+                .memberships
+                .as_mut()
+                .expect("the table joins groups")
         }
 
         pub(in crate::dispatch) fn test_memberships(
@@ -558,9 +754,16 @@ mod tests {
         }
     }
 
-    // refresh_by_ifindex re-resolves only the interface(s) with the matching kernel index, reporting
-    // the changed fields (`None` for an unwatched index). Resolution is unprivileged (no capture
-    // needed), so this exercises the monitor's refresh path without CAP_NET_RAW.
+    impl Unbound {
+        pub(in crate::dispatch) fn test_due(ifindex: NonZeroU32, next_try: Instant) -> Self {
+            Self {
+                ifindex,
+                attempts: 0,
+                next_try,
+            }
+        }
+    }
+
     #[test]
     fn was_sent_remembers_every_datagram_of_the_packet_being_routed() {
         let mut table = InterfaceTable::new();
@@ -584,37 +787,58 @@ mod tests {
         table.record_sent(CaptureKey::from_u64(999), 2, 0xf3); // an unknown key is a no-op
     }
 
+    fn loopback_index() -> NonZeroU32 {
+        if_index(&InterfaceName::loopback()).expect("loopback has an ifindex")
+    }
+
+    fn rename(table: &mut InterfaceTable, interface: InterfaceKey, name: &str) {
+        table.entries[interface.0 as usize].interface.name = name.parse().unwrap();
+    }
+
     #[test]
     #[cfg_attr(miri, ignore = "resolves a real interface")]
-    fn key_by_ifindex_finds_only_a_watched_interface() -> io::Result<()> {
+    fn an_absent_name_is_not_found_at_startup() {
+        let mut table = InterfaceTable::new();
+        let err = table
+            .find_or_add_interface(&"nf-gone0".parse().unwrap())
+            .expect_err("no interface bears the name");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "resolves a real interface")]
+    fn key_by_ifindex_finds_only_a_bound_interface() -> io::Result<()> {
         let mut table = InterfaceTable::new();
         let key = table.find_or_add_interface(&InterfaceName::loopback())?;
-        let ifindex = if_index(&InterfaceName::loopback()).expect("loopback has an ifindex");
-        assert_eq!(table.key_by_ifindex(ifindex), Some(key));
+        assert_eq!(table.key_by_ifindex(loopback_index()), Some(key));
         assert_eq!(table.key_by_ifindex(NonZeroU32::MAX), None);
         let change = table.refresh(key)?;
         assert!(
             !change.v4,
             "re-resolving the unchanged loopback reports no v4 move, the bit the DIAL eviction gates on",
         );
+        rename(&mut table, key, "nf-gone0");
+        table.step(key, Instant::now());
+        assert_eq!(table.key_by_ifindex(loopback_index()), None);
         Ok(())
     }
 
-    // Each result comes back under its own interface, parked ones included: no index can tell
-    // two parked interfaces apart.
+    // A parked interface is not re-read: on the BSDs a read by name would adopt the addresses of
+    // an interface returning under it before its captures re-bind.
     #[test]
     #[cfg_attr(miri, ignore = "resolves a real interface")]
-    fn refresh_all_reports_each_interface_by_its_key() -> io::Result<()> {
+    fn refresh_all_reads_only_bound_interfaces() -> io::Result<()> {
         let mut table = InterfaceTable::new();
-        let first = table.find_or_add_interface(&"nf-gone0".parse().unwrap())?;
-        let second = table.find_or_add_interface(&"nf-gone1".parse().unwrap())?;
-        assert_eq!(table.interface_index(first), None);
+        let parked = table.find_or_add_interface(&InterfaceName::loopback())?;
+        rename(&mut table, parked, "nf-gone0");
+        table.step(parked, Instant::now());
+        let bound = table.find_or_add_interface(&InterfaceName::loopback())?;
         let keys: Vec<InterfaceKey> = table
             .refresh_all()
             .into_iter()
             .map(|(key, _)| key)
             .collect();
-        assert_eq!(keys, [first, second]);
+        assert_eq!(keys, [bound]);
         Ok(())
     }
 
@@ -666,64 +890,51 @@ mod tests {
         Ok(())
     }
 
-    // stale_interfaces flags an entry whose cached index no longer matches its name's, and
-    // rebind_interface repairs it. Unprivileged: pure resolution, no captures, so the probe
-    // half of the predicate stays vacuous here (pair tests cover it against real interfaces).
     #[test]
     #[cfg_attr(miri, ignore = "resolves a real interface")]
-    fn stale_interfaces_flags_and_rebind_repairs_a_moved_index() -> io::Result<()> {
+    fn a_step_leaves_a_bound_interface_alone() -> io::Result<()> {
         let mut table = InterfaceTable::new();
         let key = table.find_or_add_interface(&InterfaceName::loopback())?;
-        assert!(
-            table.stale_interfaces().is_empty(),
-            "a fresh entry is healthy"
-        );
-        let real = if_index(&InterfaceName::loopback()).expect("loopback has an ifindex");
-        // Simulate a recreation: the kernel identity moved while the cache kept the old index.
-        let old = NonZeroU32::new(real.get() + 1000);
-        table.entries[key.0 as usize].interface.ifindex = old;
-        assert_eq!(
-            table.stale_interfaces(),
-            [StaleInterface {
-                key,
-                cached: old,
-                cur: Some(real)
-            }]
-        );
-        table.rebind_interface(key, Some(real))?;
-        assert!(
-            table.stale_interfaces().is_empty(),
-            "the rebuild repaired the identity"
-        );
-        assert_eq!(table.entries[key.0 as usize].interface.ifindex, Some(real));
+        assert_eq!(table.step(key, Instant::now()), Stepped::default());
+        assert_eq!(table.presence_of(key), Presence::Present(loopback_index()));
         Ok(())
     }
 
-    // An entry whose name no longer resolves reports absent; rebinding to that parks it: no
-    // index, addresses cleared (the egress gate closes).
+    // Unprivileged: no captures, so the probe half of the check stays vacuous here (pair tests
+    // cover it against real interfaces).
     #[test]
     #[cfg_attr(miri, ignore = "resolves a real interface")]
-    fn rebind_to_absent_parks_the_entry() -> io::Result<()> {
+    fn a_step_binds_an_interface_whose_index_moved() -> io::Result<()> {
         let mut table = InterfaceTable::new();
         let key = table.find_or_add_interface(&InterfaceName::loopback())?;
-        table.entries[key.0 as usize].interface.name = "nf-gone0".parse().unwrap();
-        let real = if_index(&InterfaceName::loopback()).expect("loopback has an ifindex");
-        assert_eq!(
-            table.stale_interfaces(),
-            [StaleInterface {
-                key,
-                cached: Some(real),
-                cur: None
-            }]
-        );
-        table.rebind_interface(key, None)?;
+        let moved = NonZeroU32::new(loopback_index().get() + 1000).unwrap();
+        table.set_test_presence(key, Presence::Present(moved));
+        let stepped = table.step(key, Instant::now());
+        assert_eq!(stepped.moved, Some(Moved::Rebound));
+        assert_eq!(table.presence_of(key), Presence::Present(loopback_index()));
+        Ok(())
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "resolves a real interface")]
+    fn a_step_parks_a_vanished_interface_and_drops_what_it_held() -> io::Result<()> {
+        let Some((mut table, key)) = loopback_joined()? else {
+            return Ok(());
+        };
+        rename(&mut table, key, "nf-gone0");
+        let now = Instant::now();
+        assert_eq!(table.step(key, now).moved, Some(Moved::Removed));
+        assert_eq!(table.presence_of(key), Presence::Parked);
+        assert!(table.any_parked());
         assert!(
             table.entries[key.0 as usize].interface.addrs.v4().is_none(),
             "a parked entry's addresses clear, closing the egress gate"
         );
-        assert!(
-            table.stale_interfaces().is_empty(),
-            "a parked entry matches its (absent) identity"
+        assert!(table.test_memberships(key).test_socketless());
+        assert_eq!(
+            table.step(key, now),
+            Stepped::default(),
+            "a parked interface whose name still resolves to nothing stays quiet"
         );
         Ok(())
     }
@@ -734,11 +945,9 @@ mod tests {
         let Some((mut table, key)) = loopback_joined()? else {
             return Ok(());
         };
-        table.entries[key.0 as usize].interface.name = "nf-gone0".parse().unwrap();
-        table.rebind_interface(key, None)?;
-        assert!(table.test_memberships(key).test_socketless());
-
+        rename(&mut table, key, "nf-gone0");
         let now = Instant::now();
+        table.step(key, now);
         table.refresh_all();
         assert_eq!(table.converge_all(now), Ok(()));
         assert_eq!(table.converge(key, now), Ok(()));
@@ -754,21 +963,147 @@ mod tests {
         Ok(())
     }
 
-    // The rebuild drops the memberships with their sockets, and the converge after the captures
-    // re-bind joins every group again.
     #[test]
     #[cfg_attr(miri, ignore = "resolves a real interface")]
-    fn a_rebuilt_interface_joins_its_groups_at_the_next_converge() -> io::Result<()> {
+    fn a_returned_interface_binds_and_joins_its_groups() -> io::Result<()> {
         let Some((mut table, key)) = loopback_joined()? else {
             return Ok(());
         };
-        let ifindex = if_index(&InterfaceName::loopback());
-        table.rebind_interface(key, ifindex)?;
-        assert!(table.test_memberships(key).test_socketless());
-        assert!(!table.test_memberships(key).test_all_joined());
-
-        assert_eq!(table.converge(key, Instant::now()), Ok(()));
+        rename(&mut table, key, "nf-gone0");
+        let now = Instant::now();
+        table.step(key, now);
+        rename(&mut table, key, LOOPBACK_IFACE);
+        let stepped = table.step(key, now);
+        assert_eq!(stepped.moved, Some(Moved::Rebound));
+        assert!(!stepped.retry_soon);
+        assert_eq!(table.presence_of(key), Presence::Present(loopback_index()));
         assert!(table.test_memberships(key).test_all_joined());
+        assert!(table.entries[key.0 as usize].interface.addrs.v4().is_some());
+        Ok(())
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "resolves a real interface")]
+    fn a_failed_bind_is_retried_when_due_or_woken() -> io::Result<()> {
+        let mut table = InterfaceTable::new();
+        let key = table.find_or_add_interface(&InterfaceName::loopback())?;
+        let now = Instant::now();
+        let due = now + Duration::from_secs(4);
+        table.set_test_presence(
+            key,
+            Presence::Unbound(Unbound {
+                ifindex: loopback_index(),
+                attempts: 2,
+                next_try: due,
+            }),
+        );
+        assert_eq!(table.next_bind_retry(), Some(due));
+        assert_eq!(table.key_by_ifindex(loopback_index()), None);
+        assert_eq!(table.step(key, now), Stepped::default(), "not due yet");
+
+        assert!(table.wake_unbound(loopback_index(), now));
+        assert_eq!(table.step(key, now).moved, Some(Moved::Rebound));
+        assert_eq!(table.presence_of(key), Presence::Present(loopback_index()));
+        assert_eq!(table.next_bind_retry(), None);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "resolves a real interface")]
+    fn an_overflow_makes_every_failed_bind_due() -> io::Result<()> {
+        let mut table = InterfaceTable::new();
+        let key = table.find_or_add_interface(&InterfaceName::loopback())?;
+        let now = Instant::now();
+        let later = now + Duration::from_secs(30);
+        table.set_test_presence(
+            key,
+            Presence::Unbound(Unbound::test_due(loopback_index(), later)),
+        );
+        table.wake_all_unbound(now);
+        assert_eq!(table.next_bind_retry(), Some(now));
+        Ok(())
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "resolves a real interface")]
+    fn a_failed_bind_releases_the_interface_and_backs_off() -> io::Result<()> {
+        let Some((mut table, key)) = loopback_joined()? else {
+            return Ok(());
+        };
+        let refused = || Err(io::Error::from(io::ErrorKind::Unsupported));
+        let ifindex = loopback_index();
+        let now = Instant::now();
+        let first = table.settle_bind(key, ifindex, Presence::Present(ifindex), refused(), now);
+        assert_eq!(first.moved, Some(Moved::Removed));
+        let unbound = |attempts, seconds| {
+            Presence::Unbound(Unbound {
+                ifindex,
+                attempts,
+                next_try: now + Duration::from_secs(seconds),
+            })
+        };
+        assert_eq!(table.presence_of(key), unbound(0, 1));
+        assert!(table.entries[key.0 as usize].interface.addrs.v4().is_none());
+        assert!(table.test_memberships(key).test_socketless());
+        assert_eq!(table.step(key, now), Stepped::default(), "not due yet");
+
+        let again = table.settle_bind(key, ifindex, unbound(0, 1), refused(), now);
+        assert_eq!(again.moved, None, "nothing was bound to move");
+        assert_eq!(table.presence_of(key), unbound(1, 2));
+        Ok(())
+    }
+
+    // Only a retry at the same index waits for its time: a new index is a new interface.
+    #[test]
+    #[cfg_attr(miri, ignore = "resolves a real interface")]
+    fn an_unbound_interface_at_a_new_index_binds_at_once() -> io::Result<()> {
+        let mut table = InterfaceTable::new();
+        let key = table.find_or_add_interface(&InterfaceName::loopback())?;
+        let now = Instant::now();
+        let failed_at = NonZeroU32::new(loopback_index().get() + 1000).unwrap();
+        table.set_test_presence(
+            key,
+            Presence::Unbound(Unbound::test_due(failed_at, now + Duration::from_secs(30))),
+        );
+        assert_eq!(table.step(key, now).moved, Some(Moved::Rebound));
+        assert_eq!(table.presence_of(key), Presence::Present(loopback_index()));
+        Ok(())
+    }
+
+    // A recreated interface can be another kind of link: the captures re-bind with the kind the
+    // bind read, or a loopback capture stops seeing what the host sends.
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    #[test]
+    #[cfg_attr(miri, ignore = "needs a real capture device")]
+    fn a_bind_re_binds_the_captures_with_the_link_it_read() -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+
+        let _serial = crate::test_support::loopback_lock();
+        let mut table = InterfaceTable::new();
+        let capture = match table.open_capture(&InterfaceName::loopback()) {
+            Ok(capture) => capture,
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                skip(Capability::Capture, format_args!("cannot capture ({e})"));
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        let key = table.captures[capture.0 as usize].interface;
+        table.entries[key.0 as usize].interface.loopback = false;
+        let moved = NonZeroU32::new(loopback_index().get() + 1000).unwrap();
+        table.set_test_presence(key, Presence::Present(moved));
+
+        assert_eq!(table.step(key, Instant::now()).moved, Some(Moved::Rebound));
+        let fd = table.captures[capture.0 as usize]
+            .capture
+            .as_ref()
+            .expect("the capture is held")
+            .as_raw_fd();
+        let mut see_sent: libc::c_uint = 0;
+        // SAFETY: BIOCGSEESENT writes a `c_uint`.
+        let rc = unsafe { libc::ioctl(fd, libc::BIOCGSEESENT, &raw mut see_sent) };
+        assert_eq!(rc, 0, "{}", io::Error::last_os_error());
+        assert_eq!(see_sent, 1, "re-bound as a loopback");
         Ok(())
     }
 
@@ -779,7 +1114,11 @@ mod tests {
         let Some((mut table, key)) = loopback_joined()? else {
             return Ok(());
         };
-        table.rebind_interface(key, if_index(&InterfaceName::loopback()))?;
+        table.entries[key.0 as usize]
+            .memberships
+            .as_mut()
+            .unwrap()
+            .rebase();
         table.refresh(key)?;
         table.refresh_all();
         assert!(table.test_memberships(key).test_socketless());
@@ -787,16 +1126,12 @@ mod tests {
     }
 
     #[test]
-    fn captures_of_maps_the_reverse_link_and_empty_slots_rebind_as_noops() {
+    fn captures_of_maps_the_reverse_link() {
         let mut table = InterfaceTable::new();
         let a = table.add_test_capture(); // both link InterfaceKey(0)
         let b = table.add_test_capture();
         assert_eq!(table.captures_of(InterfaceKey(0)), [a, b]);
         assert_eq!(table.captures_of(InterfaceKey(1)), []);
-        // Capture-less slots (drained, or test entries with no fd) and out-of-range keys
-        // report Ok(false) -- a signal for the caller to log, not an error and not a success.
-        assert!(matches!(table.rebind_capture(a), Ok(false)));
-        assert!(matches!(table.rebind_capture(CaptureKey(99)), Ok(false)));
     }
 
     #[test]
