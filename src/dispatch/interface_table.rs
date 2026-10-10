@@ -6,7 +6,7 @@ use std::io;
 use std::net::IpAddr;
 use std::num::NonZeroU32;
 use std::os::fd::{AsRawFd, RawFd};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::capture::Capture;
 use crate::interface::{
@@ -55,21 +55,29 @@ pub(super) struct Unbound {
     next_try: Instant,
 }
 
-/// How a [`step`](InterfaceTable::step) changed what an interface's captures read.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum Moved {
-    /// Bound to a recreated or returned interface.
-    Rebound,
-    /// No longer bound to anything.
-    Removed,
-}
-
-/// What a [`step`](InterfaceTable::step) did.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub(super) struct Stepped {
-    pub(super) moved: Option<Moved>,
-    /// Something could not be settled; step again soon rather than at the slow tick.
-    pub(super) retry_soon: bool,
+/// What a [`step`](InterfaceTable::step) did to an interface.
+#[derive(Debug)]
+pub(super) enum Step {
+    /// Nothing changed, or a failed bind is not due its retry yet.
+    Kept,
+    /// The name lookup could not run, so nothing is known.
+    LookupFailed(io::Error),
+    /// The name resolves to nothing. `was`: the index it was bound to, if it was bound.
+    Parked { was: Option<NonZeroU32> },
+    /// Bound to `ifindex`. `gone`: joining its groups already found the index dead.
+    Bound {
+        was: Presence,
+        ifindex: NonZeroU32,
+        gone: bool,
+    },
+    /// Binding to `ifindex` failed; retried in `retry_in`. `first`: not a retry at this index.
+    BindFailed {
+        was: Presence,
+        ifindex: NonZeroU32,
+        error: io::Error,
+        retry_in: Duration,
+        first: bool,
+    },
 }
 
 /// `capture` is `None` while taken out for its drain; the rest stays resident, so addresses
@@ -502,45 +510,31 @@ impl InterfaceTable {
     /// resolves to nothing, bind it when it resolves to an interface other than the bound one
     /// (or the same index with its captures detached, a recreation that reused it), and retry a
     /// failed bind once due.
-    pub(super) fn step(&mut self, interface: InterfaceKey, now: Instant) -> Stepped {
+    pub(super) fn step(&mut self, interface: InterfaceKey, now: Instant) -> Step {
         // Keys come from this table, so the index is in range.
-        let entry = &self.entries[interface.0 as usize];
-        let name = &entry.interface.name;
-        let cur = match if_index_checked(name) {
+        let entry = &mut self.entries[interface.0 as usize];
+        let cur = match if_index_checked(&entry.interface.name) {
             Ok(cur) => cur,
-            Err(e) => {
-                // Says nothing about the interface; reading it as absent would park a healthy one.
-                log::debug!("looking up {name} failed: {e}; retrying");
-                return Stepped {
-                    moved: None,
-                    retry_soon: true,
-                };
-            }
+            // Says nothing about the interface; reading it as absent would park a healthy one.
+            Err(e) => return Step::LookupFailed(e),
         };
         match (entry.presence, cur) {
-            (Presence::Parked, None) => Stepped::default(),
+            (Presence::Parked, None) => Step::Kept,
             (Presence::Present(was), None) => {
-                log::info!(
-                    "interface {name} is gone (was ifindex {was}); parking until it returns"
-                );
-                self.entries[interface.0 as usize].release(Presence::Parked);
-                Stepped {
-                    moved: Some(Moved::Removed),
-                    retry_soon: false,
-                }
+                entry.release(Presence::Parked);
+                Step::Parked { was: Some(was) }
             }
             (Presence::Unbound(_), None) => {
-                log::info!("interface {name} is gone; parking until it returns");
-                self.entries[interface.0 as usize].presence = Presence::Parked;
-                Stepped::default()
+                entry.presence = Presence::Parked;
+                Step::Parked { was: None }
             }
             (Presence::Present(bound), Some(cur)) if cur == bound && self.probe(interface) => {
-                Stepped::default()
+                Step::Kept
             }
             (Presence::Unbound(unbound), Some(cur))
                 if cur == unbound.ifindex && now < unbound.next_try =>
             {
-                Stepped::default()
+                Step::Kept
             }
             (_, Some(cur)) => self.bind(interface, cur, now),
         }
@@ -549,29 +543,9 @@ impl InterfaceTable {
     /// All or nothing: the interface is read, every capture re-bound with the kind of link the
     /// read found, and only then are its addresses adopted and its groups joined, so the captures'
     /// probe vouches for the interface the groups join on.
-    fn bind(&mut self, interface: InterfaceKey, ifindex: NonZeroU32, now: Instant) -> Stepped {
+    fn bind(&mut self, interface: InterfaceKey, ifindex: NonZeroU32, now: Instant) -> Step {
         let entry = &mut self.entries[interface.0 as usize];
         let was = entry.presence;
-        let name = &entry.interface.name;
-        match was {
-            Presence::Present(bound) => {
-                log::info!(
-                    "interface {name}: recreated (ifindex {bound} -> {ifindex}); re-binding"
-                );
-            }
-            Presence::Parked => {
-                log::info!("interface {name}: returned as ifindex {ifindex}; re-binding");
-            }
-            Presence::Unbound(unbound) if unbound.ifindex == ifindex => {
-                log::debug!("interface {name}: retrying the bind to ifindex {ifindex}");
-            }
-            Presence::Unbound(unbound) => {
-                log::info!(
-                    "interface {name}: recreated (ifindex {} -> {ifindex}); re-binding",
-                    unbound.ifindex
-                );
-            }
-        }
         if let Some(memberships) = &mut entry.memberships {
             memberships.rebase();
         }
@@ -595,46 +569,39 @@ impl InterfaceTable {
         was: Presence,
         bound: io::Result<()>,
         now: Instant,
-    ) -> Stepped {
+    ) -> Step {
         let entry = &mut self.entries[interface.0 as usize];
-        let name = &entry.interface.name;
-        if let Err(e) = bound {
+        if let Err(error) = bound {
             let attempts = match was {
                 Presence::Unbound(unbound) if unbound.ifindex == ifindex => {
                     unbound.attempts.saturating_add(1)
                 }
                 Presence::Present(_) | Presence::Parked | Presence::Unbound(_) => 0,
             };
-            let delay = retry_delay(attempts);
-            if attempts == 0 {
-                log::warn!(
-                    "binding {name} to ifindex {ifindex} failed; retrying in {}s: {e}",
-                    delay.as_secs()
-                );
-            } else {
-                log::debug!("binding {name} to ifindex {ifindex} still fails: {e}");
-            }
+            let retry_in = retry_delay(attempts);
             entry.release(Presence::Unbound(Unbound {
                 ifindex,
                 attempts,
-                next_try: now + delay,
+                next_try: now + retry_in,
             }));
-            return Stepped {
-                moved: matches!(was, Presence::Present(_)).then_some(Moved::Removed),
-                retry_soon: false,
+            return Step::BindFailed {
+                was,
+                ifindex,
+                error,
+                retry_in,
+                first: attempts == 0,
             };
         }
         entry.presence = Presence::Present(ifindex);
-        log::info!("interface {name}: recovery complete");
         for capture in &mut self.captures {
             if capture.interface == interface {
                 capture.counters.record_recovery();
             }
         }
-        Stepped {
-            moved: Some(Moved::Rebound),
-            // Gone again already: the next pass parks it.
-            retry_soon: self.converge(interface, now).is_err(),
+        Step::Bound {
+            was,
+            ifindex,
+            gone: self.converge(interface, now).is_err(),
         }
     }
 
@@ -646,10 +613,9 @@ impl InterfaceTable {
             if entry.interface != interface {
                 continue;
             }
-            match &mut entry.capture {
-                Some(capture) => capture.rebind(record, ifindex)?,
-                // Only a drain takes one out, and the drain never steps.
-                None => log::warn!("a capture on {} is missing from its rebuild", record.name),
+            // Only a drain takes a capture out, and the drain never steps.
+            if let Some(capture) = &mut entry.capture {
+                capture.rebind(record, ifindex)?;
             }
         }
         Ok(())
@@ -923,7 +889,7 @@ mod tests {
     fn a_step_leaves_a_bound_interface_alone() -> io::Result<()> {
         let mut table = InterfaceTable::new();
         let key = table.find_or_add_interface(&InterfaceName::loopback())?;
-        assert_eq!(table.step(key, Instant::now()), Stepped::default());
+        assert!(matches!(table.step(key, Instant::now()), Step::Kept));
         assert_eq!(table.presence_of(key), Presence::Present(loopback_index()));
         Ok(())
     }
@@ -937,8 +903,12 @@ mod tests {
         let key = table.find_or_add_interface(&InterfaceName::loopback())?;
         let moved = NonZeroU32::new(loopback_index().get() + 1000).unwrap();
         table.set_test_presence(key, Presence::Present(moved));
-        let stepped = table.step(key, Instant::now());
-        assert_eq!(stepped.moved, Some(Moved::Rebound));
+        let step = table.step(key, Instant::now());
+        assert!(
+            matches!(step, Step::Bound { was: Presence::Present(was), ifindex, gone: false }
+                if was == moved && ifindex == loopback_index()),
+            "{step:?}"
+        );
         assert_eq!(table.presence_of(key), Presence::Present(loopback_index()));
         Ok(())
     }
@@ -951,7 +921,11 @@ mod tests {
         };
         rename(&mut table, key, "nf-gone0");
         let now = Instant::now();
-        assert_eq!(table.step(key, now).moved, Some(Moved::Removed));
+        let step = table.step(key, now);
+        assert!(
+            matches!(step, Step::Parked { was: Some(was) } if was == loopback_index()),
+            "{step:?}"
+        );
         assert_eq!(table.presence_of(key), Presence::Parked);
         assert!(table.any_parked());
         assert!(
@@ -959,9 +933,8 @@ mod tests {
             "a parked entry's addresses clear, closing the egress gate"
         );
         assert!(table.test_memberships(key).test_socketless());
-        assert_eq!(
-            table.step(key, now),
-            Stepped::default(),
+        assert!(
+            matches!(table.step(key, now), Step::Kept),
             "a parked interface whose name still resolves to nothing stays quiet"
         );
         Ok(())
@@ -1001,9 +974,18 @@ mod tests {
         let now = Instant::now();
         table.step(key, now);
         rename(&mut table, key, LOOPBACK_IFACE);
-        let stepped = table.step(key, now);
-        assert_eq!(stepped.moved, Some(Moved::Rebound));
-        assert!(!stepped.retry_soon);
+        let step = table.step(key, now);
+        assert!(
+            matches!(
+                step,
+                Step::Bound {
+                    was: Presence::Parked,
+                    gone: false,
+                    ..
+                }
+            ),
+            "{step:?}"
+        );
         assert_eq!(table.presence_of(key), Presence::Present(loopback_index()));
         assert!(table.test_memberships(key).test_all_joined());
         assert!(table.entries[key.0 as usize].interface.addrs.v4().is_some());
@@ -1027,10 +1009,16 @@ mod tests {
         );
         assert_eq!(table.next_bind_retry(), Some(due));
         assert_eq!(table.key_by_ifindex(loopback_index()), None);
-        assert_eq!(table.step(key, now), Stepped::default(), "not due yet");
+        assert!(matches!(table.step(key, now), Step::Kept), "not due yet");
 
         assert!(table.wake_unbound(loopback_index(), now));
-        assert_eq!(table.step(key, now).moved, Some(Moved::Rebound));
+        assert!(matches!(
+            table.step(key, now),
+            Step::Bound {
+                was: Presence::Unbound(_),
+                ..
+            }
+        ));
         assert_eq!(table.presence_of(key), Presence::Present(loopback_index()));
         assert_eq!(table.next_bind_retry(), None);
         Ok(())
@@ -1062,7 +1050,11 @@ mod tests {
         let ifindex = loopback_index();
         let now = Instant::now();
         let first = table.settle_bind(key, ifindex, Presence::Present(ifindex), refused(), now);
-        assert_eq!(first.moved, Some(Moved::Removed));
+        assert!(
+            matches!(first, Step::BindFailed { first: true, retry_in, .. }
+                if retry_in == Duration::from_secs(1)),
+            "{first:?}"
+        );
         let unbound = |attempts, seconds| {
             Presence::Unbound(Unbound {
                 ifindex,
@@ -1073,10 +1065,14 @@ mod tests {
         assert_eq!(table.presence_of(key), unbound(0, 1));
         assert!(table.entries[key.0 as usize].interface.addrs.v4().is_none());
         assert!(table.test_memberships(key).test_socketless());
-        assert_eq!(table.step(key, now), Stepped::default(), "not due yet");
+        assert!(matches!(table.step(key, now), Step::Kept), "not due yet");
 
         let again = table.settle_bind(key, ifindex, unbound(0, 1), refused(), now);
-        assert_eq!(again.moved, None, "nothing was bound to move");
+        assert!(
+            matches!(again, Step::BindFailed { first: false, retry_in, .. }
+                if retry_in == Duration::from_secs(2)),
+            "a retry is not reported as a new failure: {again:?}"
+        );
         assert_eq!(table.presence_of(key), unbound(1, 2));
         Ok(())
     }
@@ -1093,8 +1089,12 @@ mod tests {
             key,
             Presence::Unbound(Unbound::test_due(failed_at, now + Duration::from_secs(30))),
         );
-        assert_eq!(table.step(key, now).moved, Some(Moved::Rebound));
-        assert_eq!(table.presence_of(key), Presence::Present(loopback_index()));
+        let step = table.step(key, now);
+        assert!(
+            matches!(step, Step::Bound { was: Presence::Unbound(_), ifindex, .. }
+                if ifindex == loopback_index()),
+            "{step:?}"
+        );
         Ok(())
     }
 
@@ -1121,7 +1121,8 @@ mod tests {
         let moved = NonZeroU32::new(loopback_index().get() + 1000).unwrap();
         table.set_test_presence(key, Presence::Present(moved));
 
-        assert_eq!(table.step(key, Instant::now()).moved, Some(Moved::Rebound));
+        let step = table.step(key, Instant::now());
+        assert!(matches!(step, Step::Bound { .. }), "{step:?}");
         let fd = table.captures[capture.0 as usize]
             .capture
             .as_ref()

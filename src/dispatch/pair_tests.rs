@@ -24,7 +24,7 @@ use crate::test_support::{Capability, open_capture, open_interface, skip};
 
 use super::CaptureKey;
 use super::datagram::{DatagramSource, build_udp, ethernet_dst};
-use super::interface_table::{InterfaceTable, Moved, Presence, Stepped};
+use super::interface_table::{InterfaceTable, Presence, Step};
 use super::multicast::tests::{BEST_EFFORT, REQUIRED};
 use super::multicast::{JoinError, Memberships, Target, Wait};
 use super::reassembly::Reassembler;
@@ -767,9 +767,8 @@ fn pair_interface_table_recovers_after_interface_recreation() -> io::Result<()> 
             .expect("the receive side joins");
     }
     for interface in table.interfaces() {
-        assert_eq!(
-            table.step(interface, Instant::now()),
-            Stepped::default(),
+        assert!(
+            matches!(table.step(interface, Instant::now()), Step::Kept),
             "a freshly-built table is healthy"
         );
     }
@@ -804,13 +803,10 @@ fn pair_interface_table_recovers_after_interface_recreation() -> io::Result<()> 
 
     // Both interfaces are stranded. On a reused index only the attached() probe catches it.
     for interface in table.interfaces() {
-        assert_eq!(
-            table.step(interface, Instant::now()),
-            Stepped {
-                moved: Some(Moved::Rebound),
-                retry_soon: false,
-            },
-            "the recreated interface is bound again"
+        let step = table.step(interface, Instant::now());
+        assert!(
+            matches!(step, Step::Bound { gone: false, .. }),
+            "the recreated interface is bound again: {step:?}"
         );
         assert!(matches!(table.presence_of(interface), Presence::Present(_)));
     }

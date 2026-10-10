@@ -12,7 +12,7 @@ use crate::interface::{InterfaceEvent, InterfaceMonitor};
 use crate::linear_map::LinearMap;
 
 use super::CaptureKey;
-use super::interface_table::{InterfaceKey, InterfaceTable, Moved, Stepped};
+use super::interface_table::{InterfaceKey, InterfaceTable, Presence, Step};
 
 /// The reconcile's periodic floor: an interface recreation whose every event was lost (macOS's
 /// silent route-socket overflow) is still detected.
@@ -233,12 +233,14 @@ impl InterfaceLifecycle {
         let mut retry_soon = false;
         let mut rebuilt = Vec::new();
         for interface in table.interfaces() {
-            let stepped = table.step(interface, now);
+            let step = table.step(interface, now);
+            report(name_of(table, interface), &step);
             // A kept interface can still have groups to join, ones whose event an overflow lost;
             // with every group joined this costs no syscall.
-            let gone = stepped == Stepped::default() && table.converge(interface, now).is_err();
-            retry_soon |= gone || stepped.retry_soon;
-            if let Some(moved) = stepped.moved {
+            let gone = matches!(step, Step::Kept) && table.converge(interface, now).is_err();
+            retry_soon |=
+                gone || matches!(step, Step::LookupFailed(_) | Step::Bound { gone: true, .. });
+            if let Some(moved) = moved(&step) {
                 rebuilt.push(Rebuilt {
                     captures: table.captures_of(interface),
                     removed: moved == Moved::Removed,
@@ -274,6 +276,76 @@ fn unwatched_event_reconciles(
         is_link
     };
     creation || !InterfaceMonitor::LIFECYCLE_EVENTS
+}
+
+fn report(name: &str, step: &Step) {
+    match step {
+        Step::Kept => {}
+        Step::LookupFailed(e) => log::debug!("looking up {name} failed: {e}; retrying"),
+        Step::Parked { was: Some(was) } => {
+            log::info!("interface {name} is gone (was ifindex {was}); parking until it returns");
+        }
+        Step::Parked { was: None } => {
+            log::info!("interface {name} is gone; parking until it returns");
+        }
+        Step::Bound { was, ifindex, .. } => match was {
+            Presence::Present(bound) => {
+                log::info!("interface {name}: recreated (ifindex {bound} -> {ifindex}); re-bound");
+            }
+            Presence::Parked => {
+                log::info!("interface {name}: returned as ifindex {ifindex}; re-bound");
+            }
+            Presence::Unbound(unbound) if unbound.ifindex == *ifindex => {
+                log::info!("interface {name}: bound to ifindex {ifindex} on a retry");
+            }
+            Presence::Unbound(unbound) => log::info!(
+                "interface {name}: recreated (ifindex {} -> {ifindex}); re-bound",
+                unbound.ifindex
+            ),
+        },
+        Step::BindFailed {
+            ifindex,
+            error,
+            retry_in,
+            first,
+            ..
+        } => {
+            if *first {
+                log::warn!(
+                    "interface {name}: binding to ifindex {ifindex} failed; retrying in {}s: \
+                     {error}",
+                    retry_in.as_secs()
+                );
+            } else {
+                log::debug!("interface {name}: binding to ifindex {ifindex} still fails: {error}");
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Moved {
+    /// The captures read the interface the name resolves to now.
+    Rebound,
+    /// The captures read nothing.
+    Removed,
+}
+
+/// How a step changed what the interface's captures read, if it did.
+fn moved(step: &Step) -> Option<Moved> {
+    match step {
+        Step::Parked { was: Some(_) }
+        | Step::BindFailed {
+            was: Presence::Present(_),
+            ..
+        } => Some(Moved::Removed),
+        Step::Bound { .. } => Some(Moved::Rebound),
+        // Its captures were not reading anything before either.
+        Step::Kept
+        | Step::LookupFailed(_)
+        | Step::Parked { was: None }
+        | Step::BindFailed { .. } => None,
+    }
 }
 
 /// Soon while something is unsettled, else at the slow tick, and no later than a failed bind's
@@ -318,7 +390,7 @@ fn open_monitor() -> Option<InterfaceMonitor> {
 mod tests {
     use std::io;
 
-    use super::super::interface_table::{Presence, Unbound};
+    use super::super::interface_table::Unbound;
     use super::*;
     use crate::interface::{InterfaceName, if_index};
 
@@ -337,6 +409,37 @@ mod tests {
         let later = now + Duration::from_secs(5);
         assert_eq!(next_pass(now, true, Some(later)), now + RECONCILE_RETRY);
         assert_eq!(next_pass(now, false, Some(later)), later);
+    }
+
+    #[test]
+    fn only_a_change_of_what_the_captures_read_moves_them() {
+        let index = loopback_index();
+        let failed = |was| Step::BindFailed {
+            was,
+            ifindex: index,
+            error: io::Error::from(io::ErrorKind::Unsupported),
+            retry_in: RECONCILE_RETRY,
+            first: true,
+        };
+        assert_eq!(
+            moved(&Step::Parked { was: Some(index) }),
+            Some(Moved::Removed)
+        );
+        assert_eq!(
+            moved(&failed(Presence::Present(index))),
+            Some(Moved::Removed)
+        );
+        assert_eq!(
+            moved(&Step::Bound {
+                was: Presence::Parked,
+                ifindex: index,
+                gone: false
+            }),
+            Some(Moved::Rebound)
+        );
+        assert_eq!(moved(&failed(Presence::Parked)), None);
+        assert_eq!(moved(&Step::Parked { was: None }), None);
+        assert_eq!(moved(&Step::Kept), None);
     }
 
     #[test]
