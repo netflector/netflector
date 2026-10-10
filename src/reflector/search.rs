@@ -6,6 +6,7 @@
 //! [`SearchProtocol`] plus a [`ReplyRewrite`] factory.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::num::NonZeroU32;
 use std::time::{Duration, Instant};
 
 use crate::config::{AddressFamily, Reflector};
@@ -146,7 +147,9 @@ impl SearchReflector {
         };
         // The scope id for an IPv6 link-local bind: read per session, not cached at build, so it
         // tracks the interface table.
-        let target_ifindex = dispatcher.capture_ifindex(self.target).unwrap_or(0);
+        let target_ifindex = dispatcher
+            .capture_ifindex(self.target)
+            .map_or(0, NonZeroU32::get);
         let reservation = match PortReservation::create(our_addr, target_ifindex) {
             Ok(reservation) => reservation,
             Err(e) => {

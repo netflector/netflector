@@ -263,7 +263,6 @@ impl PacketDispatcher {
             .table
             .interface_of(key)
             .and_then(|interface| self.table.interface_index(interface))
-            .and_then(NonZeroU32::new)
         {
             self.lifecycle.saw_interface(ifindex);
         }
@@ -338,8 +337,8 @@ impl PacketDispatcher {
         (&mut self.dial, target_iface)
     }
 
-    /// The kernel ifindex behind `capture`, 0 while its interface is parked absent.
-    pub(crate) fn capture_ifindex(&self, capture: CaptureKey) -> Option<u32> {
+    /// The kernel ifindex behind `capture`; `None` while its interface is parked absent.
+    pub(crate) fn capture_ifindex(&self, capture: CaptureKey) -> Option<NonZeroU32> {
         self.table.ifindex_of(capture)
     }
 
@@ -436,7 +435,7 @@ impl PacketDispatcher {
         let fd = capture.as_raw_fd();
         // A rename parks the entry but keeps the kernel interface, so the capture still reads.
         // Its frames are drained, since the wait is level-triggered, but never routed.
-        let parked = self.table.ifindex_of(ingress) == Some(0);
+        let parked = self.table.ifindex_of(ingress).is_none();
         let mut drained = 0u32;
         let mut oversized = 0u64;
         loop {

@@ -265,16 +265,16 @@ fn drop_outgoing_filter(classifier: &[BpfInsn]) -> Vec<BpfInsn> {
 }
 
 fn link_addr(interface: &Interface) -> io::Result<libc::sockaddr_ll> {
-    if interface.ifindex == 0 {
+    let Some(ifindex) = interface.ifindex else {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!("interface {} not found", interface.name),
         ));
-    }
+    };
     // SAFETY: all-zero is a valid `sockaddr_ll`: integer and byte-array fields only.
     let mut addr: libc::sockaddr_ll = unsafe { core::mem::zeroed() };
     addr.sll_family = u16::try_from(libc::AF_PACKET).expect("AF_PACKET fits u16");
-    addr.sll_ifindex = c_int::try_from(interface.ifindex)
+    addr.sll_ifindex = c_int::try_from(ifindex.get())
         .map_err(|_| io::Error::other("interface index too large"))?;
     Ok(addr)
 }

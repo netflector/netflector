@@ -130,11 +130,11 @@ impl Ipv6Scope {
 
 /// One configured interface. `ifindex` caches what `name` resolves to, the process's only
 /// persistent copy of an interface index: when the OS destroys and recreates the interface (a
-/// `PPPoE` reconnect, a bridge/VLAN rebuild), the dispatcher's reconcile re-points it (0 while
-/// the name resolves to nothing) and re-binds the captures.
+/// `PPPoE` reconnect, a bridge/VLAN rebuild), the dispatcher's reconcile re-points it (`None`
+/// while the name resolves to nothing) and re-binds the captures.
 pub(crate) struct Interface {
     pub(crate) name: InterfaceName,
-    pub(crate) ifindex: u32,
+    pub(crate) ifindex: Option<NonZeroU32>,
     pub(crate) addrs: InterfaceAddresses,
     /// Outside [`InterfaceAddresses`] on purpose: that struct's equality drives the refresh
     /// diffing, and a bare MTU change must not read as an address change (which clears sessions).
@@ -145,22 +145,22 @@ pub(crate) struct Interface {
 }
 
 impl Interface {
-    /// `ifindex` is 0 while the name resolves to nothing; no real event carries 0.
+    /// `ifindex` is `None` while the name resolves to nothing.
     ///
     /// # Errors
     /// Propagates a resolution syscall failure.
     pub(crate) fn open(name: &InterfaceName) -> io::Result<Self> {
         let mut iface = Self {
             name: name.clone(),
-            ifindex: if_index(name).map_or(0, NonZeroU32::get),
+            ifindex: if_index(name),
             addrs: InterfaceAddresses::default(),
             mtu: None,
             #[cfg(any(target_os = "macos", target_os = "freebsd"))]
             loopback: false,
         };
         match iface.ifindex {
-            0 => log::debug!("{name}: no kernel ifindex (interface absent)"),
-            i => log::debug!("{name}: ifindex {i}"),
+            None => log::debug!("{name}: no kernel ifindex (interface absent)"),
+            Some(i) => log::debug!("{name}: ifindex {i}"),
         }
         iface.refresh()?;
         Ok(iface)
