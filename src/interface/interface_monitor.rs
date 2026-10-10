@@ -4,6 +4,7 @@
 //! startup-resolved addresses, never aborts the daemon.
 
 use std::io;
+use std::num::NonZeroU32;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
 use crate::sys::IoStatus;
@@ -26,12 +27,12 @@ const MAX_CONSECUTIVE_OVERFLOWS: u32 = 16;
 pub(crate) enum InterfaceEvent {
     /// An address-level change on this kernel index. BSD `RTM_IFINFO` (link state, MAC) maps
     /// here too: a flap refreshes addresses, it is not a lifecycle change.
-    Address(u32),
+    Address(NonZeroU32),
     /// A link lifecycle event on this kernel index: Linux `RTM_{NEW,DEL}LINK` (creation,
     /// deletion or any link change, netlink doesn't distinguish), FreeBSD `RTM_IFANNOUNCE`.
     /// macOS has no lifecycle message, so this is never constructed there.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
-    Link(u32),
+    Link(NonZeroU32),
     /// Notifications were dropped: every interface may be stale.
     Overflow,
 }

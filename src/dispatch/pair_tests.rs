@@ -7,6 +7,7 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+#[cfg(target_os = "linux")]
 use std::num::NonZeroU32;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::process::Command;
@@ -19,12 +20,13 @@ use crate::net::packet::Parsed;
 use crate::sys::setsockopt;
 #[cfg(target_os = "linux")]
 use crate::sys::sockaddr_for;
-use crate::test_support::{Capability, skip};
+use crate::test_support::{Capability, open_capture, open_interface, skip};
 
 use super::CaptureKey;
 use super::datagram::{DatagramSource, build_udp, ethernet_dst};
-use super::interface_table::InterfaceTable;
-use super::multicast::MulticastJoiner;
+use super::interface_table::{InterfaceTable, Presence, Step};
+use super::multicast::tests::{BEST_EFFORT, REQUIRED};
+use super::multicast::{JoinError, Memberships, Target, Wait};
 use super::reassembly::Reassembler;
 
 const INJECT_SRC_PORT: u16 = 40000;
@@ -118,7 +120,7 @@ impl InterfacePair {
             self.inject,
             self.receive
         );
-        let mut inject = Interface::open(&self.inject).expect("resolve the inject interface");
+        let (mut inject, _) = open_interface(&self.inject).expect("resolve the inject interface");
         assert!(
             wait_for_source(&mut inject, |iface| {
                 iface.addrs.has_v4()
@@ -134,7 +136,8 @@ impl InterfacePair {
             "{} never resolved its v4 + link-local + routable v6 plan",
             self.inject
         );
-        let mut receive = Interface::open(&self.receive).expect("resolve the receive interface");
+        let (mut receive, _) =
+            open_interface(&self.receive).expect("resolve the receive interface");
         assert!(
             wait_for_source(&mut receive, |iface| iface.addrs.has_v4()
                 && iface.addrs.has_v6()),
@@ -517,7 +520,9 @@ fn wait_for_source(iface: &mut Interface, ready: impl Fn(&Interface) -> bool) ->
             return false;
         }
         std::thread::sleep(POLL_SLICE);
-        iface.refresh().ok();
+        if let Some(ifindex) = if_index(&iface.name) {
+            iface.refresh(ifindex).ok();
+        }
     }
 }
 
@@ -623,9 +628,9 @@ fn pair_injected_broadcast_is_captured_on_the_peer() -> io::Result<()> {
     let Some(pair) = InterfacePair::create() else {
         return Ok(());
     };
-    let iface = Interface::open(&pair.inject)?;
-    let injector = Capture::open(&iface)?;
-    let mut peer = Capture::open(&Interface::open(&pair.receive)?)?;
+    let (iface, ifindex) = open_interface(&pair.inject)?;
+    let injector = Capture::open(&iface, ifindex)?;
+    let mut peer = open_capture(&pair.receive)?;
 
     let payload = b"pair-broadcast";
     let dst = SocketAddr::from((Ipv4Addr::BROADCAST, INJECT_DST_PORT));
@@ -646,9 +651,9 @@ fn pair_capture_drops_vlan_tagged_frames() -> io::Result<()> {
     let Some(pair) = InterfacePair::create() else {
         return Ok(());
     };
-    let iface = Interface::open(&pair.inject)?;
-    let injector = Capture::open(&iface)?;
-    let mut peer = Capture::open(&Interface::open(&pair.receive)?)?;
+    let (iface, ifindex) = open_interface(&pair.inject)?;
+    let injector = Capture::open(&iface, ifindex)?;
+    let mut peer = open_capture(&pair.receive)?;
     let dst = SocketAddr::from((Ipv4Addr::BROADCAST, INJECT_DST_PORT));
 
     let tagged_payload = b"pair-vlan-30";
@@ -678,9 +683,9 @@ fn pair_capture_takes_priority_tagged_frames() -> io::Result<()> {
     let Some(pair) = InterfacePair::create() else {
         return Ok(());
     };
-    let iface = Interface::open(&pair.inject)?;
-    let injector = Capture::open(&iface)?;
-    let mut peer = Capture::open(&Interface::open(&pair.receive)?)?;
+    let (iface, ifindex) = open_interface(&pair.inject)?;
+    let injector = Capture::open(&iface, ifindex)?;
+    let mut peer = open_capture(&pair.receive)?;
     let dst = SocketAddr::from((Ipv4Addr::BROADCAST, INJECT_DST_PORT));
 
     let payload = b"pair-priority-5";
@@ -703,7 +708,7 @@ fn pair_capture_rebinds_after_interface_recreation() -> io::Result<()> {
     let Some(pair) = InterfacePair::create() else {
         return Ok(());
     };
-    let mut peer = Capture::open(&Interface::open(&pair.receive)?)?;
+    let mut peer = open_capture(&pair.receive)?;
     let index = if_index(&pair.receive).expect("receive ifindex");
     assert!(peer.attached(index), "a fresh capture reports attached");
 
@@ -714,15 +719,15 @@ fn pair_capture_rebinds_after_interface_recreation() -> io::Result<()> {
         "a capture on the destroyed interface reports detached"
     );
 
-    peer.rebind(&Interface::open(&pair.receive)?)?;
+    peer.rebind(&open_interface(&pair.receive)?.0, index)?;
     assert!(
         peer.attached(index),
         "the re-bound capture reports attached"
     );
 
     // Delivery is live again: inject on the recreated far end, capture on the re-bound fd.
-    let iface = Interface::open(&pair.inject)?;
-    let injector = Capture::open(&iface)?;
+    let (iface, ifindex) = open_interface(&pair.inject)?;
+    let injector = Capture::open(&iface, ifindex)?;
     let payload = b"pair-rebind";
     let dst = SocketAddr::from((Ipv4Addr::BROADCAST, INJECT_DST_PORT));
     inject(&iface.addrs, &injector, dst, payload)?;
@@ -736,12 +741,11 @@ fn pair_capture_rebinds_after_interface_recreation() -> io::Result<()> {
 // the pair at once -- the path the periodic reconcile follows (the only detection macOS has, its
 // recreated ifnet keeping the index). Both interfaces sit in the table with a capture each, and a
 // baseline injection proves delivery works first. After the pair is destroyed and recreated under
-// its names, stale_interfaces flags BOTH entries through the captures' attached() probe -- the half
-// the unprivileged unit test leaves vacuous, and the only half that fires when the index is reused.
-// rebind_interface re-points each entry and replays its recorded joins on a fresh socket (none
-// deferred), rebind_capture re-attaches each fd in place, and a second injection -- sent on the
-// re-bound injector, observed on the re-bound receiver -- proves delivery resumed through the very
-// captures that were stranded.
+// its names, a step re-binds BOTH entries: the name lookup or the captures' attached() probe, the
+// half the unprivileged unit test leaves vacuous and the only one that fires when the index is
+// reused, says each moved. The step re-attaches each fd in place and joins the groups on fresh
+// sockets, and a second injection -- sent on the re-bound injector, observed on the re-bound
+// receiver -- proves delivery resumed through the very captures that were stranded.
 #[test]
 fn pair_interface_table_recovers_after_interface_recreation() -> io::Result<()> {
     let Some(pair) = InterfacePair::create() else {
@@ -751,16 +755,23 @@ fn pair_interface_table_recovers_after_interface_recreation() -> io::Result<()> 
     let injector = table.open_capture(&pair.inject)?;
     let receiver = table.open_capture(&pair.receive)?;
     let receive_key = table.find_or_add_interface(&pair.receive)?;
-    // Record memberships on the receive side so its rebuild has groups to replay on the fresh socket.
-    table.join_on(receive_key, IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)))?;
-    table.join_on(
-        receive_key,
-        IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb)),
-    )?;
-    assert!(
-        table.stale_interfaces().is_empty(),
-        "a freshly-built table is healthy"
-    );
+    // Memberships on the receive side, for its rebuild to join again.
+    for group in ["224.0.0.251", "ff02::fb"] {
+        table
+            .join_on(
+                receive_key,
+                group.parse().unwrap(),
+                BEST_EFFORT,
+                Instant::now(),
+            )
+            .expect("the receive side joins");
+    }
+    for interface in table.interfaces() {
+        assert!(
+            matches!(table.step(interface, Instant::now()), Step::Kept),
+            "a freshly-built table is healthy"
+        );
+    }
 
     // Baseline: delivery works through both captures before any recreation. The frame's source
     // addresses come from the table's own resolved copy of the inject interface -- no second open.
@@ -790,35 +801,18 @@ fn pair_interface_table_recovers_after_interface_recreation() -> io::Result<()> 
 
     pair.recreate();
 
-    // Both interfaces are stranded. On a reused index only the attached() probe catches it; either
-    // way both entries are flagged.
-    let stale = table.stale_interfaces();
-    assert_eq!(
-        stale.len(),
-        2,
-        "both recreated interfaces are flagged stale"
-    );
-
-    // Drive the production recovery for each: re-point + replay its joins on a fresh socket (only
-    // the receive side recorded any), then re-attach its capture fd in place.
-    for s in &stale {
-        let counts = table.rebind_interface(s.key, s.cur)?;
-        let expected_joined = if s.key == receive_key { 2 } else { 0 };
-        assert_eq!(
-            (counts.joined, counts.deferred, counts.failed),
-            (expected_joined, 0, 0),
-            "the interface re-joined its recorded groups on the fresh socket, none deferred"
+    // Both interfaces are stranded. On a reused index only the attached() probe catches it.
+    for interface in table.interfaces() {
+        let step = table.step(interface, Instant::now());
+        assert!(
+            matches!(step, Step::Bound { gone: false, .. }),
+            "the recreated interface is bound again: {step:?}"
         );
-        for capture in table.captures_of(s.key) {
-            assert!(
-                table.rebind_capture(capture)?,
-                "the capture re-bound in place"
-            );
-        }
+        assert!(matches!(table.presence_of(interface), Presence::Present(_)));
     }
     assert!(
-        table.stale_interfaces().is_empty(),
-        "the rebuild cleared all staleness"
+        table.test_memberships(receive_key).test_all_joined(),
+        "the recreated interface holds its groups again"
     );
 
     // Delivery resumes through the very captures that were stranded: sent on the re-bound injector
@@ -851,14 +845,14 @@ fn pair_injected_v6_multicast_reaches_a_joined_udp_socket() -> io::Result<()> {
     let Some(pair) = InterfacePair::create() else {
         return Ok(());
     };
-    let iface = Interface::open(&pair.inject)?;
-    let injector = Capture::open(&iface)?;
+    let (iface, ifindex) = open_interface(&pair.inject)?;
+    let injector = Capture::open(&iface, ifindex)?;
 
     let receiver = UdpSocket::bind(SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)))?;
     let all_nodes = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
     receiver.join_multicast_v6(
         &all_nodes,
-        if_index(&pair.receive).expect("receive ifindex"),
+        if_index(&pair.receive).expect("receive ifindex").get(),
     )?;
     receiver.set_read_timeout(Some(WAIT_BUDGET))?;
     let port = receiver.local_addr()?.port();
@@ -915,14 +909,14 @@ fn pair_fragments_reassemble_in_the_peer_kernel() -> io::Result<()> {
     let Some(pair) = InterfacePair::create() else {
         return Ok(());
     };
-    let iface = Interface::open(&pair.inject)?;
-    let injector = Capture::open(&iface)?;
+    let (iface, ifindex) = open_interface(&pair.inject)?;
+    let injector = Capture::open(&iface, ifindex)?;
 
     let receiver = UdpSocket::bind(SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)))?;
     let all_nodes = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
     receiver.join_multicast_v6(
         &all_nodes,
-        if_index(&pair.receive).expect("receive ifindex"),
+        if_index(&pair.receive).expect("receive ifindex").get(),
     )?;
     receiver.set_read_timeout(Some(WAIT_BUDGET))?;
     let port = receiver.local_addr()?.port();
@@ -944,9 +938,9 @@ fn pair_captured_fragments_reassemble() -> io::Result<()> {
     let Some(pair) = InterfacePair::create() else {
         return Ok(());
     };
-    let iface = Interface::open(&pair.inject)?;
-    let injector = Capture::open(&iface)?;
-    let mut peer = Capture::open(&Interface::open(&pair.receive)?)?;
+    let (iface, ifindex) = open_interface(&pair.inject)?;
+    let injector = Capture::open(&iface, ifindex)?;
+    let mut peer = open_capture(&pair.receive)?;
     let link = peer.link_type();
     let payload: Vec<u8> = (0..3000).map(|i| u8::try_from(i % 241).unwrap()).collect();
 
@@ -996,9 +990,9 @@ fn pair_sources_v6_multicast_by_destination_scope() -> io::Result<()> {
     let Some(pair) = InterfacePair::create() else {
         return Ok(());
     };
-    let iface = Interface::open(&pair.inject)?;
-    let injector = Capture::open(&iface)?;
-    let mut peer = Capture::open(&Interface::open(&pair.receive)?)?;
+    let (iface, ifindex) = open_interface(&pair.inject)?;
+    let injector = Capture::open(&iface, ifindex)?;
+    let mut peer = open_capture(&pair.receive)?;
     let payload = b"pair-scope";
 
     let site_group = Ipv6Addr::new(0xff05, 0, 0, 0, 0, 0, 0, 0x0c);
@@ -1042,7 +1036,7 @@ fn pair_sources_v6_multicast_by_destination_scope() -> io::Result<()> {
 /// what it wants to see. The BSDs deliver raw packets by protocol alone -- and macOS rejects
 /// `MCAST_JOIN_GROUP` on raw sockets outright -- so there this is neither needed nor possible.
 #[cfg(target_os = "linux")]
-fn subscribe(fd: &OwnedFd, group: IpAddr, ifindex: u32) -> io::Result<()> {
+fn subscribe(fd: &OwnedFd, group: IpAddr, ifindex: NonZeroU32) -> io::Result<()> {
     let level = match group {
         IpAddr::V4(_) => libc::IPPROTO_IP,
         IpAddr::V6(_) => libc::IPPROTO_IPV6,
@@ -1051,7 +1045,7 @@ fn subscribe(fd: &OwnedFd, group: IpAddr, ifindex: u32) -> io::Result<()> {
     // included.
     // SAFETY: `group_req` is plain data; all-zero is valid.
     let mut request: libc::group_req = unsafe { std::mem::zeroed() };
-    request.gr_interface = ifindex;
+    request.gr_interface = ifindex.get();
     request.gr_group = sockaddr_for(group, 0, 0).0;
     setsockopt(fd.as_raw_fd(), level, libc::MCAST_JOIN_GROUP, &request)
 }
@@ -1122,21 +1116,23 @@ fn pair_join_announces_membership_on_the_wire() -> io::Result<()> {
     let Some(pair) = InterfacePair::create() else {
         return Ok(());
     };
+    #[cfg(target_os = "linux")]
     let receive_ifindex = if_index(&pair.receive).expect("receive ifindex");
 
     let group_v4 = Ipv4Addr::new(239, 199, 99, 9);
     let group_v6 = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0x9d99);
     // IGMPv3 reports go to 224.0.0.22, MLDv2 reports to ff02::16. The receive side joins those
-    // (and only those) through the production joiner, so its device accepts the arriving report
-    // packets for the observers. Its own joins announce 224.0.0.22/ff02::16 -- never the test
-    // groups -- so a test-group match below can only come from the inject side's announcements.
-    let receive_join_ix = NonZeroU32::new(receive_ifindex).expect("receive ifindex is nonzero");
-    let mut receive_joiner = MulticastJoiner::new();
-    receive_joiner.join(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 22)), receive_join_ix)?;
-    receive_joiner.join(
-        IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0x16)),
-        receive_join_ix,
-    )?;
+    // (and only those) through the production memberships, so its device accepts the arriving
+    // report packets for the observers. Its own joins announce 224.0.0.22/ff02::16 -- never the
+    // test groups -- so a test-group match below can only come from the inject side's
+    // announcements.
+    let _receive_memberships = join_all(
+        &pair.receive,
+        &[
+            IpAddr::V4(Ipv4Addr::new(224, 0, 0, 22)),
+            IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0x16)),
+        ],
+    );
     let igmp = raw_observer(libc::AF_INET, libc::IPPROTO_IGMP)?;
     let mld = raw_observer(libc::AF_INET6, libc::IPPROTO_ICMPV6)?;
     #[cfg(target_os = "linux")]
@@ -1153,11 +1149,7 @@ fn pair_join_announces_membership_on_the_wire() -> io::Result<()> {
         )?;
     }
 
-    let mut joiner = MulticastJoiner::new();
-    let inject_ifindex = NonZeroU32::new(if_index(&pair.inject).expect("inject ifindex"))
-        .expect("inject ifindex is nonzero");
-    joiner.join(IpAddr::V4(group_v4), inject_ifindex)?;
-    joiner.join(IpAddr::V6(group_v6), inject_ifindex)?;
+    let _memberships = join_all(&pair.inject, &[IpAddr::V4(group_v4), IpAddr::V6(group_v6)]);
 
     assert!(
         saw_membership_report(&igmp, &group_v4.octets()),
@@ -1170,35 +1162,27 @@ fn pair_join_announces_membership_on_the_wire() -> io::Result<()> {
     Ok(())
 }
 
-// Joins both families' groups on a real multicast-capable interface, then joins them again: the
-// kernel keys memberships by (group, ifindex), so the repeats succeed through the already-member
-// path. On a virtual pair multicast reaches the capture regardless of membership, so this asserts
-// the joins *succeed*; the wire-level announcement is the test above.
-#[test]
-fn pair_joins_multicast_groups_idempotently() -> io::Result<()> {
-    let Some(pair) = InterfacePair::create() else {
-        return Ok(());
-    };
-    let mut joiner = MulticastJoiner::new();
-    let inject_ifindex = NonZeroU32::new(if_index(&pair.inject).expect("inject ifindex"))
-        .expect("inject ifindex is nonzero");
-    let mdns_v4: IpAddr = "224.0.0.251".parse().expect("mDNS v4 group");
-    let mdns_v6: IpAddr = "ff02::fb".parse().expect("mDNS v6 group");
-    joiner.join(mdns_v4, inject_ifindex)?;
-    joiner.join(mdns_v6, inject_ifindex)?;
-    joiner.join(mdns_v4, inject_ifindex)?;
-    joiner.join(mdns_v6, inject_ifindex)?;
-    Ok(())
+/// Join `groups` on `name` through the production memberships, which hold them while alive.
+fn join_all(name: &InterfaceName, groups: &[IpAddr]) -> Memberships {
+    let mut memberships = Memberships::new();
+    for group in groups {
+        memberships
+            .join(*group, BEST_EFFORT, target(name), Instant::now())
+            .unwrap_or_else(|e| panic!("joining {group} on {name}: {e:?}"));
+    }
+    assert!(memberships.test_all_joined());
+    memberships
 }
 
-// What the join logic relies on: a join by index needs no address, even on a down interface, and
-// an index that names no interface fails with a per-platform errno.
+fn target(name: &InterfaceName) -> Target<'_> {
+    let ifindex = if_index(name).expect("the interface exists");
+    Target { name, ifindex }
+}
+
+// A join by index needs no address, even on a down interface, and an index that names no
+// interface any more reads as gone on every platform, whatever errno its kernel answers.
 #[test]
-fn a_join_needs_no_address_and_fails_only_on_a_dead_index() -> io::Result<()> {
-    #[cfg(target_os = "linux")]
-    const DEAD_INDEX: i32 = libc::ENODEV;
-    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-    const DEAD_INDEX: i32 = libc::EADDRNOTAVAIL;
+fn a_join_needs_no_address_and_a_dead_index_is_gone() -> io::Result<()> {
     // The destroy frees a kernel-assigned name, as in InterfacePair::recreate.
     let _serialize = PAIR_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     let Some(bare) = BareInterface::create(900) else {
@@ -1209,44 +1193,99 @@ fn a_join_needs_no_address_and_fails_only_on_a_dead_index() -> io::Result<()> {
         bare.attach_families(),
         "could not attach the address families"
     );
-    let addrs = Interface::open(&bare.name)?.addrs;
+    let addrs = open_interface(&bare.name)?.0.addrs;
     assert!(!addrs.has_v4() && !addrs.has_v6());
-    let ifindex = NonZeroU32::new(if_index(&bare.name).expect("the interface exists"))
-        .expect("an ifindex is nonzero");
     let groups: [IpAddr; 2] = ["224.0.0.251".parse().unwrap(), "ff02::fb".parse().unwrap()];
-    for group in groups {
-        MulticastJoiner::new().join(group, ifindex)?;
-    }
+    let dead = target(&bare.name);
+    drop(join_all(&bare.name, &groups));
     bare.destroy();
     for group in groups {
-        let err = MulticastJoiner::new()
-            .join(group, ifindex)
+        let err = Memberships::new()
+            .join(group, BEST_EFFORT, dead, Instant::now())
             .expect_err("the index names no interface");
-        assert_eq!(err.raw_os_error(), Some(DEAD_INDEX), "{group}");
+        assert!(matches!(err, JoinError::Gone), "{group}: {err:?}");
     }
     Ok(())
+}
+
+// Linux gives an interface below the IPv6 minimum MTU no IPv6 at all, so no IPv6 group joins.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_interface_below_the_ipv6_minimum_mtu_joins_no_ipv6_group() {
+    let _serialize = PAIR_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(bare) = BareInterface::create(903) else {
+        return;
+    };
+    assert!(run(&format!("ip link set {} mtu 1279", bare.name)));
+    let (v4, v6): (IpAddr, IpAddr) = (
+        "239.255.77.77".parse().unwrap(),
+        "ff02::77".parse().unwrap(),
+    );
+    let now = Instant::now();
+    let mut memberships = Memberships::new();
+    let err = memberships
+        .join(v6, REQUIRED, target(&bare.name), now)
+        .expect_err("IPv6 is required and the interface has none");
+    assert!(matches!(err, JoinError::NoFamily), "{err:?}");
+    memberships
+        .join(v6, BEST_EFFORT, target(&bare.name), now)
+        .expect("best effort: the entry runs without IPv6");
+    assert_eq!(memberships.test_waiting(v6), Some(Wait::NoFamily));
+    memberships
+        .join(v4, REQUIRED, target(&bare.name), now)
+        .expect("IPv4 is unaffected");
+
+    assert!(run(&format!("ip link set {} mtu 1280", bare.name)));
+    assert_eq!(memberships.converge(target(&bare.name), now), Ok(()));
+    assert!(memberships.test_all_joined());
+}
+
+// A 6to4 interface has no IFF_MULTICAST, and the kernel answers its joins like a dead index's.
+#[cfg(target_os = "freebsd")]
+#[test]
+fn an_interface_without_iff_multicast_waits() {
+    let _serialize = PAIR_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    if !can_create_interfaces() {
+        return;
+    }
+    let Some(name) = run_capture("ifconfig stf create") else {
+        skip(Capability::Pair, "could not create a 6to4 interface");
+        return;
+    };
+    let stf = BareInterface {
+        name: name.parse().expect("the kernel assigned a valid name"),
+    };
+    let group: IpAddr = "239.255.77.77".parse().unwrap();
+    let mut memberships = Memberships::new();
+    memberships
+        .join(group, REQUIRED, target(&stf.name), Instant::now())
+        .expect("the group waits");
+    assert_eq!(memberships.test_waiting(group), Some(Wait::NotMulticast));
 }
 
 // Groups nothing on the host holds, so an existing membership can't make a join succeed early.
 #[cfg(target_os = "macos")]
 #[test]
-fn a_join_waits_for_the_address_family_and_a_refresh_retries_it() -> io::Result<()> {
-    use super::multicast::join_waits_for_family;
-
+fn a_join_waits_for_the_address_family_and_joins_once_it_is_there() -> io::Result<()> {
     let _serialize = PAIR_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     let Some(bare) = BareInterface::create(901) else {
         return Ok(());
     };
     let mut table = InterfaceTable::new();
     let key = table.find_or_add_interface(&bare.name)?;
-    for group in ["239.255.77.77", "ff02::77"] {
-        let group: IpAddr = group.parse().unwrap();
-        let err = table
-            .join_on(key, group)
-            .expect_err("the interface has neither address family");
-        assert!(join_waits_for_family(&err, group), "{group}: {err}");
+    let groups: [IpAddr; 2] = [
+        "239.255.77.77".parse().unwrap(),
+        "ff02::77".parse().unwrap(),
+    ];
+    for group in groups {
+        table
+            .join_on(key, group, REQUIRED, Instant::now())
+            .expect("the group waits for its address family");
+        assert_eq!(
+            table.test_memberships(key).test_waiting(group),
+            Some(Wait::NoAddress)
+        );
     }
-    assert_eq!(table.test_join_state(key), (true, false));
     assert!(
         run(&format!("ifconfig {} inet 192.0.2.2/32", bare.name))
             && run(&format!(
@@ -1254,8 +1293,9 @@ fn a_join_waits_for_the_address_family_and_a_refresh_retries_it() -> io::Result<
                 bare.name
             ))
     );
-    table.refresh_by_ifindex(if_index(&bare.name).expect("the interface exists"))?;
-    assert_eq!(table.test_join_state(key), (false, false));
+    table.refresh(key)?;
+    assert_eq!(table.converge(key, Instant::now()), Ok(()));
+    assert!(table.test_memberships(key).test_all_joined());
     Ok(())
 }
 

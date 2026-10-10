@@ -3,453 +3,865 @@
 //! interface, so Linux's `net.ipv4.igmp_max_memberships` (default 20, unraisable on a locked-down
 //! router) is never reached; unbound, the kernel queues it no datagrams.
 
+use std::fmt;
 use std::io;
 use std::net::IpAddr;
 use std::num::NonZeroU32;
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::time::Instant;
 
+use crate::interface::{InterfaceName, if_index_checked};
 use crate::sys::{open_socket, setsockopt, sockaddr_for};
 
-/// How a [`rejoin`](MulticastJoiner::rejoin) landed; the four sum to the desired-group count. A
-/// deferral (the index already names no interface) resolves at the next reconcile, a waiting
-/// group at the refresh after the interface gets its address family.
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
-pub(crate) struct RejoinCounts {
-    pub(crate) joined: usize,
-    pub(crate) deferred: usize,
-    pub(crate) waiting: usize,
-    pub(crate) failed: usize,
+use super::retry_delay;
+
+/// Why a live interface takes no membership as it is. Re-reading the interface retries the join.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Wait {
+    /// macOS joins a group only once the interface has the group's address family, which its
+    /// first address of that family attaches.
+    NoAddress,
+    /// The interface carries no IPv4 or no IPv6 at all: on Linux, an MTU below the family's
+    /// minimum (1280 for IPv6).
+    NoFamily,
+    /// The BSDs give no membership to an interface without `IFF_MULTICAST`.
+    NotMulticast,
 }
 
-/// `reported`: the current failure episode has been logged; cleared when the group joins.
-/// `waiting`: refused until the interface has the group's address family; every refresh retries
-/// it.
-struct Desired {
+/// How a reflector wants a group.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Wanted {
+    /// The protocol, for the logs.
+    pub(crate) label: &'static str,
+    /// The entry requires the group's address family: [`Wait::NoFamily`] then fails the join.
+    pub(crate) required: bool,
+    /// The level a wait logs at.
+    pub(crate) wait_level: log::Level,
+}
+
+#[derive(Debug)]
+pub(crate) enum JoinError {
+    /// The index names no interface any more.
+    Gone,
+    /// [`Wait::NoFamily`] for a family the entry requires.
+    NoFamily,
+    /// `capped`: the socket holds as many memberships as the system allows.
+    Failed { source: io::Error, capped: bool },
+}
+
+/// The interface a pass joins on. The memberships cache no index.
+#[derive(Clone, Copy)]
+pub(crate) struct Target<'a> {
+    pub(crate) name: &'a InterfaceName,
+    pub(crate) ifindex: NonZeroU32,
+}
+
+impl Target<'_> {
+    /// Whether the name still resolves to the index.
+    fn is_live(&self) -> io::Result<bool> {
+        if_index_checked(self.name).map(|current| current == Some(self.ifindex))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum State {
+    /// Not attempted on the sockets held now, or refused by an interface found gone.
+    Pending,
+    Joined,
+    Waiting(Wait),
+    /// Any other failure; retried from `retry_at`.
+    Failed {
+        attempts: u32,
+        retry_at: Instant,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Problem {
+    Wait(Wait),
+    Failed,
+}
+
+/// One attempt on a live interface.
+#[derive(Debug)]
+enum Outcome {
+    Joined,
+    Waits(Wait),
+    Failed { source: io::Error, capped: bool },
+}
+
+/// The index names no interface any more.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Gone;
+
+struct Membership {
     group: IpAddr,
-    reported: bool,
-    waiting: bool,
+    label: &'static str,
+    wait_level: log::Level,
+    state: State,
+    /// The problem last reported. A join clears it, so a problem is reported once until the
+    /// group joins, however often the interface is rebuilt in between.
+    reported: Option<Problem>,
 }
 
-/// One interface's memberships: a socket per family, opened on first join. The caller passes the
-/// interface's current ifindex per call; the joiner caches none.
-pub(crate) struct MulticastJoiner {
+impl Membership {
+    /// At the group's level, or at debug when this problem was reported already.
+    fn report_wait(&mut self, wait: Wait, name: &InterfaceName) {
+        let (group, label) = (self.group, self.label);
+        let level = if self.reported == Some(Problem::Wait(wait)) {
+            log::Level::Debug
+        } else {
+            self.wait_level
+        };
+        let family = if group.is_ipv4() { "IPv4" } else { "IPv6" };
+        match wait {
+            Wait::NoAddress => log::log!(
+                level,
+                "{label}: joining {group} on {name} once it has an {family} address"
+            ),
+            Wait::NoFamily => log::log!(
+                level,
+                "{label}: {group} is not joined on {name}: the interface has no {family}"
+            ),
+            Wait::NotMulticast => log::log!(
+                level,
+                "{label}: {group} is not joined on {name}: the interface takes no multicast \
+                 memberships"
+            ),
+        }
+        self.reported = Some(Problem::Wait(wait));
+    }
+
+    fn settle(&mut self, outcome: Outcome, name: &InterfaceName, now: Instant) {
+        let (group, label) = (self.group, self.label);
+        match outcome {
+            Outcome::Joined => {
+                if self.reported.take().is_some() {
+                    log::info!("{label}: joined {group} on {name}");
+                } else {
+                    log::debug!("{label}: joined {group} on {name}");
+                }
+                self.state = State::Joined;
+            }
+            Outcome::Waits(wait) => {
+                if self.state == State::Waiting(wait) {
+                    return;
+                }
+                self.report_wait(wait, name);
+                self.state = State::Waiting(wait);
+            }
+            Outcome::Failed { source, .. } => {
+                let attempts = match self.state {
+                    State::Failed { attempts, .. } => attempts.saturating_add(1),
+                    _ => 0,
+                };
+                if self.reported == Some(Problem::Failed) {
+                    log::debug!("{label}: joining {group} on {name} still fails: {source}");
+                } else {
+                    log::warn!(
+                        "{label}: joining {group} on {name} failed; its traffic is not reflected \
+                         until a retry succeeds: {source}"
+                    );
+                }
+                self.reported = Some(Problem::Failed);
+                self.state = State::Failed {
+                    attempts,
+                    retry_at: now + retry_delay(attempts),
+                };
+            }
+        }
+    }
+}
+
+/// A socket per family, opened on first use.
+#[derive(Default)]
+struct Sockets {
     v4: Option<OwnedFd>,
     v6: Option<OwnedFd>,
-    desired: Vec<Desired>,
-    joins: bool,
 }
 
-impl MulticastJoiner {
-    pub(crate) fn new() -> Self {
-        Self {
-            v4: None,
-            v6: None,
-            desired: Vec::new(),
-            joins: true,
-        }
-    }
-
-    /// Joins nothing: `--no-join`.
-    pub(crate) fn inert() -> Self {
-        Self {
-            joins: false,
-            ..Self::new()
-        }
-    }
-
-    /// Record `group` for a later [`rejoin`](Self::rejoin) without joining: the parked-interface
-    /// path. Returns its index in the desired list.
-    pub(crate) fn record(&mut self, group: IpAddr) -> usize {
-        if let Some(index) = self.desired.iter().position(|d| d.group == group) {
-            return index;
-        }
-        self.desired.push(Desired {
-            group,
-            reported: false,
-            waiting: false,
-        });
-        self.desired.len() - 1
-    }
-
-    /// Join `group` on `ifindex` and record it for later replays. Idempotent: the kernel keys
-    /// memberships by `(group, ifindex)`.
-    ///
-    /// # Errors
-    /// The OS error. A [deferrable](join_deferrable) one is left to the reconcile, which
-    /// re-joins on the interface's new index, and one [waiting for the interface's address
-    /// family](join_waits_for_family) to the next refresh. Any other error is marked reported:
-    /// the caller's log is the report, and the replay repeats it at debug.
-    pub(crate) fn join(&mut self, group: IpAddr, ifindex: NonZeroU32) -> io::Result<()> {
-        if !self.joins {
-            return Ok(());
-        }
-        let index = self.record(group);
-        let result = self.apply(group, ifindex);
-        match &result {
-            Ok(()) => self.desired[index].waiting = false,
-            Err(e) if join_waits_for_family(e, group) => self.desired[index].waiting = true,
-            Err(e) if !join_deferrable(e) => self.desired[index].reported = true,
-            Err(_) => {}
-        }
-        result
-    }
-
-    /// Drop the sockets so the next join starts fresh. Memberships keyed to a destroyed
-    /// interface's index are never scrubbed from a surviving socket, and on Linux still count
-    /// toward `igmp_max_memberships`; dropping the fds releases them all. `desired` survives for
-    /// the replay.
-    pub(crate) fn reset(&mut self) {
-        self.v4 = None;
-        self.v6 = None;
-    }
-
-    /// Re-attempt every recorded membership. A deferrable failure logs at debug (the next
-    /// reconcile retries it), as does one waiting for the interface's address family (the next
-    /// refresh does); anything else warns once per failure episode and logs info when it finally
-    /// joins. `NonZeroU32`: `MCAST_JOIN_GROUP` on index 0 lets the kernel pick an arbitrary
-    /// interface by route lookup, so callers skip explicitly while parked.
-    pub(crate) fn rejoin(&mut self, ifindex: NonZeroU32) -> RejoinCounts {
-        self.replay(ifindex, false)
-    }
-
-    /// Re-attempt the memberships waiting for the interface's address family, as
-    /// [`rejoin`](Self::rejoin) would.
-    pub(crate) fn retry_waiting(&mut self, ifindex: NonZeroU32) {
-        self.replay(ifindex, true);
-    }
-
-    fn replay(&mut self, ifindex: NonZeroU32, only_waiting: bool) -> RejoinCounts {
-        let mut counts = RejoinCounts::default();
-        for i in 0..self.desired.len() {
-            if only_waiting && !self.desired[i].waiting {
-                continue;
-            }
-            let group = self.desired[i].group;
-            match self.apply(group, ifindex) {
-                Ok(()) => {
-                    counts.joined += 1;
-                    if std::mem::take(&mut self.desired[i].waiting) {
-                        log::info!(
-                            "joined {group} on ifindex {ifindex}: the interface has that address \
-                             family now"
-                        );
-                    }
-                    if self.desired[i].reported {
-                        self.desired[i].reported = false;
-                        log::info!(
-                            "re-join of {group} on ifindex {ifindex} succeeded after an \
-                             earlier failure"
-                        );
-                    }
-                }
-                Err(e) if join_waits_for_family(&e, group) => {
-                    if !self.desired[i].waiting {
-                        self.desired[i].waiting = true;
-                        log::debug!(
-                            "join of {group} on ifindex {ifindex} waits for the interface's \
-                             address family: {e}"
-                        );
-                    }
-                    counts.waiting += 1;
-                }
-                Err(e) if join_deferrable(&e) => {
-                    log::debug!("re-join of {group} on ifindex {ifindex} deferred: {e}");
-                    counts.deferred += 1;
-                }
-                Err(e) => {
-                    counts.failed += 1;
-                    self.desired[i].waiting = false;
-                    if self.desired[i].reported {
-                        log::debug!("re-join of {group} on ifindex {ifindex} still failing: {e}");
-                    } else {
-                        self.desired[i].reported = true;
-                        log::warn!(
-                            "re-join of {group} on ifindex {ifindex} failed; its traffic is \
-                             not reflected: {e}"
-                        );
-                    }
-                }
-            }
-        }
-        counts
-    }
-
-    fn apply(&mut self, group: IpAddr, ifindex: NonZeroU32) -> io::Result<()> {
+impl Sockets {
+    fn join(&mut self, group: IpAddr, target: Target<'_>) -> Result<Outcome, Gone> {
         let (slot, family, level) = match group {
             IpAddr::V4(_) => (&mut self.v4, libc::AF_INET, libc::IPPROTO_IP),
             IpAddr::V6(_) => (&mut self.v6, libc::AF_INET6, libc::IPPROTO_IPV6),
         };
         let fd = match slot {
             Some(sock) => sock.as_raw_fd(),
-            None => slot
-                .insert(open_socket(family, libc::SOCK_DGRAM, 0)?)
-                .as_raw_fd(),
+            None => match open_socket(family, libc::SOCK_DGRAM, 0) {
+                Ok(sock) => slot.insert(sock).as_raw_fd(),
+                Err(source) => {
+                    return Ok(Outcome::Failed {
+                        source,
+                        capped: false,
+                    });
+                }
+            },
         };
         // Zeroed, not a field literal: `setsockopt` reads the padding after `gr_interface` too.
         // SAFETY: `group_req` is plain data; all-zero is valid.
         let mut req: libc::group_req = unsafe { std::mem::zeroed() };
-        req.gr_interface = ifindex.get();
+        // Never 0: the kernel would pick an interface by route lookup.
+        req.gr_interface = target.ifindex.get();
         // `gr_interface` selects the interface, so the group sockaddr carries no scope id.
         req.gr_group = sockaddr_for(group, 0, 0).0;
         match setsockopt(fd, level, libc::MCAST_JOIN_GROUP, &req) {
-            Err(e) if !already_member(&e) => Err(e),
-            _ => Ok(()),
+            Ok(()) => Ok(Outcome::Joined),
+            Err(e) => classify(e, group, || target.is_live()),
         }
     }
 }
 
-/// Every target returns `EADDRINUSE` for an any-source re-join of a held membership; the
-/// idempotent replay relies on it.
-fn already_member(err: &io::Error) -> bool {
-    err.raw_os_error() == Some(libc::EADDRINUSE)
+/// A group not joined, as the state dump shows it.
+pub(crate) struct Unjoined<'a>(&'a Membership);
+
+impl fmt::Display for Unjoined<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Membership {
+            group,
+            label,
+            state,
+            ..
+        } = self.0;
+        let family = if group.is_ipv4() { "IPv4" } else { "IPv6" };
+        write!(f, "{label} {group} (")?;
+        match state {
+            State::Pending => f.write_str("pending")?,
+            State::Joined => f.write_str("joined")?,
+            State::Waiting(Wait::NoAddress) => write!(f, "waiting for an {family} address")?,
+            State::Waiting(Wait::NoFamily) => write!(f, "the interface has no {family}")?,
+            State::Waiting(Wait::NotMulticast) => {
+                f.write_str("the interface takes no multicast memberships")?;
+            }
+            State::Failed { .. } => f.write_str("failed, retrying")?,
+        }
+        f.write_str(")")
+    }
+}
+
+/// One interface's memberships: the groups its reflectors want, each with its state, and the
+/// sockets that hold them.
+pub(crate) struct Memberships {
+    sockets: Sockets,
+    groups: Vec<Membership>,
+}
+
+impl Memberships {
+    pub(crate) fn new() -> Self {
+        Self {
+            sockets: Sockets::default(),
+            groups: Vec::new(),
+        }
+    }
+
+    /// Want `group` without attempting it: the next [`converge`](Self::converge) does. Returns
+    /// its index. A wanter that would log the group's wait more severely raises its level, and a
+    /// wait already reported is reported again at that level.
+    pub(crate) fn add(&mut self, group: IpAddr, wanted: Wanted) -> usize {
+        if let Some(index) = self.groups.iter().position(|known| known.group == group) {
+            let known = &mut self.groups[index];
+            // `log::Level` orders the more severe level first.
+            if wanted.wait_level < known.wait_level {
+                known.wait_level = wanted.wait_level;
+                if let State::Waiting(_) = known.state {
+                    known.reported = None;
+                }
+            }
+            return index;
+        }
+        self.groups.push(Membership {
+            group,
+            label: wanted.label,
+            wait_level: wanted.wait_level,
+            state: State::Pending,
+            reported: None,
+        });
+        self.groups.len() - 1
+    }
+
+    /// Want `group` and join it on `target`: the startup path. A group another reflector already
+    /// wanted is not attempted again.
+    ///
+    /// # Errors
+    /// Whatever leaves the group neither joined nor waiting. The group stays wanted.
+    pub(crate) fn join(
+        &mut self,
+        group: IpAddr,
+        wanted: Wanted,
+        target: Target<'_>,
+        now: Instant,
+    ) -> Result<(), JoinError> {
+        let index = self.add(group, wanted);
+        let membership = &mut self.groups[index];
+        match membership.state {
+            State::Pending => {}
+            State::Waiting(Wait::NoFamily) if wanted.required => return Err(JoinError::NoFamily),
+            State::Waiting(wait) if membership.reported.is_none() => {
+                membership.report_wait(wait, target.name);
+                return Ok(());
+            }
+            _ => return Ok(()),
+        }
+        match self.sockets.join(group, target) {
+            Err(Gone) => Err(JoinError::Gone),
+            Ok(Outcome::Failed { source, capped }) => Err(JoinError::Failed { source, capped }),
+            Ok(Outcome::Waits(Wait::NoFamily)) if wanted.required => Err(JoinError::NoFamily),
+            Ok(outcome) => {
+                membership.settle(outcome, target.name, now);
+                Ok(())
+            }
+        }
+    }
+
+    /// Attempt every group that is not joined, a failed one only once its retry is due.
+    ///
+    /// # Errors
+    /// [`Gone`], leaving the rest to the rebuild.
+    pub(crate) fn converge(&mut self, target: Target<'_>, now: Instant) -> Result<(), Gone> {
+        for membership in &mut self.groups {
+            match membership.state {
+                State::Joined => continue,
+                State::Failed { retry_at, .. } if now < retry_at => continue,
+                _ => {}
+            }
+            let Ok(outcome) = self.sockets.join(membership.group, target) else {
+                let Target { name, ifindex } = target;
+                log::debug!("{name} (ifindex {ifindex}) is gone; its groups join when it returns");
+                // Off the retry timer: only the rebuild can help.
+                membership.state = State::Pending;
+                return Err(Gone);
+            };
+            membership.settle(outcome, target.name, now);
+        }
+        Ok(())
+    }
+
+    /// Drop the sockets, and every membership with them. A socket keeps the memberships of a
+    /// destroyed interface: on Linux they still count toward `igmp_max_memberships`, and a
+    /// re-join of one answers `EADDRINUSE` although the recreated interface holds none. So every
+    /// rebuild starts from fresh sockets, at an unchanged index too.
+    pub(crate) fn rebase(&mut self) {
+        self.sockets = Sockets::default();
+        for membership in &mut self.groups {
+            membership.state = State::Pending;
+        }
+    }
+
+    /// The groups not joined, for the state dump.
+    pub(crate) fn unjoined(&self) -> impl Iterator<Item = Unjoined<'_>> {
+        self.groups
+            .iter()
+            .filter(|membership| membership.state != State::Joined)
+            .map(Unjoined)
+    }
+
+    /// When the earliest failed group is due its retry.
+    pub(crate) fn next_retry(&self) -> Option<Instant> {
+        self.groups
+            .iter()
+            .filter_map(|membership| match membership.state {
+                State::Failed { retry_at, .. } => Some(retry_at),
+                _ => None,
+            })
+            .min()
+    }
+}
+
+/// What a refused `MCAST_JOIN_GROUP` means. `live` says whether the interface still exists, and
+/// runs only for the errnos a dead index shares with a live interface. An errno listed nowhere
+/// here is a failure the caller retries.
+fn classify(
+    err: io::Error,
+    group: IpAddr,
+    live: impl FnOnce() -> io::Result<bool>,
+) -> Result<Outcome, Gone> {
+    let errno = err.raw_os_error();
+    let v6 = group.is_ipv6();
+    let if_live = match errno {
+        // Every target answers an any-source re-join of a held membership with it.
+        Some(libc::EADDRINUSE) => return Ok(Outcome::Joined),
+        // A dead index on Linux. Live, the interface has none of the family: IPv4 below MTU 68,
+        // on FreeBSD an interface IPv6 was never set up on.
+        Some(libc::ENODEV) => Wait::NoFamily,
+        // A dead index on the BSDs, which answer a live interface without `IFF_MULTICAST` alike.
+        Some(libc::EADDRNOTAVAIL) if cfg!(not(target_os = "linux")) => Wait::NotMulticast,
+        // Linux creates no IPv6 device below MTU 1280.
+        Some(libc::EINVAL) if v6 && cfg!(target_os = "linux") => {
+            return Ok(Outcome::Waits(Wait::NoFamily));
+        }
+        // macOS: IPv6 was never attached to the interface.
+        Some(libc::EINVAL) if v6 && cfg!(target_os = "macos") => {
+            return Ok(Outcome::Waits(Wait::NoAddress));
+        }
+        Some(libc::EAFNOSUPPORT) if cfg!(target_os = "macos") => {
+            return Ok(Outcome::Waits(Wait::NoAddress));
+        }
+        _ => {
+            // The one cap a socket per interface can reach: `net.ipv4.igmp_max_memberships`.
+            let capped = cfg!(target_os = "linux") && !v6 && errno == Some(libc::ENOBUFS);
+            return Ok(Outcome::Failed {
+                source: err,
+                capped,
+            });
+        }
+    };
+    match live() {
+        Ok(true) => Ok(Outcome::Waits(if_live)),
+        Ok(false) => Err(Gone),
+        Err(_) => Ok(Outcome::Failed {
+            source: err,
+            capped: false,
+        }),
+    }
 }
 
 /// The environment can't join at all: QEMU user-mode returns `ENOPROTOOPT` for
 /// `MCAST_JOIN_GROUP`. The join tests self-skip on it.
 #[cfg(test)]
-pub(crate) fn join_unsupported(err: &io::Error) -> bool {
+pub(crate) fn join_unsupported(err: &JoinError) -> bool {
     matches!(
-        err.raw_os_error(),
-        Some(libc::ENOPROTOOPT | libc::EOPNOTSUPP | libc::ENOSYS)
+        err,
+        JoinError::Failed { source, .. } if matches!(
+            source.raw_os_error(),
+            Some(libc::ENOPROTOOPT | libc::EOPNOTSUPP | libc::ENOSYS)
+        )
     )
 }
 
-/// The socket holds as many memberships as the system allows: `ENOBUFS` on Linux
-/// (`net.ipv4.igmp_max_memberships`), `ETOOMANYREFS` on the BSDs.
-pub(crate) fn join_capped(e: &io::Error) -> bool {
-    matches!(e.raw_os_error(), Some(libc::ENOBUFS | libc::ETOOMANYREFS))
-}
-
-/// `EADDRNOTAVAIL`: on the BSDs, the index names no interface any more; the reconcile re-joins
-/// when it returns. Linux reports a dead index as `ENODEV`, which this doesn't cover.
-pub(crate) fn join_deferrable(e: &io::Error) -> bool {
-    e.raw_os_error() == Some(libc::EADDRNOTAVAIL)
-}
-
-/// macOS refuses a join until the interface has the group's address family, which the first
-/// address of that family attaches: `EAFNOSUPPORT`, or `EINVAL` for an IPv6 group on an interface
-/// IPv6 was never attached to. Linux and FreeBSD join without it.
-pub(crate) fn join_waits_for_family(e: &io::Error, group: IpAddr) -> bool {
-    cfg!(target_os = "macos")
-        && match e.raw_os_error() {
-            Some(libc::EAFNOSUPPORT) => true,
-            Some(libc::EINVAL) => group.is_ipv6(),
-            _ => false,
-        }
-}
-
 #[cfg(test)]
-mod tests {
+pub(in crate::dispatch) mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::time::Duration;
 
     use super::*;
     use crate::test_support::{Capability, skip};
 
-    #[test]
-    fn an_inert_joiner_joins_nothing_and_opens_no_socket() {
-        let mut joiner = MulticastJoiner::inert();
-        let ifindex = NonZeroU32::new(1).unwrap();
-        joiner
-            .join(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)), ifindex)
-            .unwrap();
-        assert!(joiner.test_socketless());
-        assert_eq!(joiner.rejoin(ifindex), RejoinCounts::default());
-    }
+    const MDNS_V4: IpAddr = IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251));
+    const MDNS_V6: IpAddr = IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb));
+    /// A unicast address can never join: `EINVAL` on every target, a plain failure for IPv4.
+    const NOT_A_GROUP: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
 
-    #[test]
-    fn the_membership_cap_errnos_are_capped_joins() {
-        let of = io::Error::from_raw_os_error;
-        assert!(join_capped(&of(libc::ENOBUFS)));
-        assert!(join_capped(&of(libc::ETOOMANYREFS)));
-        assert!(!join_capped(&of(libc::EINVAL)));
-        assert!(!join_capped(&of(libc::EADDRNOTAVAIL)));
-    }
+    pub(in crate::dispatch) const BEST_EFFORT: Wanted = Wanted {
+        label: "test",
+        required: false,
+        wait_level: log::Level::Info,
+    };
+    pub(in crate::dispatch) const REQUIRED: Wanted = Wanted {
+        required: true,
+        ..BEST_EFFORT
+    };
 
-    #[test]
-    fn a_join_waits_for_its_address_family_only_on_macos() {
-        let of = io::Error::from_raw_os_error;
-        let v4 = IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251));
-        let v6 = IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb));
-        let macos = cfg!(target_os = "macos");
-        assert_eq!(join_waits_for_family(&of(libc::EAFNOSUPPORT), v4), macos);
-        assert_eq!(join_waits_for_family(&of(libc::EAFNOSUPPORT), v6), macos);
-        assert_eq!(join_waits_for_family(&of(libc::EINVAL), v6), macos);
-        assert!(!join_waits_for_family(&of(libc::EINVAL), v4));
-        assert!(!join_waits_for_family(&of(libc::EADDRNOTAVAIL), v6));
-    }
-
-    #[test]
-    #[cfg_attr(miri, ignore = "resolves a real interface")]
-    fn retry_waiting_replays_only_the_waiting_groups() {
-        let mut joiner = MulticastJoiner::new();
-        let ifindex = loopback_ifindex();
-        joiner.record(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)));
-        joiner.retry_waiting(ifindex);
-        assert!(
-            joiner.test_socketless(),
-            "a group not waiting is left alone"
-        );
-        joiner.desired[0].waiting = true;
-        joiner.retry_waiting(ifindex);
-        assert!(!joiner.test_socketless(), "the waiting group is retried");
-        assert!(!joiner.test_waiting());
-    }
-
-    #[test]
-    fn only_eaddrnotavail_is_a_deferrable_join() {
-        let of = io::Error::from_raw_os_error;
-        assert!(join_deferrable(&of(libc::EADDRNOTAVAIL)));
-        assert!(!join_deferrable(&of(libc::ENODEV)));
-        assert!(!join_deferrable(&of(libc::EINVAL)));
-    }
-
-    impl MulticastJoiner {
-        /// Whether no family socket is open (nothing joined since the last reset). Reachable
-        /// from the interface table's parked-interface tests, hence `pub(in crate::dispatch)`.
+    impl Memberships {
+        /// Whether no family socket is open (nothing attempted since the last rebase).
         pub(in crate::dispatch) fn test_socketless(&self) -> bool {
-            self.v4.is_none() && self.v6.is_none()
+            self.sockets.v4.is_none() && self.sockets.v6.is_none()
         }
 
-        pub(in crate::dispatch) fn test_waiting(&self) -> bool {
-            self.desired.iter().any(|desired| desired.waiting)
+        pub(in crate::dispatch) fn test_all_joined(&self) -> bool {
+            self.groups.iter().all(|group| group.state == State::Joined)
         }
 
-        #[cfg(target_os = "macos")]
-        pub(in crate::dispatch) fn test_reported(&self) -> bool {
-            self.desired.iter().any(|desired| desired.reported)
+        /// As if `group` had failed once, due its retry at `retry_at`.
+        pub(in crate::dispatch) fn test_fail(&mut self, group: IpAddr, retry_at: Instant) {
+            let index = self.add(group, BEST_EFFORT);
+            self.groups[index].state = State::Failed {
+                attempts: 0,
+                retry_at,
+            };
         }
-    }
 
-    #[test]
-    fn already_member_only_for_the_duplicate_join_errno() {
-        let of = io::Error::from_raw_os_error;
-        assert!(already_member(&of(libc::EADDRINUSE))); // duplicate any-source join, every target
-        assert!(!already_member(&of(libc::EINVAL))); // a genuine rejection (bad / non-multicast group)
-        assert!(!already_member(&of(libc::ENOBUFS))); // membership cap, a real failure
-        assert!(!already_member(&of(libc::EADDRNOTAVAIL))); // interface transiently down
-    }
-
-    fn loopback_ifindex() -> NonZeroU32 {
-        crate::interface::if_index(&crate::interface::InterfaceName::loopback())
-            .and_then(NonZeroU32::new)
-            .expect("loopback must resolve to an index")
-    }
-
-    // reset drops the per-family sockets while keeping the desired list, so the next rejoin
-    // replays every group on fresh fds (no zombie memberships from a destroyed interface).
-    #[test]
-    #[cfg_attr(miri, ignore = "resolves a real interface")]
-    fn reset_keeps_desired_and_rejoin_replays_on_fresh_sockets() {
-        let mut joiner = MulticastJoiner::new();
-        let ifindex = loopback_ifindex();
-        match joiner.join(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)), ifindex) {
-            Ok(()) => {}
-            Err(e) if join_unsupported(&e) => {
-                skip(Capability::Membership, e);
-                return;
+        pub(in crate::dispatch) fn test_waiting(&self, group: IpAddr) -> Option<Wait> {
+            match self.state_of(group) {
+                State::Waiting(wait) => Some(wait),
+                _ => None,
             }
-            Err(e) => panic!("kernel must accept the loopback join: {e}"),
         }
-        assert!(joiner.v4.is_some());
-        joiner.reset();
-        assert!(joiner.v4.is_none(), "reset drops the family sockets");
-        assert_eq!(joiner.desired.len(), 1, "the desired list survives");
-        let counts = joiner.rejoin(ifindex);
-        assert_eq!(
-            (counts.joined, counts.deferred),
-            (1, 0),
-            "rejoin replays the one recorded group, none deferred"
-        );
-        assert!(
-            joiner.v4.is_some(),
-            "rejoin re-opens a fresh socket and re-joins"
-        );
+
+        fn state_of(&self, group: IpAddr) -> State {
+            self.groups
+                .iter()
+                .find(|known| known.group == group)
+                .expect("the group is wanted")
+                .state
+        }
     }
 
-    #[test]
-    #[cfg_attr(miri, ignore = "needs a real socket")]
-    fn a_replayed_hard_failure_reports_once() {
-        let mut joiner = MulticastJoiner::new();
-        // A unicast address can never join, so every replay fails hard (EINVAL) deterministically.
-        joiner.record(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
-        let first = joiner.rejoin(loopback_ifindex());
-        assert_eq!((first.joined, first.deferred, first.failed), (0, 0, 1));
-        assert!(joiner.desired[0].reported, "the first failure is reported");
-        let second = joiner.rejoin(loopback_ifindex());
-        assert_eq!(second.failed, 1, "the group is still retried");
-        assert!(joiner.desired[0].reported);
+    fn loopback_target(name: &InterfaceName) -> Target<'_> {
+        let ifindex = crate::interface::if_index(name).expect("loopback must resolve to an index");
+        Target { name, ifindex }
     }
 
-    #[test]
-    #[cfg_attr(miri, ignore = "needs a real socket")]
-    fn join_marks_a_hard_failure_reported() {
-        let mut joiner = MulticastJoiner::new();
-        let err = joiner
-            .join(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), loopback_ifindex())
-            .expect_err("a unicast address cannot join");
-        assert!(!join_deferrable(&err));
-        assert!(
-            joiner.desired[0].reported,
-            "the caller logs this error; the replay must not re-report it"
-        );
-    }
-
-    #[test]
-    #[cfg_attr(miri, ignore = "resolves a real interface")]
-    fn a_join_clears_the_reported_mark() {
-        let mut joiner = MulticastJoiner::new();
-        let ifindex = loopback_ifindex();
-        match joiner.join(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)), ifindex) {
-            Ok(()) => {}
-            Err(e) if join_unsupported(&e) => {
-                skip(Capability::Membership, e);
-                return;
+    /// `None` after a skip note: the environment refuses every join.
+    fn joined_on_loopback(groups: &[IpAddr]) -> Option<Memberships> {
+        let name = InterfaceName::loopback();
+        let mut memberships = Memberships::new();
+        for group in groups {
+            match memberships.join(*group, BEST_EFFORT, loopback_target(&name), Instant::now()) {
+                Ok(()) => {}
+                Err(e) if join_unsupported(&e) => {
+                    skip(Capability::Membership, format!("{e:?}"));
+                    return None;
+                }
+                Err(e) => panic!("kernel must accept the {group} join on loopback: {e:?}"),
             }
-            Err(e) => panic!("kernel must accept the loopback join: {e}"),
         }
-        // As if an earlier replay failed: the next success closes the episode.
-        joiner.desired[0].reported = true;
-        let counts = joiner.rejoin(ifindex);
-        assert_eq!((counts.joined, counts.failed), (1, 0));
-        assert!(!joiner.desired[0].reported, "the join cleared the mark");
+        Some(memberships)
     }
 
-    // The parked-interface path: record keeps the group for the rebuild's replay without
-    // touching the kernel (no index exists to join on; MCAST_JOIN_GROUP on index 0 would let
-    // the kernel pick an arbitrary interface, which the NonZeroU32 signatures now forbid).
+    fn os_error(errno: i32) -> io::Error {
+        io::Error::from_raw_os_error(errno)
+    }
+
+    fn never_asked() -> io::Result<bool> {
+        panic!("this errno says nothing about the interface's existence")
+    }
+
     #[test]
-    fn record_keeps_the_group_for_the_replay_without_joining() {
-        let mut joiner = MulticastJoiner::new();
-        joiner.record(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)));
-        joiner.record(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251))); // deduped
-        assert!(joiner.v4.is_none(), "no socket opened, no join attempted");
+    fn a_held_membership_is_a_join() {
+        assert!(matches!(
+            classify(os_error(libc::EADDRINUSE), MDNS_V4, never_asked),
+            Ok(Outcome::Joined)
+        ));
+    }
+
+    #[test]
+    fn a_dead_index_errno_is_gone_only_when_the_interface_is() {
+        let dead = || Ok(false);
+        let live = || Ok(true);
         assert_eq!(
-            joiner.desired.len(),
-            1,
-            "the group is recorded once for the replay"
+            classify(os_error(libc::ENODEV), MDNS_V4, dead).unwrap_err(),
+            Gone
         );
+        assert!(matches!(
+            classify(os_error(libc::ENODEV), MDNS_V4, live),
+            Ok(Outcome::Waits(Wait::NoFamily))
+        ));
+        if cfg!(target_os = "linux") {
+            // Not a Linux join errno: a failure like any other, the interface not asked about.
+            assert!(matches!(
+                classify(os_error(libc::EADDRNOTAVAIL), MDNS_V4, never_asked),
+                Ok(Outcome::Failed { capped: false, .. })
+            ));
+        } else {
+            assert_eq!(
+                classify(os_error(libc::EADDRNOTAVAIL), MDNS_V4, dead).unwrap_err(),
+                Gone
+            );
+            assert!(matches!(
+                classify(os_error(libc::EADDRNOTAVAIL), MDNS_V4, live),
+                Ok(Outcome::Waits(Wait::NotMulticast))
+            ));
+        }
+    }
+
+    #[test]
+    fn a_liveness_lookup_that_cannot_run_is_a_failure_to_retry() {
+        let unknown = || Err(os_error(libc::EMFILE));
+        assert!(matches!(
+            classify(os_error(libc::ENODEV), MDNS_V4, unknown),
+            Ok(Outcome::Failed { source, capped: false })
+                if source.raw_os_error() == Some(libc::ENODEV)
+        ));
+    }
+
+    #[test]
+    fn an_interface_without_the_family_waits() {
+        let v6_einval = classify(os_error(libc::EINVAL), MDNS_V6, never_asked);
+        if cfg!(target_os = "linux") {
+            assert!(matches!(v6_einval, Ok(Outcome::Waits(Wait::NoFamily))));
+        } else if cfg!(target_os = "macos") {
+            assert!(matches!(v6_einval, Ok(Outcome::Waits(Wait::NoAddress))));
+        } else {
+            assert!(matches!(v6_einval, Ok(Outcome::Failed { .. })));
+        }
+        // For an IPv4 group it is the kernel refusing the group itself.
+        assert!(matches!(
+            classify(os_error(libc::EINVAL), MDNS_V4, never_asked),
+            Ok(Outcome::Failed { .. })
+        ));
+        for group in [MDNS_V4, MDNS_V6] {
+            let unattached = classify(os_error(libc::EAFNOSUPPORT), group, never_asked);
+            if cfg!(target_os = "macos") {
+                assert!(matches!(unattached, Ok(Outcome::Waits(Wait::NoAddress))));
+            } else {
+                assert!(matches!(unattached, Ok(Outcome::Failed { .. })));
+            }
+        }
+    }
+
+    #[test]
+    fn only_the_linux_ipv4_cap_is_a_capped_join() {
+        let capped = |errno, group| {
+            matches!(
+                classify(os_error(errno), group, never_asked),
+                Ok(Outcome::Failed { capped: true, .. })
+            )
+        };
+        assert_eq!(capped(libc::ENOBUFS, MDNS_V4), cfg!(target_os = "linux"));
+        assert!(!capped(libc::ENOBUFS, MDNS_V6));
+        assert!(!capped(libc::ENOMEM, MDNS_V4));
+        assert!(!capped(libc::ETOOMANYREFS, MDNS_V4));
+    }
+
+    #[test]
+    fn an_unlisted_errno_is_a_failure_to_retry() {
+        for errno in [libc::EPERM, libc::ENOMEM, libc::EMFILE] {
+            assert!(matches!(
+                classify(os_error(errno), MDNS_V6, never_asked),
+                Ok(Outcome::Failed { capped: false, .. })
+            ));
+        }
     }
 
     #[test]
     #[cfg_attr(miri, ignore = "resolves a real interface")]
     fn kernel_accepts_a_join_on_loopback() {
-        // Exercises the full MCAST_JOIN_GROUP FFI against the kernel (per-OS const, group_req layout,
-        // by-index selection; by-index doesn't require the interface's IFF_MULTICAST flag). QEMU
-        // doesn't implement the setsockopt, so self-skip there.
-        let mut joiner = MulticastJoiner::new();
-        let ifindex = loopback_ifindex();
-        for group in [
-            IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)),
-            IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb)),
-        ] {
-            match joiner.join(group, ifindex) {
-                Ok(()) => {}
-                Err(e) if join_unsupported(&e) => {
-                    skip(Capability::Membership, e);
-                    return;
-                }
-                Err(e) => panic!("kernel must accept the {group} group join: {e}"),
-            }
+        // The full MCAST_JOIN_GROUP FFI against the kernel: per-OS const, group_req layout,
+        // by-index selection.
+        let Some(memberships) = joined_on_loopback(&[MDNS_V4, MDNS_V6]) else {
+            return;
+        };
+        assert!(memberships.test_all_joined());
+        assert!(memberships.sockets.v4.is_some() && memberships.sockets.v6.is_some());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "resolves a real interface")]
+    fn a_group_wanted_twice_is_joined_once() {
+        let Some(mut memberships) = joined_on_loopback(&[MDNS_V4]) else {
+            return;
+        };
+        let name = InterfaceName::loopback();
+        let relay = Wanted {
+            label: "relay",
+            required: true,
+            wait_level: log::Level::Warn,
+        };
+        memberships
+            .join(MDNS_V4, relay, loopback_target(&name), Instant::now())
+            .expect("already joined");
+        assert_eq!(memberships.groups.len(), 1);
+        assert_eq!(memberships.groups[0].label, "test", "the first label stays");
+        assert_eq!(
+            memberships.groups[0].wait_level,
+            log::Level::Warn,
+            "the more severe level wins"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "resolves a real interface")]
+    fn a_louder_wanter_has_a_waiting_group_reported_again() {
+        let name = InterfaceName::loopback();
+        let target = loopback_target(&name);
+        let now = Instant::now();
+        let mut memberships = Memberships::new();
+        let index = memberships.add(MDNS_V6, BEST_EFFORT);
+        memberships.groups[index].state = State::Waiting(Wait::NoAddress);
+        memberships.groups[index].reported = Some(Problem::Wait(Wait::NoAddress));
+
+        let relay = Wanted {
+            wait_level: log::Level::Warn,
+            ..BEST_EFFORT
+        };
+        memberships.add(MDNS_V6, relay);
+        assert_eq!(memberships.groups[index].wait_level, log::Level::Warn);
+        assert!(
+            memberships.groups[index].reported.is_none(),
+            "the wait is due a report at the new level"
+        );
+        memberships
+            .join(MDNS_V6, relay, target, now)
+            .expect("the group still waits");
+        assert_eq!(
+            memberships.groups[index].reported,
+            Some(Problem::Wait(Wait::NoAddress)),
+            "the wait was reported again"
+        );
+        assert!(memberships.test_socketless(), "nothing was attempted");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "needs a real socket")]
+    fn a_failed_join_is_an_error_at_startup() {
+        let name = InterfaceName::loopback();
+        let mut memberships = Memberships::new();
+        let err = memberships
+            .join(
+                NOT_A_GROUP,
+                BEST_EFFORT,
+                loopback_target(&name),
+                Instant::now(),
+            )
+            .expect_err("a unicast address cannot join");
+        assert!(
+            matches!(err, JoinError::Failed { capped: false, .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "resolves a real interface")]
+    fn a_required_family_the_interface_lacks_is_an_error_for_a_later_wanter_too() {
+        let name = InterfaceName::loopback();
+        let mut memberships = Memberships::new();
+        let index = memberships.add(MDNS_V6, BEST_EFFORT);
+        memberships.groups[index].state = State::Waiting(Wait::NoFamily);
+        let target = loopback_target(&name);
+        memberships
+            .join(MDNS_V6, BEST_EFFORT, target, Instant::now())
+            .expect("best effort: the group just waits");
+        let err = memberships
+            .join(MDNS_V6, REQUIRED, target, Instant::now())
+            .expect_err("required");
+        assert!(matches!(err, JoinError::NoFamily));
+        assert!(memberships.test_socketless(), "nothing was attempted again");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "needs a real socket")]
+    fn a_failed_group_is_retried_when_due_with_a_growing_delay() {
+        let name = InterfaceName::loopback();
+        let target = loopback_target(&name);
+        let mut memberships = Memberships::new();
+        memberships.add(NOT_A_GROUP, BEST_EFFORT);
+        let start = Instant::now();
+        assert_eq!(memberships.converge(target, start), Ok(()));
+        let after = |attempts, seconds| State::Failed {
+            attempts,
+            retry_at: start + Duration::from_secs(seconds),
+        };
+        assert_eq!(memberships.state_of(NOT_A_GROUP), after(0, 1));
+        assert_eq!(
+            memberships.next_retry(),
+            Some(start + Duration::from_secs(1))
+        );
+
+        assert_eq!(
+            memberships.converge(target, start + Duration::from_millis(999)),
+            Ok(())
+        );
+        assert_eq!(
+            memberships.state_of(NOT_A_GROUP),
+            after(0, 1),
+            "not attempted before it is due"
+        );
+
+        assert_eq!(
+            memberships.converge(target, start + Duration::from_secs(1)),
+            Ok(())
+        );
+        assert_eq!(memberships.state_of(NOT_A_GROUP), after(1, 3));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "resolves a real interface")]
+    fn a_converge_joins_what_is_not_joined() {
+        let Some(mut memberships) = joined_on_loopback(&[MDNS_V4]) else {
+            return;
+        };
+        let name = InterfaceName::loopback();
+        let target = loopback_target(&name);
+        let start = Instant::now();
+        let waiting = memberships.add(MDNS_V6, BEST_EFFORT);
+        memberships.groups[waiting].state = State::Waiting(Wait::NoAddress);
+        memberships.groups[waiting].reported = Some(Problem::Wait(Wait::NoAddress));
+        let failed = memberships.add(IpAddr::V4(Ipv4Addr::new(239, 255, 77, 77)), BEST_EFFORT);
+        memberships.groups[failed].state = State::Failed {
+            attempts: 3,
+            retry_at: start,
+        };
+        memberships.groups[failed].reported = Some(Problem::Failed);
+
+        assert_eq!(memberships.converge(target, start), Ok(()));
+        assert!(memberships.test_all_joined());
+        assert!(
+            memberships
+                .groups
+                .iter()
+                .all(|group| group.reported.is_none()),
+            "a join ends the reported problem"
+        );
+        assert_eq!(memberships.next_retry(), None);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "resolves a real interface")]
+    fn the_state_dump_lists_only_the_groups_not_joined() {
+        let Some(mut memberships) = joined_on_loopback(&[MDNS_V4]) else {
+            return;
+        };
+        memberships.add(MDNS_V6, BEST_EFFORT);
+        let unjoined: Vec<IpAddr> = memberships
+            .unjoined()
+            .map(|unjoined| unjoined.0.group)
+            .collect();
+        assert_eq!(unjoined, [MDNS_V6]);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "resolves a real interface")]
+    fn a_rebase_drops_the_sockets_and_the_next_converge_joins_again() {
+        let Some(mut memberships) = joined_on_loopback(&[MDNS_V4, MDNS_V6]) else {
+            return;
+        };
+        memberships.rebase();
+        assert!(memberships.test_socketless());
+        assert_eq!(memberships.state_of(MDNS_V4), State::Pending);
+        assert_eq!(memberships.state_of(MDNS_V6), State::Pending);
+
+        let name = InterfaceName::loopback();
+        assert_eq!(
+            memberships.converge(loopback_target(&name), Instant::now()),
+            Ok(())
+        );
+        assert!(memberships.test_all_joined());
+        assert!(memberships.sockets.v4.is_some() && memberships.sockets.v6.is_some());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "resolves a real interface")]
+    fn a_dead_index_stops_the_converge_and_leaves_its_groups_to_the_rebuild() {
+        if joined_on_loopback(&[MDNS_V4]).is_none() {
+            return;
         }
+        let name = InterfaceName::loopback();
+        // No interface has this index, and the loopback name resolves to another.
+        let dead = Target {
+            name: &name,
+            ifindex: NonZeroU32::new(0x7fff_fff0).unwrap(),
+        };
+        let mut memberships = Memberships::new();
+        memberships.add(MDNS_V4, BEST_EFFORT);
+        memberships.add(MDNS_V6, BEST_EFFORT);
+        let now = Instant::now();
+        assert_eq!(memberships.converge(dead, now), Err(Gone));
+        assert_eq!(memberships.state_of(MDNS_V4), State::Pending);
+        assert_eq!(memberships.state_of(MDNS_V6), State::Pending);
+        assert_eq!(memberships.next_retry(), None, "no retry timer spins on it");
+
+        let err = memberships
+            .join(MDNS_V4, BEST_EFFORT, dead, now)
+            .expect_err("the index names no interface");
+        assert!(matches!(err, JoinError::Gone), "{err:?}");
+    }
+
+    // stf0 exists on every macOS host and has no IFF_MULTICAST.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_interface_without_iff_multicast_waits() {
+        let name: InterfaceName = "stf0".parse().unwrap();
+        let Some(ifindex) = crate::interface::if_index(&name) else {
+            return;
+        };
+        let target = Target {
+            name: &name,
+            ifindex,
+        };
+        let mut memberships = Memberships::new();
+        memberships
+            .join(MDNS_V4, REQUIRED, target, Instant::now())
+            .expect("the group waits");
+        assert_eq!(memberships.test_waiting(MDNS_V4), Some(Wait::NotMulticast));
     }
 }

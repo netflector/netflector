@@ -1,6 +1,11 @@
-use super::lifecycle::RECONCILE_RETRY;
+use super::interface_table::{InterfaceKey, Presence, Unbound};
+use super::lifecycle::{RECHECK_INTERVAL, RECONCILE_RETRY};
+use super::multicast::join_unsupported;
+use super::multicast::tests::BEST_EFFORT;
 use super::*;
-use crate::test_support::{Capability, loopback_lock, open_capture_or_skip, skip};
+use crate::test_support::{
+    Capability, loopback_lock, open_capture_or_skip, open_loopback_or_skip, skip,
+};
 use std::cell::{Cell, RefCell};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::rc::Rc;
@@ -18,9 +23,9 @@ impl PacketDispatcher {
     }
 }
 
-// The reconcile detects a cached identity that moved (corrupted here through the test
-// seam, as a recreation would move it) and repairs it in place, then re-arms the slow
-// tick. Unprivileged: resolution only, no captures.
+// The reconcile detects a bound index that moved (moved here through the test seam, as a
+// recreation would move it) and binds the new one, then re-arms the slow tick. Unprivileged:
+// resolution only, no captures.
 #[test]
 #[cfg_attr(miri, ignore = "resolves a real interface")]
 fn reconcile_repairs_a_moved_identity_and_arms_the_slow_tick() -> io::Result<()> {
@@ -31,15 +36,14 @@ fn reconcile_repairs_a_moved_identity_and_arms_the_slow_tick() -> io::Result<()>
         .find_or_add_interface(&InterfaceName::loopback())?;
     let real =
         crate::interface::if_index(&InterfaceName::loopback()).expect("loopback has an ifindex");
-    dispatcher.table.set_test_ifindex(key, real + 1000);
-    assert_ne!(dispatcher.table.stale_interfaces(), []);
+    let moved = NonZeroU32::new(real.get() + 1000).unwrap();
+    dispatcher
+        .table
+        .set_test_presence(key, Presence::Present(moved));
 
     dispatcher.reconcile_interfaces(&mut reactor);
 
-    assert!(
-        dispatcher.table.stale_interfaces().is_empty(),
-        "the moved identity is repaired"
-    );
+    assert_eq!(dispatcher.table.presence_of(key), Presence::Present(real));
     assert!(
         dispatcher.lifecycle.next_reconcile() > Instant::now() + RECONCILE_RETRY,
         "a healthy table re-arms the slow tick, not the retry"
@@ -47,8 +51,8 @@ fn reconcile_repairs_a_moved_identity_and_arms_the_slow_tick() -> io::Result<()>
     Ok(())
 }
 
-// A vanished interface parks (identity 0, quiescent thereafter) and keeps the fast retry
-// cadence armed, so its return is picked up promptly even with every event lost.
+// A vanished interface parks and keeps the fast retry cadence armed, so its return is picked up
+// promptly even with every event lost.
 #[test]
 #[cfg_attr(miri, ignore = "resolves a real interface")]
 fn reconcile_parks_a_vanished_interface_and_keeps_the_fast_retry() -> io::Result<()> {
@@ -63,11 +67,7 @@ fn reconcile_parks_a_vanished_interface_and_keeps_the_fast_retry() -> io::Result
 
     dispatcher.reconcile_interfaces(&mut reactor);
 
-    assert!(
-        dispatcher.table.stale_interfaces().is_empty(),
-        "a parked entry is quiescent, not perpetually stale"
-    );
-    assert!(dispatcher.table.any_absent());
+    assert_eq!(dispatcher.table.presence_of(key), Presence::Parked);
     assert!(
         dispatcher.lifecycle.next_reconcile() <= Instant::now() + RECONCILE_RETRY,
         "an absent interface keeps the fast retry cadence"
@@ -78,8 +78,8 @@ fn reconcile_parks_a_vanished_interface_and_keeps_the_fast_retry() -> io::Result
         .set_test_name(key, &InterfaceName::loopback());
     dispatcher.reconcile_interfaces(&mut reactor);
     assert!(
-        !dispatcher.table.any_absent(),
-        "the returned interface is re-pointed"
+        matches!(dispatcher.table.presence_of(key), Presence::Present(_)),
+        "the returned interface is bound again"
     );
     assert!(
         dispatcher.lifecycle.next_reconcile() > Instant::now() + RECONCILE_RETRY,
@@ -89,8 +89,8 @@ fn reconcile_parks_a_vanished_interface_and_keeps_the_fast_retry() -> io::Result
 }
 
 // A completed recovery bumps the recoveries count on each of the interface's capture rows.
-// Unprivileged: the moved identity is faked through the test seam and the capture row is a
-// capture-less test entry (rebind_capture reports it missing, which does not fail the recovery).
+// Unprivileged: the moved index is faked through the test seam and the capture row is a
+// capture-less test entry (its re-bind skips it, which does not fail the recovery).
 #[test]
 #[cfg_attr(miri, ignore = "resolves a real interface")]
 fn reconcile_counts_a_recovery_on_the_interface_captures() -> io::Result<()> {
@@ -103,7 +103,10 @@ fn reconcile_counts_a_recovery_on_the_interface_captures() -> io::Result<()> {
     assert_eq!(dispatcher.table.recoveries_of(capture), 0);
     let real =
         crate::interface::if_index(&InterfaceName::loopback()).expect("loopback has an ifindex");
-    dispatcher.table.set_test_ifindex(key, real + 1000); // as a recreation would move it
+    let moved = NonZeroU32::new(real.get() + 1000).unwrap(); // as a recreation would move it
+    dispatcher
+        .table
+        .set_test_presence(key, Presence::Present(moved));
 
     dispatcher.reconcile_interfaces(&mut reactor);
 
@@ -112,6 +115,89 @@ fn reconcile_counts_a_recovery_on_the_interface_captures() -> io::Result<()> {
         1,
         "the completed recovery is counted on the interface's capture row"
     );
+    Ok(())
+}
+
+/// The captures of one `on_iface_change`, and the index the first had when the call ran.
+type ChangeCall = (Vec<CaptureKey>, Option<NonZeroU32>);
+
+struct ChangeRecorder {
+    calls: Rc<RefCell<Vec<ChangeCall>>>,
+}
+
+impl PacketHandler for ChangeRecorder {
+    fn on_packet(&mut self, _: &Packet, _: &mut PacketDispatcher, _: &mut Reactor) -> Outcome {
+        Outcome::Filtered
+    }
+
+    fn on_iface_change(
+        &mut self,
+        captures: &[CaptureKey],
+        dispatcher: &mut PacketDispatcher,
+        _: &mut Reactor,
+    ) {
+        let ifindex = dispatcher.capture_ifindex(captures[0]);
+        self.calls.borrow_mut().push((captures.to_vec(), ifindex));
+    }
+}
+
+// A drain that both moves an address and needs a reconcile tells each reflector once, and only
+// after the reconcile repaired the table.
+#[test]
+#[cfg_attr(miri, ignore = "resolves a real interface")]
+fn reflectors_hear_of_a_change_once_and_after_the_repair() -> io::Result<()> {
+    let mut reactor = Reactor::new()?;
+    let mut dispatcher = PacketDispatcher::new();
+    let key = dispatcher
+        .table
+        .find_or_add_interface(&InterfaceName::loopback())?;
+    let capture = dispatcher.table.add_test_capture(); // links the first interface
+    let real =
+        crate::interface::if_index(&InterfaceName::loopback()).expect("loopback has an ifindex");
+    let moved = NonZeroU32::new(real.get() + 1000).unwrap();
+    dispatcher
+        .table
+        .set_test_presence(key, Presence::Present(moved));
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    dispatcher.register(
+        capture,
+        Filter::default(),
+        Box::new(ChangeRecorder {
+            calls: calls.clone(),
+        }),
+    );
+
+    let changes = Changes {
+        v4_moved: Vec::new(),
+        touched: vec![capture],
+        reconcile: true,
+    };
+    dispatcher.apply_interface_changes(&changes, &mut reactor);
+
+    assert_eq!(*calls.borrow(), [(vec![capture], Some(real))]);
+    Ok(())
+}
+
+// A failed bind sets its own retry time; the reconcile wakes for it rather than waiting out the
+// slow tick.
+#[test]
+#[cfg_attr(miri, ignore = "resolves a real interface")]
+fn reconcile_wakes_for_a_failed_binds_retry() -> io::Result<()> {
+    let mut reactor = Reactor::new()?;
+    let mut dispatcher = PacketDispatcher::new();
+    let key = dispatcher
+        .table
+        .find_or_add_interface(&InterfaceName::loopback())?;
+    let real =
+        crate::interface::if_index(&InterfaceName::loopback()).expect("loopback has an ifindex");
+    let due = Instant::now() + Duration::from_secs(4);
+    dispatcher
+        .table
+        .set_test_presence(key, Presence::Unbound(Unbound::test_due(real, due)));
+
+    dispatcher.reconcile_interfaces(&mut reactor);
+
+    assert_eq!(dispatcher.lifecycle.next_reconcile(), due);
     Ok(())
 }
 
@@ -563,7 +649,7 @@ fn a_parked_ingress_routes_nothing_until_it_returns() -> io::Result<()> {
         .table
         .set_test_name(key, &"nf-gone0".parse().unwrap());
     dispatcher.reconcile_interfaces(&mut reactor);
-    assert!(dispatcher.table.any_absent());
+    assert_eq!(dispatcher.table.presence_of(key), Presence::Parked);
 
     sender.send_to(b"parked", target)?;
     pump_until(
@@ -726,10 +812,10 @@ fn peers_whose_frames_share_a_checksum_each_get_a_copy() -> io::Result<()> {
 fn a_unicast_mdns_answer_from_a_peer_goes_to_the_group() -> io::Result<()> {
     use std::io::Write as _;
 
-    use crate::interface::{Interface, LOOPBACK_IFACE};
+    use crate::interface::LOOPBACK_IFACE;
     use crate::net::mdns::{MDNS_GROUP_V4, MDNS_PORT};
     use crate::reflector::{InterfaceMap, mdns};
-    use crate::test_support::frame;
+    use crate::test_support::{frame, open_capture};
 
     let _serial = loopback_lock();
     let Some(mut tun) = crate::test_support::Tun::create() else {
@@ -754,7 +840,7 @@ fn a_unicast_mdns_answer_from_a_peer_goes_to_the_group() -> io::Result<()> {
     .reflectors
     .remove(0);
     mdns::build(&entry, &interfaces, &mut dispatcher).expect("build the mDNS reflector");
-    let mut observer = Capture::open(&Interface::open(&InterfaceName::loopback())?)?;
+    let mut observer = open_capture(&InterfaceName::loopback())?;
 
     // A DNS header with QR set: a response with no records.
     let answer = [0, 0, 0x84, 0, 0, 0, 0, 0, 0, 0, 0, 0];
@@ -807,10 +893,10 @@ fn a_unicast_mdns_answer_from_a_peer_goes_to_the_group() -> io::Result<()> {
 fn an_mdns_answer_goes_to_the_source_peers() -> io::Result<()> {
     use std::io::Write as _;
 
-    use crate::interface::{Interface, LOOPBACK_IFACE};
+    use crate::interface::LOOPBACK_IFACE;
     use crate::net::mdns::{MDNS_GROUP_V4, MDNS_PORT};
     use crate::reflector::{InterfaceMap, mdns};
-    use crate::test_support::frame;
+    use crate::test_support::{frame, open_capture};
 
     let _serial = loopback_lock();
     let Some(mut tun) = crate::test_support::Tun::create() else {
@@ -836,7 +922,7 @@ fn an_mdns_answer_goes_to_the_source_peers() -> io::Result<()> {
     .reflectors
     .remove(0);
     mdns::build(&entry, &interfaces, &mut dispatcher).expect("build the mDNS reflector");
-    let mut observer = Capture::open(&Interface::open(&InterfaceName::loopback())?)?;
+    let mut observer = open_capture(&InterfaceName::loopback())?;
 
     // A DNS header with QR set: a response with no records, sent to the group.
     let answer = [0, 0, 0x84, 0, 0, 0, 0, 0, 0, 0, 0, 0];
@@ -1880,5 +1966,168 @@ fn monitor_fd_is_watched_under_the_sentinel_tag() {
 fn join_group_ignores_an_unknown_capture() {
     let mut dispatcher = PacketDispatcher::new();
     let group = IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251));
-    assert!(dispatcher.join_group(CaptureKey(9999), group).is_ok());
+    assert!(
+        dispatcher
+            .join_group(CaptureKey(9999), group, BEST_EFFORT)
+            .is_ok()
+    );
+}
+
+// A timed join retry that finds its interface gone repairs it in the same pass: left for a later
+// one, the retry stays due and the deadline loop spins.
+#[test]
+#[cfg_attr(miri, ignore = "resolves a real interface")]
+fn a_join_retry_that_finds_the_interface_gone_repairs_it_at_once() -> io::Result<()> {
+    let mut reactor = Reactor::new()?;
+    let Some((mut dispatcher, key)) = dispatcher_joined_on_loopback()? else {
+        return Ok(());
+    };
+    let real =
+        crate::interface::if_index(&InterfaceName::loopback()).expect("loopback has an ifindex");
+    let dead = NonZeroU32::new(0x7fff_fff0).unwrap();
+    dispatcher
+        .table
+        .set_test_presence(key, Presence::Present(dead));
+    let due = Instant::now();
+    let memberships = dispatcher.table.test_memberships_mut(key);
+    memberships.rebase(); // the joined group, now pending, comes first
+    memberships.test_fail(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), due);
+
+    dispatcher.on_deadline(due, &mut reactor);
+
+    assert_eq!(dispatcher.table.presence_of(key), Presence::Present(real));
+    assert!(dispatcher.next_deadline().is_some_and(|next| next > due));
+    Ok(())
+}
+
+// A healthy interface still joins what it has not: an overflow can lose the event that would
+// have retried a group.
+#[test]
+#[cfg_attr(miri, ignore = "resolves a real interface")]
+fn a_reconcile_joins_what_a_kept_interface_has_not() -> io::Result<()> {
+    let mut reactor = Reactor::new()?;
+    let Some((mut dispatcher, key)) = dispatcher_joined_on_loopback()? else {
+        return Ok(());
+    };
+    dispatcher.table.test_memberships_mut(key).rebase();
+
+    dispatcher.reconcile_interfaces(&mut reactor);
+
+    assert!(matches!(
+        dispatcher.table.presence_of(key),
+        Presence::Present(_)
+    ));
+    assert!(dispatcher.table.test_memberships(key).test_all_joined());
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "needs a real capture device")]
+fn a_send_on_an_unbound_interface_is_refused() {
+    let _serial = loopback_lock();
+    let mut dispatcher = PacketDispatcher::new();
+    let Some(egress) = open_loopback_or_skip(&mut dispatcher) else {
+        return;
+    };
+    let key = dispatcher
+        .table
+        .interface_of(egress)
+        .expect("the capture has an interface");
+    dispatcher.table.set_test_presence(key, Presence::Parked);
+    let err = dispatcher
+        .send_udp(
+            egress,
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 9)),
+            MacAddr::from([0xff; 6]),
+            DatagramSource::Exact(SocketAddr::from((Ipv4Addr::LOCALHOST, 1))),
+            64,
+            b"x",
+        )
+        .expect_err("the interface is not bound");
+    assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+}
+
+/// A dispatcher with the mDNS group joined on loopback, or `None` after a skip note.
+fn dispatcher_joined_on_loopback() -> io::Result<Option<(PacketDispatcher, InterfaceKey)>> {
+    let mut dispatcher = PacketDispatcher::new();
+    let key = dispatcher
+        .table
+        .find_or_add_interface(&InterfaceName::loopback())?;
+    let group = IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251));
+    match dispatcher
+        .table
+        .join_on(key, group, BEST_EFFORT, Instant::now())
+    {
+        Ok(()) => Ok(Some((dispatcher, key))),
+        Err(e) if join_unsupported(&e) => {
+            skip(Capability::Membership, format!("{e:?}"));
+            Ok(None)
+        }
+        Err(e) => panic!("kernel must accept the join on loopback: {e:?}"),
+    }
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "resolves a real interface")]
+fn a_returned_interface_joins_its_groups_again() -> io::Result<()> {
+    let mut reactor = Reactor::new()?;
+    let Some((mut dispatcher, key)) = dispatcher_joined_on_loopback()? else {
+        return Ok(());
+    };
+    dispatcher
+        .table
+        .set_test_name(key, &"nf-gone0".parse().unwrap());
+    dispatcher.reconcile_interfaces(&mut reactor);
+    assert!(dispatcher.table.test_memberships(key).test_socketless());
+
+    dispatcher
+        .table
+        .set_test_name(key, &InterfaceName::loopback());
+    dispatcher.reconcile_interfaces(&mut reactor);
+    assert!(dispatcher.table.test_memberships(key).test_all_joined());
+    Ok(())
+}
+
+// A join that fails on a healthy interface has no interface event to wait for: the next
+// re-read attempts it, and from then on its own timer does.
+#[test]
+#[cfg_attr(miri, ignore = "resolves a real interface")]
+fn a_failed_join_is_retried_on_its_own_timer() -> io::Result<()> {
+    let mut reactor = Reactor::new()?;
+    let mut dispatcher = PacketDispatcher::new();
+    let key = dispatcher
+        .table
+        .find_or_add_interface(&InterfaceName::loopback())?;
+    // A unicast address is no group, so every attempt fails.
+    let not_a_group = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    let start = Instant::now();
+    dispatcher
+        .table
+        .join_on(key, not_a_group, BEST_EFFORT, start)
+        .expect_err("a unicast address cannot join");
+    assert_eq!(dispatcher.table.next_join_retry(), None);
+
+    let recheck = start + RECHECK_INTERVAL;
+    dispatcher.on_deadline(recheck, &mut reactor);
+    let first_retry = recheck + Duration::from_secs(1);
+    assert_eq!(dispatcher.table.next_join_retry(), Some(first_retry));
+    assert!(
+        dispatcher
+            .next_deadline()
+            .is_some_and(|due| due <= first_retry)
+    );
+
+    dispatcher.on_deadline(first_retry, &mut reactor);
+    assert_eq!(
+        dispatcher.table.next_join_retry(),
+        Some(first_retry + Duration::from_secs(2))
+    );
+    Ok(())
+}
+
+#[test]
+fn the_retry_delay_doubles_from_one_second_to_thirty() {
+    let seconds: Vec<u64> = (0..7).map(|n| retry_delay(n).as_secs()).collect();
+    assert_eq!(seconds, [1, 2, 4, 8, 16, 30, 30]);
+    assert_eq!(retry_delay(u32::MAX), Duration::from_secs(30));
 }

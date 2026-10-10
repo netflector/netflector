@@ -23,8 +23,7 @@ use thiserror::Error;
 
 use crate::config::{AddressFamily, PeerList, Reflector};
 use crate::dispatch::{
-    CaptureKey, DatagramSource, MessageType, PacketDispatcher, join_capped, join_deferrable,
-    join_waits_for_family,
+    CaptureKey, DatagramSource, JoinError, MessageType, PacketDispatcher, Wanted,
 };
 use crate::interface::{InterfaceAddresses, InterfaceName};
 use crate::linear_map::LinearMap;
@@ -199,8 +198,8 @@ pub(crate) enum BuildError {
     RequiredFamilyUnavailable { interface: String, family: IpFamily },
     #[error("macs can never match on interface \"{0}\": its link carries no MAC addresses")]
     MacsUnmatchable(String),
-    /// For a reason no later event clears; a deferrable failure is left to the reconcile, and one
-    /// waiting for the interface's address family to a refresh.
+    #[error("interface \"{0}\" went away during startup")]
+    InterfaceGone(String),
     #[error("cannot join {group} on interface \"{interface}\": {reason}")]
     GroupJoin {
         group: IpAddr,
@@ -315,12 +314,12 @@ fn require_both_sides_family(
 ///
 /// # Errors
 /// [`BuildError::UnknownInterface`], [`BuildError::RequiredFamilyUnavailable`],
-/// [`BuildError::MacsUnmatchable`] or [`BuildError::GroupJoin`].
+/// [`BuildError::MacsUnmatchable`], [`BuildError::InterfaceGone`] or [`BuildError::GroupJoin`].
 fn open_pair(
     reflector: &Reflector,
     interfaces: &InterfaceMap,
     dispatcher: &mut PacketDispatcher,
-    protocol: &str,
+    protocol: &'static str,
     groups: &[SocketAddr],
 ) -> Result<(CaptureKey, CaptureKey), BuildError> {
     let source = interfaces.require(&reflector.source_if)?;
@@ -344,15 +343,18 @@ fn open_pair(
             (source, &reflector.source_if),
             (target, &reflector.target_if),
         ] {
-            // Both sides have a required family's address, so only a default entry's
-            // best-effort IPv6 groups can wait.
+            // A group that waits for the interface never fails the build; a required family
+            // the interface lacks does.
             require_group_join(
                 dispatcher,
                 capture,
                 group.ip(),
-                protocol,
                 interface,
-                log::Level::Info,
+                Wanted {
+                    label: protocol,
+                    required: reflector.address_family.requires(group.ip()),
+                    wait_level: log::Level::Info,
+                },
             )?;
         }
     }
@@ -370,55 +372,54 @@ fn group_addrs(family: AddressFamily, port: u16, v4: Ipv4Addr, v6: &[Ipv6Addr]) 
     groups
 }
 
-/// A [deferrable](join_deferrable) failure only logs: the interface is already gone, and the
-/// reconcile re-joins when it returns. So does one [waiting for the interface's address
-/// family](join_waits_for_family), at `wait_log_level`, which a refresh retries.
+/// Join `group` on the interface behind `capture` for as long as the daemon runs. A group the
+/// interface can't take as it is stays wanted, and joins when the interface changes.
 ///
 /// # Errors
-/// [`BuildError::GroupJoin`].
+/// [`BuildError::InterfaceGone`] or [`BuildError::GroupJoin`].
 fn require_group_join(
     dispatcher: &mut PacketDispatcher,
     capture: CaptureKey,
     group: IpAddr,
-    protocol: &str,
     interface: &str,
-    wait_log_level: log::Level,
+    wanted: Wanted,
 ) -> Result<(), BuildError> {
-    match dispatcher.join_group(capture, group) {
-        Ok(()) => log::debug!("{protocol}: joined {group} on {interface}"),
-        Err(e) if join_waits_for_family(&e, group) => {
-            let family = if group.is_ipv4() {
-                IpFamily::V4
+    dispatcher
+        .join_group(capture, group, wanted)
+        .map_err(|e| join_failure(e, group, interface))
+}
+
+fn join_failure(err: JoinError, group: IpAddr, interface: &str) -> BuildError {
+    let reason = match err {
+        JoinError::Gone => return BuildError::InterfaceGone(interface.to_owned()),
+        JoinError::NoFamily if group.is_ipv4() => {
+            "the interface has no IPv4, which the reflector requires".to_owned()
+        }
+        JoinError::NoFamily => {
+            let hint = if cfg!(target_os = "linux") {
+                " (an MTU below 1280 rules IPv6 out)"
             } else {
-                IpFamily::V6
+                ""
             };
-            log::log!(
-                wait_log_level,
-                "{protocol}: joining {group} on {interface} once it has an {family} address ({e})"
-            );
+            format!("the interface has no IPv6, which the reflector requires{hint}")
         }
-        Err(e) if join_deferrable(&e) => {
-            log::debug!(
-                "{protocol}: join {group} on {interface} deferred (the interface is gone): {e}"
-            );
-        }
-        Err(e) => {
-            let reason = if join_capped(&e) {
-                format!(
-                    "{e}; the interface holds as many memberships as the system allows \
-                     (net.ipv4.igmp_max_memberships on Linux)"
-                )
-            } else {
-                e.to_string()
-            };
-            return Err(BuildError::GroupJoin {
-                group,
-                interface: interface.to_owned(),
-                reason,
-            });
-        }
+        JoinError::Failed {
+            source,
+            capped: true,
+        } => format!(
+            "{source}; the interface holds as many memberships as the system allows \
+             (net.ipv4.igmp_max_memberships)"
+        ),
+        JoinError::Failed {
+            source,
+            capped: false,
+        } => source.to_string(),
+    };
+    BuildError::GroupJoin {
+        group,
+        interface: interface.to_owned(),
+        reason,
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -490,7 +491,7 @@ mod tests {
 
     #[test]
     #[cfg_attr(miri, ignore = "needs a real capture device")]
-    fn a_join_failure_no_event_clears_fails_the_build() {
+    fn a_failed_join_fails_the_build() {
         let _serial = loopback_lock();
         let mut dispatcher = PacketDispatcher::new();
         let Some(capture) = open_loopback_or_skip(&mut dispatcher) else {
@@ -502,15 +503,34 @@ mod tests {
             &mut dispatcher,
             capture,
             not_a_group,
-            "test",
             LOOPBACK_IFACE,
-            log::Level::Info,
+            Wanted {
+                label: "test",
+                required: false,
+                wait_level: log::Level::Info,
+            },
         );
         assert!(matches!(
             result,
             Err(BuildError::GroupJoin { group, ref interface, .. })
                 if group == not_a_group && interface == LOOPBACK_IFACE
         ));
+    }
+
+    #[test]
+    fn a_join_failure_names_its_cause() {
+        let v4 = IpAddr::V4(Ipv4Addr::new(239, 255, 90, 90));
+        let v6: IpAddr = "ff02::fb".parse().unwrap();
+        assert_eq!(
+            join_failure(JoinError::Gone, v4, "eth1"),
+            BuildError::InterfaceGone("eth1".to_owned())
+        );
+        for group in [v4, v6] {
+            assert!(matches!(
+                join_failure(JoinError::NoFamily, group, "eth1"),
+                BuildError::GroupJoin { group: g, ref interface, .. } if g == group && interface == "eth1"
+            ));
+        }
     }
 
     #[test]

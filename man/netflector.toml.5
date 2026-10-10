@@ -234,8 +234,11 @@ Multicast groups to join and relay on
 of either family the entry's
 .Ic address_family
 uses.
-Startup fails when a group cannot be joined on
-.Ic source_if .
+Startup fails when
+.Ic source_if
+refuses a group, unless the interface takes no multicast memberships at all, as
+.Xr stf 4
+does: that is logged and the entry runs.
 .It Ic udp_broadcast
 Also relay broadcasts to
 .Ic udp_ports :

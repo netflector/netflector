@@ -6,6 +6,7 @@
 use std::fmt;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::num::NonZeroU32;
 
 use crate::net::mac::MacAddr;
 
@@ -127,13 +128,19 @@ impl Ipv6Scope {
     }
 }
 
-/// One configured interface. `ifindex` caches what `name` resolves to, the process's only
-/// persistent copy of an interface index: when the OS destroys and recreates the interface (a
-/// `PPPoE` reconnect, a bridge/VLAN rebuild), the dispatcher's reconcile re-points it (0 while
-/// the name resolves to nothing) and re-binds the captures.
+/// What a read of an interface found; [`Interface::adopt`] takes it.
+pub(crate) struct Reading {
+    addrs: InterfaceAddresses,
+    mtu: Option<u32>,
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    loopback: bool,
+}
+
+/// One configured interface: what its name resolved to last. The index it is bound to is the
+/// dispatcher's, which re-binds the captures when the OS destroys and recreates the interface (a
+/// `PPPoE` reconnect, a bridge/VLAN rebuild).
 pub(crate) struct Interface {
     pub(crate) name: InterfaceName,
-    pub(crate) ifindex: u32,
     pub(crate) addrs: InterfaceAddresses,
     /// Outside [`InterfaceAddresses`] on purpose: that struct's equality drives the refresh
     /// diffing, and a bare MTU change must not read as an address change (which clears sessions).
@@ -144,45 +151,80 @@ pub(crate) struct Interface {
 }
 
 impl Interface {
-    /// `ifindex` is 0 while the name resolves to nothing; no real event carries 0.
-    ///
     /// # Errors
     /// Propagates a resolution syscall failure.
-    pub(crate) fn open(name: &InterfaceName) -> io::Result<Self> {
+    pub(crate) fn open(name: &InterfaceName, ifindex: NonZeroU32) -> io::Result<Self> {
         let mut iface = Self {
             name: name.clone(),
-            ifindex: if_index(name).unwrap_or(0),
             addrs: InterfaceAddresses::default(),
             mtu: None,
             #[cfg(any(target_os = "macos", target_os = "freebsd"))]
             loopback: false,
         };
-        match iface.ifindex {
-            0 => log::debug!("{name}: no kernel ifindex (interface absent)"),
-            i => log::debug!("{name}: ifindex {i}"),
-        }
-        iface.refresh()?;
+        log::debug!("{name}: ifindex {ifindex}");
+        iface.refresh(ifindex)?;
         Ok(iface)
     }
 
-    /// Re-resolve the addresses in place and report which source fields changed.
+    /// Re-resolve the addresses of the interface at `ifindex` in place and report which source
+    /// fields changed. The BSDs resolve by name.
     ///
     /// # Errors
     /// Propagates a resolution syscall failure.
-    pub(crate) fn refresh(&mut self) -> io::Result<AddressChange> {
+    pub(crate) fn refresh(&mut self, ifindex: NonZeroU32) -> io::Result<AddressChange> {
+        let reading = self.read(ifindex)?;
+        Ok(self.adopt(&reading))
+    }
+
+    /// What the interface at `ifindex` has now, adopting none of it. The BSDs read by name.
+    ///
+    /// # Errors
+    /// Propagates a resolution syscall failure.
+    pub(crate) fn read(&self, ifindex: NonZeroU32) -> io::Result<Reading> {
         #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-        let (addrs, mtu) = {
+        let reading = {
+            let _ = ifindex;
             let (addrs, mtu, loopback) = self::getifaddrs::resolve(&self.name)?;
-            self.loopback = loopback;
-            (addrs, mtu)
+            Reading {
+                addrs,
+                mtu,
+                loopback,
+            }
         };
         #[cfg(target_os = "linux")]
-        let (addrs, mtu) = self::rtnetlink::resolve(&self.name, self.ifindex)?;
-        self.mtu = mtu;
-        match mtu {
+        let reading = {
+            let (addrs, mtu) = self::rtnetlink::resolve(&self.name, ifindex)?;
+            Reading { addrs, mtu }
+        };
+        let addrs = &reading.addrs;
+        match reading.mtu {
             Some(mtu) => log::debug!("{}: resolved {addrs}, mtu {mtu}", self.name),
             None => log::debug!("{}: resolved {addrs}, mtu unreadable", self.name),
         }
+        Ok(reading)
+    }
+
+    /// Take the kind of link `reading` found, which a capture re-bind follows, and none of its
+    /// addresses.
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    pub(crate) fn take_link(&mut self, reading: &Reading) {
+        self.loopback = reading.loopback;
+    }
+
+    /// Adopt `reading`, logging each address change.
+    pub(crate) fn adopt(&mut self, reading: &Reading) -> AddressChange {
+        #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+        self.take_link(reading);
+        self.replace_addrs(reading.addrs, reading.mtu)
+    }
+
+    /// Drop the addresses of an interface no longer bound, logging each loss.
+    pub(crate) fn forget(&mut self) -> AddressChange {
+        self.replace_addrs(InterfaceAddresses::default(), None)
+    }
+
+    fn replace_addrs(&mut self, addrs: InterfaceAddresses, mtu: Option<u32>) -> AddressChange {
+        self.mtu = mtu;
         // Separate `let`s so both v6 transitions log; `||` would short-circuit the second.
         let v6 = log_field_change(&self.name, "IPv6", self.addrs.v6, addrs.v6);
         let v6_routable = log_field_change(
@@ -197,13 +239,14 @@ impl Interface {
             v6: v6 || v6_routable,
         };
         self.addrs = addrs;
-        Ok(change)
+        change
     }
 }
 
 /// `None` if `name` names no interface or the lookup itself failed. A caller that acts
 /// destructively on absence wants [`if_index_checked`] instead.
-pub(crate) fn if_index(name: &InterfaceName) -> Option<u32> {
+#[cfg(any(test, target_os = "macos", target_os = "freebsd"))]
+pub(crate) fn if_index(name: &InterfaceName) -> Option<NonZeroU32> {
     if_index_checked(name).ok().flatten()
 }
 
@@ -213,11 +256,10 @@ pub(crate) fn if_index(name: &InterfaceName) -> Option<u32> {
 /// # Errors
 /// Only the resource errnos. Anything else still reads as absent, so an unlisted errno can't
 /// mask a removed interface.
-pub(crate) fn if_index_checked(name: &InterfaceName) -> io::Result<Option<u32>> {
+pub(crate) fn if_index_checked(name: &InterfaceName) -> io::Result<Option<NonZeroU32>> {
     let c_name = name.to_c_array();
     // SAFETY: `c_name` is NUL-terminated and outlives the call.
-    let index = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
-    if index != 0 {
+    if let Some(index) = NonZeroU32::new(unsafe { libc::if_nametoindex(c_name.as_ptr()) }) {
         return Ok(Some(index));
     }
     let err = io::Error::last_os_error();
@@ -228,11 +270,11 @@ pub(crate) fn if_index_checked(name: &InterfaceName) -> io::Result<Option<u32>> 
 }
 
 #[cfg(target_os = "freebsd")]
-pub(crate) fn if_name(index: u32) -> Option<String> {
+pub(crate) fn if_name(index: NonZeroU32) -> Option<String> {
     let mut buf = [0u8; libc::IF_NAMESIZE];
     // SAFETY: `buf` is IF_NAMESIZE bytes, the size `if_indextoname` documents it writes into; it
     // returns NULL on failure without writing.
-    let name = unsafe { libc::if_indextoname(index, buf.as_mut_ptr().cast()) };
+    let name = unsafe { libc::if_indextoname(index.get(), buf.as_mut_ptr().cast()) };
     if name.is_null() {
         return None;
     }
@@ -324,6 +366,12 @@ pub(crate) const LOOPBACK_IFACE: &str = "lo0";
 mod tests {
     use super::*;
 
+    fn open_loopback() -> Interface {
+        let name = InterfaceName::loopback();
+        let ifindex = if_index(&name).expect("the loopback exists");
+        Interface::open(&name, ifindex).expect("the loopback resolves")
+    }
+
     impl InterfaceAddresses {
         /// Construct a record directly, for tests in other modules (the fields are private, so they
         /// can't use a struct literal). Production builds these through the platform resolvers.
@@ -379,7 +427,7 @@ mod tests {
     fn resolves_loopback_v4() {
         // Every host's loopback has 127.0.0.1; resolution needs no privileges, so this
         // exercises the full backend (the v4 path, and on Linux the rtnetlink round-trip).
-        let addrs = Interface::open(&InterfaceName::loopback()).unwrap().addrs;
+        let addrs = open_loopback().addrs;
         assert_eq!(addrs.v4, Some(Ipv4Addr::LOCALHOST));
     }
 
@@ -387,24 +435,21 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "resolves a real interface")]
     fn resolves_the_loopback_flag() {
-        assert!(
-            Interface::open(&InterfaceName::loopback())
-                .unwrap()
-                .loopback
-        );
+        assert!(open_loopback().loopback);
     }
 
     #[test]
     #[cfg_attr(miri, ignore = "resolves a real interface")]
     fn refresh_reports_which_source_fields_changed() {
-        let mut iface = Interface::open(&InterfaceName::loopback()).unwrap();
+        let mut iface = open_loopback();
+        let ifindex = if_index(&iface.name).unwrap();
         // Re-resolving an interface whose addresses are already current reports nothing moved.
-        assert_eq!(iface.refresh().unwrap(), AddressChange::default());
+        assert_eq!(iface.refresh(ifindex).unwrap(), AddressChange::default());
         // With a stale v4 cached, the next resolve (back to the real 127.0.0.1) reports a v4 move, and
         // only v4. This is the flag the DIAL eviction gates on.
         iface.addrs.v4 = Some(Ipv4Addr::new(10, 0, 0, 1));
         assert_eq!(
-            iface.refresh().unwrap(),
+            iface.refresh(ifindex).unwrap(),
             AddressChange {
                 v4: true,
                 ..AddressChange::default()
@@ -413,18 +458,19 @@ mod tests {
         // A stale v6 is reported independently of v4, so a routine v6 rotation can't masquerade as the
         // v4 change that would evict a DIAL proxy.
         iface.addrs.v6 = Some("2001:db8::1".parse().unwrap());
-        let change = iface.refresh().unwrap();
+        let change = iface.refresh(ifindex).unwrap();
         assert!(change.v6, "the differing v6 is reported");
         assert!(!change.v4, "but it does not look like a v4 change");
     }
 
     #[test]
     #[cfg_attr(miri, ignore = "resolves a real interface")]
-    fn unknown_interface_has_no_addresses() {
-        let addrs = Interface::open(&"nf-absent0".parse().unwrap())
-            .unwrap()
-            .addrs;
-        assert_eq!(addrs, InterfaceAddresses::default());
+    fn forgetting_an_interface_drops_its_addresses() {
+        let mut iface = open_loopback();
+        let change = iface.forget();
+        assert!(change.v4, "the loopback's 127.0.0.1 is reported lost");
+        assert_eq!(iface.addrs, InterfaceAddresses::default());
+        assert_eq!(iface.mtu, None);
     }
 
     #[test]
@@ -508,7 +554,7 @@ mod tests {
     fn a_name_that_resolves_to_nothing_is_absent_not_an_error() {
         assert!(matches!(
             if_index_checked(&InterfaceName::loopback()),
-            Ok(Some(index)) if index != 0
+            Ok(Some(_))
         ));
         assert!(matches!(
             if_index_checked(&"nf-absent0".parse().unwrap()),
@@ -531,7 +577,8 @@ mod tests {
             .expect("NETFLECTOR_TEST_IFACE is an interface name");
         crate::logging::init();
         crate::logging::set_level(crate::config::LogLevel::Trace);
-        let addrs = Interface::open(&iface).expect("open failed").addrs;
+        let ifindex = if_index(&iface).expect("NETFLECTOR_TEST_IFACE names an interface");
+        let addrs = Interface::open(&iface, ifindex).expect("open failed").addrs;
         eprintln!("resolved {iface}: {addrs}");
     }
 
@@ -545,10 +592,7 @@ mod tests {
         const LOOPBACK_MTU: u32 = 65536;
         #[cfg(any(target_os = "macos", target_os = "freebsd"))]
         const LOOPBACK_MTU: u32 = 16384;
-        let mtu = Interface::open(&InterfaceName::loopback())
-            .unwrap()
-            .mtu
-            .expect("loopback has an MTU");
+        let mtu = open_loopback().mtu.expect("loopback has an MTU");
         assert_eq!(mtu, LOOPBACK_MTU);
     }
 }

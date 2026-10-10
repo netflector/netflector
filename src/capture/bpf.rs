@@ -8,6 +8,7 @@
 //! backend filters first.
 
 use std::io;
+use std::num::NonZeroU32;
 use std::ops::Range;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
@@ -36,7 +37,7 @@ impl Capture {
     /// # Errors
     /// No free BPF device, an unbindable interface, a link type neither Ethernet nor
     /// `DLT_NULL`, or a failed setup ioctl.
-    pub(crate) fn open(interface: &Interface) -> io::Result<Self> {
+    pub(crate) fn open(interface: &Interface, _ifindex: NonZeroU32) -> io::Result<Self> {
         let fd = open_bpf_device()?;
 
         let link_type = attach(&fd, interface)?;
@@ -73,7 +74,7 @@ impl Capture {
     ///
     /// # Errors
     /// The attach ioctl failure while no interface bears the name, or an unsupported link type.
-    pub(crate) fn rebind(&mut self, interface: &Interface) -> io::Result<()> {
+    pub(crate) fn rebind(&mut self, interface: &Interface, _ifindex: NonZeroU32) -> io::Result<()> {
         self.link_type = attach(&self.fd, interface)?;
         // The kernel reset its buffer at the re-attach; match it.
         self.filled = 0;
@@ -90,7 +91,7 @@ impl Capture {
     /// attachment when the interface is destroyed and per-attachment ioctls then fail; a
     /// recreated interface (same name, even a reused index) never re-attaches, so this catches
     /// recreation where an index comparison can't.
-    pub(crate) fn attached(&self, _ifindex: u32) -> bool {
+    pub(crate) fn attached(&self, _ifindex: NonZeroU32) -> bool {
         let mut dlt: c_uint = 0;
         // SAFETY: BIOCGDLT writes a `c_uint`.
         unsafe { ioctl(&self.fd, libc::BIOCGDLT, &mut dlt) }.is_ok()

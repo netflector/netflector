@@ -20,10 +20,11 @@ mod pair_tests;
 pub(crate) use self::counters::{MessageType, Outcome};
 pub(crate) use self::datagram::DatagramSource;
 pub(crate) use self::dial_context::{DialContext, DialProxyKey};
-pub(crate) use self::multicast::{join_capped, join_deferrable, join_waits_for_family};
+pub(crate) use self::multicast::{JoinError, Wanted};
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::num::NonZeroU32;
 use std::ops::Deref;
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::{Duration, Instant};
@@ -39,8 +40,9 @@ use crate::reactor::{Arena, ControlEvent, Handler, HandlerSlot, Key, Reactor, Re
 
 use self::counters::log_counters;
 use self::egress::{Datagram, Egress};
-use self::interface_table::InterfaceTable;
-use self::lifecycle::{Changes, InterfaceLifecycle};
+use self::interface_table::{InterfaceTable, Presence};
+use self::lifecycle::{Changes, InterfaceLifecycle, Rebuilt};
+use self::multicast::Memberships;
 use self::reassembly::{Loss, Lost, MAX_DATAGRAM_LEN, Reassembler};
 
 /// Frames drained per readable event before yielding, so a flooded interface can't starve the
@@ -258,11 +260,13 @@ impl PacketDispatcher {
     /// open.
     pub(crate) fn open_capture(&mut self, name: &InterfaceName) -> io::Result<CaptureKey> {
         let key = self.table.open_capture(name)?;
-        let ifindex = self
+        if let Some(ifindex) = self
             .table
             .interface_of(key)
-            .and_then(|interface| self.table.interface_index(interface));
-        self.lifecycle.saw_interface(ifindex.unwrap_or(0));
+            .and_then(|interface| self.table.interface_index(interface))
+        {
+            self.lifecycle.saw_interface(ifindex);
+        }
         log::debug!("watching {name} as capture {key:?}");
         Ok(key)
     }
@@ -295,18 +299,22 @@ impl PacketDispatcher {
         self.registrations.remove(key.0);
     }
 
-    /// Join `group` on the interface behind `capture`; the reconcile re-joins it on a recreated
-    /// interface.
+    /// Join `group` on the interface behind `capture`, for as long as the daemon runs: a group
+    /// the interface can't take yet, or loses with a recreation, is joined when it can be.
     ///
     /// # Errors
-    /// The join's OS error; [`join_deferrable`] tells an interface already gone from a hard
-    /// failure, [`join_waits_for_family`] one without the group's address family yet.
-    pub(crate) fn join_group(&mut self, capture: CaptureKey, group: IpAddr) -> io::Result<()> {
+    /// The group is neither joined nor waiting for the interface to change.
+    pub(crate) fn join_group(
+        &mut self,
+        capture: CaptureKey,
+        group: IpAddr,
+        wanted: Wanted,
+    ) -> Result<(), JoinError> {
         let Some(interface) = self.table.interface_of(capture) else {
             log::warn!("join_group: capture {capture:?} unknown; group {group} not joined");
             return Ok(());
         };
-        self.table.join_on(interface, group)
+        self.table.join_on(interface, group, wanted, Instant::now())
     }
 
     pub(crate) fn interface_mtu(&self, capture: CaptureKey) -> Option<u32> {
@@ -330,8 +338,9 @@ impl PacketDispatcher {
         (&mut self.dial, target_iface)
     }
 
-    /// The kernel ifindex behind `capture`, 0 while its interface is parked absent.
-    pub(crate) fn capture_ifindex(&self, capture: CaptureKey) -> Option<u32> {
+    /// The kernel ifindex behind `capture`; `None` while its interface is not bound: parked, or
+    /// its re-bind failed.
+    pub(crate) fn capture_ifindex(&self, capture: CaptureKey) -> Option<NonZeroU32> {
         self.table.ifindex_of(capture)
     }
 
@@ -426,9 +435,10 @@ impl PacketDispatcher {
         };
         let link = capture.link_type(); // hoisted: next_frame's borrow would pin `capture`
         let fd = capture.as_raw_fd();
-        // A rename parks the entry but keeps the kernel interface, so the capture still reads.
-        // Its frames are drained, since the wait is level-triggered, but never routed.
-        let parked = self.table.ifindex_of(ingress) == Some(0);
+        // A capture can still read while its interface is not bound: a rename keeps the kernel
+        // interface, a failed re-bind can keep the old attachment. Its frames are drained, since
+        // the wait is level-triggered, but never routed.
+        let bound = self.table.ifindex_of(ingress).is_some();
         let mut drained = 0u32;
         let mut oversized = 0u64;
         loop {
@@ -447,7 +457,8 @@ impl PacketDispatcher {
                     // The reconcile can't run from here, mid-drain with this capture taken
                     // out; pull it forward instead.
                     if Capture::lost_interface(&e) {
-                        log::info!("fd {fd}: capture lost its interface ({e}); reconciling");
+                        // Also what a Linux interface taken down reports; the reconcile tells.
+                        log::debug!("fd {fd}: capture read {e}; checking its interface");
                         self.lifecycle.reconcile_now();
                     } else {
                         log::error!("fd {fd}: capture read failed, abandoning batch: {e}");
@@ -455,7 +466,7 @@ impl PacketDispatcher {
                     break;
                 }
             };
-            if parked {
+            if !bound {
                 drained += 1;
                 continue;
             }
@@ -614,20 +625,53 @@ impl PacketDispatcher {
     }
 
     fn refresh_changed_interfaces(&mut self, reactor: &mut Reactor) {
-        let changes = self.lifecycle.drain(&mut self.table);
+        let changes = self.lifecycle.drain(&mut self.table, Instant::now());
         self.apply_interface_changes(&changes, reactor);
     }
 
     fn apply_interface_changes(&mut self, changes: &Changes, reactor: &mut Reactor) {
+        let rebuilt = if changes.reconcile {
+            self.lifecycle.reconcile(&mut self.table, Instant::now())
+        } else {
+            Vec::new()
+        };
         self.dial.evict_on_interface_change(
             reactor,
             &changes.v4_moved,
             "after its interface's address changed",
         );
-        self.notify_iface_change(&changes.touched, reactor);
-        if changes.reconcile {
-            self.reconcile_interfaces(reactor);
+        self.after_repair(&changes.touched, rebuilt, reactor);
+    }
+
+    fn reconcile_interfaces(&mut self, reactor: &mut Reactor) {
+        let rebuilt = self.lifecycle.reconcile(&mut self.table, Instant::now());
+        self.after_repair(&[], rebuilt, reactor);
+    }
+
+    /// Evict the DIAL proxies on each rebuilt interface, then tell the reflectors once about every
+    /// capture that changed, now that the table is repaired.
+    fn after_repair(
+        &mut self,
+        touched: &[CaptureKey],
+        rebuilt: Vec<Rebuilt>,
+        reactor: &mut Reactor,
+    ) {
+        let mut changed = touched.to_vec();
+        for rebuilt in rebuilt {
+            let reason = if rebuilt.removed {
+                "after its interface was unbound"
+            } else {
+                "after its interface was re-bound"
+            };
+            self.dial
+                .evict_on_interface_change(reactor, &rebuilt.captures, reason);
+            for capture in rebuilt.captures {
+                if !changed.contains(&capture) {
+                    changed.push(capture);
+                }
+            }
         }
+        self.notify_iface_change(&changed, reactor);
     }
 
     fn notify_iface_change(&mut self, captures: &[CaptureKey], reactor: &mut Reactor) {
@@ -648,19 +692,6 @@ impl PacketDispatcher {
             };
             handler.on_iface_change(captures, self, reactor);
             self.registrations.restore_handler(key.0, handler);
-        }
-    }
-
-    fn reconcile_interfaces(&mut self, reactor: &mut Reactor) {
-        for rebuilt in self.lifecycle.reconcile(&mut self.table) {
-            let reason = if rebuilt.removed {
-                "after its interface was removed"
-            } else {
-                "after its interface was recreated"
-            };
-            self.dial
-                .evict_on_interface_change(reactor, &rebuilt.captures, reason);
-            self.notify_iface_change(&rebuilt.captures, reactor);
         }
     }
 }
@@ -685,6 +716,7 @@ impl Handler for PacketDispatcher {
             .chain(self.report.as_ref().map(|r| r.next))
             .chain(Some(self.lifecycle.next_reconcile()))
             .chain(Some(self.lifecycle.next_recheck()))
+            .chain(self.table.next_join_retry())
             .min()
     }
 
@@ -714,11 +746,13 @@ impl Handler for PacketDispatcher {
         }
 
         if now >= self.lifecycle.next_recheck() {
-            let changes = self.lifecycle.recheck(&mut self.table);
+            let changes = self.lifecycle.recheck(&mut self.table, now);
             self.apply_interface_changes(&changes, reactor);
         }
 
-        if now >= self.lifecycle.next_reconcile() {
+        let joins_found_gone = self.table.next_join_retry().is_some_and(|due| now >= due)
+            && self.table.converge_all(now).is_err();
+        if joins_found_gone || now >= self.lifecycle.next_reconcile() {
             self.reconcile_interfaces(reactor);
         }
     }
@@ -726,9 +760,46 @@ impl Handler for PacketDispatcher {
     /// `Dump` is SIGUSR1: log the counters on demand, whether or not the periodic report is on.
     fn on_control(&mut self, event: ControlEvent, _reactor: &mut Reactor) {
         match event {
-            ControlEvent::Dump => log_counters(self.table.counter_rows()),
+            ControlEvent::Dump => {
+                log_counters(self.table.counter_rows());
+                log_interfaces(self.table.interface_rows());
+            }
         }
     }
+}
+
+/// One line per interface: what its captures are bound to, and, while it is bound, the groups it
+/// holds no membership of.
+fn log_interfaces<'a>(
+    rows: impl Iterator<Item = (&'a InterfaceName, Presence, Option<&'a Memberships>)>,
+) {
+    for (name, presence, memberships) in rows {
+        // Not bound, the presence says why nothing is joined.
+        let bound = matches!(presence, Presence::Present(_));
+        let unjoined: Vec<String> = memberships
+            .filter(|_| bound)
+            .into_iter()
+            .flat_map(Memberships::unjoined)
+            .map(|group| group.to_string())
+            .collect();
+        if unjoined.is_empty() {
+            log::info!("state {name}: {presence}");
+        } else {
+            log::info!(
+                "state {name}: {presence}; not joined: {}",
+                unjoined.join(", ")
+            );
+        }
+    }
+}
+
+/// The wait before retrying something that failed `attempts` times before: 1 s doubling to 30 s.
+fn retry_delay(attempts: u32) -> Duration {
+    const FLOOR: Duration = Duration::from_secs(1);
+    const CEILING: Duration = Duration::from_secs(30);
+    1u32.checked_shl(attempts)
+        .and_then(|factor| FLOOR.checked_mul(factor))
+        .map_or(CEILING, |delay| delay.min(CEILING))
 }
 
 /// The all-zero address is exempt: Linux reports it as a loopback's hardware address, so it
