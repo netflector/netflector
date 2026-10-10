@@ -24,10 +24,10 @@ pub(super) struct InterfaceKey(u32);
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) struct StaleInterface {
     pub(super) key: InterfaceKey,
-    /// The cached identity; 0 while parked absent.
-    pub(super) cached: u32,
-    /// What the name resolves to now; 0 for nothing.
-    pub(super) cur: u32,
+    /// The cached identity; `None` while parked absent.
+    pub(super) cached: Option<NonZeroU32>,
+    /// What the name resolves to now; `None` for nothing.
+    pub(super) cur: Option<NonZeroU32>,
 }
 
 /// `capture` is `None` while taken out for its drain; the rest stays resident, so addresses
@@ -50,7 +50,7 @@ struct InterfaceEntry {
 impl InterfaceEntry {
     /// `None` while parked absent, or with `--no-join`.
     fn join_target(&mut self) -> Option<(&mut Memberships, Target<'_>)> {
-        let ifindex = NonZeroU32::new(self.interface.ifindex)?;
+        let ifindex = self.interface.ifindex?;
         let target = Target {
             name: &self.interface.name,
             ifindex,
@@ -131,21 +131,6 @@ impl InterfaceTable {
     pub(super) fn converge(&mut self, interface: InterfaceKey, now: Instant) -> Result<(), Gone> {
         self.entries
             .get_mut(interface.0 as usize)
-            .map_or(Ok(()), |entry| entry.converge(now))
-    }
-
-    /// [`converge`](Self::converge) for the interface at kernel index `ifindex`.
-    ///
-    /// # Errors
-    /// See [`Memberships::converge`].
-    pub(super) fn converge_by_ifindex(
-        &mut self,
-        ifindex: NonZeroU32,
-        now: Instant,
-    ) -> Result<(), Gone> {
-        self.entries
-            .iter_mut()
-            .find(|entry| entry.interface.ifindex == ifindex.get())
             .map_or(Ok(()), |entry| entry.converge(now))
     }
 
@@ -235,8 +220,8 @@ impl InterfaceTable {
             .map(|entry| &entry.interface.addrs)
     }
 
-    /// 0 while the interface is parked absent.
-    pub(super) fn ifindex_of(&self, capture: CaptureKey) -> Option<u32> {
+    /// `None` for an unknown capture, or while its interface is parked absent.
+    pub(super) fn ifindex_of(&self, capture: CaptureKey) -> Option<NonZeroU32> {
         self.interface_index(self.interface_of(capture)?)
     }
 
@@ -253,10 +238,11 @@ impl InterfaceTable {
             .map_or("?", |name| name)
     }
 
-    pub(super) fn interface_index(&self, interface: InterfaceKey) -> Option<u32> {
+    /// `None` for an unknown key, or while the interface is parked absent.
+    pub(super) fn interface_index(&self, interface: InterfaceKey) -> Option<NonZeroU32> {
         self.entries
             .get(interface.0 as usize)
-            .map(|entry| entry.interface.ifindex)
+            .and_then(|entry| entry.interface.ifindex)
     }
 
     pub(super) fn egress_addrs(&self, capture: CaptureKey) -> Option<&InterfaceAddresses> {
@@ -328,29 +314,27 @@ impl InterfaceTable {
         })
     }
 
-    /// Re-resolve the interface at kernel index `ifindex` in place; `None` for one we don't
-    /// watch.
+    /// The interface at kernel index `ifindex`; `None` for one we don't watch.
+    pub(super) fn key_by_ifindex(&self, ifindex: NonZeroU32) -> Option<InterfaceKey> {
+        self.entries
+            .iter()
+            .position(|entry| entry.interface.ifindex == Some(ifindex))
+            .map(|index| InterfaceKey(u32::try_from(index).expect("interface count fits a u32")))
+    }
+
+    /// Re-resolve `interface` in place.
     ///
     /// # Errors
     /// A resolution syscall failure.
-    pub(super) fn refresh_by_ifindex(
-        &mut self,
-        ifindex: NonZeroU32,
-    ) -> io::Result<Option<AddressChange>> {
-        let Some(entry) = self
-            .entries
-            .iter_mut()
-            .find(|entry| entry.interface.ifindex == ifindex.get())
-        else {
-            return Ok(None);
-        };
-        entry.interface.refresh().map(Some)
+    pub(super) fn refresh(&mut self, interface: InterfaceKey) -> io::Result<AddressChange> {
+        // Keys come from this table, so the index is in range.
+        self.entries[interface.0 as usize].interface.refresh()
     }
 
     /// Every interface whose kernel identity no longer matches the cache: the identity moved
     /// (caught by the name lookup), or a capture's binding died behind an unchanged identity
     /// (an index reused by the recreation, caught by the
-    /// [`attached`](crate::capture::Capture::attached) probe). A parked entry (cached 0, name
+    /// [`attached`](crate::capture::Capture::attached) probe). A parked entry (no index, name
     /// still resolving to nothing) is quiescent, not stale.
     pub(super) fn stale_interfaces(&self) -> Vec<StaleInterface> {
         self.entries
@@ -361,15 +345,14 @@ impl InterfaceTable {
                 let cached = entry.interface.ifindex;
                 // A failed lookup says nothing; reading it as absent would park a healthy entry.
                 // Skip until the next tick.
-                let found = if_index_checked(&entry.interface.name).ok()?;
-                let cur = found.map_or(0, NonZeroU32::get);
+                let cur = if_index_checked(&entry.interface.name).ok()?;
                 let dead_capture = |ifindex| {
                     self.captures.iter().any(|c| {
                         c.interface == key
                             && c.capture.as_ref().is_some_and(|cap| !cap.attached(ifindex))
                     })
                 };
-                (cur != cached || found.is_some_and(dead_capture)).then_some(StaleInterface {
+                (cur != cached || cur.is_some_and(dead_capture)).then_some(StaleInterface {
                     key,
                     cached,
                     cur,
@@ -378,19 +361,14 @@ impl InterfaceTable {
             .collect()
     }
 
-    /// Whether every capture on the interface at `ifindex` is still attached (vacuously true
-    /// with no match): catches an index reused by a recreation as its first events arrive.
-    pub(super) fn probe_by_ifindex(&self, ifindex: NonZeroU32) -> bool {
-        let Some(index) = self
-            .entries
-            .iter()
-            .position(|entry| entry.interface.ifindex == ifindex.get())
-        else {
+    /// Whether every capture on `interface` is still attached to its index (vacuously true while
+    /// parked): catches an index reused by a recreation as its first events arrive.
+    pub(super) fn probe(&self, interface: InterfaceKey) -> bool {
+        let Some(ifindex) = self.interface_index(interface) else {
             return true;
         };
-        let key = InterfaceKey(u32::try_from(index).expect("interface count fits a u32"));
         self.captures.iter().all(|entry| {
-            entry.interface != key
+            entry.interface != interface
                 || entry
                     .capture
                     .as_ref()
@@ -398,14 +376,14 @@ impl InterfaceTable {
         })
     }
 
-    /// Whether any interface is parked absent (ifindex 0).
+    /// Whether any interface is parked absent.
     pub(super) fn any_absent(&self) -> bool {
         self.entries
             .iter()
-            .any(|entry| entry.interface.ifindex == 0)
+            .any(|entry| entry.interface.ifindex.is_none())
     }
 
-    /// Re-point interface `key` at kernel index `cur` (0 = parked absent), re-resolve its
+    /// Re-point interface `key` at kernel index `cur` (`None` = parked absent), re-resolve its
     /// addresses and drop its memberships with their sockets. The refresh still runs while
     /// absent, so the addresses clear and the egress gate closes. The ifindex is written first:
     /// the Linux resolver keys its dumps by it. The captures re-bind
@@ -417,7 +395,11 @@ impl InterfaceTable {
     /// A resolution syscall failure. The identity is rolled back so the entry stays visibly
     /// stale and the retry re-runs the rebuild; committed, it would scan as healthy while
     /// carrying the old interface's addresses.
-    pub(super) fn rebind_interface(&mut self, key: InterfaceKey, cur: u32) -> io::Result<()> {
+    pub(super) fn rebind_interface(
+        &mut self,
+        key: InterfaceKey,
+        cur: Option<NonZeroU32>,
+    ) -> io::Result<()> {
         // Keys come from this table's own scan, so the index is in range.
         let entry = &mut self.entries[key.0 as usize];
         let previous = entry.interface.ifindex;
@@ -441,19 +423,6 @@ impl InterfaceTable {
             .collect()
     }
 
-    pub(super) fn captures_at_ifindex(&self, ifindex: u32) -> Vec<CaptureKey> {
-        match self
-            .entries
-            .iter()
-            .position(|entry| entry.interface.ifindex == ifindex)
-        {
-            Some(index) => self.captures_of(InterfaceKey(
-                u32::try_from(index).expect("interface count fits a u32"),
-            )),
-            None => Vec::new(),
-        }
-    }
-
     /// Re-bind the capture behind `key` in place: same fd, same slot, so held keys and the
     /// reactor's watch stay valid. `Ok(false)`: no capture in the slot. A failed re-bind retries
     /// when the `attached` probe re-flags the entry.
@@ -475,10 +444,14 @@ impl InterfaceTable {
 
     /// Re-resolve every interface in place (an overflow, the periodic re-read); a per-interface
     /// failure is returned, not fatal.
-    pub(super) fn refresh_all(&mut self) -> Vec<(u32, io::Result<AddressChange>)> {
+    pub(super) fn refresh_all(&mut self) -> Vec<(InterfaceKey, io::Result<AddressChange>)> {
         self.entries
             .iter_mut()
-            .map(|entry| (entry.interface.ifindex, entry.interface.refresh()))
+            .enumerate()
+            .map(|(index, entry)| {
+                let key = InterfaceKey(u32::try_from(index).expect("interface count fits a u32"));
+                (key, entry.interface.refresh())
+            })
             .collect()
     }
 
@@ -514,7 +487,7 @@ mod tests {
         pub(in crate::dispatch) fn set_test_ifindex(
             &mut self,
             interface: InterfaceKey,
-            ifindex: u32,
+            ifindex: Option<NonZeroU32>,
         ) {
             self.entries[interface.0 as usize].interface.ifindex = ifindex;
         }
@@ -613,21 +586,35 @@ mod tests {
 
     #[test]
     #[cfg_attr(miri, ignore = "resolves a real interface")]
-    fn refresh_by_ifindex_targets_the_matching_interface() -> io::Result<()> {
+    fn key_by_ifindex_finds_only_a_watched_interface() -> io::Result<()> {
         let mut table = InterfaceTable::new();
-        table.find_or_add_interface(&InterfaceName::loopback())?;
+        let key = table.find_or_add_interface(&InterfaceName::loopback())?;
         let ifindex = if_index(&InterfaceName::loopback()).expect("loopback has an ifindex");
-        let change = table
-            .refresh_by_ifindex(ifindex)?
-            .expect("the loopback interface matches its ifindex and re-resolves");
+        assert_eq!(table.key_by_ifindex(ifindex), Some(key));
+        assert_eq!(table.key_by_ifindex(NonZeroU32::MAX), None);
+        let change = table.refresh(key)?;
         assert!(
             !change.v4,
             "re-resolving the unchanged loopback reports no v4 move, the bit the DIAL eviction gates on",
         );
-        assert!(
-            table.refresh_by_ifindex(NonZeroU32::MAX)?.is_none(),
-            "an ifindex we don't watch should refresh nothing",
-        );
+        Ok(())
+    }
+
+    // Each result comes back under its own interface, parked ones included: no index can tell
+    // two parked interfaces apart.
+    #[test]
+    #[cfg_attr(miri, ignore = "resolves a real interface")]
+    fn refresh_all_reports_each_interface_by_its_key() -> io::Result<()> {
+        let mut table = InterfaceTable::new();
+        let first = table.find_or_add_interface(&"nf-gone0".parse().unwrap())?;
+        let second = table.find_or_add_interface(&"nf-gone1".parse().unwrap())?;
+        assert_eq!(table.interface_index(first), None);
+        let keys: Vec<InterfaceKey> = table
+            .refresh_all()
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        assert_eq!(keys, [first, second]);
         Ok(())
     }
 
@@ -691,49 +678,45 @@ mod tests {
             table.stale_interfaces().is_empty(),
             "a fresh entry is healthy"
         );
-        let real = if_index(&InterfaceName::loopback())
-            .expect("loopback has an ifindex")
-            .get();
+        let real = if_index(&InterfaceName::loopback()).expect("loopback has an ifindex");
         // Simulate a recreation: the kernel identity moved while the cache kept the old index.
-        table.entries[key.0 as usize].interface.ifindex = real + 1000;
+        let old = NonZeroU32::new(real.get() + 1000);
+        table.entries[key.0 as usize].interface.ifindex = old;
         assert_eq!(
             table.stale_interfaces(),
             [StaleInterface {
                 key,
-                cached: real + 1000,
-                cur: real
+                cached: old,
+                cur: Some(real)
             }]
         );
-        table.rebind_interface(key, real)?;
+        table.rebind_interface(key, Some(real))?;
         assert!(
             table.stale_interfaces().is_empty(),
             "the rebuild repaired the identity"
         );
-        assert_eq!(table.entries[key.0 as usize].interface.ifindex, real);
+        assert_eq!(table.entries[key.0 as usize].interface.ifindex, Some(real));
         Ok(())
     }
 
-    // An entry whose name no longer resolves reports absent (0); rebinding to 0 parks it:
-    // identity 0, addresses cleared (the egress gate closes), no join attempted (a join on
-    // index 0 would let the kernel pick an arbitrary interface).
+    // An entry whose name no longer resolves reports absent; rebinding to that parks it: no
+    // index, addresses cleared (the egress gate closes).
     #[test]
     #[cfg_attr(miri, ignore = "resolves a real interface")]
     fn rebind_to_absent_parks_the_entry() -> io::Result<()> {
         let mut table = InterfaceTable::new();
         let key = table.find_or_add_interface(&InterfaceName::loopback())?;
         table.entries[key.0 as usize].interface.name = "nf-gone0".parse().unwrap();
-        let real = if_index(&InterfaceName::loopback())
-            .expect("loopback has an ifindex")
-            .get();
+        let real = if_index(&InterfaceName::loopback()).expect("loopback has an ifindex");
         assert_eq!(
             table.stale_interfaces(),
             [StaleInterface {
                 key,
-                cached: real,
-                cur: 0
+                cached: Some(real),
+                cur: None
             }]
         );
-        table.rebind_interface(key, 0)?;
+        table.rebind_interface(key, None)?;
         assert!(
             table.entries[key.0 as usize].interface.addrs.v4().is_none(),
             "a parked entry's addresses clear, closing the egress gate"
@@ -745,7 +728,6 @@ mod tests {
         Ok(())
     }
 
-    // A join on index 0 would let the kernel pick an arbitrary interface.
     #[test]
     #[cfg_attr(miri, ignore = "resolves a real interface")]
     fn a_parked_interface_joins_nothing() -> io::Result<()> {
@@ -753,7 +735,7 @@ mod tests {
             return Ok(());
         };
         table.entries[key.0 as usize].interface.name = "nf-gone0".parse().unwrap();
-        table.rebind_interface(key, 0)?;
+        table.rebind_interface(key, None)?;
         assert!(table.test_memberships(key).test_socketless());
 
         let now = Instant::now();
@@ -780,12 +762,12 @@ mod tests {
         let Some((mut table, key)) = loopback_joined()? else {
             return Ok(());
         };
-        let ifindex = if_index(&InterfaceName::loopback()).expect("loopback has an ifindex");
-        table.rebind_interface(key, ifindex.get())?;
+        let ifindex = if_index(&InterfaceName::loopback());
+        table.rebind_interface(key, ifindex)?;
         assert!(table.test_memberships(key).test_socketless());
         assert!(!table.test_memberships(key).test_all_joined());
 
-        assert_eq!(table.converge_by_ifindex(ifindex, Instant::now()), Ok(()));
+        assert_eq!(table.converge(key, Instant::now()), Ok(()));
         assert!(table.test_memberships(key).test_all_joined());
         Ok(())
     }
@@ -797,9 +779,8 @@ mod tests {
         let Some((mut table, key)) = loopback_joined()? else {
             return Ok(());
         };
-        let ifindex = if_index(&InterfaceName::loopback()).expect("loopback has an ifindex");
-        table.rebind_interface(key, ifindex.get())?;
-        table.refresh_by_ifindex(ifindex)?;
+        table.rebind_interface(key, if_index(&InterfaceName::loopback()))?;
+        table.refresh(key)?;
         table.refresh_all();
         assert!(table.test_memberships(key).test_socketless());
         Ok(())

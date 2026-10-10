@@ -12,7 +12,7 @@ use crate::interface::{InterfaceEvent, InterfaceMonitor};
 use crate::linear_map::LinearMap;
 
 use super::CaptureKey;
-use super::interface_table::InterfaceTable;
+use super::interface_table::{InterfaceKey, InterfaceTable};
 
 /// The reconcile's periodic floor: an interface recreation whose every event was lost (macOS's
 /// silent route-socket overflow) is still detected.
@@ -91,18 +91,19 @@ impl InterfaceLifecycle {
         self.next_recheck = now + RECHECK_INTERVAL;
         let mut v4_moved = Vec::new();
         let mut touched = Vec::new();
-        for (ifindex, result) in table.refresh_all() {
+        for (key, result) in table.refresh_all() {
             match result {
                 Ok(change) => {
                     if change.v4 {
-                        v4_moved.push(ifindex);
+                        v4_moved.push(key);
                     }
                     if change.v4 || change.v6 {
-                        touched.push(ifindex);
+                        touched.push(key);
                     }
                 }
                 Err(e) => log::debug!(
-                    "re-reading ifindex {ifindex} failed: {e}; keeping its last-known addresses"
+                    "re-reading {} failed: {e}; keeping its last-known addresses",
+                    name_of(table, key)
                 ),
             }
         }
@@ -153,28 +154,29 @@ impl InterfaceLifecycle {
             self.max_seen_ifindex = self.max_seen_ifindex.max(Some(*ifindex));
         }
         let mut want_reconcile = overflow;
-        let mut v4_moved: Vec<u32> = Vec::new();
-        let mut touched: Vec<u32> = Vec::new();
+        let mut v4_moved = Vec::new();
+        let mut touched = Vec::new();
         if overflow {
             log::debug!("interface monitor overflow; re-resolving all interfaces");
-            for (ifindex, result) in table.refresh_all() {
+            for (key, result) in table.refresh_all() {
                 match result {
                     Ok(change) => {
                         if change.v4 {
-                            v4_moved.push(ifindex);
+                            v4_moved.push(key);
                         }
                         if change.v4 || change.v6 {
-                            touched.push(ifindex);
+                            touched.push(key);
                         }
                     }
                     Err(e) => {
                         // Can't confirm the address survived: treat it as moved rather than keep
                         // a listener on a possibly-vanished address.
                         log::warn!(
-                            "re-resolving ifindex {ifindex} failed: {e}; evicting its proxies"
+                            "re-resolving {} failed: {e}; evicting its proxies",
+                            name_of(table, key)
                         );
-                        v4_moved.push(ifindex);
-                        touched.push(ifindex);
+                        v4_moved.push(key);
+                        touched.push(key);
                     }
                 }
             }
@@ -182,35 +184,36 @@ impl InterfaceLifecycle {
             want_reconcile |= table.converge_all(now).is_err();
         } else {
             for (ifindex, is_link) in changed.iter() {
-                match table.refresh_by_ifindex(*ifindex) {
-                    Ok(Some(change)) => {
+                let Some(key) = table.key_by_ifindex(*ifindex) else {
+                    // Unwatched, unless it is ours recreated under a new index. With monotonic
+                    // indexes a Link event above the ceiling is a creation; FreeBSD reuses
+                    // indexes, so any Link event reconciles; macOS has no lifecycle events, so
+                    // any unknown-index event does.
+                    let creation = if InterfaceMonitor::INDEXES_MONOTONIC {
+                        *is_link && Some(*ifindex) > prior_ceiling
+                    } else {
+                        *is_link
+                    };
+                    if creation || !InterfaceMonitor::LIFECYCLE_EVENTS {
+                        want_reconcile = true;
+                    }
+                    continue;
+                };
+                match table.refresh(key) {
+                    Ok(change) => {
                         log::debug!("re-resolved interface (ifindex {ifindex}) after a change");
                         if change.v4 {
-                            v4_moved.push(ifindex.get());
+                            v4_moved.push(key);
                         }
                         // A bare Link event (carrier, MTU, flags) must not clear sessions.
                         if change.v4 || change.v6 {
-                            touched.push(ifindex.get());
+                            touched.push(key);
                         }
                         // A detached capture says the index is another interface's now: the
                         // reconcile joins after it re-binds.
-                        let attached = table.probe_by_ifindex(*ifindex);
-                        let gone = attached && table.converge_by_ifindex(*ifindex, now).is_err();
+                        let attached = table.probe(key);
+                        let gone = attached && table.converge(key, now).is_err();
                         if *is_link || !attached || gone {
-                            want_reconcile = true;
-                        }
-                    }
-                    Ok(None) => {
-                        // Unwatched, unless it is ours recreated under a new index. With monotonic
-                        // indexes a Link event above the ceiling is a creation; FreeBSD reuses
-                        // indexes, so any Link event reconciles; macOS has no lifecycle events,
-                        // so any unknown-index event does.
-                        let creation = if InterfaceMonitor::INDEXES_MONOTONIC {
-                            *is_link && Some(*ifindex) > prior_ceiling
-                        } else {
-                            *is_link
-                        };
-                        if creation || !InterfaceMonitor::LIFECYCLE_EVENTS {
                             want_reconcile = true;
                         }
                     }
@@ -220,8 +223,8 @@ impl InterfaceLifecycle {
                         log::warn!(
                             "re-resolving ifindex {ifindex} failed: {e}; evicting its proxies"
                         );
-                        v4_moved.push(ifindex.get());
-                        touched.push(ifindex.get());
+                        v4_moved.push(key);
+                        touched.push(key);
                         want_reconcile = true;
                     }
                 }
@@ -249,23 +252,25 @@ impl InterfaceLifecycle {
             let captures = table.captures_of(stale.key);
             let mut failed = false;
             match (stale.cached, stale.cur) {
-                (was, 0) => {
+                (Some(was), None) => {
                     log::info!(
                         "interface {name} is gone (was ifindex {was}); parking until it returns"
                     );
                 }
-                (0, now) => {
+                (None, Some(now)) => {
                     log::info!("interface {name}: returned as ifindex {now}; re-binding");
                 }
-                (was, now) => {
+                (Some(was), Some(now)) => {
                     log::info!("interface {name}: recreated (ifindex {was} -> {now}); re-binding");
                 }
+                // Parked and still absent is never stale.
+                (None, None) => {}
             }
             if let Err(e) = table.rebind_interface(stale.key, stale.cur) {
                 log::warn!("re-resolving {name} failed: {e}; will retry");
                 failed = true;
             }
-            if stale.cur != 0 {
+            if stale.cur.is_some() {
                 for capture in &captures {
                     match table.rebind_capture(*capture) {
                         Ok(true) => {}
@@ -279,7 +284,7 @@ impl InterfaceLifecycle {
                     }
                 }
             }
-            if stale.cur != 0 && !failed {
+            if stale.cur.is_some() && !failed {
                 for capture in &captures {
                     table.record_recovery(*capture);
                 }
@@ -290,7 +295,7 @@ impl InterfaceLifecycle {
             pending |= failed;
             rebuilt.push(Rebuilt {
                 captures,
-                removed: stale.cur == 0,
+                removed: stale.cur.is_none(),
             });
         }
         // Parked interfaces are not in the stale list; the fast cadence picks up their return.
@@ -305,11 +310,15 @@ impl InterfaceLifecycle {
     }
 }
 
-fn captures_for(table: &InterfaceTable, ifindexes: &[u32]) -> Vec<CaptureKey> {
-    ifindexes
+fn captures_for(table: &InterfaceTable, interfaces: &[InterfaceKey]) -> Vec<CaptureKey> {
+    interfaces
         .iter()
-        .flat_map(|ifindex| table.captures_at_ifindex(*ifindex))
+        .flat_map(|interface| table.captures_of(*interface))
         .collect()
+}
+
+fn name_of(table: &InterfaceTable, interface: InterfaceKey) -> &str {
+    table.interface_name(interface).map_or("?", |name| name)
 }
 
 fn open_monitor() -> Option<InterfaceMonitor> {

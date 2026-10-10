@@ -1306,9 +1306,8 @@ fn a_join_waits_for_the_address_family_and_joins_once_it_is_there() -> io::Resul
                 bare.name
             ))
     );
-    let ifindex = if_index(&bare.name).expect("the interface exists");
-    table.refresh_by_ifindex(ifindex)?;
-    assert_eq!(table.converge_by_ifindex(ifindex, Instant::now()), Ok(()));
+    table.refresh(key)?;
+    assert_eq!(table.converge(key, Instant::now()), Ok(()));
     assert!(table.test_memberships(key).test_all_joined());
     Ok(())
 }

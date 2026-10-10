@@ -3,6 +3,7 @@
 
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::num::NonZeroU32;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::ptr;
 use std::time::{Duration, Instant};
@@ -84,18 +85,18 @@ pub(super) fn nl_align(len: usize) -> usize {
         .expect("NLMSG_ALIGN of an in-buffer length is non-negative")
 }
 
-/// `if_name` is for tracing only; the dumps filter by `ifindex`. A 0 `ifindex` skips the dumps.
+/// `if_name` is for tracing only; the dumps filter by `ifindex`. No `ifindex` skips the dumps.
 ///
 /// # Errors
 /// A failed netlink socket, request or reply.
 pub(super) fn resolve(
     if_name: &str,
-    ifindex: u32,
+    ifindex: Option<NonZeroU32>,
 ) -> io::Result<(InterfaceAddresses, Option<u32>)> {
-    if ifindex == 0 {
+    let Some(ifindex) = ifindex else {
         log::debug!("{if_name}: no kernel ifindex; skipping the address dump");
         return Ok((InterfaceAddresses::default(), None));
-    }
+    };
 
     let sock = netlink_socket()?;
     let mut addrs = InterfaceAddresses::default();
@@ -299,7 +300,7 @@ fn nlmsg_error(buf: &[u8], offset: usize) -> io::Error {
 fn scan_addr(
     msg: &[u8],
     if_name: &str,
-    ifindex: u32,
+    ifindex: NonZeroU32,
     addrs: &mut InterfaceAddresses,
     v6_pick: &mut V6Pick,
 ) {
@@ -308,7 +309,7 @@ fn scan_addr(
         return;
     };
     let family = c_int::from(body.ifa_family);
-    if body.ifa_index != ifindex || (family != libc::AF_INET && family != libc::AF_INET6) {
+    if body.ifa_index != ifindex.get() || (family != libc::AF_INET && family != libc::AF_INET6) {
         return;
     }
 
@@ -366,7 +367,7 @@ fn scan_addr(
 fn scan_link(
     msg: &[u8],
     if_name: &str,
-    ifindex: u32,
+    ifindex: NonZeroU32,
     addrs: &mut InterfaceAddresses,
     mtu: &mut Option<u32>,
 ) {
@@ -374,7 +375,7 @@ fn scan_link(
     let Some(body) = read_at::<libc::ifinfomsg>(msg, body_at) else {
         return;
     };
-    if u32::try_from(body.ifi_index).ok() != Some(ifindex) {
+    if u32::try_from(body.ifi_index).ok() != Some(ifindex.get()) {
         return;
     }
 
@@ -398,6 +399,9 @@ fn scan_link(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ETH0: NonZeroU32 = NonZeroU32::new(5).unwrap();
+    const OTHER: NonZeroU32 = NonZeroU32::new(6).unwrap();
 
     /// Serialize `[len:u16][type:u16][value]` rtattr TLVs, each padded to 4 bytes, onto `buf`.
     fn push_attrs(buf: &mut Vec<u8>, attrs: &[(u16, &[u8])]) {
@@ -512,7 +516,7 @@ mod tests {
     fn scan_addr_records_a_usable_v4() {
         let msg = addr_msg(libc::AF_INET, 5, 0, &[(libc::IFA_ADDRESS, &[10, 0, 0, 1])]);
         let mut addrs = InterfaceAddresses::default();
-        scan_addr(&msg, "eth0", 5, &mut addrs, &mut V6Pick::default());
+        scan_addr(&msg, "eth0", ETH0, &mut addrs, &mut V6Pick::default());
         assert_eq!(addrs.v4, Some(Ipv4Addr::new(10, 0, 0, 1)));
     }
 
@@ -526,7 +530,7 @@ mod tests {
             &[(libc::IFA_ADDRESS, &[192, 0, 2, 2])],
         );
         let mut addrs = InterfaceAddresses::default();
-        scan_addr(&msg, "eth0", 5, &mut addrs, &mut V6Pick::default());
+        scan_addr(&msg, "eth0", ETH0, &mut addrs, &mut V6Pick::default());
         assert_eq!(
             addrs.v4_directed_broadcast(),
             Some(Ipv4Addr::new(192, 0, 2, 255))
@@ -546,7 +550,7 @@ mod tests {
             ],
         );
         let mut addrs = InterfaceAddresses::default();
-        scan_addr(&msg, "eth0", 5, &mut addrs, &mut V6Pick::default());
+        scan_addr(&msg, "eth0", ETH0, &mut addrs, &mut V6Pick::default());
         assert_eq!(addrs.v4, Some(Ipv4Addr::new(10, 0, 0, 1)));
     }
 
@@ -563,7 +567,7 @@ mod tests {
             ],
         );
         let mut addrs = InterfaceAddresses::default();
-        scan_addr(&msg, "eth0", 5, &mut addrs, &mut V6Pick::default());
+        scan_addr(&msg, "eth0", ETH0, &mut addrs, &mut V6Pick::default());
         assert_eq!(addrs.v4, None);
     }
 
@@ -571,7 +575,7 @@ mod tests {
     fn scan_addr_ignores_a_different_ifindex() {
         let msg = addr_msg(libc::AF_INET, 99, 0, &[(libc::IFA_ADDRESS, &[10, 0, 0, 1])]);
         let mut addrs = InterfaceAddresses::default();
-        scan_addr(&msg, "eth0", 5, &mut addrs, &mut V6Pick::default());
+        scan_addr(&msg, "eth0", ETH0, &mut addrs, &mut V6Pick::default());
         assert_eq!(addrs.v4, None);
     }
 
@@ -580,7 +584,7 @@ mod tests {
         let v6 = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
         let msg = addr_msg(libc::AF_INET6, 5, 0, &[(libc::IFA_ADDRESS, &v6.octets())]);
         let mut addrs = InterfaceAddresses::default();
-        scan_addr(&msg, "eth0", 5, &mut addrs, &mut V6Pick::default());
+        scan_addr(&msg, "eth0", ETH0, &mut addrs, &mut V6Pick::default());
         assert_eq!(addrs.v6, Some(v6));
     }
 
@@ -590,11 +594,11 @@ mod tests {
         let msg = link_msg(5, &[(libc::IFLA_ADDRESS, &mac)]);
         let mut addrs = InterfaceAddresses::default();
         let mut mtu = None;
-        scan_link(&msg, "eth0", 5, &mut addrs, &mut mtu);
+        scan_link(&msg, "eth0", ETH0, &mut addrs, &mut mtu);
         assert_eq!(addrs.mac, Some(MacAddr::from(mac)));
 
         let mut other = InterfaceAddresses::default();
-        scan_link(&msg, "eth0", 6, &mut other, &mut mtu);
+        scan_link(&msg, "eth0", OTHER, &mut other, &mut mtu);
         assert_eq!(other.mac, None);
     }
 
@@ -610,7 +614,7 @@ mod tests {
         );
         let mut addrs = InterfaceAddresses::default();
         let mut mtu = None;
-        scan_link(&msg, "eth0", 5, &mut addrs, &mut mtu);
+        scan_link(&msg, "eth0", ETH0, &mut addrs, &mut mtu);
         assert_eq!(addrs.mac, Some(MacAddr::from(mac)));
         assert_eq!(mtu, Some(1500));
     }
