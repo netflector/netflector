@@ -32,8 +32,9 @@ fn reconcile_repairs_a_moved_identity_and_arms_the_slow_tick() -> io::Result<()>
     let key = dispatcher
         .table
         .find_or_add_interface(&InterfaceName::loopback())?;
-    let real =
-        crate::interface::if_index(&InterfaceName::loopback()).expect("loopback has an ifindex");
+    let real = crate::interface::if_index(&InterfaceName::loopback())
+        .expect("loopback has an ifindex")
+        .get();
     dispatcher.table.set_test_ifindex(key, real + 1000);
     assert_ne!(dispatcher.table.stale_interfaces(), []);
 
@@ -104,8 +105,9 @@ fn reconcile_counts_a_recovery_on_the_interface_captures() -> io::Result<()> {
         .find_or_add_interface(&InterfaceName::loopback())?;
     let capture = dispatcher.table.add_test_capture(); // links the first interface
     assert_eq!(dispatcher.table.recoveries_of(capture), 0);
-    let real =
-        crate::interface::if_index(&InterfaceName::loopback()).expect("loopback has an ifindex");
+    let real = crate::interface::if_index(&InterfaceName::loopback())
+        .expect("loopback has an ifindex")
+        .get();
     dispatcher.table.set_test_ifindex(key, real + 1000); // as a recreation would move it
 
     dispatcher.reconcile_interfaces(&mut reactor);

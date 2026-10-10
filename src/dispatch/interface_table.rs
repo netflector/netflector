@@ -134,14 +134,18 @@ impl InterfaceTable {
             .map_or(Ok(()), |entry| entry.converge(now))
     }
 
-    /// [`converge`](Self::converge) for the interface at kernel index `ifindex`, never 0.
+    /// [`converge`](Self::converge) for the interface at kernel index `ifindex`.
     ///
     /// # Errors
     /// See [`Memberships::converge`].
-    pub(super) fn converge_by_ifindex(&mut self, ifindex: u32, now: Instant) -> Result<(), Gone> {
+    pub(super) fn converge_by_ifindex(
+        &mut self,
+        ifindex: NonZeroU32,
+        now: Instant,
+    ) -> Result<(), Gone> {
         self.entries
             .iter_mut()
-            .find(|entry| entry.interface.ifindex == ifindex)
+            .find(|entry| entry.interface.ifindex == ifindex.get())
             .map_or(Ok(()), |entry| entry.converge(now))
     }
 
@@ -325,17 +329,18 @@ impl InterfaceTable {
     }
 
     /// Re-resolve the interface at kernel index `ifindex` in place; `None` for one we don't
-    /// watch. `ifindex` is never 0 here: both monitor backends drop index-0 notifications, and
-    /// an overflow goes to [`refresh_all`](Self::refresh_all). A 0 would match the first parked
-    /// entry.
+    /// watch.
     ///
     /// # Errors
     /// A resolution syscall failure.
-    pub(super) fn refresh_by_ifindex(&mut self, ifindex: u32) -> io::Result<Option<AddressChange>> {
+    pub(super) fn refresh_by_ifindex(
+        &mut self,
+        ifindex: NonZeroU32,
+    ) -> io::Result<Option<AddressChange>> {
         let Some(entry) = self
             .entries
             .iter_mut()
-            .find(|entry| entry.interface.ifindex == ifindex)
+            .find(|entry| entry.interface.ifindex == ifindex.get())
         else {
             return Ok(None);
         };
@@ -354,25 +359,32 @@ impl InterfaceTable {
             .filter_map(|(index, entry)| {
                 let key = InterfaceKey(u32::try_from(index).expect("interface count fits a u32"));
                 let cached = entry.interface.ifindex;
-                // A failed lookup says nothing; reading it as 0 would park a healthy entry.
+                // A failed lookup says nothing; reading it as absent would park a healthy entry.
                 // Skip until the next tick.
-                let cur = if_index_checked(&entry.interface.name).ok()?.unwrap_or(0);
-                let dead_capture = |c: &CaptureEntry| {
-                    c.interface == key && c.capture.as_ref().is_some_and(|cap| !cap.attached(cur))
+                let found = if_index_checked(&entry.interface.name).ok()?;
+                let cur = found.map_or(0, NonZeroU32::get);
+                let dead_capture = |ifindex| {
+                    self.captures.iter().any(|c| {
+                        c.interface == key
+                            && c.capture.as_ref().is_some_and(|cap| !cap.attached(ifindex))
+                    })
                 };
-                (cur != cached || (cur != 0 && self.captures.iter().any(dead_capture)))
-                    .then_some(StaleInterface { key, cached, cur })
+                (cur != cached || found.is_some_and(dead_capture)).then_some(StaleInterface {
+                    key,
+                    cached,
+                    cur,
+                })
             })
             .collect()
     }
 
     /// Whether every capture on the interface at `ifindex` is still attached (vacuously true
     /// with no match): catches an index reused by a recreation as its first events arrive.
-    pub(super) fn probe_by_ifindex(&self, ifindex: u32) -> bool {
+    pub(super) fn probe_by_ifindex(&self, ifindex: NonZeroU32) -> bool {
         let Some(index) = self
             .entries
             .iter()
-            .position(|entry| entry.interface.ifindex == ifindex)
+            .position(|entry| entry.interface.ifindex == ifindex.get())
         else {
             return true;
         };
@@ -613,7 +625,7 @@ mod tests {
             "re-resolving the unchanged loopback reports no v4 move, the bit the DIAL eviction gates on",
         );
         assert!(
-            table.refresh_by_ifindex(u32::MAX)?.is_none(),
+            table.refresh_by_ifindex(NonZeroU32::MAX)?.is_none(),
             "an ifindex we don't watch should refresh nothing",
         );
         Ok(())
@@ -679,7 +691,9 @@ mod tests {
             table.stale_interfaces().is_empty(),
             "a fresh entry is healthy"
         );
-        let real = if_index(&InterfaceName::loopback()).expect("loopback has an ifindex");
+        let real = if_index(&InterfaceName::loopback())
+            .expect("loopback has an ifindex")
+            .get();
         // Simulate a recreation: the kernel identity moved while the cache kept the old index.
         table.entries[key.0 as usize].interface.ifindex = real + 1000;
         assert_eq!(
@@ -708,7 +722,9 @@ mod tests {
         let mut table = InterfaceTable::new();
         let key = table.find_or_add_interface(&InterfaceName::loopback())?;
         table.entries[key.0 as usize].interface.name = "nf-gone0".parse().unwrap();
-        let real = if_index(&InterfaceName::loopback()).expect("loopback has an ifindex");
+        let real = if_index(&InterfaceName::loopback())
+            .expect("loopback has an ifindex")
+            .get();
         assert_eq!(
             table.stale_interfaces(),
             [StaleInterface {
@@ -764,8 +780,8 @@ mod tests {
         let Some((mut table, key)) = loopback_joined()? else {
             return Ok(());
         };
-        let ifindex = table.entries[key.0 as usize].interface.ifindex;
-        table.rebind_interface(key, ifindex)?;
+        let ifindex = if_index(&InterfaceName::loopback()).expect("loopback has an ifindex");
+        table.rebind_interface(key, ifindex.get())?;
         assert!(table.test_memberships(key).test_socketless());
         assert!(!table.test_memberships(key).test_all_joined());
 
@@ -781,8 +797,8 @@ mod tests {
         let Some((mut table, key)) = loopback_joined()? else {
             return Ok(());
         };
-        let ifindex = table.entries[key.0 as usize].interface.ifindex;
-        table.rebind_interface(key, ifindex)?;
+        let ifindex = if_index(&InterfaceName::loopback()).expect("loopback has an ifindex");
+        table.rebind_interface(key, ifindex.get())?;
         table.refresh_by_ifindex(ifindex)?;
         table.refresh_all();
         assert!(table.test_memberships(key).test_socketless());

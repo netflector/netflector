@@ -37,8 +37,8 @@ pub(super) fn confine(
                 format!("interface {name} not found"),
             )
         })?;
-        let index =
-            libc::c_int::try_from(index).map_err(|_| io::Error::other("ifindex too large"))?;
+        let index = libc::c_int::try_from(index.get())
+            .map_err(|_| io::Error::other("ifindex too large"))?;
         crate::sys::setsockopt(fd, libc::IPPROTO_IP, libc::IP_BOUND_IF, &index)?;
     }
     log::trace!("connect egress pinned to {name}");

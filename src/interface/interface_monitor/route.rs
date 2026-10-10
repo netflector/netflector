@@ -2,6 +2,7 @@
 //! offset: the `ifa_msghdr`/`if_msghdr` tails diverge across the BSDs.
 
 use std::io;
+use std::num::NonZeroU32;
 use std::os::fd::{AsRawFd, OwnedFd};
 
 use libc::c_int;
@@ -62,12 +63,12 @@ pub(super) fn for_each_change(buf: &[u8], on_change: &mut impl FnMut(InterfaceEv
         let hit = match msg_type {
             libc::RTM_NEWADDR | libc::RTM_DELADDR | libc::RTM_IFINFO => Some((
                 INDEX_OFFSET,
-                InterfaceEvent::Address as fn(u32) -> InterfaceEvent,
+                InterfaceEvent::Address as fn(NonZeroU32) -> InterfaceEvent,
             )),
             #[cfg(target_os = "freebsd")]
             libc::RTM_IFANNOUNCE => Some((
                 ANNOUNCE_INDEX_OFFSET,
-                InterfaceEvent::Link as fn(u32) -> InterfaceEvent,
+                InterfaceEvent::Link as fn(NonZeroU32) -> InterfaceEvent,
             )),
             _ => {
                 // PF_ROUTE is unfiltered; this trace is the only trail of what a drain saw.
@@ -80,13 +81,13 @@ pub(super) fn for_each_change(buf: &[u8], on_change: &mut impl FnMut(InterfaceEv
         {
             let index =
                 u16::from_ne_bytes([buf[offset + index_offset], buf[offset + index_offset + 1]]);
-            if index == 0 {
-                // Kernel indices are >= 1.
-                log::warn!("interface monitor: dropping a change with no valid interface index");
-            } else {
-                let event = event(u32::from(index));
+            if let Some(index) = NonZeroU32::new(u32::from(index)) {
+                let event = event(index);
                 log::trace!("interface monitor: {event:?}");
                 on_change(event);
+            } else {
+                // Kernel indices are >= 1.
+                log::warn!("interface monitor: dropping a change with no valid interface index");
             }
         }
         offset += msglen;
@@ -103,6 +104,10 @@ pub(super) fn sender_ok(_src: &libc::sockaddr_storage, _len: libc::socklen_t) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn nonzero(index: u32) -> NonZeroU32 {
+        NonZeroU32::new(index).unwrap()
+    }
 
     /// A routing message of `msglen` bytes: header (msglen, type) plus `index` at its fixed
     /// offset, the rest zero.
@@ -127,7 +132,10 @@ mod tests {
         // RTM_IFINFO is a flap/MAC change, not a lifecycle event, so both report Address.
         assert_eq!(
             seen,
-            [InterfaceEvent::Address(7), InterfaceEvent::Address(9)]
+            [
+                InterfaceEvent::Address(nonzero(7)),
+                InterfaceEvent::Address(nonzero(9))
+            ]
         );
     }
 
@@ -142,7 +150,7 @@ mod tests {
         m[ANNOUNCE_INDEX_OFFSET..ANNOUNCE_INDEX_OFFSET + 2].copy_from_slice(&7u16.to_ne_bytes());
         let mut seen = Vec::new();
         for_each_change(&m, &mut |e| seen.push(e));
-        assert_eq!(seen, [InterfaceEvent::Link(7)]);
+        assert_eq!(seen, [InterfaceEvent::Link(nonzero(7))]);
     }
 
     #[test]
