@@ -20,7 +20,7 @@ mod pair_tests;
 pub(crate) use self::counters::{MessageType, Outcome};
 pub(crate) use self::datagram::DatagramSource;
 pub(crate) use self::dial_context::{DialContext, DialProxyKey};
-pub(crate) use self::multicast::{join_capped, join_deferrable, join_waits_for_family};
+pub(crate) use self::multicast::{JoinError, Wanted};
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -295,18 +295,22 @@ impl PacketDispatcher {
         self.registrations.remove(key.0);
     }
 
-    /// Join `group` on the interface behind `capture`; the reconcile re-joins it on a recreated
-    /// interface.
+    /// Join `group` on the interface behind `capture`, for as long as the daemon runs: a group
+    /// the interface can't take yet, or loses with a recreation, is joined when it can be.
     ///
     /// # Errors
-    /// The join's OS error; [`join_deferrable`] tells an interface already gone from a hard
-    /// failure, [`join_waits_for_family`] one without the group's address family yet.
-    pub(crate) fn join_group(&mut self, capture: CaptureKey, group: IpAddr) -> io::Result<()> {
+    /// The group is neither joined nor waiting for the interface to change.
+    pub(crate) fn join_group(
+        &mut self,
+        capture: CaptureKey,
+        group: IpAddr,
+        wanted: Wanted,
+    ) -> Result<(), JoinError> {
         let Some(interface) = self.table.interface_of(capture) else {
             log::warn!("join_group: capture {capture:?} unknown; group {group} not joined");
             return Ok(());
         };
-        self.table.join_on(interface, group)
+        self.table.join_on(interface, group, wanted, Instant::now())
     }
 
     pub(crate) fn interface_mtu(&self, capture: CaptureKey) -> Option<u32> {
@@ -614,7 +618,7 @@ impl PacketDispatcher {
     }
 
     fn refresh_changed_interfaces(&mut self, reactor: &mut Reactor) {
-        let changes = self.lifecycle.drain(&mut self.table);
+        let changes = self.lifecycle.drain(&mut self.table, Instant::now());
         self.apply_interface_changes(&changes, reactor);
     }
 
@@ -652,7 +656,7 @@ impl PacketDispatcher {
     }
 
     fn reconcile_interfaces(&mut self, reactor: &mut Reactor) {
-        for rebuilt in self.lifecycle.reconcile(&mut self.table) {
+        for rebuilt in self.lifecycle.reconcile(&mut self.table, Instant::now()) {
             let reason = if rebuilt.removed {
                 "after its interface was removed"
             } else {
@@ -685,6 +689,7 @@ impl Handler for PacketDispatcher {
             .chain(self.report.as_ref().map(|r| r.next))
             .chain(Some(self.lifecycle.next_reconcile()))
             .chain(Some(self.lifecycle.next_recheck()))
+            .chain(self.table.next_join_retry())
             .min()
     }
 
@@ -714,11 +719,13 @@ impl Handler for PacketDispatcher {
         }
 
         if now >= self.lifecycle.next_recheck() {
-            let changes = self.lifecycle.recheck(&mut self.table);
+            let changes = self.lifecycle.recheck(&mut self.table, now);
             self.apply_interface_changes(&changes, reactor);
         }
 
-        if now >= self.lifecycle.next_reconcile() {
+        let joins_found_gone = self.table.next_join_retry().is_some_and(|due| now >= due)
+            && self.table.converge_all(now).is_err();
+        if joins_found_gone || now >= self.lifecycle.next_reconcile() {
             self.reconcile_interfaces(reactor);
         }
     }

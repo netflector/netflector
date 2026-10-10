@@ -1,7 +1,8 @@
 //! Interface lifecycle: keeping the table current as addresses change and as the kernel destroys
 //! and recreates interfaces. The monitor drain refreshes what a notification names, and a periodic
 //! re-read catches what none announces; the reconcile re-points a stale entry at its name's
-//! current interface (or parks it absent) and re-binds its captures in place.
+//! current interface (or parks it absent) and re-binds its captures in place. Each of them ends
+//! by attempting the groups the interface has not joined.
 
 use std::os::fd::RawFd;
 use std::time::{Duration, Instant};
@@ -85,8 +86,8 @@ impl InterfaceLifecycle {
 
     /// A failed read keeps the last-known addresses: nothing says they moved, and the next pass
     /// retries.
-    pub(super) fn recheck(&mut self, table: &mut InterfaceTable) -> Changes {
-        self.next_recheck = Instant::now() + RECHECK_INTERVAL;
+    pub(super) fn recheck(&mut self, table: &mut InterfaceTable, now: Instant) -> Changes {
+        self.next_recheck = now + RECHECK_INTERVAL;
         let mut v4_moved = Vec::new();
         let mut touched = Vec::new();
         for (ifindex, result) in table.refresh_all() {
@@ -107,7 +108,7 @@ impl InterfaceLifecycle {
         Changes {
             v4_moved: captures_for(table, &v4_moved),
             touched: captures_for(table, &touched),
-            reconcile: false,
+            reconcile: table.converge_all(now).is_err(),
         }
     }
 
@@ -115,9 +116,9 @@ impl InterfaceLifecycle {
     /// per wakeup; an [`InterfaceEvent::Overflow`] re-resolves every interface. Best-effort: a
     /// failure logs and the last-known addresses stand. [`Changes::reconcile`] is set by anything
     /// that can announce a destroyed or recreated interface: a Link event on a watched interface,
-    /// an unknown index that reads as a creation, an overflow, or a capture whose kernel binding
-    /// died behind a matched index.
-    pub(super) fn drain(&mut self, table: &mut InterfaceTable) -> Changes {
+    /// an unknown index that reads as a creation, an overflow, a capture whose kernel binding
+    /// died behind a matched index, or a join finding its index dead.
+    pub(super) fn drain(&mut self, table: &mut InterfaceTable, now: Instant) -> Changes {
         let Some(monitor) = self.monitor.as_mut() else {
             return Changes::default();
         };
@@ -176,6 +177,8 @@ impl InterfaceLifecycle {
                     }
                 }
             }
+            // The lost events may have been the ones to retry a group.
+            want_reconcile |= table.converge_all(now).is_err();
         } else {
             for (ifindex, is_link) in changed.iter() {
                 match table.refresh_by_ifindex(*ifindex) {
@@ -188,7 +191,11 @@ impl InterfaceLifecycle {
                         if change.v4 || change.v6 {
                             touched.push(*ifindex);
                         }
-                        if *is_link || !table.probe_by_ifindex(*ifindex) {
+                        // A detached capture says the index is another interface's now: the
+                        // reconcile joins after it re-binds.
+                        let attached = table.probe_by_ifindex(*ifindex);
+                        let gone = attached && table.converge_by_ifindex(*ifindex, now).is_err();
+                        if *is_link || !attached || gone {
                             want_reconcile = true;
                         }
                     }
@@ -227,9 +234,10 @@ impl InterfaceLifecycle {
     }
 
     /// Repair every stale interface: re-point it at its name's current interface (or park it
-    /// absent) and re-bind its captures behind their stable keys. Re-arms the next pass at
-    /// [`RECONCILE_TICK`], or [`RECONCILE_RETRY`] while an interface is absent or a step failed.
-    pub(super) fn reconcile(&mut self, table: &mut InterfaceTable) -> Vec<Rebuilt> {
+    /// absent), re-bind its captures behind their stable keys, then join its groups. Re-arms the
+    /// next pass at [`RECONCILE_TICK`], or [`RECONCILE_RETRY`] while an interface is absent or a
+    /// step failed.
+    pub(super) fn reconcile(&mut self, table: &mut InterfaceTable, now: Instant) -> Vec<Rebuilt> {
         let mut pending = false;
         let mut rebuilt = Vec::new();
         for stale in table.stale_interfaces() {
@@ -252,34 +260,9 @@ impl InterfaceLifecycle {
                     log::info!("interface {name}: recreated (ifindex {was} -> {now}); re-binding");
                 }
             }
-            match table.rebind_interface(stale.key, stale.cur) {
-                Ok(counts) => {
-                    if counts.failed > 0 {
-                        log::warn!(
-                            "{} group membership(s) on {name} did not re-join; that traffic is \
-                             not reflected",
-                            counts.failed
-                        );
-                    }
-                    if counts.deferred > 0 {
-                        log::warn!(
-                            "{} group membership(s) on {name} not re-joined yet: the interface \
-                             is gone again; retrying when it returns",
-                            counts.deferred
-                        );
-                    }
-                    if counts.waiting > 0 {
-                        log::info!(
-                            "{} group membership(s) on {name} wait until it has an address of \
-                             their family",
-                            counts.waiting
-                        );
-                    }
-                }
-                Err(e) => {
-                    log::warn!("re-resolving {name} failed: {e}; will retry");
-                    failed = true;
-                }
+            if let Err(e) = table.rebind_interface(stale.key, stale.cur) {
+                log::warn!("re-resolving {name} failed: {e}; will retry");
+                failed = true;
             }
             if stale.cur != 0 {
                 for capture in &captures {
@@ -300,6 +283,8 @@ impl InterfaceLifecycle {
                     table.record_recovery(*capture);
                 }
                 log::info!("interface {name}: recovery complete");
+                // Gone again already: the next pass parks it.
+                failed = table.converge(stale.key, now).is_err();
             }
             pending |= failed;
             rebuilt.push(Rebuilt {
@@ -309,7 +294,7 @@ impl InterfaceLifecycle {
         }
         // Parked interfaces are not in the stale list; the fast cadence picks up their return.
         let retry = pending || table.any_absent();
-        self.next_reconcile = Instant::now()
+        self.next_reconcile = now
             + if retry {
                 RECONCILE_RETRY
             } else {

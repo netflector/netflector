@@ -4,7 +4,7 @@
 //! shared [`SimpleReflector`] runs with an admit-all classifier.
 
 use crate::config::Reflector;
-use crate::dispatch::{Filter, MessageType, PacketDispatcher, PortSet};
+use crate::dispatch::{Filter, MessageType, PacketDispatcher, PortSet, Wanted};
 
 use super::{
     BuildError, Delivery, Emit, InterfaceMap, SimpleReflector, Verdict, require_egress_family,
@@ -16,8 +16,8 @@ fn relay(_payload: &[u8]) -> Verdict {
 }
 
 /// # Errors
-/// [`BuildError::UnknownInterface`], [`BuildError::RequiredFamilyUnavailable`] or
-/// [`BuildError::GroupJoin`].
+/// [`BuildError::UnknownInterface`], [`BuildError::RequiredFamilyUnavailable`],
+/// [`BuildError::InterfaceGone`] or [`BuildError::GroupJoin`].
 pub(crate) fn build(
     reflector: &Reflector,
     interfaces: &InterfaceMap,
@@ -43,9 +43,12 @@ pub(crate) fn build(
             dispatcher,
             ingress,
             *group,
-            "UDP relay",
             &reflector.source_if,
-            log::Level::Warn,
+            Wanted {
+                label: "UDP relay",
+                required: reflector.address_family.requires(*group),
+                wait_level: log::Level::Warn,
+            },
         )?;
     }
 
