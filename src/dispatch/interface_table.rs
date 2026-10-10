@@ -1,10 +1,11 @@
-//! The dispatcher's interface table: every interface with its multicast joiner, and every capture
-//! linked to its interface, all addressed by `Copy` index keys.
+//! The dispatcher's interface table: every interface with its group memberships, and every
+//! capture linked to its interface, all addressed by `Copy` index keys.
 
 use std::io;
 use std::net::IpAddr;
 use std::num::NonZeroU32;
 use std::os::fd::{AsRawFd, RawFd};
+use std::time::Instant;
 
 use crate::capture::Capture;
 use crate::interface::{
@@ -13,7 +14,7 @@ use crate::interface::{
 
 use super::CaptureKey;
 use super::counters::{CaptureCounters, Outcome};
-use super::multicast::{MulticastJoiner, RejoinCounts};
+use super::multicast::{Gone, JoinError, Memberships, Target, Wanted};
 
 /// A `Copy` index into the table's interface entries; insert-only, so stable.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -42,17 +43,26 @@ struct CaptureEntry {
 
 struct InterfaceEntry {
     interface: Interface,
-    joiner: MulticastJoiner,
+    /// `None`: `--no-join`.
+    memberships: Option<Memberships>,
 }
 
 impl InterfaceEntry {
-    /// Re-resolve the interface, then retry the joins waiting for its address family.
-    fn refresh(&mut self) -> io::Result<AddressChange> {
-        let change = self.interface.refresh();
-        if let Some(ifindex) = NonZeroU32::new(self.interface.ifindex) {
-            self.joiner.retry_waiting(ifindex);
-        }
-        change
+    /// `None` while parked absent, or with `--no-join`.
+    fn join_target(&mut self) -> Option<(&mut Memberships, Target<'_>)> {
+        let ifindex = NonZeroU32::new(self.interface.ifindex)?;
+        let target = Target {
+            name: &self.interface.name,
+            ifindex,
+        };
+        Some((self.memberships.as_mut()?, target))
+    }
+
+    /// See [`Memberships::converge`].
+    fn converge(&mut self, now: Instant) -> Result<(), Gone> {
+        self.join_target().map_or(Ok(()), |(memberships, target)| {
+            memberships.converge(target, now)
+        })
     }
 }
 
@@ -83,29 +93,78 @@ impl InterfaceTable {
     fn add_interface(&mut self, interface: Interface) -> InterfaceKey {
         let key =
             InterfaceKey(u32::try_from(self.entries.len()).expect("interface count fits a u32"));
-        let joiner = if self.join_groups {
-            MulticastJoiner::new()
-        } else {
-            MulticastJoiner::inert()
-        };
-        self.entries.push(InterfaceEntry { interface, joiner });
+        let memberships = self.join_groups.then(Memberships::new);
+        self.entries.push(InterfaceEntry {
+            interface,
+            memberships,
+        });
         key
     }
 
-    /// Join `group` on `interface` and record it for the rebuild's replay.
+    /// Want `group` on `interface` and join it. A parked interface joins it when it returns.
     ///
     /// # Errors
-    /// The joiner's OS error; see [`MulticastJoiner::join`].
-    pub(super) fn join_on(&mut self, interface: InterfaceKey, group: IpAddr) -> io::Result<()> {
+    /// See [`Memberships::join`].
+    pub(super) fn join_on(
+        &mut self,
+        interface: InterfaceKey,
+        group: IpAddr,
+        wanted: Wanted,
+        now: Instant,
+    ) -> Result<(), JoinError> {
         // Startup-only with a fresh key, so the index is in range.
         let entry = &mut self.entries[interface.0 as usize];
-        if let Some(ifindex) = NonZeroU32::new(entry.interface.ifindex) {
-            entry.joiner.join(group, ifindex)
+        if let Some((memberships, target)) = entry.join_target() {
+            memberships.join(group, wanted, target, now)
         } else {
-            // Never join on index 0; record for the rebuild's replay.
-            entry.joiner.record(group);
+            if let Some(memberships) = &mut entry.memberships {
+                memberships.add(group, wanted);
+            }
             Ok(())
         }
+    }
+
+    /// Attempt the groups not joined on `interface`.
+    ///
+    /// # Errors
+    /// See [`Memberships::converge`].
+    pub(super) fn converge(&mut self, interface: InterfaceKey, now: Instant) -> Result<(), Gone> {
+        self.entries
+            .get_mut(interface.0 as usize)
+            .map_or(Ok(()), |entry| entry.converge(now))
+    }
+
+    /// [`converge`](Self::converge) for the interface at kernel index `ifindex`, never 0.
+    ///
+    /// # Errors
+    /// See [`Memberships::converge`].
+    pub(super) fn converge_by_ifindex(&mut self, ifindex: u32, now: Instant) -> Result<(), Gone> {
+        self.entries
+            .iter_mut()
+            .find(|entry| entry.interface.ifindex == ifindex)
+            .map_or(Ok(()), |entry| entry.converge(now))
+    }
+
+    /// [`converge`](Self::converge) for every interface.
+    ///
+    /// # Errors
+    /// [`Gone`] if any interface reported it; the others converge all the same.
+    pub(super) fn converge_all(&mut self, now: Instant) -> Result<(), Gone> {
+        let mut result = Ok(());
+        for entry in &mut self.entries {
+            if entry.converge(now).is_err() {
+                result = Err(Gone);
+            }
+        }
+        result
+    }
+
+    /// When the earliest failed join is due its retry.
+    pub(super) fn next_join_retry(&self) -> Option<Instant> {
+        self.entries
+            .iter()
+            .filter_map(|entry| entry.memberships.as_ref()?.next_retry())
+            .min()
     }
 
     /// # Errors
@@ -280,7 +339,7 @@ impl InterfaceTable {
         else {
             return Ok(None);
         };
-        entry.refresh().map(Some)
+        entry.interface.refresh().map(Some)
     }
 
     /// Every interface whose kernel identity no longer matches the cache: the identity moved
@@ -335,36 +394,30 @@ impl InterfaceTable {
     }
 
     /// Re-point interface `key` at kernel index `cur` (0 = parked absent), re-resolve its
-    /// addresses and re-join its groups on fresh sockets. No join while absent: a join on index
-    /// 0 lets the kernel pick an arbitrary interface. The refresh still runs while absent, so
-    /// the addresses clear and the egress gate closes. The ifindex is written first: the Linux
-    /// resolver keys its dumps by it. Captures re-bind separately
-    /// ([`rebind_capture`](Self::rebind_capture)).
+    /// addresses and drop its memberships with their sockets. The refresh still runs while
+    /// absent, so the addresses clear and the egress gate closes. The ifindex is written first:
+    /// the Linux resolver keys its dumps by it. The captures re-bind
+    /// ([`rebind_capture`](Self::rebind_capture)) and the groups join again
+    /// ([`converge`](Self::converge)) separately, in that order: the captures' probe then
+    /// vouches for the interface the groups joined on.
     ///
     /// # Errors
     /// A resolution syscall failure. The identity is rolled back so the entry stays visibly
     /// stale and the retry re-runs the rebuild; committed, it would scan as healthy while
-    /// carrying the old interface's addresses. The joins are replayed before the rollback
-    /// either way: a transient resolver error must not leave the interface deaf.
-    pub(super) fn rebind_interface(
-        &mut self,
-        key: InterfaceKey,
-        cur: u32,
-    ) -> io::Result<RejoinCounts> {
+    /// carrying the old interface's addresses.
+    pub(super) fn rebind_interface(&mut self, key: InterfaceKey, cur: u32) -> io::Result<()> {
         // Keys come from this table's own scan, so the index is in range.
         let entry = &mut self.entries[key.0 as usize];
         let previous = entry.interface.ifindex;
         entry.interface.ifindex = cur;
-        entry.joiner.reset();
+        if let Some(memberships) = &mut entry.memberships {
+            memberships.rebase();
+        }
         let refreshed = entry.interface.refresh();
-        let counts = match NonZeroU32::new(cur) {
-            None => RejoinCounts::default(),
-            Some(ifindex) => entry.joiner.rejoin(ifindex),
-        };
         if refreshed.is_err() {
             entry.interface.ifindex = previous;
         }
-        refreshed.map(|_| counts)
+        refreshed.map(|_| ())
     }
 
     pub(super) fn captures_of(&self, interface: InterfaceKey) -> Vec<CaptureKey> {
@@ -413,7 +466,7 @@ impl InterfaceTable {
     pub(super) fn refresh_all(&mut self) -> Vec<(u32, io::Result<AddressChange>)> {
         self.entries
             .iter_mut()
-            .map(|entry| (entry.interface.ifindex, entry.refresh()))
+            .map(|entry| (entry.interface.ifindex, entry.interface.refresh()))
             .collect()
     }
 
@@ -439,6 +492,7 @@ mod tests {
     use super::*;
     use crate::dispatch::MessageType;
     use crate::dispatch::multicast::join_unsupported;
+    use crate::dispatch::multicast::tests::BEST_EFFORT;
     use crate::interface::if_index;
     use crate::test_support::{Capability, skip};
 
@@ -453,11 +507,14 @@ mod tests {
             self.entries[interface.0 as usize].interface.ifindex = ifindex;
         }
 
-        /// Whether a join on `interface` waits for its address family, and whether one failed.
-        #[cfg(target_os = "macos")]
-        pub(in crate::dispatch) fn test_join_state(&self, interface: InterfaceKey) -> (bool, bool) {
-            let joiner = &self.entries[interface.0 as usize].joiner;
-            (joiner.test_waiting(), joiner.test_reported())
+        pub(in crate::dispatch) fn test_memberships(
+            &self,
+            interface: InterfaceKey,
+        ) -> &Memberships {
+            self.entries[interface.0 as usize]
+                .memberships
+                .as_ref()
+                .expect("the table joins groups")
         }
 
         /// Rename an entry out from under its kernel interface, standing in for a vanished
@@ -562,34 +619,51 @@ mod tests {
         Ok(())
     }
 
-    // join_on records a group on the interface's joiner and joins it; a later refresh re-attempts
-    // the recorded memberships idempotently. Unprivileged: loopback accepts the join and resolving
-    // the interface needs no CAP_NET_RAW.
-    #[test]
-    #[cfg_attr(miri, ignore = "resolves a real interface")]
-    fn join_on_records_a_membership_and_refresh_re_attempts_it() -> io::Result<()> {
+    const MDNS_GROUPS: [IpAddr; 2] = [
+        IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)),
+        IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb)),
+    ];
+
+    /// The loopback interface with both mDNS groups joined, or `None` after a skip note: QEMU
+    /// user-mode emulation doesn't implement the join.
+    fn loopback_joined() -> io::Result<Option<(InterfaceTable, InterfaceKey)>> {
         let mut table = InterfaceTable::new();
-        let iface = table.find_or_add_interface(&InterfaceName::loopback())?;
-        for group in [
-            IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)),
-            IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb)),
-        ] {
-            // QEMU user-mode emulation doesn't implement the join setsockopt; self-skip there.
-            if let Err(e) = table.join_on(iface, group) {
-                if join_unsupported(&e) {
-                    skip(Capability::Membership, e);
-                    return Ok(());
+        let key = table.find_or_add_interface(&InterfaceName::loopback())?;
+        for group in MDNS_GROUPS {
+            match table.join_on(key, group, BEST_EFFORT, Instant::now()) {
+                Ok(()) => {}
+                Err(e) if join_unsupported(&e) => {
+                    skip(Capability::Membership, format!("{e:?}"));
+                    return Ok(None);
                 }
-                return Err(e);
+                Err(e) => panic!("kernel must accept the {group} join on loopback: {e:?}"),
             }
         }
-        // The recorded memberships survive a refresh, re-attempted idempotently (each interface
-        // resolves cleanly).
-        let results = table.refresh_all();
-        assert!(
-            results.iter().all(|(_, r)| r.is_ok()),
-            "re-resolving every interface succeeds",
-        );
+        Ok(Some((table, key)))
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "resolves a real interface")]
+    fn join_on_joins_the_group_on_the_interface() -> io::Result<()> {
+        let Some((mut table, key)) = loopback_joined()? else {
+            return Ok(());
+        };
+        assert!(table.test_memberships(key).test_all_joined());
+        assert_eq!(table.converge_all(Instant::now()), Ok(()));
+        assert_eq!(table.next_join_retry(), None);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "resolves a real interface")]
+    fn a_table_without_group_joins_wants_nothing() -> io::Result<()> {
+        let mut table = InterfaceTable::without_group_joins();
+        let key = table.find_or_add_interface(&InterfaceName::loopback())?;
+        table
+            .join_on(key, MDNS_GROUPS[0], BEST_EFFORT, Instant::now())
+            .expect("nothing to fail");
+        assert!(table.entries[key.0 as usize].memberships.is_none());
+        assert_eq!(table.converge_all(Instant::now()), Ok(()));
         Ok(())
     }
 
@@ -655,59 +729,64 @@ mod tests {
         Ok(())
     }
 
-    // The overflow response must not touch a parked interface's joiner: a rejoin there would
-    // have targeted index 0, which the kernel resolves to an arbitrary interface. Socket-less
-    // after the park, the joiner must stay socket-less through refresh_all.
+    // A join on index 0 would let the kernel pick an arbitrary interface.
     #[test]
     #[cfg_attr(miri, ignore = "resolves a real interface")]
-    fn refresh_all_does_not_rejoin_a_parked_interface() -> io::Result<()> {
-        let mut table = InterfaceTable::new();
-        let key = table.find_or_add_interface(&InterfaceName::loopback())?;
-        if let Err(e) = table.join_on(key, IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251))) {
-            if join_unsupported(&e) {
-                skip(Capability::Membership, e);
-                return Ok(());
-            }
-            return Err(e);
-        }
+    fn a_parked_interface_joins_nothing() -> io::Result<()> {
+        let Some((mut table, key)) = loopback_joined()? else {
+            return Ok(());
+        };
         table.entries[key.0 as usize].interface.name = "nf-gone0".parse().unwrap();
-        table.rebind_interface(key, 0)?; // park: joiner reset, no rejoin
+        table.rebind_interface(key, 0)?;
+        assert!(table.test_memberships(key).test_socketless());
+
+        let now = Instant::now();
         table.refresh_all();
-        assert!(
-            table.entries[key.0 as usize].joiner.test_socketless(),
-            "a parked interface's joiner stays socket-less through the overflow refresh"
-        );
+        assert_eq!(table.converge_all(now), Ok(()));
+        assert_eq!(table.converge(key, now), Ok(()));
+        table
+            .join_on(
+                key,
+                IpAddr::V4(Ipv4Addr::new(239, 255, 255, 250)),
+                BEST_EFFORT,
+                now,
+            )
+            .expect("wanted for the return");
+        assert!(table.test_memberships(key).test_socketless());
         Ok(())
     }
 
-    // A refresh retries only a join waiting for its address family: on a destroyed interface's
-    // dead index any other retry would only fail.
+    // The rebuild drops the memberships with their sockets, and the converge after the captures
+    // re-bind joins every group again.
     #[test]
     #[cfg_attr(miri, ignore = "resolves a real interface")]
-    fn refresh_by_ifindex_joins_nothing() -> io::Result<()> {
-        let (mut table, key) = loopback_with_a_pending_join()?;
+    fn a_rebuilt_interface_joins_its_groups_at_the_next_converge() -> io::Result<()> {
+        let Some((mut table, key)) = loopback_joined()? else {
+            return Ok(());
+        };
         let ifindex = table.entries[key.0 as usize].interface.ifindex;
-        table.refresh_by_ifindex(ifindex)?;
-        assert!(table.entries[key.0 as usize].joiner.test_socketless());
+        table.rebind_interface(key, ifindex)?;
+        assert!(table.test_memberships(key).test_socketless());
+        assert!(!table.test_memberships(key).test_all_joined());
+
+        assert_eq!(table.converge_by_ifindex(ifindex, Instant::now()), Ok(()));
+        assert!(table.test_memberships(key).test_all_joined());
         Ok(())
     }
 
+    // Reading an interface's addresses again joins nothing by itself.
     #[test]
     #[cfg_attr(miri, ignore = "resolves a real interface")]
-    fn refresh_all_joins_nothing() -> io::Result<()> {
-        let (mut table, key) = loopback_with_a_pending_join()?;
+    fn a_refresh_leaves_the_memberships_alone() -> io::Result<()> {
+        let Some((mut table, key)) = loopback_joined()? else {
+            return Ok(());
+        };
+        let ifindex = table.entries[key.0 as usize].interface.ifindex;
+        table.rebind_interface(key, ifindex)?;
+        table.refresh_by_ifindex(ifindex)?;
         table.refresh_all();
-        assert!(table.entries[key.0 as usize].joiner.test_socketless());
+        assert!(table.test_memberships(key).test_socketless());
         Ok(())
-    }
-
-    fn loopback_with_a_pending_join() -> io::Result<(InterfaceTable, InterfaceKey)> {
-        let mut table = InterfaceTable::new();
-        let key = table.find_or_add_interface(&InterfaceName::loopback())?;
-        table.entries[key.0 as usize]
-            .joiner
-            .record(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)));
-        Ok((table, key))
     }
 
     #[test]

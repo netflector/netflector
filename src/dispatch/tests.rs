@@ -1,4 +1,7 @@
-use super::lifecycle::RECONCILE_RETRY;
+use super::interface_table::InterfaceKey;
+use super::lifecycle::{RECHECK_INTERVAL, RECONCILE_RETRY};
+use super::multicast::join_unsupported;
+use super::multicast::tests::BEST_EFFORT;
 use super::*;
 use crate::test_support::{Capability, loopback_lock, open_capture_or_skip, skip};
 use std::cell::{Cell, RefCell};
@@ -1880,5 +1883,87 @@ fn monitor_fd_is_watched_under_the_sentinel_tag() {
 fn join_group_ignores_an_unknown_capture() {
     let mut dispatcher = PacketDispatcher::new();
     let group = IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251));
-    assert!(dispatcher.join_group(CaptureKey(9999), group).is_ok());
+    assert!(
+        dispatcher
+            .join_group(CaptureKey(9999), group, BEST_EFFORT)
+            .is_ok()
+    );
+}
+
+/// A dispatcher with the mDNS group joined on loopback, or `None` after a skip note.
+fn dispatcher_joined_on_loopback() -> io::Result<Option<(PacketDispatcher, InterfaceKey)>> {
+    let mut dispatcher = PacketDispatcher::new();
+    let key = dispatcher
+        .table
+        .find_or_add_interface(&InterfaceName::loopback())?;
+    let group = IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251));
+    match dispatcher
+        .table
+        .join_on(key, group, BEST_EFFORT, Instant::now())
+    {
+        Ok(()) => Ok(Some((dispatcher, key))),
+        Err(e) if join_unsupported(&e) => {
+            skip(Capability::Membership, format!("{e:?}"));
+            Ok(None)
+        }
+        Err(e) => panic!("kernel must accept the join on loopback: {e:?}"),
+    }
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "resolves a real interface")]
+fn a_returned_interface_joins_its_groups_again() -> io::Result<()> {
+    let mut reactor = Reactor::new()?;
+    let Some((mut dispatcher, key)) = dispatcher_joined_on_loopback()? else {
+        return Ok(());
+    };
+    dispatcher
+        .table
+        .set_test_name(key, &"nf-gone0".parse().unwrap());
+    dispatcher.reconcile_interfaces(&mut reactor);
+    assert!(dispatcher.table.test_memberships(key).test_socketless());
+
+    dispatcher
+        .table
+        .set_test_name(key, &InterfaceName::loopback());
+    dispatcher.reconcile_interfaces(&mut reactor);
+    assert!(dispatcher.table.test_memberships(key).test_all_joined());
+    Ok(())
+}
+
+// A join that fails on a healthy interface has no interface event to wait for: the next
+// re-read attempts it, and from then on its own timer does.
+#[test]
+#[cfg_attr(miri, ignore = "resolves a real interface")]
+fn a_failed_join_is_retried_on_its_own_timer() -> io::Result<()> {
+    let mut reactor = Reactor::new()?;
+    let mut dispatcher = PacketDispatcher::new();
+    let key = dispatcher
+        .table
+        .find_or_add_interface(&InterfaceName::loopback())?;
+    // A unicast address is no group, so every attempt fails.
+    let not_a_group = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    let start = Instant::now();
+    dispatcher
+        .table
+        .join_on(key, not_a_group, BEST_EFFORT, start)
+        .expect_err("a unicast address cannot join");
+    assert_eq!(dispatcher.table.next_join_retry(), None);
+
+    let recheck = start + RECHECK_INTERVAL;
+    dispatcher.on_deadline(recheck, &mut reactor);
+    let first_retry = recheck + Duration::from_secs(1);
+    assert_eq!(dispatcher.table.next_join_retry(), Some(first_retry));
+    assert!(
+        dispatcher
+            .next_deadline()
+            .is_some_and(|due| due <= first_retry)
+    );
+
+    dispatcher.on_deadline(first_retry, &mut reactor);
+    assert_eq!(
+        dispatcher.table.next_join_retry(),
+        Some(first_retry + Duration::from_secs(2))
+    );
+    Ok(())
 }

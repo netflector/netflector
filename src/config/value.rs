@@ -155,6 +155,13 @@ impl AddressFamily {
     pub(crate) fn requires_ipv6(self) -> bool {
         matches!(self, Self::Dual | Self::Ipv6)
     }
+
+    pub(crate) fn requires(self, ip: IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(_) => self.requires_ipv4(),
+            IpAddr::V6(_) => self.requires_ipv6(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
