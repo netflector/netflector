@@ -90,7 +90,7 @@ fn reconcile_parks_a_vanished_interface_and_keeps_the_fast_retry() -> io::Result
 
 // A completed recovery bumps the recoveries count on each of the interface's capture rows.
 // Unprivileged: the moved index is faked through the test seam and the capture row is a
-// capture-less test entry (its re-bind reports it missing, which does not fail the recovery).
+// capture-less test entry (its re-bind skips it, which does not fail the recovery).
 #[test]
 #[cfg_attr(miri, ignore = "resolves a real interface")]
 fn reconcile_counts_a_recovery_on_the_interface_captures() -> io::Result<()> {
