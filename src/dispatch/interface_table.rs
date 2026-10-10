@@ -1,6 +1,7 @@
 //! The dispatcher's interface table: every interface with its presence and group memberships,
 //! and every capture linked to its interface, all addressed by `Copy` index keys.
 
+use std::fmt;
 use std::io;
 use std::net::IpAddr;
 use std::num::NonZeroU32;
@@ -31,6 +32,20 @@ pub(super) enum Presence {
     Parked,
     /// The name resolves, but binding to it failed. Treated as parked until a retry binds it.
     Unbound(Unbound),
+}
+
+impl fmt::Display for Presence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Present(ifindex) => write!(f, "bound to ifindex {ifindex}"),
+            Self::Parked => f.write_str("parked, its name resolves to nothing"),
+            Self::Unbound(unbound) => write!(
+                f,
+                "not bound, binding to ifindex {} failed",
+                unbound.ifindex
+            ),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -367,6 +382,19 @@ impl InterfaceTable {
                 self.interface_name(entry.interface)?.as_str(),
                 &entry.counters,
             ))
+        })
+    }
+
+    /// Each interface's name, presence and memberships, for the state dump.
+    pub(super) fn interface_rows(
+        &self,
+    ) -> impl Iterator<Item = (&InterfaceName, Presence, Option<&Memberships>)> {
+        self.entries.iter().map(|entry| {
+            (
+                &entry.interface.name,
+                entry.presence,
+                entry.memberships.as_ref(),
+            )
         })
     }
 

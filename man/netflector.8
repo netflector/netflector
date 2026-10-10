@@ -34,9 +34,9 @@ it switches to that account once they are open.
 .Pp
 .Nm
 adapts to interface changes at runtime, with no restart needed.
-Reflection for an address family pauses while a required address is missing
-and resumes when it returns; an interface that is destroyed and recreated is
-picked up again under its new kernel identity.
+Reflection for an address family pauses while an interface has no address of
+that family and resumes when one returns; an interface that is destroyed and
+recreated is picked up again under its new kernel identity.
 .Pp
 Configuration comes from a TOML file, from
 .Ev NETFLECTOR_ Ns *
@@ -103,8 +103,8 @@ text; each line also carries two timestamps, syslog's and the daemon's.
 Shut down gracefully.
 .It Dv SIGUSR1
 Dump diagnostics to the log: the per-interface packet counters
-.Pq see Sx DIAGNOSTICS
-and a memory report (peak RSS).
+.Pq see Sx DIAGNOSTICS ,
+each interface's state, and a memory report (peak RSS).
 This works on demand even when the periodic reports are disabled.
 Under the
 .Xr rc 8
@@ -226,6 +226,12 @@ that overlap, or a datagram past the 9000-byte reassembly limit.
 .It Sy recoveries
 Times the interface was destroyed and recreated, and its capture re-bound.
 .El
+.Pp
+On
+.Dv SIGUSR1 ,
+a state line per interface follows: what its captures are bound to, and, while
+it is bound, each multicast group it holds no membership of, with the reason
+.Pq e.g. Ql state stf0: bound to ifindex 4; not joined: UDP relay 239.255.90.90 (the interface takes no multicast memberships) .
 .Sh SEE ALSO
 .Xr carp 4 ,
 .Xr netflector.toml 5 ,

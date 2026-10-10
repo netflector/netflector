@@ -3,6 +3,7 @@
 //! interface, so Linux's `net.ipv4.igmp_max_memberships` (default 20, unraisable on a locked-down
 //! router) is never reached; unbound, the kernel queues it no datagrams.
 
+use std::fmt;
 use std::io;
 use std::net::IpAddr;
 use std::num::NonZeroU32;
@@ -211,6 +212,33 @@ impl Sockets {
     }
 }
 
+/// A group not joined, as the state dump shows it.
+pub(crate) struct Unjoined<'a>(&'a Membership);
+
+impl fmt::Display for Unjoined<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Membership {
+            group,
+            label,
+            state,
+            ..
+        } = self.0;
+        let family = if group.is_ipv4() { "IPv4" } else { "IPv6" };
+        write!(f, "{label} {group} (")?;
+        match state {
+            State::Pending => f.write_str("pending")?,
+            State::Joined => f.write_str("joined")?,
+            State::Waiting(Wait::NoAddress) => write!(f, "waiting for an {family} address")?,
+            State::Waiting(Wait::NoFamily) => write!(f, "the interface has no {family}")?,
+            State::Waiting(Wait::NotMulticast) => {
+                f.write_str("the interface takes no multicast memberships")?;
+            }
+            State::Failed { .. } => f.write_str("failed, retrying")?,
+        }
+        f.write_str(")")
+    }
+}
+
 /// One interface's memberships: the groups its reflectors want, each with its state, and the
 /// sockets that hold them.
 pub(crate) struct Memberships {
@@ -317,6 +345,14 @@ impl Memberships {
         for membership in &mut self.groups {
             membership.state = State::Pending;
         }
+    }
+
+    /// The groups not joined, for the state dump.
+    pub(crate) fn unjoined(&self) -> impl Iterator<Item = Unjoined<'_>> {
+        self.groups
+            .iter()
+            .filter(|membership| membership.state != State::Joined)
+            .map(Unjoined)
     }
 
     /// When the earliest failed group is due its retry.
@@ -747,6 +783,20 @@ pub(in crate::dispatch) mod tests {
             "a join ends the reported problem"
         );
         assert_eq!(memberships.next_retry(), None);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "resolves a real interface")]
+    fn the_state_dump_lists_only_the_groups_not_joined() {
+        let Some(mut memberships) = joined_on_loopback(&[MDNS_V4]) else {
+            return;
+        };
+        memberships.add(MDNS_V6, BEST_EFFORT);
+        let unjoined: Vec<IpAddr> = memberships
+            .unjoined()
+            .map(|unjoined| unjoined.0.group)
+            .collect();
+        assert_eq!(unjoined, [MDNS_V6]);
     }
 
     #[test]

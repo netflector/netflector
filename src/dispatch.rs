@@ -40,8 +40,9 @@ use crate::reactor::{Arena, ControlEvent, Handler, HandlerSlot, Key, Reactor, Re
 
 use self::counters::log_counters;
 use self::egress::{Datagram, Egress};
-use self::interface_table::InterfaceTable;
-use self::lifecycle::{Changes, InterfaceLifecycle};
+use self::interface_table::{InterfaceTable, Presence};
+use self::lifecycle::{Changes, InterfaceLifecycle, Rebuilt};
+use self::multicast::Memberships;
 use self::reassembly::{Loss, Lost, MAX_DATAGRAM_LEN, Reassembler};
 
 /// Frames drained per readable event before yielding, so a flooded interface can't starve the
@@ -456,7 +457,8 @@ impl PacketDispatcher {
                     // The reconcile can't run from here, mid-drain with this capture taken
                     // out; pull it forward instead.
                     if Capture::lost_interface(&e) {
-                        log::info!("fd {fd}: capture lost its interface ({e}); reconciling");
+                        // Also what a Linux interface taken down reports; the reconcile tells.
+                        log::debug!("fd {fd}: capture read {e}; checking its interface");
                         self.lifecycle.reconcile_now();
                     } else {
                         log::error!("fd {fd}: capture read failed, abandoning batch: {e}");
@@ -628,15 +630,48 @@ impl PacketDispatcher {
     }
 
     fn apply_interface_changes(&mut self, changes: &Changes, reactor: &mut Reactor) {
+        let rebuilt = if changes.reconcile {
+            self.lifecycle.reconcile(&mut self.table, Instant::now())
+        } else {
+            Vec::new()
+        };
         self.dial.evict_on_interface_change(
             reactor,
             &changes.v4_moved,
             "after its interface's address changed",
         );
-        self.notify_iface_change(&changes.touched, reactor);
-        if changes.reconcile {
-            self.reconcile_interfaces(reactor);
+        self.after_repair(&changes.touched, rebuilt, reactor);
+    }
+
+    fn reconcile_interfaces(&mut self, reactor: &mut Reactor) {
+        let rebuilt = self.lifecycle.reconcile(&mut self.table, Instant::now());
+        self.after_repair(&[], rebuilt, reactor);
+    }
+
+    /// Evict the DIAL proxies on each rebuilt interface, then tell the reflectors once about every
+    /// capture that changed, now that the table is repaired.
+    fn after_repair(
+        &mut self,
+        touched: &[CaptureKey],
+        rebuilt: Vec<Rebuilt>,
+        reactor: &mut Reactor,
+    ) {
+        let mut changed = touched.to_vec();
+        for rebuilt in rebuilt {
+            let reason = if rebuilt.removed {
+                "after its interface was unbound"
+            } else {
+                "after its interface was re-bound"
+            };
+            self.dial
+                .evict_on_interface_change(reactor, &rebuilt.captures, reason);
+            for capture in rebuilt.captures {
+                if !changed.contains(&capture) {
+                    changed.push(capture);
+                }
+            }
         }
+        self.notify_iface_change(&changed, reactor);
     }
 
     fn notify_iface_change(&mut self, captures: &[CaptureKey], reactor: &mut Reactor) {
@@ -657,19 +692,6 @@ impl PacketDispatcher {
             };
             handler.on_iface_change(captures, self, reactor);
             self.registrations.restore_handler(key.0, handler);
-        }
-    }
-
-    fn reconcile_interfaces(&mut self, reactor: &mut Reactor) {
-        for rebuilt in self.lifecycle.reconcile(&mut self.table, Instant::now()) {
-            let reason = if rebuilt.removed {
-                "after its interface was unbound"
-            } else {
-                "after its interface was re-bound"
-            };
-            self.dial
-                .evict_on_interface_change(reactor, &rebuilt.captures, reason);
-            self.notify_iface_change(&rebuilt.captures, reactor);
         }
     }
 }
@@ -738,7 +760,35 @@ impl Handler for PacketDispatcher {
     /// `Dump` is SIGUSR1: log the counters on demand, whether or not the periodic report is on.
     fn on_control(&mut self, event: ControlEvent, _reactor: &mut Reactor) {
         match event {
-            ControlEvent::Dump => log_counters(self.table.counter_rows()),
+            ControlEvent::Dump => {
+                log_counters(self.table.counter_rows());
+                log_interfaces(self.table.interface_rows());
+            }
+        }
+    }
+}
+
+/// One line per interface: what its captures are bound to, and, while it is bound, the groups it
+/// holds no membership of.
+fn log_interfaces<'a>(
+    rows: impl Iterator<Item = (&'a InterfaceName, Presence, Option<&'a Memberships>)>,
+) {
+    for (name, presence, memberships) in rows {
+        // Not bound, the presence says why nothing is joined.
+        let bound = matches!(presence, Presence::Present(_));
+        let unjoined: Vec<String> = memberships
+            .filter(|_| bound)
+            .into_iter()
+            .flat_map(Memberships::unjoined)
+            .map(|group| group.to_string())
+            .collect();
+        if unjoined.is_empty() {
+            log::info!("state {name}: {presence}");
+        } else {
+            log::info!(
+                "state {name}: {presence}; not joined: {}",
+                unjoined.join(", ")
+            );
         }
     }
 }

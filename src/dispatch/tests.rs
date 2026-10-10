@@ -118,6 +118,66 @@ fn reconcile_counts_a_recovery_on_the_interface_captures() -> io::Result<()> {
     Ok(())
 }
 
+/// The captures of one `on_iface_change`, and the index the first had when the call ran.
+type ChangeCall = (Vec<CaptureKey>, Option<NonZeroU32>);
+
+struct ChangeRecorder {
+    calls: Rc<RefCell<Vec<ChangeCall>>>,
+}
+
+impl PacketHandler for ChangeRecorder {
+    fn on_packet(&mut self, _: &Packet, _: &mut PacketDispatcher, _: &mut Reactor) -> Outcome {
+        Outcome::Filtered
+    }
+
+    fn on_iface_change(
+        &mut self,
+        captures: &[CaptureKey],
+        dispatcher: &mut PacketDispatcher,
+        _: &mut Reactor,
+    ) {
+        let ifindex = dispatcher.capture_ifindex(captures[0]);
+        self.calls.borrow_mut().push((captures.to_vec(), ifindex));
+    }
+}
+
+// A drain that both moves an address and needs a reconcile tells each reflector once, and only
+// after the reconcile repaired the table.
+#[test]
+#[cfg_attr(miri, ignore = "resolves a real interface")]
+fn reflectors_hear_of_a_change_once_and_after_the_repair() -> io::Result<()> {
+    let mut reactor = Reactor::new()?;
+    let mut dispatcher = PacketDispatcher::new();
+    let key = dispatcher
+        .table
+        .find_or_add_interface(&InterfaceName::loopback())?;
+    let capture = dispatcher.table.add_test_capture(); // links the first interface
+    let real =
+        crate::interface::if_index(&InterfaceName::loopback()).expect("loopback has an ifindex");
+    let moved = NonZeroU32::new(real.get() + 1000).unwrap();
+    dispatcher
+        .table
+        .set_test_presence(key, Presence::Present(moved));
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    dispatcher.register(
+        capture,
+        Filter::default(),
+        Box::new(ChangeRecorder {
+            calls: calls.clone(),
+        }),
+    );
+
+    let changes = Changes {
+        v4_moved: Vec::new(),
+        touched: vec![capture],
+        reconcile: true,
+    };
+    dispatcher.apply_interface_changes(&changes, &mut reactor);
+
+    assert_eq!(*calls.borrow(), [(vec![capture], Some(real))]);
+    Ok(())
+}
+
 // A failed bind sets its own retry time; the reconcile wakes for it rather than waiting out the
 // slow tick.
 #[test]

@@ -60,8 +60,8 @@ Configuration comes from a TOML file, from environment variables, or from both. 
 the file is read and merged with any `NETFLECTOR_*` environment variables; with **no argument** the
 configuration comes entirely from the environment (see [Environment variables](#environment-variables)).
 The process logs to stderr with UTC timestamps, shuts down cleanly on `SIGINT` / `SIGTERM`, and on
-`SIGUSR1` dumps the per-interface [packet counters](#diagnostics) and a memory report to the log on
-demand (regardless of `counters_interval_secs`). Warnings whose cause can recur per packet (a failing
+`SIGUSR1` dumps the per-interface [packet counters](#diagnostics), each interface's state and a
+memory report to the log on demand (regardless of `counters_interval_secs`). Warnings whose cause can recur per packet (a failing
 send, an oversized frame) are logged at most once per minute; occurrences inside the window are
 counted and reported by the next logged warning as `(N suppressed)`; the counters carry the exact
 volumes.
@@ -408,34 +408,42 @@ requires both; `"ipv4"` / `"ipv6"` use only one. It applies to every protocol th
 mDNS, SSDP, and WSD are bidirectional, so a handled family must have a source address on **both**
 interfaces (the target re-emits relayed queries/searches, the source re-emits relayed
 responses/advertisements).
-The condition is re-checked at runtime (see
-[Reacting to address changes](#reacting-to-address-changes) below): a family is torn down if either
-interface loses its address and brought back up once both can send it again.
+The table follows address changes as they happen (see
+[Reacting to address changes](#reacting-to-address-changes) below), and a packet is not re-emitted
+onto an interface that has no address of its family at that moment: each direction of a family pauses
+while the interface it leaves by lacks the address and resumes once the address returns.
 
 ### Reacting to address changes
 
 netflector watches the kernel for interface address and lifecycle changes (a `NETLINK_ROUTE`
-socket on Linux, a `PF_ROUTE` socket on the BSDs) and adapts at runtime, without a restart. mDNS,
-SSDP, and WSD bring a family up (joining its multicast group(s)) once that family becomes
-reflectable (a source address for it is present on **both** interfaces), and tear it down when either
-interface loses the address; the family resumes automatically when the address returns. Capture
-registrations stay installed throughout; what changes is the group membership and whether the egress
-can source the family. WoL has no group to join and instead checks reachability per packet.
-Either way, a best-effort IPv6 family that had no address at startup begins reflecting as soon as one
-appears. Gaining a family logs at `info`; losing a *required* family logs at `error`, an optional one at
-`info`. The monitor is best-effort: if it cannot start, netflector logs a warning and runs without
-address refresh.
+socket on Linux, a `PF_ROUTE` socket on the BSDs), and re-reads every interface every 30 s for the
+changes no notification announces. It adapts at runtime, without a restart. When an interface
+loses its address of a family, that family stops reflecting there (sends drop, counted as `stalled`)
+and resumes when the address returns; a best-effort IPv6 family that had no address at startup
+begins reflecting as soon as one appears. Each change logs at `info` (`interface eth0: lost IPv4 (was 192.0.2.1)`). The
+monitor is best-effort: if it cannot start, netflector logs a warning and relies on the periodic
+re-read.
+
+Multicast groups are joined at startup and held for as long as netflector runs. A group the
+interface can't take yet waits and joins when it can: macOS joins one only once the interface has an
+address of the group's family. A BSD interface without multicast support (a 6to4 `stf`) takes none,
+which is logged; startup goes on. On Linux an interface with an MTU below 1280 has no IPv6, which
+fails an entry that requires IPv6 and leaves a `default` one on IPv4. Any other join the kernel
+refuses fails startup; at runtime it logs a warning and is retried, from every second up to every
+30 s.
 
 It also survives an interface being destroyed and recreated (a fresh kernel identity, e.g. a PPPoE
 reconnect or a bridge/VLAN rebuild). Lifecycle events (backed by a periodic reconcile, so recovery
-never depends on one notification surviving) detect that the name's kernel identity moved; the
-captures are then re-bound in place, addresses re-resolved, and multicast groups re-joined on the new
-interface, while its DIAL proxies are evicted to re-mint on the next advertisement. While the
-interface is absent its reflection parks (sends drop quietly, as on an address loss) and resumes when
-the name returns (`interface <name>: returned as ifindex B`, or `recreated (ifindex A -> B)` when the
-replacement appeared within one event batch). On macOS the route socket
-has no lifecycle messages and can drop notifications silently, so detection there may fall back to
-the periodic reconcile (up to ~30 s).
+never depends on one notification surviving) detect that the name's kernel identity moved. The
+interface is then bound again as a whole: captures re-bound in place, addresses re-resolved, then its
+multicast groups re-joined, while its DIAL proxies are evicted to re-mint on the next
+advertisement. While the name resolves to nothing the interface is parked (sends drop quietly, as on
+an address loss) and resumes when the name returns (`interface <name>: returned as ifindex B`, or
+`recreated (ifindex A -> B)` when the replacement appeared within one event batch). A bind that
+fails, say because the name now belongs to a link type netflector can't capture on, is retried from
+every second up to every 30 s. On macOS the route socket has no lifecycle messages and can drop
+notifications silently, so detection there may fall back to the periodic reconcile (up to ~30 s).
+Every configured interface must exist when netflector starts.
 
 ### Per-protocol behavior
 
@@ -598,9 +606,10 @@ since it captures ahead of the packet filter.
 The relay ignores `macs`: a datagram to a group or a broadcast has no single target device. It admits
 every datagram it captures, so it must not overlap a protocol that relays the same datagrams; see
 [duplicate detection](#duplicate-detection). Its counters are reported as `UDP relay`, except that a
-datagram a discovery protocol on the same interface also handles counts under that protocol. A group that
-cannot be joined on `source_if` is a startup error, as it is for the discovery protocols. The system
-limits memberships per interface: `net.ipv4.igmp_max_memberships` on Linux, 20 by default.
+datagram a discovery protocol on the same interface also handles counts under that protocol. Its groups
+are joined on `source_if` as the discovery protocols' are (see
+[Reacting to address changes](#reacting-to-address-changes)). The system limits memberships per
+interface: `net.ipv4.igmp_max_memberships` on Linux, 20 by default.
 
 ### Duplicate detection
 
@@ -630,7 +639,7 @@ enable *different* protocols, coexist.
 With `counters_interval_secs` set (and on `SIGUSR1`), one summary line per interface reports its
 non-zero counters:
 
-```
+```log
 counters eth0: recoveries=1; mDNS query reflected=42 skipped=10; SSDP search reflected=5 dropped=1; filtered=2; oversized=3
 ```
 
@@ -645,6 +654,15 @@ before routing), `oversized` (received frames too large to forward), `unreassemb
 datagrams given up on: a fragment that never arrived, overlapping fragments, or past the 9000-byte
 limit) and `recoveries` (the interface was destroyed and recreated, and its capture re-bound). `netflector(8)` carries the full
 definitions.
+
+`SIGUSR1` also logs each interface's state: what its captures are bound to, and, while it is bound,
+any multicast group it holds no membership of, with the reason:
+
+```log
+state eth0: bound to ifindex 4
+state wg0: bound to ifindex 9; not joined: mDNS ff02::fb (the interface has no IPv6)
+state eth2: parked, its name resolves to nothing
+```
 
 ## Developing
 
