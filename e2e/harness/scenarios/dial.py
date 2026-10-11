@@ -159,8 +159,8 @@ class DialRunner:
         # unpinned connect now follows it, ARPs the device on the client's segment (where it does
         # not live) and fails, so the whole DIAL flow breaks. Only the egress pin -- which
         # constrains the route lookup to the device's interface -- still reaches the device, so
-        # PASS now requires it. (FreeBSD declines: no pin primitive there, see
-        # Backend.add_decoy_route.)
+        # PASS now requires it. (FreeBSD declines: its route check refuses the connect instead of
+        # steering it, see NativeFreeBSDBackend.add_decoy_route.)
         device_ip = self.env.backend.probe_ip("device", self.device_seg)
         if not self.env.backend.add_decoy_route(
             device_ip, NETFLECTOR_IFNAMES[self.client_seg]

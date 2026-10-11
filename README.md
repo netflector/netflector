@@ -135,9 +135,9 @@ Log out and back in after installing for the group membership to take effect.
 
 #### FreeBSD
 
-Capture and injection use BPF (`/dev/bpf*`), like macOS. FreeBSD has no `IP_BOUND_IF`, so the DIAL
-proxy's connect pins its interface by binding the source address; no port privileges are needed. BPF
-devices are root-only by default, so out of the box netflector must run as root. To run
+Capture and injection use BPF (`/dev/bpf*`), like macOS. FreeBSD has no `IP_BOUND_IF`, so before
+each DIAL connect the proxy looks up the route to the device and refuses one that leaves by another
+interface; that needs no privilege. BPF devices are root-only by default, so out of the box netflector must run as root. To run
 unprivileged, grant a group read/write on `/dev/bpf*` with a devfs ruleset (`/etc/devfs.rules` +
 `devfs_system_ruleset` in `/etc/rc.conf`) and add the user to that group. Or start it as root with
 `user` set: it drops to that account once its captures are open and holds only those, where a devfs

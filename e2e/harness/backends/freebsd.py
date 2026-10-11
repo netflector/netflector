@@ -185,8 +185,9 @@ class NativeFreeBSDBackend(NativeBackend):
         return captured
 
     def add_decoy_route(self, dest_ip: str, ifname: str) -> bool:
-        # No egress-pin primitive on FreeBSD (see Backend.add_decoy_route): the pin under test
-        # there is the source-address bind, which the device-peer assertion validates on its own.
+        # FreeBSD confines the DIAL connect by checking the route first and refusing one via
+        # another interface, so a decoy route would fail the flow rather than prove a pin. The
+        # route lookup has its own tests in src/net/route_query.rs.
         del dest_ip, ifname
         return False
 
