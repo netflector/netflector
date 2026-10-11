@@ -199,11 +199,8 @@ impl InterfaceLifecycle {
                         if change.v4 || change.v6 {
                             touched.push(key);
                         }
-                        // A detached capture says the index is another interface's now: the
-                        // reconcile joins after it re-binds.
-                        let attached = table.probe(key);
-                        let gone = attached && table.converge(key, now).is_err();
-                        if *is_link || !attached || gone {
+                        let gone = table.converge(key, now).is_err();
+                        if *is_link || gone {
                             want_reconcile = true;
                         }
                     }

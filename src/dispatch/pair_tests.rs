@@ -27,7 +27,7 @@ use super::CaptureKey;
 use super::datagram::{DatagramSource, build_udp, ethernet_dst};
 use super::interface_table::{InterfaceTable, Presence, Step};
 use super::multicast::tests::{BEST_EFFORT, REQUIRED};
-use super::multicast::{JoinError, Memberships, Target, Wait};
+use super::multicast::{Gone, JoinError, Memberships, Target, Wait};
 use super::reassembly::Reassembler;
 
 const INJECT_SRC_PORT: u16 = 40000;
@@ -839,6 +839,28 @@ fn pair_capture_rebinds_after_interface_recreation() -> io::Result<()> {
     let captured =
         capture_injected(&mut peer, dst.ip())?.expect("the re-bound capture sees the broadcast");
     assert_eq!(captured.payload, payload);
+    Ok(())
+}
+
+#[test]
+fn a_converge_leaves_a_recreated_interface_to_the_reconcile() -> io::Result<()> {
+    let Some(pair) = InterfacePair::create() else {
+        return Ok(());
+    };
+    let mut table = InterfaceTable::new();
+    table.open_capture(&pair.receive)?;
+    let key = table.find_or_add_interface(&pair.receive)?;
+    let now = Instant::now();
+    table
+        .test_memberships_mut(key)
+        .test_fail("224.0.0.251".parse().unwrap(), now);
+    pair.recreate();
+    assert_eq!(table.converge_all(now), Err(Gone));
+    assert_eq!(
+        table.next_join_retry(),
+        Some(now),
+        "no join was attempted on the stranded sockets"
+    );
     Ok(())
 }
 

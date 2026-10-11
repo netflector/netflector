@@ -187,8 +187,13 @@ impl InterfaceTable {
     /// Attempt the groups not joined on `interface`.
     ///
     /// # Errors
-    /// See [`Memberships::converge`].
+    /// [`Gone`] without an attempt when a capture on `interface` has detached: the index is
+    /// another interface's now, and the reconcile joins after it re-binds. Otherwise see
+    /// [`Memberships::converge`].
     pub(super) fn converge(&mut self, interface: InterfaceKey, now: Instant) -> Result<(), Gone> {
+        if !self.probe(interface) {
+            return Err(Gone);
+        }
         self.entries
             .get_mut(interface.0 as usize)
             .map_or(Ok(()), |entry| entry.converge(now))
@@ -200,8 +205,8 @@ impl InterfaceTable {
     /// [`Gone`] if any interface reported it; the others converge all the same.
     pub(super) fn converge_all(&mut self, now: Instant) -> Result<(), Gone> {
         let mut result = Ok(());
-        for entry in &mut self.entries {
-            if entry.converge(now).is_err() {
+        for interface in self.interfaces() {
+            if self.converge(interface, now).is_err() {
                 result = Err(Gone);
             }
         }
