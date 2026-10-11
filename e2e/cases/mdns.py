@@ -101,7 +101,6 @@ MDNS_CASES = [
         group=MDNS_GROUP_V4,
         direction="reverse",
     ),
-    # Every address is link-local, so the response is suppressed rather than relayed.
     # A response from any port but 5353 is not one (RFC 6762 §6), so it stays where it was sent.
     TestCase(
         name="ignores_mdns_response_from_another_port",
@@ -113,6 +112,7 @@ MDNS_CASES = [
         group=MDNS_GROUP_V4,
         direction="reverse",
     ),
+    # Every address is link-local, so the response is suppressed rather than relayed.
     TestCase(
         name="ignores_mdns_link_local_only_response",
         send_source_port=MDNS_PORT,

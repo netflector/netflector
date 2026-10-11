@@ -2,8 +2,8 @@ log_level = "debug"
 
 # A dual-family mDNS reflector (address_family = "dual"): requires and reflects both IPv4 and IPv6.
 # The e2e bridges are dual-stack, so both families are present at startup. The mdns_address_change
-# case then knocks out one (interface, family) source address at a time and proves -- via real
-# traffic -- that only that family's reflection stops, then resumes once the address returns.
+# case then knocks out one (interface, family) source address at a time and proves with real
+# traffic that reflection of that family stops, then resumes once the address returns.
 [reflectors.mdns]
 source_if = "nf_source"
 target_if = "nf_target"

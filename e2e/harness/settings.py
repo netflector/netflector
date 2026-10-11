@@ -69,6 +69,6 @@ HELPER_HOST = 20
 
 
 # Native segment addressing over SEGMENT_V4_SUBNET / SEGMENT_V6_PREFIX: netflector is always host 1
-# and a segment's helper host 2, replacing Docker's IPAM discovery with a fixed plan (the kernel adds
-# fe80:: itself).
+# and a segment's helper HELPER_HOST, replacing Docker's IPAM discovery with a fixed plan (the kernel
+# adds fe80:: itself).
 NATIVE_NETFLECTOR_HOST = 1

@@ -214,8 +214,8 @@ class DialAddressChangeRunner(DialRunner):
     # change waits for the "gained IPv4 <new>" log before the next pass.
     def _different_cidr(self, cidr: str) -> str:
         # A different host on the same subnet: both backends hand out low addresses (Docker IPAM
-        # .2, .3, ...; the native plan .1/.2), so .222 is free (and .221 if the interface somehow
-        # already holds .222).
+        # .2, .3, ...; the native plan .1 and .20), so .222 is free (and .221 if the interface
+        # somehow already holds .222).
         host, prefix = cidr.split("/")
         octets = host.split(".")
         octets[-1] = "222" if octets[-1] != "222" else "221"

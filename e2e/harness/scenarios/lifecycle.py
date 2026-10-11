@@ -21,9 +21,9 @@ from harness.settings import (
 class AddressChangeRunner:
     # Proves the dynamic family bring-up/teardown end to end: with a dual-family reflector
     # running, knock out one (interface, family) source address at a time and verify -- with real
-    # traffic, not logs -- that reflection of exactly that family stops, then resumes once the
-    # address returns. netflector reacts on its own event loop after the netlink notification,
-    # so every check polls across that async window. All phases probe forward (source -> target).
+    # traffic, not logs -- that reflection of that family stops, then resumes once the address
+    # returns. netflector reacts on its own event loop after the netlink notification, so every
+    # check polls across that async window.
     def __init__(
         self, env: Environment, case: AddressChangeCase | RecreateCase
     ) -> None:
