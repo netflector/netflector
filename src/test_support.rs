@@ -413,9 +413,195 @@ pub(crate) mod addr {
         Ipv4Addr::new(NET[0], NET[1], NET[2], slot * 8 + host)
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) fn holds(addr: Ipv4Addr) -> bool {
+        addr.octets()[..3] == NET
+    }
+
     /// Host `host` of the /64 at `slot`.
     pub(crate) const fn v6(slot: u8, host: u16) -> Ipv6Addr {
         Ipv6Addr::new(0x2001, 0xdb8, 0, slot as u16, 0, 0, 0, host)
+    }
+}
+
+/// Removes the fixture interfaces a killed test run left behind. Fixtures tag what they create with
+/// the owning process, in the name on Linux and in the description on FreeBSD, whose cloners pick
+/// the names. macOS feths take no tag: there every feth holding a plan address or a fixed unit
+/// goes, a concurrent run's included.
+pub(crate) mod sweep {
+    use std::process::Command;
+    use std::sync::Once;
+
+    #[cfg(target_os = "linux")]
+    use crate::interface::InterfaceName;
+
+    #[cfg(any(target_os = "freebsd", target_os = "linux"))]
+    const TAG: &str = "nft";
+
+    /// The feth units bare fixtures name; pairs take kernel-assigned ones from 0.
+    #[cfg(target_os = "macos")]
+    pub(crate) const FIXED_FETH_UNITS: std::ops::RangeFrom<u16> = 900..;
+
+    /// A Linux fixture interface's name: the tag, the owning pid, then `role`.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn ifname_owned_by(pid: u32, role: &str) -> InterfaceName {
+        format!("{TAG}{pid}{role}")
+            .parse()
+            .expect("a valid interface name")
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn ifname(role: &str) -> InterfaceName {
+        ifname_owned_by(std::process::id(), role)
+    }
+
+    /// The command that tags the FreeBSD interface `name` with its owning pid.
+    #[cfg(target_os = "freebsd")]
+    pub(crate) fn tag_owned_by(name: &str, pid: u32) -> String {
+        format!("ifconfig {name} description {TAG}{pid}")
+    }
+
+    #[cfg(target_os = "freebsd")]
+    pub(crate) fn tag(name: &str) -> String {
+        tag_owned_by(name, std::process::id())
+    }
+
+    /// [`run`], once per process: before its first fixture interface.
+    pub(crate) fn once() {
+        static SWEPT: Once = Once::new();
+        SWEPT.call_once(run);
+    }
+
+    pub(crate) fn run() {
+        for name in leftovers() {
+            #[cfg(target_os = "linux")]
+            let remove = ["ip", "link", "del", &name];
+            #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+            let remove = ["ifconfig", &name, "destroy"];
+            if Command::new(remove[0])
+                .args(&remove[1..])
+                .status()
+                .is_ok_and(|status| status.success())
+            {
+                eprintln!("removed {name}, left by a killed test run");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn leftovers() -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+            .filter(|name| owner(name).is_some_and(|pid| !alive(pid)))
+            .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn owner(name: &str) -> Option<libc::pid_t> {
+        let rest = name.strip_prefix(TAG)?;
+        let digits = rest.find(|c: char| !c.is_ascii_digit())?;
+        rest[..digits].parse().ok()
+    }
+
+    #[cfg(target_os = "freebsd")]
+    fn leftovers() -> Vec<String> {
+        blocks(&ifconfig())
+            .into_iter()
+            .filter(|(_, details)| {
+                details.iter().any(|line| {
+                    line.trim()
+                        .strip_prefix("description: ")
+                        .and_then(|description| description.strip_prefix(TAG))
+                        .and_then(|pid| pid.parse().ok())
+                        .is_some_and(|pid| !alive(pid))
+                })
+            })
+            .map(|(name, _)| name.to_owned())
+            .collect()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn leftovers() -> Vec<String> {
+        fixture_feths(&ifconfig())
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The fixture feths in an `ifconfig` listing.
+    #[cfg(target_os = "macos")]
+    fn fixture_feths(listing: &str) -> Vec<&str> {
+        let planned = |line: &&str| {
+            line.trim()
+                .strip_prefix("inet ")
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|addr| addr.parse().ok())
+                .is_some_and(super::addr::holds)
+        };
+        blocks(listing)
+            .into_iter()
+            .filter(|(name, details)| {
+                name.strip_prefix("feth").is_some_and(|unit| {
+                    unit.parse()
+                        .is_ok_and(|unit| FIXED_FETH_UNITS.contains(&unit))
+                        || details.iter().any(planned)
+                })
+            })
+            .map(|(name, _)| name)
+            .collect()
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    fn ifconfig() -> String {
+        Command::new("ifconfig")
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+            .unwrap_or_default()
+    }
+
+    /// Each interface in an `ifconfig` listing with the lines that follow its header.
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    fn blocks(listing: &str) -> Vec<(&str, Vec<&str>)> {
+        let mut blocks: Vec<(&str, Vec<&str>)> = Vec::new();
+        for line in listing.lines() {
+            if line.starts_with(char::is_whitespace) {
+                if let Some((_, details)) = blocks.last_mut() {
+                    details.push(line);
+                }
+            } else if let Some((name, _)) = line.split_once(": flags=") {
+                blocks.push((name, Vec::new()));
+            }
+        }
+        blocks
+    }
+
+    #[cfg(any(target_os = "freebsd", target_os = "linux"))]
+    fn alive(pid: libc::pid_t) -> bool {
+        // SAFETY: signal 0 delivers nothing; it only checks that the process exists.
+        let found = unsafe { libc::kill(pid, 0) } == 0;
+        found || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn the_macos_sweep_takes_only_fixture_feths() {
+            let listing = "\
+feth0: flags=8843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+\tether 7a:00:00:00:00:01
+\tinet 203.0.113.9 netmask 0xfffffff8 broadcast 203.0.113.15
+feth1: flags=8843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+\tinet 192.168.7.2 netmask 0xffffff00 broadcast 192.168.7.255
+feth900: flags=8802<BROADCAST,SIMPLEX,MULTICAST> mtu 1500
+en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+\tinet 203.0.113.1 netmask 0xffffff00 broadcast 203.0.113.255
+";
+            assert_eq!(super::fixture_feths(listing), ["feth0", "feth900"]);
+        }
     }
 }
 

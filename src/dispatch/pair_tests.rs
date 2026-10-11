@@ -21,7 +21,7 @@ use crate::net::packet::Parsed;
 use crate::sys::setsockopt;
 #[cfg(target_os = "linux")]
 use crate::sys::sockaddr_for;
-use crate::test_support::{Capability, addr, open_capture, open_interface, skip};
+use crate::test_support::{Capability, addr, open_capture, open_interface, skip, sweep};
 
 use super::CaptureKey;
 use super::datagram::{DatagramSource, build_udp, ethernet_dst};
@@ -186,12 +186,8 @@ impl InterfacePair {
     /// against other processes and against this process's concurrently-running tests.
     #[cfg(target_os = "linux")]
     fn create_platform(subnet: u8) -> Option<Self> {
-        let inject: InterfaceName = format!("rp{}x{subnet}a", std::process::id() % 100_000)
-            .parse()
-            .expect("a valid veth name");
-        let receive: InterfaceName = format!("rp{}x{subnet}b", std::process::id() % 100_000)
-            .parse()
-            .expect("a valid veth name");
+        let inject = sweep::ifname(&format!("p{subnet}a"));
+        let receive = sweep::ifname(&format!("p{subnet}b"));
         if !run(&format!(
             "ip link add {inject} type veth peer name {receive}"
         )) {
@@ -368,21 +364,25 @@ impl InterfacePair {
         Some(pair)
     }
 
-    /// Assign the pair's address plan and bring both ends up.
+    /// Tag the pair, assign its address plan and bring both ends up.
     #[cfg(target_os = "freebsd")]
     fn configure(&self) -> bool {
-        run(&format!(
-            "ifconfig {} inet {}/29 up",
-            self.inject,
-            self.inject_v4()
-        )) && run(&format!(
-            "ifconfig {} inet6 fe80::1 prefixlen 64",
-            self.inject
-        )) && run(&format!(
-            "ifconfig {} inet6 {} prefixlen 64",
-            self.inject,
-            self.inject_routable_v6()
-        )) && run(&format!("ifconfig {} up", self.receive))
+        run(&sweep::tag(&self.inject))
+            && run(&format!(
+                "ifconfig {} inet {}/29 up",
+                self.inject,
+                self.inject_v4()
+            ))
+            && run(&format!(
+                "ifconfig {} inet6 fe80::1 prefixlen 64",
+                self.inject
+            ))
+            && run(&format!(
+                "ifconfig {} inet6 {} prefixlen 64",
+                self.inject,
+                self.inject_routable_v6()
+            ))
+            && run(&format!("ifconfig {} up", self.receive))
             && run(&format!(
                 "ifconfig {} inet {}/29",
                 self.receive,
@@ -442,19 +442,25 @@ impl BareInterface {
 
     #[cfg(target_os = "linux")]
     fn create_platform(_unit: u16) -> Option<String> {
-        let name = format!("nfbare{}", std::process::id() % 100_000);
-        run(&format!("ip link add {name} type veth peer name {name}p")).then_some(name)
+        let name = sweep::ifname("b");
+        run(&format!("ip link add {name} type veth peer name {name}p")).then(|| name.to_string())
     }
 
     #[cfg(target_os = "macos")]
     fn create_platform(unit: u16) -> Option<String> {
+        assert!(
+            sweep::FIXED_FETH_UNITS.contains(&unit),
+            "feth{unit} is not a fixed unit"
+        );
         let name = format!("feth{unit}");
         run(&format!("ifconfig {name} create")).then_some(name)
     }
 
     #[cfg(target_os = "freebsd")]
     fn create_platform(_unit: u16) -> Option<String> {
-        run_capture("ifconfig epair create")
+        let name = run_capture("ifconfig epair create")?;
+        run(&sweep::tag(&name));
+        Some(name)
     }
 
     /// macOS joins a group only on an interface with the group's address family attached, which
@@ -484,6 +490,49 @@ impl Drop for BareInterface {
     }
 }
 
+#[cfg(any(target_os = "freebsd", target_os = "linux"))]
+#[test]
+fn the_sweep_removes_a_dead_process_interface_and_keeps_a_live_one() {
+    if !can_create_interfaces() {
+        return;
+    }
+    let _serialize = PAIR_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut child = Command::new("true").spawn().expect("spawn true");
+    child.wait().expect("reap true");
+    let left = plant_owned_by(child.id());
+    let kept = plant_owned_by(std::process::id());
+    sweep::run();
+    let (left_gone, kept_there) = (if_index(&left).is_none(), if_index(&kept).is_some());
+    for name in [&left, &kept] {
+        #[cfg(target_os = "linux")]
+        run(&format!("ip link del {name}"));
+        #[cfg(target_os = "freebsd")]
+        run(&format!("ifconfig {name} destroy"));
+    }
+    assert!(left_gone, "the sweep left {left}, whose owner is dead");
+    assert!(kept_there, "the sweep removed {kept}, whose owner runs");
+}
+
+#[cfg(target_os = "linux")]
+fn plant_owned_by(pid: u32) -> InterfaceName {
+    let name = sweep::ifname_owned_by(pid, "s");
+    assert!(
+        run(&format!("ip link add {name} type veth peer name {name}p")),
+        "could not create {name}"
+    );
+    name
+}
+
+#[cfg(target_os = "freebsd")]
+fn plant_owned_by(pid: u32) -> InterfaceName {
+    let name = run_capture("ifconfig epair create").expect("create an epair");
+    assert!(
+        run(&sweep::tag_owned_by(&name, pid)),
+        "could not tag {name}"
+    );
+    name.parse().expect("the kernel assigned a valid name")
+}
+
 /// Root; skips with a note otherwise.
 fn can_create_interfaces() -> bool {
     // SAFETY: geteuid takes no arguments and cannot fail.
@@ -491,6 +540,7 @@ fn can_create_interfaces() -> bool {
         skip(Capability::Pair, "interface creation requires root");
         return false;
     }
+    sweep::once();
     true
 }
 
@@ -726,10 +776,7 @@ fn pair_capture_on_a_vlan_interface_takes_its_traffic() -> io::Result<()> {
     };
     // Removed with their parents when the pair drops.
     let vlan = |parent: &InterfaceName, end: char, host: u8| -> InterfaceName {
-        let name: InterfaceName =
-            format!("nfv{}x{}{end}", std::process::id() % 10_000, pair.subnet)
-                .parse()
-                .expect("a valid VLAN interface name");
+        let name = sweep::ifname(&format!("v{}{end}", pair.subnet));
         assert!(
             run(&format!(
                 "ip link add link {parent} name {name} type vlan id 10 && \

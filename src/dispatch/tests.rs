@@ -980,6 +980,7 @@ fn wg_can_run() -> bool {
         skip(Capability::WireGuard, "wg(8) is not installed");
         return false;
     }
+    crate::test_support::sweep::once();
     true
 }
 
@@ -991,6 +992,7 @@ fn wg_create(_tag: &str) -> Option<InterfaceName> {
         skip(Capability::WireGuard, "could not create a wg interface");
         return None;
     };
+    sh(&crate::test_support::sweep::tag(&name));
     Some(name.parse().expect("the kernel assigned a valid name"))
 }
 
@@ -998,9 +1000,7 @@ fn wg_create(_tag: &str) -> Option<InterfaceName> {
 /// pid two test processes.
 #[cfg(target_os = "linux")]
 fn wg_create(tag: &str) -> Option<InterfaceName> {
-    let name: InterfaceName = format!("nf{tag}{}", std::process::id() % 100_000)
-        .parse()
-        .expect("a valid wg name");
+    let name = crate::test_support::sweep::ifname(tag);
     if sh(&format!("ip link add {name} type wireguard")) {
         Some(name)
     } else {
