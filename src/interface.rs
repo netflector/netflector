@@ -142,8 +142,8 @@ pub(crate) struct Reading {
 pub(crate) struct Interface {
     pub(crate) name: InterfaceName,
     pub(crate) addrs: InterfaceAddresses,
-    /// Outside [`InterfaceAddresses`] on purpose: that struct's equality drives the refresh
-    /// diffing, and a bare MTU change must not read as an address change (which clears sessions).
+    /// Outside [`InterfaceAddresses`] on purpose: an MTU is no address, and a change to it alone
+    /// must not read as an address change (which clears sessions).
     pub(crate) mtu: Option<u32>,
     /// `IFF_LOOPBACK`: the one link whose capture must see what the host sends.
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]

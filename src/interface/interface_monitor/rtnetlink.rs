@@ -88,8 +88,8 @@ pub(super) fn for_each_change(buf: &[u8], on_change: &mut impl FnMut(InterfaceEv
     }
 }
 
-/// The kernel's netlink source address has `nl_pid == 0`; a non-zero pid is a locally spoofed
-/// datagram (netlink user-to-user unicast needs no privilege).
+/// The kernel's netlink source address has `nl_pid == 0`; a non-zero pid is another process
+/// unicasting to us, which `NETLINK_ROUTE` allows only with `CAP_NET_ADMIN`.
 pub(super) fn sender_ok(src: &libc::sockaddr_storage, len: socklen_t) -> bool {
     if usize::try_from(len).unwrap_or(0) < size_of::<libc::sockaddr_nl>() {
         return false;
@@ -207,8 +207,7 @@ mod tests {
 
     #[test]
     fn never_forwards_index_zero() {
-        // Kernel indices start at 1, so a 0 is malformed. Forwarding it would match the first
-        // parked table entry, which caches 0, and re-resolve the wrong interface.
+        // Kernel indices start at 1, so a 0 is malformed, and an event has no way to carry it.
         let buf = message(libc::RTM_NEWADDR, &ifaddrmsg(0));
         let mut seen = Vec::new();
         for_each_change(&buf, &mut |e| seen.push(e));

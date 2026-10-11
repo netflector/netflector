@@ -16,8 +16,8 @@ use crate::net::mac::MacAddr;
 use crate::sys::{check, no_ipv6_stack, open_socket};
 
 /// # Errors
-/// `getifaddrs` failing or the v6 flag socket not opening. An unknown interface, or a host with
-/// no IPv6 stack, yields all-absent addresses instead.
+/// `getifaddrs` failing or the v6 flag socket not opening. An unknown interface yields all-absent
+/// addresses instead, and a host with no IPv6 stack only absent v6 ones.
 pub(super) fn resolve(
     if_name: &InterfaceName,
 ) -> io::Result<(InterfaceAddresses, Option<u32>, bool)> {

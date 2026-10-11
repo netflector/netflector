@@ -179,8 +179,7 @@ mod tests {
 
     #[test]
     fn never_forwards_index_zero() {
-        // Kernel indices start at 1, so a 0 is malformed. Forwarding it would match the first
-        // parked table entry, which caches 0, and re-resolve the wrong interface.
+        // Kernel indices start at 1, so a 0 is malformed, and an event has no way to carry it.
         let buf = message(libc::RTM_NEWADDR, 0, 20);
         let mut seen = Vec::new();
         for_each_change(&buf, &mut |e| seen.push(e));

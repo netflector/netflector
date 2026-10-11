@@ -213,8 +213,8 @@ fn dump<B>(
         let IoStatus::Ready(received) = IoStatus::from_syscall(received)? else {
             return Err(io::Error::other("the netlink dump went unanswered"));
         };
-        // Only the kernel (nl_pid 0) may answer: a local process could unicast a spoofed reply to
-        // inject a bogus address.
+        // Only the kernel (nl_pid 0) may answer: a local process holding CAP_NET_ADMIN could
+        // unicast a spoofed reply to inject a bogus address.
         if src.nl_pid != 0 {
             log::debug!(
                 "netlink dump: ignoring a reply from a non-kernel sender (pid {})",
