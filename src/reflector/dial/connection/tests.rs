@@ -27,8 +27,8 @@ fn connected_pair() -> (TcpSocket, TcpSocket) {
     (initiator, accepted)
 }
 
-/// Drive `forward_dir` until the message it forwards arrives at `peer_out`. Returns those bytes
-/// alongside the REST endpoint learned from an `Application-URL`, if any.
+/// Drive `DirectionContext::forward` until the message it forwards arrives at `peer_out`. Returns
+/// those bytes alongside the REST endpoint learned from an `Application-URL`, if any.
 fn drive_forward(
     from: &TcpSocket,
     to: &TcpSocket,

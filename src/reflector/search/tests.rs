@@ -271,10 +271,10 @@ fn a_session_is_keyed_by_searcher_and_group() {
     assert!(reflector.sessions.get(&key(site_local)).is_none());
 }
 
-// on_iface_change drops every session on a capture the reflector uses: a recreation or address
+// on_iface_change drops every session when the target capture changes: a recreation or address
 // change orphaned each session's reservation and response registration, so they must go (their
-// ports free with the reservations) and the next search re-opens fresh. A change on a capture the
-// reflector does not use leaves them.
+// ports free with the reservations) and the next search re-opens fresh. A change on any other
+// capture, the source's included, leaves them.
 #[test]
 #[cfg_attr(miri, ignore = "needs a real socket")]
 fn on_iface_change_clears_sessions_on_a_used_capture() {
@@ -511,7 +511,8 @@ fn a_failed_reflect_rolls_back_the_session_registration() {
     let _serial = loopback_lock();
     // make_session makes the response registration before reflecting; if the reflect then fails, that
     // registration must be rolled back, not leaked. A real loopback target lets make_session succeed;
-    // a payload past the UDP length field then makes build_udp reject the reflect deterministically.
+    // a 65,508-byte payload, too long for an IPv4 packet's total length though not for UDP's length
+    // field, then makes build_udp reject the reflect deterministically, so the case is IPv4-only.
     let mut dispatcher = PacketDispatcher::new();
     let Some(target) = open_loopback_or_skip(&mut dispatcher) else {
         return;

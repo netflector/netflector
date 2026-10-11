@@ -370,8 +370,8 @@ impl PacketHandler for SearchReflector {
     }
 }
 
-/// The same scope-matched pick `build_udp` makes for the reflected search, so the reservation
-/// watches the address the device actually answers.
+/// The target's address of `dest`'s scope. The search goes out from it and the reservation
+/// watches it, so the device answers where the session listens.
 fn reply_source(dispatcher: &PacketDispatcher, target: CaptureKey, dest: IpAddr) -> Option<IpAddr> {
     match dest {
         IpAddr::V4(_) => dispatcher
