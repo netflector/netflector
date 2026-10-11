@@ -226,6 +226,7 @@ class RecreateRunner(AddressChangeRunner):
                 f"recreated"
             )
         print(f"{desc}: reflection resumed after interface recreation", flush=True)
+        self.env.check_memberships(f"after the {phase.interface} recreation")
         return mark
 
     def _assert_recreations_logged(self, marks: list[tuple[int, int]]) -> None:

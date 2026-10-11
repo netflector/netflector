@@ -8,10 +8,12 @@ import time
 import uuid
 
 from harness.backends import make_backend
+from harness.memberships import expected as expected_memberships
 from harness.settings import (
     CONTAINER_READY_TIMEOUT_SECONDS,
     E2E_DIR,
     E2E_RESOURCE_PREFIX,
+    MEMBERSHIP_DEADLINE_SECONDS,
     NETFLECTOR_DROPPED_LOG,
     NETFLECTOR_READY_LOG,
     NETFLECTOR_SOURCE_IFNAME,
@@ -83,6 +85,26 @@ class Environment:
     def start_netflector(self) -> None:
         self.backend.start_netflector(self.config_path)
         self.wait_for_netflector()
+        self.check_memberships("at startup")
+
+    def check_memberships(self, when: str) -> None:
+        if self.args.no_join:
+            return
+        wanted = expected_memberships(self.config_path)
+        if wanted is None:
+            print("membership check skipped: reading the config needs Python 3.11", flush=True)
+            return
+        deadline = time.monotonic() + MEMBERSHIP_DEADLINE_SECONDS
+        while True:
+            missing = wanted - self.backend.memberships()
+            if not missing:
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"{self.name} {when}: the kernel holds no membership of "
+                    + ", ".join(f"{group} on {ifname}" for ifname, group in sorted(missing))
+                )
+            time.sleep(0.25)
 
     def wait_for_log(
         self, role: str, marker: str, description: str, count: int = 1

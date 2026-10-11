@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import sys
 from pathlib import Path
 
@@ -176,6 +177,9 @@ class NativeFreeBSDBackend(NativeBackend):
         result = run_command(["jexec", self.jails["dut"], "sh", "-ec", script])
         return result.stdout.strip() if capture else ""
 
+    def memberships(self) -> set[tuple[str, str]]:
+        return parse_ifmcstat(self.admin("ifmcstat", capture=True))
+
     def set_address(self, ifname: str, family: int, *, up: bool, cidr: str | None = None) -> str | None:
         # The base implementation's semantics in ifconfig verbs. v6 down deletes every address
         # (the monitor sees RTM_DELADDR and the resolver a family with no source); v6 up
@@ -219,3 +223,16 @@ class NativeFreeBSDBackend(NativeBackend):
             if result.returncode == 0 and result.stdout:
                 print(f"--- jail {jail} ifconfig -a ---", file=sys.stderr, flush=True)
                 print(result.stdout, end="", file=sys.stderr, flush=True)
+
+
+def parse_ifmcstat(listing: str) -> set[tuple[str, str]]:
+    found: set[tuple[str, str]] = set()
+    ifname = ""
+    for line in listing.splitlines():
+        if line and not line[0].isspace():
+            ifname = line.rstrip(":")
+            continue
+        fields = line.split()
+        if len(fields) >= 2 and fields[0] == "group":
+            found.add((ifname, str(ipaddress.ip_address(fields[1].split("%")[0]))))
+    return found

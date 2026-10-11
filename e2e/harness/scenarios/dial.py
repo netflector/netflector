@@ -310,6 +310,7 @@ class DialRecreateRunner(DialAddressChangeRunner):
         )
         if self.dial.decoy:
             self.env.backend.remove_decoy_interface()
+        self.env.check_memberships(f"after the {interface} recreation")
 
     def run(self) -> None:
         self.start_device()  # passive: advertises NOTIFY + serves HTTP

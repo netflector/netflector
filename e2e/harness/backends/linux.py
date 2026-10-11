@@ -155,6 +155,9 @@ class NativeLinuxBackend(NativeBackend):
     def _netflector_command(self, config_path: Path) -> list[str]:
         return ["ip", "netns", "exec", self.ns["dut"], *self._netflector_args(config_path)]
 
+    def memberships(self) -> set[tuple[str, str]]:
+        return linux_admin.memberships(self.admin)
+
     def admin(self, script: str, *, capture: bool = False) -> str:
         # The harness already runs as root, so netflector's network view is one netns exec
         # away -- no privileged sidecar needed.

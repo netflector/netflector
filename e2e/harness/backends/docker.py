@@ -223,6 +223,9 @@ class DockerBackend(Backend):
     def stop_probe(self, role: str, grace_seconds: int) -> None:
         docker(["stop", "-t", str(grace_seconds), self.roles[role]], check=False, echo=False)
 
+    def memberships(self) -> set[tuple[str, str]]:
+        return linux_admin.memberships(self.admin)
+
     def admin(self, script: str, *, capture: bool = False) -> str:
         # Address/route changes need CAP_NET_ADMIN and a writable /proc/sys, which the netflector
         # container (scratch image, NET_RAW only) has by neither. Run a throwaway privileged

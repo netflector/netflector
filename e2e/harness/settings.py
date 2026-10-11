@@ -33,6 +33,8 @@ NETFLECTOR_DROPPED_LOG = "dropped root: running as uid"
 RECEIVER_READY_LOG = "receiver ready: UDP socket bound"
 EXPECT_NONE_SAW_PACKET = "expected no packets, but one was received"
 CONTAINER_READY_TIMEOUT_SECONDS = 15.0
+# A rebound interface joins once its addresses are back.
+MEMBERSHIP_DEADLINE_SECONDS = 10.0
 # Every resource a run creates is named with this prefix, so a sweep can find what a killed run left.
 E2E_RESOURCE_PREFIX = "netflector-e2e-"
 # A clean SIGTERM exit triggers valgrind's leak analysis; give `docker stop` this much grace before it

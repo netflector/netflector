@@ -5,12 +5,17 @@ from __future__ import annotations
 import argparse
 import contextlib
 import io
+import sys
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from cases.models import DialRecreateCase, Phase, TestCase
-from harness.backends.freebsd import NativeFreeBSDBackend
+from harness import memberships
+from harness.backends import linux_admin
+from harness.backends.freebsd import NativeFreeBSDBackend, parse_ifmcstat
 from harness.backends.linux import NativeLinuxBackend
 from harness.environment import Environment
 from harness.scenarios.datagram import DatagramScenario
@@ -23,7 +28,7 @@ class LifecycleTests(unittest.TestCase):
     def environment(self, backend: Mock, *, keep: bool = False) -> Environment:
         with patch("harness.environment.make_backend", return_value=backend):
             return Environment(
-                argparse.Namespace(keep_on_failure=keep, show_netflector_logs=False),
+                argparse.Namespace(keep_on_failure=keep, show_netflector_logs=False, no_join=True),
                 "failure",
                 "config.toml",
             )
@@ -203,6 +208,20 @@ class LifecycleTests(unittest.TestCase):
     def test_a_dial_recreation_that_evicted_the_proxy_passes(self) -> None:
         self.dial_recreate_run("after its interface was unbound")
 
+    def test_a_missing_membership_fails_the_case(self) -> None:
+        backend = Mock()
+        backend.memberships.return_value = {("nf_source", "224.0.0.251")}
+        env = self.environment(backend)
+        env.args.no_join = False
+        wanted = {("nf_source", "224.0.0.251"), ("nf_target", "224.0.0.251")}
+        with (
+            patch("harness.environment.expected_memberships", return_value=wanted),
+            patch("harness.environment.MEMBERSHIP_DEADLINE_SECONDS", 0.0),
+            self.assertRaises(RuntimeError) as caught,
+        ):
+            env.check_memberships("at startup")
+        self.assertIn("224.0.0.251 on nf_target", str(caught.exception))
+
 
 class PreflightTests(unittest.TestCase):
     def preflight(self, backend: type, outputs: dict[tuple[str, ...], str]) -> list[list[str]]:
@@ -252,6 +271,83 @@ class PreflightTests(unittest.TestCase):
         )
         self.assertGreater(calls.index(["jail", "-r", jail]), calls.index(destroys[-1]))
         self.assertFalse(any("build" in call for call in calls))
+
+
+class MembershipTests(unittest.TestCase):
+    @unittest.skipIf(sys.version_info < (3, 11), "tomllib arrived in Python 3.11")
+    def test_each_reflector_wants_its_groups_on_its_interfaces(self) -> None:
+        config = """
+[reflectors.v4-mdns]
+source_if = "src"
+target_if = "dst"
+mdns = true
+address_family = "ipv4"
+
+[reflectors.one-way-relay]
+source_if = "src"
+target_if = "dst"
+udp_ports = [9003]
+udp_groups = ["239.255.90.90", "ff02::5a5a"]
+
+[reflectors.wol]
+source_if = "src"
+target_if = "dst"
+wol = true
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".toml") as file:
+            file.write(config)
+            file.flush()
+            wanted = memberships.expected(Path(file.name))
+        self.assertEqual(
+            wanted,
+            {
+                ("src", "224.0.0.251"),
+                ("dst", "224.0.0.251"),
+                ("src", "239.255.90.90"),
+                ("src", "ff02::5a5a"),
+            },
+        )
+
+    def test_linux_tables_name_each_group_with_its_interface(self) -> None:
+        igmp = (
+            "Idx\tDevice    :  Count Querier\tGroup    Users Timer\tReporter\n"
+            "1\tlo        :     1      V3\n"
+            "\t\t\t\t010000E0     1 0:00000000\t\t0\n"
+            "4\tnf_source :     2      V3\n"
+            "\t\t\t\tFB0000E0     1 0:00000000\t\t0\n"
+            "\t\t\t\t010000E0     1 0:00000000\t\t0\n"
+        )
+        igmp6 = (
+            "1    lo              ff020000000000000000000000000001     1 0000000C 0\n"
+            "4    nf_source       ff0200000000000000000000000000fb     1 00000004 0\n"
+        )
+        self.assertEqual(
+            linux_admin.parse_memberships(igmp, igmp6),
+            {
+                ("lo", "224.0.0.1"),
+                ("nf_source", "224.0.0.251"),
+                ("nf_source", "224.0.0.1"),
+                ("lo", "ff02::1"),
+                ("nf_source", "ff02::fb"),
+            },
+        )
+
+    def test_ifmcstat_names_each_group_with_its_interface(self) -> None:
+        listing = (
+            "nf_source:\n"
+            "\tinet 192.0.2.1\n"
+            "\tigmpv3 rv 2 qi 125 qri 10 uri 3\n"
+            "\t\tgroup 224.0.0.251 mode exclude\n"
+            "\t\t\tmcast-macaddr 01:00:5e:00:00:fb\n"
+            "\tinet6 fe80::1%nf_source scopeid 0x2\n"
+            "\tmldv2 flags=2<USEALLOW> rv 2 qi 125 qri 10 uri 3\n"
+            "\t\tgroup ff02::fb%nf_source scopeid 0x2 mode exclude\n"
+            "\t\t\tmcast-macaddr 33:33:00:00:00:fb\n"
+        )
+        self.assertEqual(
+            parse_ifmcstat(listing),
+            {("nf_source", "224.0.0.251"), ("nf_source", "ff02::fb")},
+        )
 
 
 if __name__ == "__main__":

@@ -80,6 +80,10 @@ class Backend:
     def logs(self, role: str) -> tuple[str, str]:
         raise NotImplementedError
 
+    def memberships(self) -> set[tuple[str, str]]:
+        # (interface, group) for every membership in netflector's network stack.
+        raise NotImplementedError
+
     def status(self, role: str) -> tuple[bool, str]:
         # (still running?, human-readable state) -- state is "unknown" when unavailable.
         raise NotImplementedError
