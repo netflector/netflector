@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # Exercise the installed plugin on the converted OPNsense VM (ci/freebsd-vm.sh
 # env applies), the way a user's firewall runs it: the model checked against
-# this core, the configuration rendered by real configd, validated by the
-# daemon and through the GUI's own check action, the service started. No sysrc:
-# the seeded config.xml arms the
+# this core, the configuration rendered by real configd and validated by the
+# daemon, the service started. No sysrc: the seeded config.xml arms the
 # service through the plugin's rc.conf.d template, the same path a user's
 # firewall takes (and /etc/rc.conf.d overrides rc.conf anyway).
 set -euo pipefail
