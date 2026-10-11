@@ -196,7 +196,8 @@ impl fmt::Display for RefusedServices<'_> {
 /// What an allow-list makes of one message.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Decision<'a> {
-    /// Nothing service-scoped in it is refused: relay it verbatim.
+    /// Relay it verbatim: nothing in it is refused, or it is a query with a question worth asking.
+    /// See [`ServiceFilter::decide`].
     Pass,
     /// The list refuses it: do not relay it. See [`ServiceFilter::decide`].
     Refuse(RefusedServices<'a>),
