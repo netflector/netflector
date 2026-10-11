@@ -155,11 +155,18 @@ jobs:
       # closes on its own within days.
       - name: Check the latest set has the tree's rust
         id: rust
+        # Explicitly bash for pipefail: a failed query must fail here, not read as a lagging cluster.
+        shell: bash
         run: |
           tree=$(ci/freebsd-vm.sh run 'make -C /usr/ports/lang/rust -V PKGVERSION' | tr -d ' \r')
-          ci/freebsd-vm.sh run 'mkdir -p /usr/local/etc/pkg/repos && printf "ci-latest: { url: \"pkg+https://pkg.FreeBSD.org/\${ABI}/latest\", enabled: yes }\n" > /usr/local/etc/pkg/repos/ci-latest.conf'
+          ci/freebsd-vm.sh run 'mkdir -p /usr/local/etc/pkg/repos && printf "ci-latest: { url: \"pkg+https://pkg.FreeBSD.org/\${ABI}/latest\", mirror_type: \"srv\", enabled: yes }\n" > /usr/local/etc/pkg/repos/ci-latest.conf'
+          ci/freebsd-vm.sh run 'pkg update -r ci-latest'
           latest=$(ci/freebsd-vm.sh run 'pkg rquery -r ci-latest %v rust' | tail -1 | tr -d ' \r')
           echo "tree wants rust $tree; latest has $latest"
+          if [ -z "$tree" ] || [ -z "$latest" ]; then
+            echo "::error::no rust version from the tree or the latest set"
+            exit 1
+          fi
           if [ "$tree" != "$latest" ]; then
             echo "::warning::latest has rust $latest but the tree wants $tree; skipping testport until the cluster catches up"
             echo "skip=true" >> "$GITHUB_OUTPUT"
