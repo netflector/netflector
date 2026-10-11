@@ -514,7 +514,7 @@ mod tests {
             ]),
         )
         .unwrap_err();
-        assert!(matches!(e, ConfigError::DuplicateReflector { name } if name == "tv"));
+        assert!(matches!(e, ConfigError::DuplicateReflector { tag } if tag == "tv"));
     }
 
     #[test]
@@ -536,7 +536,7 @@ mod tests {
             ]),
         )
         .unwrap_err();
-        assert!(matches!(e, ConfigError::DuplicateReflector { name } if name == "tv"));
+        assert!(matches!(e, ConfigError::DuplicateReflector { tag } if tag == "tv"));
     }
 
     #[test]

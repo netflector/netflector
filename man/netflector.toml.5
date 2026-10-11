@@ -267,6 +267,9 @@ Ties one entry's parameters together: any alphanumeric string.
 It also becomes the entry's name unless a
 .Ic NAME
 parameter overrides it.
+It must differ from every entry table key in a configuration file, whatever
+.Ic NAME
+says.
 .It Aq Ar PARAM
 .Ic NAME ,
 or any entry field:
@@ -307,7 +310,10 @@ applies across both.
 .Sh DUPLICATE DETECTION
 Entry names must be unique across the file and the environment; a name that
 appears twice, including the same name from both sources, is rejected at
-startup.
+startup, and so is an environment tag equal to a file entry's table key, even
+when
+.Ic NAME
+renames the entry.
 .Pp
 Beyond names, two entries that enable the same protocol are rejected only when
 they could reflect the same packet twice: a shared direction, overlapping MAC

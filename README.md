@@ -319,7 +319,8 @@ then optional; with none, the environment is the whole configuration. Variables 
 `NETFLECTOR_<TAG>_<PARAM>`:
 
 - `<TAG>` ties one entry's parameters together: any alphanumeric string (`1`, `2`, `TV`, …). It also
-  becomes the entry's name (and thus its log label) unless a `NAME` parameter overrides it.
+  becomes the entry's name (and thus its log label) unless a `NAME` parameter overrides it. It must
+  differ from every `[reflectors.<key>]` in a configuration file, whatever `NAME` says.
 - `<PARAM>` is `NAME` or any field from the entry table above (`SOURCE_IF`, `TARGET_IF`,
   `SOURCE_PEERS`, `TARGET_PEERS`, `MACS`, `WOL`, `MDNS`, `MDNS_SERVICES`, `SSDP`, `WSD`, `DIAL`, `WOL_PORTS`,
   `ADDRESS_FAMILY`, `BIDIRECTIONAL`, `UDP_PORTS`, `UDP_GROUPS`, `UDP_BROADCAST`), case-insensitive.
@@ -621,7 +622,8 @@ interface: `net.ipv4.igmp_max_memberships` on Linux, 20 by default.
 ### Duplicate detection
 
 Entry names must be unique across the file and the environment: a name that appears twice (including the
-same name from both sources) is rejected at startup. Beyond that, two entries that enable the same
+same name from both sources) is rejected at startup, and so is an environment tag equal to a file entry's
+table key, even when `NAME` renames the entry. Beyond that, two entries that enable the same
 protocol are rejected as a duplicate of that protocol only when they could reflect the same packet
 twice: a shared direction, overlapping MAC selection, overlapping address-family handling, and, for
 WoL, at least one shared port. The UDP relay is different. It admits every datagram it captures, so it

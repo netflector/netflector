@@ -98,8 +98,10 @@ pub(crate) enum ConfigError {
     )]
     DialRequiresIpv4 { name: ReflectorName },
 
-    #[error("reflector \"{name}\" is defined in both the configuration file and the environment")]
-    DuplicateReflector { name: String },
+    #[error(
+        "environment tag \"{tag}\" is also a [reflectors] table in the configuration file; use another tag (NAME does not change it)"
+    )]
+    DuplicateReflector { tag: String },
 
     #[error(
         "reflector name \"{name}\" is used by more than one reflector (names are compared case-insensitively and trimmed)"

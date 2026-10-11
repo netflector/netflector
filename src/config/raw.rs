@@ -80,7 +80,7 @@ impl RawConfig {
                 .keys()
                 .any(|k| k.trim().eq_ignore_ascii_case(&name))
             {
-                return Err(ConfigError::DuplicateReflector { name });
+                return Err(ConfigError::DuplicateReflector { tag: name });
             }
             self.reflectors.insert(name, reflector);
         }
