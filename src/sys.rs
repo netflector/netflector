@@ -147,8 +147,8 @@ pub(crate) fn getsockopt_int(fd: RawFd, level: c_int, name: c_int) -> io::Result
 /// The OS error if the option can't be set.
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub(crate) fn set_recv_timeout(fd: RawFd, timeout: std::time::Duration) -> io::Result<()> {
-    // `suseconds_t` is 32-bit on some targets and 64-bit on musl: the conversion must stay
-    // fallible for the former, and clippy objects where it can't fail.
+    // `suseconds_t` is `c_long`, 32-bit on the arm32 musl targets: the conversion must stay
+    // fallible there, and clippy objects where it can't fail.
     #[allow(clippy::unnecessary_fallible_conversions)]
     let tv_usec = timeout
         .subsec_micros()
@@ -572,8 +572,8 @@ mod tests {
 
     #[test]
     fn process_env_sees_a_set_variable() {
-        // SAFETY: nothing else in the test binary reads or writes the process
-        // environment concurrently (config tests take env as a parameter).
+        // SAFETY: every environment access in the test binary goes through std (`env::var*`,
+        // `Command`), whose lock serializes it with this write.
         unsafe { std::env::set_var("NETFLECTOR_SYS_ENV_PROBE", "probe-value") };
         let env = process_env();
         assert!(
