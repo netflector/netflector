@@ -232,6 +232,16 @@ impl<C: Classify> PacketHandler for SimpleReflector<C> {
             Verdict::Junk => return self.unrecognized(packet),
         };
 
+        if self.delivery.destination(packet.dest.ip()).is_none() {
+            log::debug!(
+                "{}: dropping {} from {}: no peer of its family",
+                self.name,
+                self.kind,
+                packet.source
+            );
+            return Outcome::Filtered;
+        }
+
         let Some(dest) = self.destination(packet, dispatcher) else {
             log::debug!(
                 "{}: dropping {} to {} from {}: not for this leg",
@@ -345,6 +355,7 @@ fn link_destination(
 
 #[cfg(test)]
 mod tests {
+    use std::net::IpAddr;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
@@ -381,6 +392,38 @@ mod tests {
         .with_rewrite(rewrite)
         .with_suppress(suppress);
         Some((reflector, dispatcher, reactor))
+    }
+
+    // A peers entry with no peer of the packet's family has nowhere to send it.
+    #[test]
+    #[cfg_attr(miri, ignore = "needs a real capture device")]
+    fn a_packet_of_a_family_no_peer_has_is_filtered() {
+        let _serial = loopback_lock();
+        let mut dispatcher = PacketDispatcher::new();
+        let Some(egress) = open_loopback_or_skip(&mut dispatcher) else {
+            return;
+        };
+        let mut reactor = Reactor::new().expect("reactor");
+        let mut reflector = SimpleReflector::new(
+            egress,
+            Delivery::Peers(Box::new([IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))])),
+            "TEST",
+            "response",
+            reflect_all as fn(&[u8]) -> Verdict,
+            Emit::fixed(5353, 255),
+        );
+        let packet = Packet {
+            source: "[::1]:5353".parse().unwrap(),
+            dest: "[ff02::fb]:5353".parse().unwrap(),
+            ttl: 255,
+            dst_mac: None,
+            src_mac: None,
+            payload: b"response",
+        };
+        assert_eq!(
+            reflector.on_packet(&packet, &mut dispatcher, &mut reactor),
+            Outcome::Filtered
+        );
     }
 
     fn group_packet() -> Packet<'static> {

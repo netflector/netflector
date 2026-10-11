@@ -374,6 +374,7 @@ fn make_session_drops_at_the_session_cap() {
     };
     let outcome = reflector.make_session(
         &packet,
+        packet.dest.ip(),
         &mut dispatcher,
         Instant::now(),
         MessageType::SsdpSearch,
@@ -414,6 +415,38 @@ fn a_search_without_a_source_mac_opens_a_session() {
     let outcome = reflector.on_packet(&packet, &mut dispatcher, &mut reactor);
     assert_eq!(outcome, Outcome::Reflected(MessageType::SsdpSearch));
     assert_eq!(reflector.sessions.len(), 1);
+}
+
+// A peers entry with no peer of the search's family has nowhere to send it: no session, and no
+// port reserved for replies that cannot come.
+#[test]
+#[cfg_attr(miri, ignore = "needs a real capture device")]
+fn a_search_of_a_family_no_peer_has_opens_no_session() {
+    let _serial = loopback_lock();
+    let mut dispatcher = PacketDispatcher::new();
+    let Some(target) = open_loopback_or_skip(&mut dispatcher) else {
+        return;
+    };
+    let mut reactor = Reactor::new().expect("reactor");
+    let mut reflector = SearchReflector::new(
+        CaptureKey::from_u64(999),
+        target,
+        Delivery::Peers(Box::new([IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))])),
+        None,
+        TEST_PROTOCOL,
+        no_rewrite(),
+    );
+    let packet = Packet {
+        source: "[::1]:1900".parse().unwrap(),
+        dest: "[ff02::c]:1900".parse().unwrap(),
+        ttl: TEST_TTL,
+        dst_mac: None,
+        src_mac: None,
+        payload: b"M-SEARCH",
+    };
+    let outcome = reflector.on_packet(&packet, &mut dispatcher, &mut reactor);
+    assert_eq!(outcome, Outcome::Filtered);
+    assert_eq!(reflector.sessions.len(), 0);
 }
 
 // Peers behind a tunnel are reached by routable addresses, so a session for a link-local

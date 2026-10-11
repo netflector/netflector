@@ -67,17 +67,16 @@ impl Delivery {
         }
     }
 
-    /// The address a datagram to `dst` actually reaches; a reply must be listened for on a source
-    /// of that scope.
-    pub(crate) fn destination(&self, dst: IpAddr) -> IpAddr {
+    /// The address a datagram to `dst` actually reaches, or `None` for peers with none of its
+    /// family; a reply must be listened for on a source of that scope.
+    pub(crate) fn destination(&self, dst: IpAddr) -> Option<IpAddr> {
         match self {
-            Self::Link => dst,
+            Self::Link => Some(dst),
             Self::Peers(peers) => peers
                 .iter()
                 .copied()
-                .find(|peer| peer.is_ipv4() == dst.is_ipv4())
-                .unwrap_or(dst),
-            Self::Unicast { to, .. } => to.ip(),
+                .find(|peer| peer.is_ipv4() == dst.is_ipv4()),
+            Self::Unicast { to, .. } => Some(to.ip()),
         }
     }
 

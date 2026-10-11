@@ -112,13 +112,15 @@ impl SearchReflector {
         }
     }
 
-    /// Reserve an ephemeral port on the target's address of the scope the search reaches and
-    /// register the reply capture there before the caller reflects, so a fast responder can't beat
-    /// the capture. `Err` is the outcome to return, already logged: `Stalled` while the target has
-    /// no source address of that family, `Dropped` at the cap or on a reservation failure.
+    /// Reserve an ephemeral port on the target's address of the scope the search reaches at
+    /// `destination` and register the reply capture there before the caller reflects, so a fast
+    /// responder can't beat the capture. `Err` is the outcome to return, already logged: `Stalled`
+    /// while the target has no source address of that family, `Dropped` at the cap or on a
+    /// reservation failure.
     fn make_session(
         &self,
         packet: &Packet,
+        destination: IpAddr,
         dispatcher: &mut PacketDispatcher,
         expiry: Instant,
         message_type: MessageType,
@@ -135,7 +137,6 @@ impl SearchReflector {
         }
         // A frame off a link without MACs has none; the reply's L2 destination goes unused there.
         let searcher_mac = packet.src_mac.unwrap_or(MacAddr::broadcast());
-        let destination = self.delivery.destination(packet.dest.ip());
         let Some(our_addr) = reply_source(dispatcher, self.target, destination) else {
             log::debug!(
                 "{}: cannot reflect search from {}: target has no source address for \
@@ -225,6 +226,15 @@ impl PacketHandler for SearchReflector {
                 return Outcome::Filtered;
             }
         };
+        let Some(destination) = self.delivery.destination(packet.dest.ip()) else {
+            log::debug!(
+                "{}: dropping search from {} to {}: no peer of its family",
+                self.protocol.name,
+                packet.source,
+                packet.dest
+            );
+            return Outcome::Filtered;
+        };
         let expiry = Instant::now() + (self.protocol.window)(packet.payload);
 
         // No staleness check on a reused session: `on_iface_change` drops every session eagerly
@@ -270,7 +280,8 @@ impl PacketHandler for SearchReflector {
             };
         }
 
-        let session = match self.make_session(packet, dispatcher, expiry, message_type) {
+        let session = match self.make_session(packet, destination, dispatcher, expiry, message_type)
+        {
             Ok(session) => session,
             Err(outcome) => return outcome,
         };
