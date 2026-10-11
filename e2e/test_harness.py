@@ -1,5 +1,7 @@
 """Failure-path checks that cannot be exercised by a successful packet run."""
 
+from __future__ import annotations
+
 import argparse
 import contextlib
 import io
@@ -10,7 +12,7 @@ from unittest.mock import Mock, patch
 from cases.models import Phase, TestCase
 from harness.environment import Environment
 from harness.scenarios.datagram import DatagramScenario
-from harness.scenarios.lifecycle import AddressChangeRunner
+from harness.scenarios.lifecycle import AddressChangeRunner, RecreateRunner
 from harness.settings import RECEIVER_READY_LOG
 
 
@@ -18,7 +20,9 @@ class LifecycleTests(unittest.TestCase):
     def environment(self, backend: Mock, *, keep: bool = False) -> Environment:
         with patch("harness.environment.make_backend", return_value=backend):
             return Environment(
-                argparse.Namespace(keep_on_failure=keep), "failure", "config.toml"
+                argparse.Namespace(keep_on_failure=keep, show_netflector_logs=False),
+                "failure",
+                "config.toml",
             )
 
     def test_partial_setup_failure_cleans_up_even_when_diagnostics_fail(self) -> None:
@@ -106,6 +110,67 @@ class LifecycleTests(unittest.TestCase):
     def test_a_receiver_that_died_otherwise_still_fails_the_silence_poll(self) -> None:
         with self.assertRaises(RuntimeError):
             self.silence_probe("Traceback (most recent call last):\n")
+
+    def run_phases(self, runner_type: type, phases: tuple[Phase, ...], backend: Mock) -> None:
+        backend.status.return_value = (True, "running")
+        runner = runner_type(
+            self.environment(backend), SimpleNamespace(name="change", phases=phases)
+        )
+        with (
+            patch.object(runner_type, "_poll_reflected", return_value=True),
+            patch.object(runner_type, "_poll_not_reflected", return_value=True),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            runner.run()
+
+    def address_change_run(self, *, restore_logged: bool) -> None:
+        log = ["interface nf_target: gained IPv4 198.18.0.1"]
+
+        def set_address(ifname: str, family: int, *, up: bool, cidr: str | None) -> str:
+            if not up:
+                log.append(f"interface {ifname}: lost IPv4 (was 198.18.0.1)")
+            elif restore_logged:
+                log.append(f"interface {ifname}: gained IPv4 198.18.0.1")
+            return "198.18.0.1/24"
+
+        backend = Mock()
+        backend.logs.side_effect = lambda role: ("", "".join(f"{line}\n" for line in log))
+        backend.set_address.side_effect = set_address
+        phase = Phase(label="target IPv4", protocol="mdns", family=4, interface="target")
+        self.run_phases(AddressChangeRunner, (phase,), backend)
+
+    def test_a_restore_logged_only_at_startup_fails_the_case(self) -> None:
+        with self.assertRaises(RuntimeError):
+            self.address_change_run(restore_logged=False)
+
+    def test_a_restore_logged_after_the_change_passes(self) -> None:
+        self.address_change_run(restore_logged=True)
+
+    def recreate_run(self, *, regain_logged: bool) -> None:
+        log = ["interface nf_target: gained IPv4 198.18.0.1"]
+
+        def delete_interface(interface: str) -> None:
+            log.append("interface nf_target is gone (was ifindex 3); parking until it returns")
+            log.append("interface nf_target: lost IPv4 (was 198.18.0.1)")
+
+        def recreate_interface(interface: str) -> None:
+            log.append("interface nf_target: returned as ifindex 4; re-bound")
+            if regain_logged:
+                log.append("interface nf_target: gained IPv4 198.18.0.1")
+
+        backend = Mock()
+        backend.logs.side_effect = lambda role: ("", "".join(f"{line}\n" for line in log))
+        backend.delete_interface.side_effect = delete_interface
+        backend.recreate_interface.side_effect = recreate_interface
+        phase = Phase(label="target recreate", protocol="mdns", family=4, interface="target")
+        self.run_phases(RecreateRunner, (phase,), backend)
+
+    def test_a_regain_logged_only_at_startup_fails_the_recreation(self) -> None:
+        with self.assertRaises(RuntimeError):
+            self.recreate_run(regain_logged=False)
+
+    def test_a_recreation_logged_in_full_passes(self) -> None:
+        self.recreate_run(regain_logged=True)
 
 
 if __name__ == "__main__":

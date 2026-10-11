@@ -15,8 +15,6 @@ from harness.settings import (
     EXPECT_NONE_BACKSTOP_SECONDS,
     EXPECT_NONE_SAW_PACKET,
     NETFLECTOR_IFNAMES,
-    NETFLECTOR_SOURCE_IFNAME,
-    NETFLECTOR_TARGET_IFNAME,
 )
 
 
@@ -103,7 +101,7 @@ class AddressChangeRunner:
                 consecutive = 0
         return False
 
-    def _run_phase(self, phase: Phase) -> None:
+    def _run_phase(self, phase: Phase) -> tuple[int, int]:
         desc = f"{self.ac.name} / {phase.label}"
         print(f"--- phase: {desc} ({phase.protocol} IPv{phase.family}) ---", flush=True)
 
@@ -111,6 +109,7 @@ class AddressChangeRunner:
             raise RuntimeError(f"{desc}: no baseline reflection before the change")
         print(f"{desc}: baseline reflected", flush=True)
 
+        mark = self.env.netflector_log_mark()
         cidr = self.env.set_address(phase.interface, phase.family, up=False)
         if not self._poll_not_reflected(phase):
             raise RuntimeError(
@@ -126,39 +125,34 @@ class AddressChangeRunner:
                 f"address was restored"
             )
         print(f"{desc}: reflection resumed after address restore", flush=True)
+        return mark
 
-    def _assert_address_changes_logged(self) -> None:
-        # Full-parity log check (the Rust equivalent of the C++'s capability-down assertion):
-        # every phase removed then restored a source address, so netflector's InterfaceMonitor
-        # must have logged both transitions -- with the monitor off it logs neither. And no
-        # reflect-failure WARN may appear: a send attempted on an addressless egress would mean
-        # the per-packet gate failed to catch the drop.
-        out, err = self.env.backend.logs("netflector")
-        text = f"{out}\n{err}"
-        for phase in self.ac.phases:
-            ifname = (
-                NETFLECTOR_SOURCE_IFNAME
-                if phase.interface == "source"
-                else NETFLECTOR_TARGET_IFNAME
-            )
+    def _assert_address_changes_logged(self, marks: list[tuple[int, int]]) -> None:
+        # Every phase removed then restored a source address, so the interface monitor must have
+        # logged both transitions since the phase began. And no reflect-failure WARN may appear: a
+        # send attempted on an addressless egress would mean the per-packet gate failed to catch
+        # the drop.
+        for phase, mark in zip(self.ac.phases, marks):
+            text = self.env.netflector_logged_since(mark)
+            ifname = NETFLECTOR_IFNAMES[phase.interface]
             family = f"IPv{phase.family}"
             for verb in ("lost", "gained"):
                 needle = f"interface {ifname}: {verb} {family}"
                 if needle not in text:
                     raise RuntimeError(
-                        f'{self.ac.name}: netflector never logged "{needle}" -- the interface monitor '
-                        f"did not observe the change"
+                        f'{self.ac.name} / {phase.label}: netflector did not log "{needle}" after '
+                        f"the change -- the interface monitor did not observe it"
                     )
-        if "cannot reflect" in text:
+        out, err = self.env.backend.logs("netflector")
+        if "cannot reflect" in f"{out}\n{err}":
             raise RuntimeError(
                 f"{self.ac.name}: netflector logged a reflect failure -- a send was attempted on an "
                 f"addressless egress (the gate did not catch the drop)"
             )
 
     def run(self) -> None:
-        for phase in self.ac.phases:
-            self._run_phase(phase)
-        self._assert_address_changes_logged()
+        marks = [self._run_phase(phase) for phase in self.ac.phases]
+        self._assert_address_changes_logged(marks)
         self.env.passed(self.ac.name)
         if self.env.args.show_netflector_logs:
             time.sleep(0.5)
@@ -191,7 +185,7 @@ class RecreateRunner(AddressChangeRunner):
             expect_payload_hex=(spec["payload"] if expect else None),
         )
 
-    def _run_phase(self, phase: Phase) -> None:
+    def _run_phase(self, phase: Phase) -> tuple[int, int]:
         desc = f"{self.ac.name} / {phase.label}"
         print(f"--- phase: {desc} ({phase.protocol} IPv{phase.family}) ---", flush=True)
 
@@ -199,6 +193,7 @@ class RecreateRunner(AddressChangeRunner):
             raise RuntimeError(f"{desc}: no baseline reflection before the recreation")
         print(f"{desc}: baseline reflected", flush=True)
 
+        mark = self.env.netflector_log_mark()
         self.env.backend.delete_interface(phase.interface)
         if phase.decoy:
             # Occupy the freed index before the recreation claims it (see Phase.decoy).
@@ -231,16 +226,16 @@ class RecreateRunner(AddressChangeRunner):
                 f"recreated"
             )
         print(f"{desc}: reflection resumed after interface recreation", flush=True)
+        return mark
 
-    def _assert_recreations_logged(self) -> None:
+    def _assert_recreations_logged(self, marks: list[tuple[int, int]]) -> None:
         # netflector must have observed each phase as a real hot-swap, in its parts: the
         # parking line when the interface vanished, the address losses parking implies (the
         # egress gate closing), the recreation line when its capture re-bound, and the address
         # gains of the re-resolve. Their absence would mean reflection "recovered" some other
         # way than the reconcile.
-        out, err = self.env.backend.logs("netflector")
-        text = f"{out}\n{err}"
-        for phase in self.ac.phases:
+        for phase, mark in zip(self.ac.phases, marks):
+            text = self.env.netflector_logged_since(mark)
             ifname = NETFLECTOR_IFNAMES[phase.interface]
             needles = (
                 f"interface {ifname} is gone",
@@ -251,14 +246,13 @@ class RecreateRunner(AddressChangeRunner):
             for needle in needles:
                 if needle not in text:
                     raise RuntimeError(
-                        f'{self.ac.name}: netflector never logged "{needle}" -- the reconcile '
-                        f"did not drive the recovery"
+                        f'{self.ac.name} / {phase.label}: netflector did not log "{needle}" '
+                        f"after the deletion -- the reconcile did not drive the recovery"
                     )
 
     def run(self) -> None:
-        for phase in self.ac.phases:
-            self._run_phase(phase)
-        self._assert_recreations_logged()
+        marks = [self._run_phase(phase) for phase in self.ac.phases]
+        self._assert_recreations_logged(marks)
         self.env.passed(self.ac.name)
         if self.env.args.show_netflector_logs:
             time.sleep(0.5)

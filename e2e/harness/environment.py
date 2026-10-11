@@ -147,6 +147,14 @@ class Environment:
         if not out and not err:
             print("<empty>", flush=True)
 
+    def netflector_log_mark(self) -> tuple[int, int]:
+        out, err = self.backend.logs("netflector")
+        return out.count("\n"), err.count("\n")
+
+    def netflector_logged_since(self, mark: tuple[int, int]) -> str:
+        out, err = self.backend.logs("netflector")
+        return "\n".join(out.split("\n")[mark[0] :] + err.split("\n")[mark[1] :])
+
     def set_address(
         self, interface: str, family: int, *, up: bool, cidr: str | None = None
     ) -> str | None:
