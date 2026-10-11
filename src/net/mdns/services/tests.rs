@@ -377,12 +377,13 @@ fn the_work_per_message_is_bounded() {
 #[test]
 fn a_dname_target_pointing_into_a_dropped_record_is_spelled_out() {
     // Record 1 (refused) owns `local`; record 2 (allowed) keeps the message a trim; record 3 is
-    // a DNAME whose target is a pointer to record 1's `local`.
+    // a DNAME whose target is a pointer to record 1's `local`. Record 1's first label is longer
+    // than record 2's, so the original offset of `local` names something else in the trim.
     let mut m = header(true, 0, 3);
     let first = m.len();
-    m.extend(name("_hap._tcp.local"));
+    m.extend(name("_airplay._tcp.local"));
     m.extend_from_slice(&[0, 12, 0x80, 1, 0, 0, 0, 120]);
-    let target = name("L._hap._tcp.local");
+    let target = name("L._airplay._tcp.local");
     m.extend_from_slice(&u16::try_from(target.len()).unwrap().to_be_bytes());
     m.extend(target);
     m.extend(name("_ipp._tcp.local"));
@@ -390,7 +391,7 @@ fn a_dname_target_pointing_into_a_dropped_record_is_spelled_out() {
     let target = name("L._ipp._tcp.local");
     m.extend_from_slice(&u16::try_from(target.len()).unwrap().to_be_bytes());
     m.extend(target);
-    let local = u8::try_from(first + 1 + 4 + 1 + 4).unwrap(); // past `_hap` and `_tcp`
+    let local = u8::try_from(first + 1 + 8 + 1 + 4).unwrap(); // past `_airplay` and `_tcp`
     m.extend(name("alias.example"));
     m.extend_from_slice(&[0, 39, 0x80, 1, 0, 0, 0, 120, 0, 2, 0xc0, local]);
     let trimmed = trim("_ipp._tcp", &m).unwrap();
@@ -502,6 +503,33 @@ fn a_kept_name_pointing_into_a_dropped_record_is_spelled_out() {
     assert_eq!(decode(&m)[1].1, "_ipp._tcp.local");
 
     let trimmed = trim("_ipp._tcp", &m).unwrap();
+    assert_eq!(
+        decode(&trimmed),
+        [(
+            Section::Answer,
+            "_ipp._tcp.local".to_owned(),
+            TYPE_PTR,
+            "|L._ipp._tcp.local|".to_owned()
+        )]
+    );
+}
+
+#[test]
+fn a_kept_name_pointing_at_a_kept_label_that_moved_is_repointed() {
+    // The refused first record shifts the second, whose PTR target ends in a pointer to its own
+    // owner: the trim must point at the owner's new offset, right after the header.
+    let mut m = header(true, 0, 2);
+    m.extend(name("_airplay._tcp.local"));
+    m.extend_from_slice(&[0, 12, 0x80, 1, 0, 0, 0, 120]);
+    let target = name("TV._airplay._tcp.local");
+    m.extend_from_slice(&u16::try_from(target.len()).unwrap().to_be_bytes());
+    m.extend(target);
+    let owner = u8::try_from(m.len()).unwrap();
+    m.extend(name("_ipp._tcp.local"));
+    m.extend_from_slice(&[0, 12, 0x80, 1, 0, 0, 0, 120, 0, 4, 1, b'L', 0xc0, owner]);
+
+    let trimmed = trim("_ipp._tcp", &m).unwrap();
+    assert_eq!(trimmed[trimmed.len() - 4..], [1, b'L', 0xc0, 12]);
     assert_eq!(
         decode(&trimmed),
         [(
