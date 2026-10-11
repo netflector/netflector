@@ -494,6 +494,9 @@ the VLAN interface needs `reorder_hdr on`, the default: with it off, captures on
 and ignore the frame. A datagram
 that arrives as IP fragments is reassembled, up to 9000 bytes, and one larger than the outgoing
 interface's MTU leaves as fragments. Of the IPv6 extension headers only a Fragment header is read.
+Jumbo frames work: netflector takes IP packets of up to 9060 bytes, enough for the usual 9000-byte
+MTU. A larger packet, which only an interface with a larger MTU carries, is dropped and counted as
+`oversized`.
 
 For SSDP, multicast reflection delivers **passive** discovery: devices' periodic `NOTIFY ssdp:alive`
 advertisements reach the source segment so clients see them. **Active** discovery works end to end as

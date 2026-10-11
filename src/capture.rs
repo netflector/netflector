@@ -24,10 +24,13 @@ pub(crate) enum Read<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::net::UdpSocket;
+    use std::time::{Duration, Instant};
+
     use super::Read;
     use crate::interface::InterfaceName;
-    use crate::net::LinkType;
-    use crate::test_support::open_or_skip;
+    use crate::net::{LinkType, MAX_DATAGRAM_LEN};
+    use crate::test_support::{Capability, loopback_lock, open_or_skip, skip};
 
     // Live capture against a real interface (`NETFLECTOR_TEST_IFACE`). Backend-neutral
     // because a real interface is Ethernet-framed on both backends: BPF reports
@@ -67,6 +70,44 @@ mod tests {
             }
         }
         eprintln!("live_capture: validated {validated} frame(s) on {iface}");
+        Ok(())
+    }
+
+    // A kernel can hand its own tap a datagram it reassembled, past the link MTU: a Linux bridge
+    // whose br_netfilter hook runs conntrack defrag does. Loopback carries one whole the same
+    // way, and the largest one the reassembler takes is read, not dropped as oversized.
+    #[test]
+    #[cfg_attr(miri, ignore = "needs a real capture device")]
+    fn a_datagram_at_the_reassembly_limit_is_read_whole() -> std::io::Result<()> {
+        let _serial = loopback_lock();
+        let Some(mut capture) = open_or_skip(&InterfaceName::loopback())? else {
+            return Ok(());
+        };
+        let payload = vec![0x5a; MAX_DATAGRAM_LEN - 8]; // the limit counts the UDP header
+        for local in ["127.0.0.1:0", "[::1]:0"] {
+            let Ok(receiver) = UdpSocket::bind(local) else {
+                skip(Capability::Ipv6, "::1 unavailable");
+                continue;
+            };
+            let sender = UdpSocket::bind(local)?;
+            sender.send_to(&payload, receiver.local_addr()?)?;
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut oversized = 0;
+            loop {
+                match capture.next_frame()? {
+                    Some(Read::Frame(frame)) if frame.ends_with(&payload) => break,
+                    Some(Read::Frame(_)) => {}
+                    Some(Read::Oversized) => oversized += 1,
+                    None if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    None => panic!(
+                        "the datagram to {} was not read whole ({oversized} oversized)",
+                        receiver.local_addr()?
+                    ),
+                }
+            }
+        }
         Ok(())
     }
 }

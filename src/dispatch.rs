@@ -33,9 +33,9 @@ use crate::capture::{Capture, Read};
 use crate::config::AddressFamily;
 use crate::interface::{InterfaceAddresses, InterfaceName};
 use crate::logging::{WARN_WINDOW, log_rate};
-use crate::net::LinkType;
 use crate::net::mac::{MacAddr, MacSet};
 use crate::net::packet::{Fragment, Packet, Parsed};
+use crate::net::{LinkType, MAX_DATAGRAM_LEN};
 use crate::reactor::{Arena, ControlEvent, Handler, HandlerSlot, Key, Reactor, ReadyEvent};
 
 use self::counters::log_counters;
@@ -43,7 +43,7 @@ use self::egress::{Datagram, Egress};
 use self::interface_table::{InterfaceTable, Presence};
 use self::lifecycle::{Changes, InterfaceLifecycle, Rebuilt};
 use self::multicast::Memberships;
-use self::reassembly::{Loss, Lost, MAX_DATAGRAM_LEN, Reassembler};
+use self::reassembly::{Loss, Lost, Reassembler};
 
 /// Frames drained per readable event before yielding, so a flooded interface can't starve the
 /// others. BPF finishes its current userland batch past this: the wait won't re-fire for

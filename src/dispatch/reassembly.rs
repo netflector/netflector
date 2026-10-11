@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use std::vec;
 
 use crate::linear_map::LinearMap;
-use crate::net::FRAGMENT_UNIT;
 use crate::net::packet::{Fragment, FragmentHeader, Packet, ParseError};
+use crate::net::{FRAGMENT_UNIT, MAX_DATAGRAM_LEN};
 
 use super::CaptureKey;
 
@@ -18,10 +18,6 @@ const SLOTS: usize = 16;
 
 /// Datagrams remembered as unwanted or given up on; an entry holds no buffer.
 const DISCARDS: usize = 64;
-
-/// The most UDP header and payload a datagram reassembles to: RFC 6762's ceiling for an mDNS
-/// packet, which also clears DPWS's 4096-byte limit on a WSD envelope.
-pub(super) const MAX_DATAGRAM_LEN: usize = 9000;
 
 /// A one-hop datagram's fragments arrive back to back; one this late is lost.
 const EXPIRY: Duration = Duration::from_secs(2);

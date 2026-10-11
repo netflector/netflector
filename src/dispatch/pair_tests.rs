@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use crate::capture::{Capture, Read};
 use crate::interface::{Interface, InterfaceAddresses, InterfaceName, Ipv6Scope, if_index};
+use crate::net::MAX_FRAME_LEN;
 use crate::net::packet::Parsed;
 use crate::sys::setsockopt;
 #[cfg(target_os = "linux")]
@@ -162,6 +163,18 @@ impl InterfacePair {
             self.receive
         );
         self.settle();
+    }
+
+    /// Read back: macOS ifconfig exits 0 on a refused MTU.
+    fn set_mtu(&self, mtu: usize) -> bool {
+        [&self.inject, &self.receive].into_iter().all(|name| {
+            #[cfg(target_os = "linux")]
+            let command = format!("ip link set {name} mtu {mtu}");
+            #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+            let command = format!("ifconfig {name} mtu {mtu}");
+            run(&command)
+                && open_interface(name).is_ok_and(|(iface, _)| iface.mtu == u32::try_from(mtu).ok())
+        })
     }
 
     /// Linux: veth names are caller-chosen, so derive them from the pid and a counter -- unique
@@ -593,7 +606,7 @@ fn inject(
     dst: SocketAddr,
     payload: &[u8],
 ) -> io::Result<()> {
-    let mut scratch = [0u8; 2048];
+    let mut scratch = [0u8; MAX_FRAME_LEN];
     let n = build_injected(addrs, injector, dst, payload, &mut scratch);
     injector.send(&scratch[..n])
 }
@@ -607,7 +620,7 @@ fn inject_tagged(
     payload: &[u8],
     tci: u16,
 ) -> io::Result<()> {
-    let mut scratch = [0u8; 2048];
+    let mut scratch = [0u8; MAX_FRAME_LEN];
     let n = build_injected(addrs, injector, dst, payload, &mut scratch);
     let [tci_hi, tci_lo] = tci.to_be_bytes();
     let tagged = [
@@ -934,7 +947,7 @@ fn inject_fragmented(
     )
     .expect("plan the injected frames");
     assert!(frames.count() > 1, "{} bytes fit one frame", payload.len());
-    let mut scratch = [0u8; 2048];
+    let mut scratch = [0u8; MAX_FRAME_LEN];
     for index in 0..frames.count() {
         let n = frames.write(index, &mut scratch).expect("build a fragment");
         injector.send(&scratch[..n])?;
@@ -1018,6 +1031,55 @@ fn pair_captured_fragments_reassemble() -> io::Result<()> {
         assert_eq!(packet.source.port(), INJECT_SRC_PORT);
         assert_eq!(packet.dest, dst);
         assert_eq!(packet.payload, payload);
+    }
+    Ok(())
+}
+
+// A frame filling a 9000-byte jumbo MTU crosses the pair unfragmented and the peer captures it
+// whole, in either family.
+#[test]
+fn pair_captures_a_jumbo_frame_whole() -> io::Result<()> {
+    const JUMBO_MTU: usize = 9000;
+    let Some(pair) = InterfacePair::create() else {
+        return Ok(());
+    };
+    // A feth refuses an MTU past this cap, which it copies at creation. Read only past the create's
+    // root check: Miri can't spawn a process.
+    #[cfg(target_os = "macos")]
+    if let Some(cap) =
+        run_capture("sysctl -n net.link.fake.max_mtu").and_then(|cap| cap.parse::<usize>().ok())
+        && cap < JUMBO_MTU
+    {
+        skip(
+            Capability::Pair,
+            format_args!("feth takes at most a {cap}-byte MTU; raise net.link.fake.max_mtu"),
+        );
+        return Ok(());
+    }
+    assert!(
+        pair.set_mtu(JUMBO_MTU),
+        "{}/{} refused a {JUMBO_MTU}-byte MTU",
+        pair.inject,
+        pair.receive
+    );
+    let (iface, ifindex) = open_interface(&pair.inject)?;
+    let injector = Capture::open(&iface, ifindex)?;
+    let mut peer = open_capture(&pair.receive)?;
+
+    for (dst, ip_header) in [
+        (SocketAddr::from((Ipv4Addr::BROADCAST, INJECT_DST_PORT)), 20),
+        (
+            SocketAddr::from((Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1), INJECT_DST_PORT)),
+            40,
+        ),
+    ] {
+        let payload: Vec<u8> = (0..JUMBO_MTU - ip_header - 8)
+            .map(|i| u8::try_from(i % 239).unwrap())
+            .collect();
+        inject(&iface.addrs, &injector, dst, &payload)?;
+        let captured = capture_injected(&mut peer, dst.ip())?
+            .unwrap_or_else(|| panic!("{} captured no jumbo datagram to {dst}", pair.receive));
+        assert_eq!(captured.payload, payload);
     }
     Ok(())
 }

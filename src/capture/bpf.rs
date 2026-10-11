@@ -38,7 +38,15 @@ impl Capture {
     /// No free BPF device, an unbindable interface, a link type neither Ethernet nor
     /// `DLT_NULL`, or a failed setup ioctl.
     pub(crate) fn open(interface: &Interface, _ifindex: NonZeroU32) -> io::Result<Self> {
+        // Room for a MAX_FRAME_LEN record; the 4 KiB default truncates past it.
+        const BUFFER_LEN: c_uint = 16 * 1024;
+
         let fd = open_bpf_device()?;
+
+        // Only an unattached descriptor takes a new size.
+        let mut blen = BUFFER_LEN;
+        // SAFETY: BIOCSBLEN takes a `c_uint`.
+        unsafe { ioctl(&fd, libc::BIOCSBLEN, &mut blen) }?;
 
         let link_type = attach(&fd, interface)?;
 
@@ -48,7 +56,6 @@ impl Capture {
         unsafe { ioctl(&fd, libc::BIOCIMMEDIATE, &mut immediate) }?;
 
         // BPF requires each read to be exactly its buffer length.
-        let mut blen: c_uint = 0;
         // SAFETY: BIOCGBLEN writes a `c_uint`.
         unsafe { ioctl(&fd, libc::BIOCGBLEN, &mut blen) }?;
 
@@ -226,8 +233,7 @@ fn parse_record(record: &[u8]) -> io::Result<(Record, usize)> {
         return Err(io::Error::other("BPF record did not advance"));
     }
 
-    // Truncated by the kernel, or whole but past MAX_FRAME_LEN: the send path would reject it
-    // once per packet.
+    // Truncated by the kernel, or whole but past the frame limit every backend applies.
     if header.bh_datalen > header.bh_caplen || header.bh_caplen as usize > crate::net::MAX_FRAME_LEN
     {
         return Ok((
@@ -361,7 +367,7 @@ mod tests {
 
     #[test]
     fn skips_a_frame_past_the_forwarding_limit() {
-        // Whole, not truncated: this one would otherwise route and then fail in build_udp.
+        // Whole, not truncated.
         let over = u32::try_from(crate::net::MAX_FRAME_LEN + 1).expect("fits u32");
         let mut batch = Vec::new();
         push_record(&mut batch, over, over, 0xaa);
@@ -480,10 +486,7 @@ mod tests {
         let receiver = std::net::UdpSocket::bind("127.0.0.1:0")?;
         let sender = std::net::UdpSocket::bind("127.0.0.1:0")?;
         // lo0's MTU carries it whole, so it arrives as one record past MAX_FRAME_LEN.
-        sender.send_to(
-            &[0u8; 2 * crate::net::MAX_FRAME_LEN],
-            receiver.local_addr()?,
-        )?;
+        sender.send_to(&[0u8; crate::net::MAX_FRAME_LEN], receiver.local_addr()?)?;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
             match capture.next_frame()? {

@@ -553,6 +553,10 @@ jobs:
           # As in the valgrind lane: a flaking third-party repo must not kill the step.
           sudo apt-get update || true
           sudo apt-get install -y --no-install-recommends wireguard-tools
+      - name: Raise the feth MTU cap
+        if: ${{ !matrix.target.emulated && runner.os == 'macOS' }}
+        # A feth takes at most a 2048-byte MTU by default; the jumbo pair test needs 9000.
+        run: sudo sysctl -w net.link.fake.max_mtu=9000
       - name: cargo test (root)
         if: ${{ !matrix.target.emulated }}
         env:

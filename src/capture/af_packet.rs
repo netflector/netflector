@@ -529,10 +529,7 @@ mod tests {
         let receiver = UdpSocket::bind("127.0.0.1:0")?;
         let sender = UdpSocket::bind("127.0.0.1:0")?;
         // lo's MTU carries it whole, so it arrives as one frame past MAX_FRAME_LEN.
-        sender.send_to(
-            &[0u8; 2 * crate::net::MAX_FRAME_LEN],
-            receiver.local_addr()?,
-        )?;
+        sender.send_to(&[0u8; crate::net::MAX_FRAME_LEN], receiver.local_addr()?)?;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
             match capture.next_frame()? {

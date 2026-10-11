@@ -40,6 +40,8 @@ const ETHERNET_HEADER_SIZE: usize = 14;
 const DLT_NULL_HEADER_SIZE: usize = 4;
 /// IPv4 without options (the minimum); the IPv6 base header and UDP header are fixed.
 const IPV4_HEADER_SIZE: usize = 20;
+/// IPv4 with the most options its 4-bit word count allows.
+const IPV4_MAX_HEADER_SIZE: usize = 60;
 const IPV6_HEADER_SIZE: usize = 40;
 const IPV6_FRAGMENT_HEADER_SIZE: usize = 8;
 const UDP_HEADER_SIZE: usize = 8;
@@ -48,10 +50,16 @@ const UDP_HEADER_SIZE: usize = 8;
 /// them.
 pub(crate) const FRAGMENT_UNIT: usize = 8;
 
+/// The most UDP header and payload a datagram reassembles to: RFC 6762's ceiling for an mDNS
+/// packet, which also clears DPWS's 4096-byte limit on a WSD envelope.
+pub(crate) const MAX_DATAGRAM_LEN: usize = 9000;
+
 /// The largest frame the daemon builds, captures or forwards; every frame-path buffer is sized
-/// from it. Clears a 1514-byte Ethernet frame (the FCS is stripped before capture) with headroom
-/// for a baby-jumbo MTU; true 9000-byte jumbo is out of reach.
-pub(crate) const MAX_FRAME_LEN: usize = 2048;
+/// from it. A kernel that reassembles ahead of its tap (a Linux bridge running conntrack defrag)
+/// hands the capture a whole datagram, so this holds the largest one reassembly takes under the
+/// longest IP header. A 9000-byte jumbo MTU fits too.
+pub(crate) const MAX_FRAME_LEN: usize =
+    ETHERNET_HEADER_SIZE + IPV4_MAX_HEADER_SIZE + MAX_DATAGRAM_LEN;
 
 /// The largest UDP payload that still fits one [`MAX_FRAME_LEN`] frame under the worst-case
 /// header stack. IPv6 is fixed at 40: an unfragmented datagram carries no extension header.
