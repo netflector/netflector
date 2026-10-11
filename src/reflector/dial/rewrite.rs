@@ -290,7 +290,7 @@ mod tests {
         let mut reactor = Reactor::new().expect("reactor");
         let mut ctx = DialContext::new();
         let first = rewrite_advert(&mut ctx, &mut reactor, DIAL_ADVERT).expect("first");
-        // The registry evicts the proxy (unregisters it); its generational key goes stale.
+        // The proxy unregisters itself after a failed accept, leaving its registry entry stale.
         reactor
             .unregister(ctx.handler_keys()[0])
             .expect("unregister the proxy");
@@ -346,7 +346,7 @@ mod tests {
         let mut reactor = Reactor::new().expect("reactor");
         let mut ctx = DialContext::new();
         rewrite_advert(&mut ctx, &mut reactor, DIAL_ADVERT).expect("minted");
-        // The proxy is torn down out from under the registry (e.g. by the grace sweep on a prior tick).
+        // The proxy unregisters itself after a failed accept, out from under the registry.
         reactor
             .unregister(ctx.handler_keys()[0])
             .expect("unregister the proxy");
