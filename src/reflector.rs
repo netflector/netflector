@@ -24,6 +24,7 @@ use thiserror::Error;
 use crate::config::{AddressFamily, PeerList, Reflector};
 use crate::dispatch::{
     CaptureKey, DatagramSource, JoinError, MessageType, PacketDispatcher, Wanted,
+    igmp_max_memberships_hint,
 };
 use crate::interface::{InterfaceAddresses, InterfaceName};
 use crate::linear_map::LinearMap;
@@ -402,17 +403,9 @@ fn join_failure(err: JoinError, group: IpAddr, interface: &str) -> BuildError {
             };
             format!("the interface has no IPv6, which the reflector requires{hint}")
         }
-        JoinError::Failed {
-            source,
-            capped: true,
-        } => format!(
-            "{source}; the interface holds as many memberships as the system allows \
-             (net.ipv4.igmp_max_memberships)"
-        ),
-        JoinError::Failed {
-            source,
-            capped: false,
-        } => source.to_string(),
+        JoinError::Failed { source, capped } => {
+            format!("{source}{}", igmp_max_memberships_hint(capped))
+        }
     };
     BuildError::GroupJoin {
         group,

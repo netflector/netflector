@@ -20,7 +20,7 @@ mod pair_tests;
 pub(crate) use self::counters::{MessageType, Outcome};
 pub(crate) use self::datagram::DatagramSource;
 pub(crate) use self::dial_context::{DialContext, DialProxyKey};
-pub(crate) use self::multicast::{JoinError, Wanted};
+pub(crate) use self::multicast::{JoinError, Wanted, igmp_max_memberships_hint};
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};

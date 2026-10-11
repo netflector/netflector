@@ -151,7 +151,7 @@ impl Membership {
                 self.report_wait(wait, name);
                 self.state = State::Waiting(wait);
             }
-            Outcome::Failed { source, .. } => {
+            Outcome::Failed { source, capped } => {
                 let attempts = match self.state {
                     State::Failed { attempts, .. } => attempts.saturating_add(1),
                     _ => 0,
@@ -159,9 +159,10 @@ impl Membership {
                 if self.reported == Some(Problem::Failed) {
                     log::debug!("{label}: joining {group} on {name} still fails: {source}");
                 } else {
+                    let hint = igmp_max_memberships_hint(capped);
                     log::warn!(
                         "{label}: joining {group} on {name} failed; its traffic is not reflected \
-                         until a retry succeeds: {source}"
+                         until a retry succeeds: {source}{hint}"
                     );
                 }
                 self.reported = Some(Problem::Failed);
@@ -418,6 +419,16 @@ fn classify(
 
 /// The environment can't join at all: QEMU user-mode returns `ENOPROTOOPT` for
 /// `MCAST_JOIN_GROUP`. The join tests self-skip on it.
+/// Follows the error of a `capped` join failure; empty for any other.
+pub(crate) fn igmp_max_memberships_hint(capped: bool) -> &'static str {
+    if capped {
+        "; the interface holds as many memberships as the system allows \
+         (net.ipv4.igmp_max_memberships)"
+    } else {
+        ""
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn join_unsupported(err: &JoinError) -> bool {
     matches!(
