@@ -199,7 +199,7 @@ class DialRunner:
                     raise RuntimeError(
                         f"{self.dial.name}: echoes on a fabric that hands no frame back"
                     )
-        print(f"PASS {self.dial.name}", flush=True)
+        self.env.passed(self.dial.name)
         if self.env.args.show_netflector_logs:
             time.sleep(0.5)
             self.env.print_netflector_logs()
@@ -282,7 +282,7 @@ class DialAddressChangeRunner(DialRunner):
         self._change_v4("target")  # the source authority is unchanged by a target move
         self._dial_pass("after target IPv4 change", source_ip, device_ip)
 
-        print(f"PASS {self.dial.name}", flush=True)
+        self.env.passed(self.dial.name)
         if self.env.args.show_netflector_logs:
             time.sleep(0.5)
             self.env.print_netflector_logs()
@@ -333,7 +333,7 @@ class DialRecreateRunner(DialAddressChangeRunner):
             )  # re-pinned to the same address
         self._dial_pass(f"after {interface} recreation", source_ip, device_ip)
 
-        print(f"PASS {self.dial.name}", flush=True)
+        self.env.passed(self.dial.name)
         if self.env.args.show_netflector_logs:
             time.sleep(0.5)
             self.env.print_netflector_logs()

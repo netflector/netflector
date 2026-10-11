@@ -152,7 +152,7 @@ class AddressChangeRunner:
         for phase in self.ac.phases:
             self._run_phase(phase)
         self._assert_address_changes_logged()
-        print(f"PASS {self.ac.name}", flush=True)
+        self.env.passed(self.ac.name)
         if self.env.args.show_netflector_logs:
             time.sleep(0.5)
             self.env.print_netflector_logs()
@@ -252,7 +252,7 @@ class RecreateRunner(AddressChangeRunner):
         for phase in self.ac.phases:
             self._run_phase(phase)
         self._assert_recreations_logged()
-        print(f"PASS {self.ac.name}", flush=True)
+        self.env.passed(self.ac.name)
         if self.env.args.show_netflector_logs:
             time.sleep(0.5)
             self.env.print_netflector_logs()

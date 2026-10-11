@@ -112,7 +112,7 @@ class RoundTripRunner:
         # never fires.
         self.env.wait_for_log("netflector", self.rt.evict_log, "session eviction")
         print(f"{self.rt.name}: session evicted after expiry", flush=True)
-        print(f"PASS {self.rt.name}", flush=True)
+        self.env.passed(self.rt.name)
         if self.env.args.show_netflector_logs:
             time.sleep(0.5)
             self.env.print_netflector_logs()
@@ -202,7 +202,7 @@ class AnswerRunner:
             detach=False,
         )
         self.env.wait_for_result()
-        print(f"PASS {self.answer.name}", flush=True)
+        self.env.passed(self.answer.name)
         if self.env.args.show_netflector_logs:
             time.sleep(0.5)
             self.env.print_netflector_logs()
@@ -334,7 +334,7 @@ class SearchRecreateRunner(RoundTripRunner):
                 "sessions never cleared",
                 flush=True,
             )
-        print(f"PASS {self.rt.name}", flush=True)
+        self.env.passed(self.rt.name)
         if self.env.args.show_netflector_logs:
             time.sleep(0.5)
             self.env.print_netflector_logs()

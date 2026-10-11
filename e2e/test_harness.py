@@ -48,6 +48,25 @@ class LifecycleTests(unittest.TestCase):
         backend.abandon.assert_called_once_with()
         backend.cleanup.assert_not_called()
 
+    def test_a_case_fails_when_netflector_stopped_during_it(self) -> None:
+        backend = Mock()
+        backend.status.return_value = (False, "exited (101)")
+        env = self.environment(backend)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(RuntimeError):
+            env.passed("crashed")
+        backend.status.assert_called_with("netflector")
+        self.assertNotIn("PASS", out.getvalue())
+
+    def test_a_case_passes_while_netflector_runs(self) -> None:
+        backend = Mock()
+        backend.status.return_value = (True, "running")
+        env = self.environment(backend)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            env.passed("fine")
+        self.assertEqual(out.getvalue(), "PASS fine\n")
+
     def test_negative_window_rejects_receiver_that_exited_before_sender(self) -> None:
         backend = Mock()
         backend.status.return_value = (False, "exited")

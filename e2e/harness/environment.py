@@ -120,6 +120,12 @@ class Environment:
                     f"not logged) although --user {self.args.user} was given"
                 )
 
+    def passed(self, case: str) -> None:
+        running, state = self.backend.status("netflector")
+        if not running:
+            raise RuntimeError(f"netflector stopped during {case} ({state})")
+        print(f"PASS {case}", flush=True)
+
     def wait_for_result(self, role: str = "receiver") -> None:
         exit_code = self.backend.wait(role)
         out, err = self.backend.logs(role)

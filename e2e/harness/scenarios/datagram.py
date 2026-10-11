@@ -149,7 +149,7 @@ class DatagramScenario:
             self.env.wait_for_log(
                 "netflector", self.case.expect_netflector_log, "netflector log line"
             )
-        print(f"PASS {self.case.name}", flush=True)
+        self.env.passed(self.case.name)
         if self.env.args.show_netflector_logs:
             time.sleep(0.5)
             self.env.print_netflector_logs()
