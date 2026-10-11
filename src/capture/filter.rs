@@ -86,17 +86,29 @@ pub(crate) const DROP_OUTGOING_PROLOGUE: [BpfInsn; 3] = [
 /// Prepended to the Ethernet classifier on Linux. The kernel moves an 802.1Q tag into
 /// `skb->vlan_tci` before packet sockets on the parent interface see the frame, so without this
 /// the classifier reads the inner ethertype and takes another VLAN's traffic as the parent's.
-/// Untagged and priority-tagged (VID 0) frames fall through.
+/// Untagged and priority-tagged (VID 0) frames fall through. The tag-present flag comes first:
+/// 5.0 through 6.1 clear only that flag when a VLAN device removes the tag, so the frames the
+/// device itself receives still carry their VID in `vlan_tci`.
 ///
 /// ```text
-/// ld #vlan_tci             skb->vlan_tci via the ancillary offset
+/// ld #vlan_present         the tag-present flag via the ancillary offset
+/// jeq 0 -> classifier      untagged
+/// ld #vlan_tci             skb->vlan_tci
 /// and 0x0fff               keep the VLAN ID
 /// jeq 0 -> classifier      else fall through
 /// ret 0                    drop
 /// ```
 #[cfg(target_os = "linux")]
-pub(crate) const DROP_VLAN_TAGGED_PROLOGUE: [BpfInsn; 4] = [
-    // BPF_LD|BPF_W|BPF_ABS: A = vlan_tci, from the negative ancillary offset.
+pub(crate) const DROP_VLAN_TAGGED_PROLOGUE: [BpfInsn; 6] = [
+    // BPF_LD|BPF_W|BPF_ABS: A = the tag-present flag, from the negative ancillary offset.
+    insn(
+        0x0020,
+        0,
+        0,
+        (libc::SKF_AD_OFF + libc::SKF_AD_VLAN_TAG_PRESENT).cast_unsigned(),
+    ),
+    insn(0x0015, 4, 0, 0x0000_0000), // BPF_JMP|BPF_JEQ|BPF_K 0: jt=4 -> the classifier
+    // BPF_LD|BPF_W|BPF_ABS: A = vlan_tci.
     insn(
         0x0020,
         0,
@@ -195,9 +207,17 @@ mod tests {
 
     const ACCEPT: u32 = u32::MAX;
 
+    /// Linux `SKF_AD_OFF`: an absolute load at or above it reads `sk_buff` metadata.
+    const ANCILLARY_OFF: u32 = 0xffff_f000;
+
     /// Run a classifier over `frame` as the kernel would: loads are big-endian, and one past the
     /// end drops the frame. Only the opcodes the classifiers use are modeled.
     fn run(program: &[BpfInsn], frame: &[u8]) -> u32 {
+        run_with(program, frame, |_| None)
+    }
+
+    /// [`run`], with an ancillary load at `k` answered by `ancillary(k)`.
+    fn run_with(program: &[BpfInsn], frame: &[u8], ancillary: impl Fn(u32) -> Option<u32>) -> u32 {
         let (mut a, mut x) = (0u32, 0u32);
         let mut pc = 0;
         loop {
@@ -213,6 +233,7 @@ mod tests {
                 )
             };
             let loaded = match code {
+                0x0020 | 0x0028 | 0x0030 if k >= ANCILLARY_OFF => ancillary(k),
                 0x0020 => load(k, 4),
                 0x0028 => load(k, 2),
                 0x0030 => load(k, 1),
@@ -313,6 +334,37 @@ mod tests {
             };
             assert_eq!(run(&ETHERNET_UDP_FILTER, &tagged(0xa000)), ACCEPT);
             assert_eq!(run(&ETHERNET_UDP_FILTER, &tagged(0xa01e)), 0);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_vlan_prologue_passes_a_frame_whose_tag_was_removed() {
+        let skb = |vlan_present: bool, vlan_tci: u16| {
+            move |k: u32| match k.cast_signed() - libc::SKF_AD_OFF {
+                libc::SKF_AD_VLAN_TAG => Some(u32::from(vlan_tci)),
+                libc::SKF_AD_VLAN_TAG_PRESENT => Some(u32::from(vlan_present)),
+                _ => None,
+            }
+        };
+        let link = LinkHeader::Ethernet {
+            dst: MacAddr::broadcast(),
+            src: MacAddr::broadcast(),
+        };
+        let program: Vec<BpfInsn> = DROP_VLAN_TAGGED_PROLOGUE
+            .iter()
+            .chain(&ETHERNET_UDP_FILTER)
+            .copied()
+            .collect();
+        for frame in udp_frames(link) {
+            assert_eq!(run_with(&program, &frame, skb(false, 0)), ACCEPT);
+            assert_eq!(run_with(&program, &frame, skb(true, 0xa000)), ACCEPT);
+            assert_eq!(run_with(&program, &frame, skb(true, 0xa01e)), 0);
+            assert_eq!(
+                run_with(&program, &frame, skb(false, 0x000a)),
+                ACCEPT,
+                "an untagged skb with a stale vlan_tci of VLAN 10 was dropped"
+            );
         }
     }
 
