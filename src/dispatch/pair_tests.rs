@@ -705,6 +705,46 @@ fn pair_capture_takes_priority_tagged_frames() -> io::Result<()> {
     Ok(())
 }
 
+// A capture on a VLAN interface takes that VLAN's traffic: the kernel removes the tag before the
+// VLAN device's own taps run.
+#[cfg(target_os = "linux")]
+#[test]
+fn pair_capture_on_a_vlan_interface_takes_its_traffic() -> io::Result<()> {
+    let Some(pair) = InterfacePair::create() else {
+        return Ok(());
+    };
+    // Removed with their parents when the pair drops.
+    let vlan = |parent: &InterfaceName, end: char, host: u8| -> InterfaceName {
+        let name: InterfaceName =
+            format!("nfv{}x{}{end}", std::process::id() % 10_000, pair.subnet)
+                .parse()
+                .expect("a valid VLAN interface name");
+        assert!(
+            run(&format!(
+                "ip link add link {parent} name {name} type vlan id 10 && \
+                 ip addr add 10.98.{}.{host}/24 dev {name} && ip link set {name} up",
+                pair.subnet
+            )),
+            "could not create {name}"
+        );
+        name
+    };
+    let inject_if = vlan(&pair.inject, 'a', 1);
+    let receive_if = vlan(&pair.receive, 'b', 2);
+    let iface = Interface::open(&inject_if)?;
+    let injector = Capture::open(&iface)?;
+    let mut peer = Capture::open(&Interface::open(&receive_if)?)?;
+
+    let payload = b"pair-vlan-10";
+    let dst = SocketAddr::from((Ipv4Addr::BROADCAST, INJECT_DST_PORT));
+    inject(&iface.addrs, &injector, dst, payload)?;
+
+    let captured = capture_injected(&mut peer, dst.ip())?
+        .expect("the capture on the VLAN interface took its broadcast");
+    assert_eq!(captured.payload, payload);
+    Ok(())
+}
+
 // Interface recreation gives the name a fresh kernel identity, stranding the old capture:
 // attached() flips false, rebind() re-attaches the same fd (Linux: bind(2) re-hooks the packet
 // socket from its unregistered state; BSD: BIOCSETIF re-attaches the detached descriptor), and

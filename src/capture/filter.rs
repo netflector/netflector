@@ -79,17 +79,29 @@ pub(crate) const DROP_OUTGOING_PROLOGUE: [BpfInsn; 3] = [
 /// Prepended to the Ethernet classifier on Linux. The kernel moves an 802.1Q tag into
 /// `skb->vlan_tci` before packet sockets on the parent interface see the frame, so without this
 /// the classifier reads the inner ethertype and takes another VLAN's traffic as the parent's.
-/// Untagged and priority-tagged (VID 0) frames fall through.
+/// Untagged and priority-tagged (VID 0) frames fall through. The tag-present flag comes first:
+/// 5.0 through 6.1 clear only that flag when a VLAN device removes the tag, so the frames the
+/// device itself receives still carry their VID in `vlan_tci`.
 ///
 /// ```text
-/// ld #vlan_tci             skb->vlan_tci via the ancillary offset
+/// ld #vlan_present         the tag-present flag via the ancillary offset
+/// jeq 0 -> classifier      untagged
+/// ld #vlan_tci             skb->vlan_tci
 /// and 0x0fff               keep the VLAN ID
 /// jeq 0 -> classifier      else fall through
 /// ret 0                    drop
 /// ```
 #[cfg(target_os = "linux")]
-pub(crate) const DROP_VLAN_TAGGED_PROLOGUE: [BpfInsn; 4] = [
-    // BPF_LD|BPF_W|BPF_ABS: A = vlan_tci, from the negative ancillary offset.
+pub(crate) const DROP_VLAN_TAGGED_PROLOGUE: [BpfInsn; 6] = [
+    // BPF_LD|BPF_W|BPF_ABS: A = the tag-present flag, from the negative ancillary offset.
+    insn(
+        0x0020,
+        0,
+        0,
+        (libc::SKF_AD_OFF + libc::SKF_AD_VLAN_TAG_PRESENT).cast_unsigned(),
+    ),
+    insn(0x0015, 4, 0, 0x0000_0000), // BPF_JMP|BPF_JEQ|BPF_K 0: jt=4 -> the classifier
+    // BPF_LD|BPF_W|BPF_ABS: A = vlan_tci.
     insn(
         0x0020,
         0,
