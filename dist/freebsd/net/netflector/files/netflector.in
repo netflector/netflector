@@ -66,10 +66,21 @@ netflector_precmd()
 
     # Checked after the config, not before: on a backup node a bad configuration should still be
     # reported now, rather than at failover.
-    if [ -n "${netflector_carp_vhid}" ] &&
-        ! carp_is_master "${netflector_carp_vhid}" "${netflector_carp_interface}"; then
-        netflector_log notice "CARP vhid ${netflector_carp_vhid} is not MASTER here; not starting netflector"
-        return 1
+    if [ -n "${netflector_carp_vhid}" ]; then
+        state=$(carp_state "${netflector_carp_vhid}" "${netflector_carp_interface}")
+        case "${state}" in
+        MASTER)
+            ;;
+        "")
+            netflector_log err "no CARP vhid ${netflector_carp_vhid} here; refusing to start"
+            exit 1
+            ;;
+        *)
+            netflector_log notice "CARP vhid ${netflector_carp_vhid} is ${state} here; not starting netflector"
+            # A backup idling is no failure: exit, not return, so the start ends with status 0.
+            exit 0
+            ;;
+        esac
     fi
 }
 
@@ -82,11 +93,11 @@ netflector_log()
 # A carp line reads "carp: MASTER vhid 1 advbase 1 advskew 0". Neither field identifies a group on its
 # own: one interface can carry several vhids, and the same vhid can run on several interfaces as
 # unrelated groups. $2 narrows ifconfig to the one that matters, and can be empty for a unique vhid.
-carp_is_master()
+# Prints the group's state, or nothing when no group has that vhid.
+carp_state()
 {
     ifconfig ${2:+"$2"} 2>/dev/null |
-        awk -v vhid="$1" '$1 == "carp:" && $4 == vhid { print $2 }' |
-        grep -q '^MASTER$'
+        awk -v vhid="$1" '$1 == "carp:" && $4 == vhid { print $2; exit }'
 }
 
 # SIGUSR1 must reach netflector itself: ${pidfile} holds daemon(8), which has no handler for it and

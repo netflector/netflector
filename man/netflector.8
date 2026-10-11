@@ -170,8 +170,9 @@ On a
 failover pair, both nodes reflecting would send two copies of every relayed
 packet.
 .Va netflector_carp_vhid
-confines the service to the node holding that virtual host ID: start is
-refused unless the group is in the MASTER state.
+confines the service to the node holding that virtual host ID: start does
+nothing unless the group is in the MASTER state, and fails when no group has
+that vhid.
 The check runs at start only; a later failover does not stop a running
 service.
 .Va netflector_carp_interface
