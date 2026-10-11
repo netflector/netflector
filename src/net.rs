@@ -61,11 +61,6 @@ pub(crate) const MAX_DATAGRAM_LEN: usize = 9000;
 pub(crate) const MAX_FRAME_LEN: usize =
     ETHERNET_HEADER_SIZE + IPV4_MAX_HEADER_SIZE + MAX_DATAGRAM_LEN;
 
-/// The largest UDP payload that still fits one [`MAX_FRAME_LEN`] frame under the worst-case
-/// header stack. IPv6 is fixed at 40: an unfragmented datagram carries no extension header.
-pub(crate) const MAX_UDP_PAYLOAD_LEN: usize =
-    MAX_FRAME_LEN - (ETHERNET_HEADER_SIZE + IPV6_HEADER_SIZE + UDP_HEADER_SIZE);
-
 /// The largest interface MTU whose full-size packets still fit [`MAX_FRAME_LEN`] once framed. An
 /// MTU counts L3 bytes; Ethernet's link header is the binding case.
 pub(crate) const MAX_MTU: usize = MAX_FRAME_LEN - ETHERNET_HEADER_SIZE;

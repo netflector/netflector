@@ -8,7 +8,7 @@ use std::time::Duration;
 use crate::config::Reflector;
 use crate::dispatch::{CaptureKey, MessageType, PacketDispatcher};
 use crate::interface::InterfaceAddresses;
-use crate::net::MAX_UDP_PAYLOAD_LEN;
+use crate::net::MAX_FRAME_LEN;
 use crate::net::packet::Packet;
 use crate::net::ssdp::{
     MSEARCH_MX_DEFAULT, SSDP_GROUP_V4, SSDP_GROUP_V6_LINK_LOCAL, SSDP_GROUP_V6_SITE_LOCAL,
@@ -28,8 +28,8 @@ use super::{
 /// across an address change.
 struct DialRewrite {
     target: CaptureKey,
-    /// Sized to the payload that still frames within [`MAX_FRAME_LEN`](crate::net::MAX_FRAME_LEN),
-    /// so a rewrite that fits is always sendable.
+    /// A captured payload falls short of [`MAX_FRAME_LEN`] by at least its headers, more than the
+    /// rewritten `LOCATION` adds.
     scratch: StreamBuffer,
 }
 
@@ -37,7 +37,7 @@ impl DialRewrite {
     fn new(target: CaptureKey) -> Self {
         Self {
             target,
-            scratch: StreamBuffer::with_capacity(MAX_UDP_PAYLOAD_LEN),
+            scratch: StreamBuffer::with_capacity(MAX_FRAME_LEN),
         }
     }
 }
@@ -192,5 +192,34 @@ mod tests {
             Verdict::Skip(MessageType::SsdpAdvertisement)
         );
         assert_eq!(search_verdict(b"junk"), Verdict::Junk);
+    }
+
+    // The largest payload a capture delivers whole, IPv4 under a bare header, leaves room for the
+    // proxy address the rewrite writes into LOCATION.
+    #[test]
+    #[cfg_attr(miri, ignore = "needs a real poll backend")]
+    fn a_dial_rewrite_fits_the_largest_captured_payload() {
+        let largest = MAX_FRAME_LEN - (14 + 20 + 8); // Ethernet, IPv4, UDP
+        let mut payload = b"NOTIFY * HTTP/1.1\r\nNT: urn:dial-multiscreen-org:service:dial:1\r\n\
+            LOCATION: http://10.0.0.5:80/dd.xml\r\nX-PAD: "
+            .to_vec();
+        payload.resize(largest - 4, b'x');
+        payload.extend_from_slice(b"\r\n\r\n");
+        let target = CaptureKey::from_u64(8);
+        let mut rewrite = DialRewrite::new(target);
+        let placement = ProxyPlacement {
+            source_capture: CaptureKey::from_u64(7),
+            source: std::net::Ipv4Addr::LOCALHOST,
+            target_capture: target,
+            target: std::net::Ipv4Addr::LOCALHOST,
+            target_iface: None,
+        };
+        assert!(rewrite_location(
+            &mut crate::dispatch::DialContext::new(),
+            &mut Reactor::new().expect("reactor"),
+            &payload,
+            placement,
+            &mut rewrite.scratch,
+        ));
     }
 }
