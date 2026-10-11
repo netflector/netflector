@@ -26,6 +26,7 @@ use crate::test_support::{Capability, addr, open_capture, open_interface, skip, 
 use super::CaptureKey;
 use super::datagram::{DatagramSource, build_udp, ethernet_dst};
 use super::interface_table::{InterfaceTable, Presence, Step};
+use super::lifecycle::InterfaceLifecycle;
 use super::multicast::tests::{BEST_EFFORT, REQUIRED};
 use super::multicast::{Gone, JoinError, Memberships, Target, Wait};
 use super::reassembly::Reassembler;
@@ -843,6 +844,42 @@ fn pair_capture_rebinds_after_interface_recreation() -> io::Result<()> {
 }
 
 #[test]
+fn a_drained_address_event_joins_a_group_due_its_retry() -> io::Result<()> {
+    let Some(pair) = InterfacePair::create() else {
+        return Ok(());
+    };
+    let mut lifecycle = InterfaceLifecycle::new();
+    if lifecycle.monitor_fd().is_none() {
+        skip(Capability::Monitor, "the interface monitor did not open");
+        return Ok(());
+    }
+    let mut table = InterfaceTable::new();
+    table.open_capture(&pair.receive)?;
+    let key = table.find_or_add_interface(&pair.receive)?;
+    table
+        .test_memberships_mut(key)
+        .test_fail("239.255.77.79".parse().unwrap(), Instant::now());
+    // A subnet of its own: macOS announces an address only with the prefix route it adds, so an
+    // alias inside a subnet the interface already holds comes with no RTM_NEWADDR.
+    let address = addr::v4(addr::DRAIN_SLOT, 1);
+    #[cfg(target_os = "linux")]
+    let add = format!("ip addr add {address}/29 dev {}", pair.receive);
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    let add = format!("ifconfig {} inet {address}/29 alias", pair.receive);
+    assert!(run(&add), "could not add an address to {}", pair.receive);
+    let deadline = Instant::now() + WAIT_BUDGET;
+    while !table.test_memberships(key).test_all_joined() && Instant::now() < deadline {
+        lifecycle.drain(&mut table, Instant::now());
+        std::thread::sleep(POLL_SLICE);
+    }
+    assert!(
+        table.test_memberships(key).test_all_joined(),
+        "the drain joined the group on the address event"
+    );
+    Ok(())
+}
+
+#[test]
 fn a_converge_leaves_a_recreated_interface_to_the_reconcile() -> io::Result<()> {
     let Some(pair) = InterfacePair::create() else {
         return Ok(());
@@ -882,8 +919,9 @@ fn pair_interface_table_recovers_after_interface_recreation() -> io::Result<()> 
     let injector = table.open_capture(&pair.inject)?;
     let receiver = table.open_capture(&pair.receive)?;
     let receive_key = table.find_or_add_interface(&pair.receive)?;
-    // Memberships on the receive side, for its rebuild to join again.
-    for group in ["224.0.0.251", "ff02::fb"] {
+    // Memberships on the receive side, for its rebuild to join again. Groups nothing else on the
+    // host holds: the delivery below must hinge on this table's membership.
+    for group in ["239.255.77.78", "ff02::78"] {
         table
             .join_on(
                 receive_key,
@@ -961,6 +999,32 @@ fn pair_interface_table_recovers_after_interface_recreation() -> io::Result<()> 
     let captured = capture_injected(&mut receiver_cap, dst.ip())?
         .expect("delivery resumed after recovery, through both re-bound captures");
     assert_eq!(captured.payload, payload);
+
+    // Linux hands a group datagram to a socket that never joined (IP_MULTICAST_ALL) only while the
+    // arrival interface holds the membership. The BSDs deliver it only to a socket that joined.
+    #[cfg(target_os = "linux")]
+    {
+        let listener = UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))?;
+        listener.set_read_timeout(Some(WAIT_BUDGET))?;
+        inject(
+            table
+                .egress_addrs(injector)
+                .expect("the re-bound inject interface's addresses"),
+            table
+                .capture(injector)
+                .expect("the re-bound injector is present"),
+            SocketAddr::from((
+                Ipv4Addr::new(239, 255, 77, 78),
+                listener.local_addr()?.port(),
+            )),
+            payload,
+        )?;
+        let mut buffer = [0u8; 64];
+        let (length, _) = listener
+            .recv_from(&mut buffer)
+            .expect("the recreated interface holds the group again");
+        assert_eq!(&buffer[..length], payload);
+    }
     Ok(())
 }
 

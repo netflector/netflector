@@ -391,7 +391,8 @@ pub(crate) mod addr {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     const NET: [u8; 3] = [203, 0, 113];
-    pub(crate) const LAST_PAIR_SLOT: u8 = 24;
+    pub(crate) const LAST_PAIR_SLOT: u8 = 23;
+    pub(crate) const DRAIN_SLOT: u8 = 24;
     #[cfg(target_os = "linux")]
     pub(crate) const VLAN_SLOT: u8 = 25;
     #[cfg(any(target_os = "freebsd", target_os = "linux"))]
