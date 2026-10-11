@@ -170,11 +170,9 @@ class DialAddressChangeCase:
 @dataclasses.dataclass(frozen=True)
 class DialRecreateCase:
     # A full DIAL pass, then the same pass again after one netflector interface is destroyed and
-    # recreated. The hardest DIAL recovery scenario: a recreation replaces the kernel objects
-    # underneath the minted proxy -- its listener binds, target-address snapshot, and egress-pin all
-    # belong to the dead interface's world -- so a passing re-run proves the recreation evicted the
-    # proxy and re-minted against the recreated interface. One case per (interface, decoy): the decoy
-    # forces a changed-index recreation (vs FreeBSD's same-index reuse), pinning both detection paths.
+    # recreated. The interface returns with the same addresses, so a proxy the recreation failed to
+    # evict would still serve the second pass: the runner also requires netflector's eviction line.
+    # One case per (interface, decoy), as in SearchRecreateCase.
     name: str
     interface: str = "target"  # which netflector interface is destroyed + recreated
     decoy: bool = False  # plant a decoy on the freed index so the recreation lands on a different one

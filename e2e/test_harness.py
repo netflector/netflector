@@ -9,9 +9,10 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from cases.models import Phase, TestCase
+from cases.models import DialRecreateCase, Phase, TestCase
 from harness.environment import Environment
 from harness.scenarios.datagram import DatagramScenario
+from harness.scenarios.dial import DialRecreateRunner
 from harness.scenarios.lifecycle import AddressChangeRunner, RecreateRunner
 from harness.settings import RECEIVER_READY_LOG
 
@@ -171,6 +172,34 @@ class LifecycleTests(unittest.TestCase):
 
     def test_a_recreation_logged_in_full_passes(self) -> None:
         self.recreate_run(regain_logged=True)
+    def dial_recreate_run(self, eviction_reason: str) -> None:
+        log: list[str] = []
+
+        def delete_interface(interface: str) -> None:
+            log.append("interface nf_target is gone (was ifindex 3); parking until it returns")
+            log.append(f"dial: evicted the proxy for 198.18.1.2:8008 {eviction_reason}")
+
+        backend = Mock()
+        backend.status.return_value = (True, "running")
+        backend.logs.side_effect = lambda role: ("", "".join(f"{line}\n" for line in log))
+        backend.delete_interface.side_effect = delete_interface
+        backend.recreate_interface.side_effect = lambda interface: log.append(
+            "interface nf_target: returned as ifindex 4; re-bound"
+        )
+        runner = DialRecreateRunner(self.environment(backend), DialRecreateCase(name="dial"))
+        with (
+            patch.object(DialRecreateRunner, "_dial_pass"),
+            patch.object(DialRecreateRunner, "start_device"),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            runner.run()
+
+    def test_a_dial_recreation_that_did_not_evict_the_proxy_fails(self) -> None:
+        with self.assertRaises(RuntimeError):
+            self.dial_recreate_run("past its grace")
+
+    def test_a_dial_recreation_that_evicted_the_proxy_passes(self) -> None:
+        self.dial_recreate_run("after its interface was unbound")
 
 
 if __name__ == "__main__":

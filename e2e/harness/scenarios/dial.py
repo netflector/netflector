@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import re
 import sys
 import time
 
@@ -317,9 +318,8 @@ class DialRecreateRunner(DialAddressChangeRunner):
 
         self._dial_pass("baseline", source_ip, device_ip)
 
-        # Recreate one interface; the baseline's proxy -- listeners on the source, egress-pin and
-        # target-address snapshot on the target -- must be evicted and the fresh pass re-mint.
         interface = self.dial.interface
+        mark = self.env.netflector_log_mark()
         self._recreate(interface)
         if interface == "target":
             # The device sits on the target segment: on the native fabrics its wire died with the
@@ -332,6 +332,12 @@ class DialRecreateRunner(DialAddressChangeRunner):
                 "source"
             )  # re-pinned to the same address
         self._dial_pass(f"after {interface} recreation", source_ip, device_ip)
+        evicted = r"dial: evicted the proxy for \S+ after its interface"
+        if not re.search(evicted, self.env.netflector_logged_since(mark)):
+            raise RuntimeError(
+                f"{self.dial.name}: netflector did not evict the baseline's proxy when the "
+                f"{interface} interface was recreated"
+            )
 
         self.env.passed(self.dial.name)
         if self.env.args.show_netflector_logs:
