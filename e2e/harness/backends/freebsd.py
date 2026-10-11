@@ -8,6 +8,7 @@ from harness.backends.native import NativeBackend
 from harness.commands import require_command, run_command
 from harness.settings import (
     DECOY_IFNAME,
+    E2E_RESOURCE_PREFIX,
     HELPER_HOST,
     NATIVE_NETFLECTOR_HOST,
     NETFLECTOR_IFNAMES,
@@ -50,6 +51,23 @@ class NativeFreeBSDBackend(NativeBackend):
         if vimage.returncode != 0 or vimage.stdout.strip() != "1":
             raise RuntimeError("--backend native requires a VIMAGE kernel (vnet jails); "
                                "stock GENERIC has it since FreeBSD 12")
+
+    @staticmethod
+    def preflight_clean() -> None:
+        # Empty every stale jail before removing any (see _teardown_fabric).
+        prefix = E2E_RESOURCE_PREFIX.replace("-", "_")
+        names = run_command(["jls", "name"], echo=False).stdout.split()
+        stale = [name for name in names if name.startswith(prefix)]
+        if stale:
+            print(f"preflight: removing {len(stale)} stale e2e jail(s)", flush=True)
+        for jail in stale:
+            ifnames = run_command(["jexec", jail, "ifconfig", "-l"], check=False, echo=False)
+            for ifname in ifnames.stdout.split():
+                if ifname != "lo0":
+                    run_command(["jexec", jail, "ifconfig", ifname, "destroy"],
+                                check=False, echo=False)
+        for jail in stale:
+            run_command(["jail", "-r", jail], check=False, echo=False)
 
     def _make_jail(self, jail: str, *interfaces: str) -> None:
         # persist keeps the (process-less) jail alive; each vnet.interface moves that interface

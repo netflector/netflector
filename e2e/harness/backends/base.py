@@ -32,9 +32,7 @@ class Backend:
 
     @staticmethod
     def preflight_clean() -> None:
-        # Remove what a killed run left behind, before the first case. Only the docker backend needs
-        # it: a leaked netns, jail or epair is untidy but harmless, since every name carries a
-        # per-run uuid and the epair allocator just takes the next free index.
+        # Remove what a killed run left behind, before the first case.
         pass
 
     def setup_segments(self) -> None:

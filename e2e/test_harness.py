@@ -10,6 +10,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from cases.models import DialRecreateCase, Phase, TestCase
+from harness.backends.freebsd import NativeFreeBSDBackend
+from harness.backends.linux import NativeLinuxBackend
 from harness.environment import Environment
 from harness.scenarios.datagram import DatagramScenario
 from harness.scenarios.dial import DialRecreateRunner
@@ -200,6 +202,56 @@ class LifecycleTests(unittest.TestCase):
 
     def test_a_dial_recreation_that_evicted_the_proxy_passes(self) -> None:
         self.dial_recreate_run("after its interface was unbound")
+
+
+class PreflightTests(unittest.TestCase):
+    def preflight(self, backend: type, outputs: dict[tuple[str, ...], str]) -> list[list[str]]:
+        calls: list[list[str]] = []
+
+        def run_command(command: list[str], **kwargs: object) -> SimpleNamespace:
+            calls.append(command)
+            return SimpleNamespace(stdout=outputs.get(tuple(command), ""), returncode=0)
+
+        with (
+            patch(f"{backend.__module__}.run_command", run_command),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            backend.preflight_clean()
+        return calls
+
+    def test_linux_preflight_removes_only_e2e_namespaces_and_what_runs_in_them(self) -> None:
+        ns = "netflector-e2e-wol-1a2b3c4d-dut"
+        calls = self.preflight(
+            NativeLinuxBackend,
+            {
+                ("ip", "netns", "list"): f"{ns} (id: 3)\nvpn\n",
+                ("ip", "netns", "pids", ns): "4242\n",
+            },
+        )
+        self.assertLess(
+            calls.index(["kill", "-KILL", "4242"]), calls.index(["ip", "netns", "del", ns])
+        )
+        self.assertFalse(any("vpn" in call for call in calls))
+
+    def test_freebsd_preflight_empties_e2e_jails_before_removing_them(self) -> None:
+        jail = "netflector_e2e_wol_1a2b3c4d_dut"
+        calls = self.preflight(
+            NativeFreeBSDBackend,
+            {
+                ("jls", "name"): f"{jail}\nbuild\n",
+                ("jexec", jail, "ifconfig", "-l"): "lo0 nf_source nf_target\n",
+            },
+        )
+        destroys = [call for call in calls if call[-1] == "destroy"]
+        self.assertEqual(
+            destroys,
+            [
+                ["jexec", jail, "ifconfig", "nf_source", "destroy"],
+                ["jexec", jail, "ifconfig", "nf_target", "destroy"],
+            ],
+        )
+        self.assertGreater(calls.index(["jail", "-r", jail]), calls.index(destroys[-1]))
+        self.assertFalse(any("build" in call for call in calls))
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ from harness.backends.native import NativeBackend
 from harness.commands import require_command, run_command
 from harness.settings import (
     DECOY_IFNAME,
+    E2E_RESOURCE_PREFIX,
     HELPER_HOST,
     NATIVE_NETFLECTOR_HOST,
     NETFLECTOR_IFNAMES,
@@ -53,6 +54,18 @@ class NativeLinuxBackend(NativeBackend):
             raise RuntimeError("the Linux native backend requires Linux (netns + veth)")
         require_command("ip")
         NativeBackend._require_native_basics()
+
+    @staticmethod
+    def preflight_clean() -> None:
+        listing = run_command(["ip", "netns", "list"], echo=False).stdout.splitlines()
+        stale = [line.split()[0] for line in listing if line.startswith(E2E_RESOURCE_PREFIX)]
+        if stale:
+            print(f"preflight: removing {len(stale)} stale e2e namespace(s)", flush=True)
+        for ns in stale:
+            pids = run_command(["ip", "netns", "pids", ns], check=False, echo=False).stdout.split()
+            if pids:
+                run_command(["kill", "-KILL", *pids], check=False, echo=False)
+            run_command(["ip", "netns", "del", ns], check=False, echo=False)
 
     def _ip(self, args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         return run_command(["ip", *args], **kwargs)  # type: ignore[arg-type]
