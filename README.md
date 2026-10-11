@@ -275,7 +275,7 @@ log_level = "info"                 # optional; one of off | error | warn | info 
 user = "netflector"                # optional; the account to run as once the captures are open, USER or USER:GROUP,
                                    # each a name or a number (see Dropping root); absent keeps the starting account
 debug_memory_interval_secs = 0     # optional; seconds between memory diagnostic reports; 0 disables (default 0)
-                                   # reports peak RSS everywhere, current RSS on Linux only
+                                   # reports current and peak RSS
 counters_interval_secs = 0         # optional; seconds between per-interface packet-counter summaries; 0 disables (default 0)
 
 [reflectors.tv]
@@ -300,8 +300,8 @@ udp_broadcast = true             # optional; also relay broadcasts on those port
 
 An entry must enable at least one protocol or set `udp_ports`, and expands into one reflector per
 enabled protocol, all sharing the entry's interfaces, MAC selection, and `address_family`. The same shape serves one or a few
-specific devices (set `macs`) or a whole network (omit it). Apart from peers, no IP addresses appear
-in the config.
+specific devices (set `macs`) or a whole network (omit it). Apart from peers and relay groups, no IP
+addresses appear in the config.
 `dial` is not a separate reflector; it augments the entry's SSDP reflector with the DIAL application
 proxy (so it requires `ssdp`; see [DIAL](#dial)).
 

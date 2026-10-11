@@ -21,8 +21,8 @@ Each entry exposes the devices on its
 to the clients on its
 .Ic source_if ,
 for one or more of the protocols; the other direction is not exposed.
-No IP addresses appear anywhere in the configuration; interfaces are named,
-and their addresses are resolved at runtime.
+Interfaces are named, and their addresses are resolved at runtime.
+The only IP addresses in the configuration are peers and relay groups.
 An unknown key, at the top level or in an entry, is rejected at startup.
 .Ss Top-level settings
 .Bl -tag -width Ds
@@ -51,7 +51,7 @@ without a
 takes its account's group; root is refused.
 Absent, the starting account is kept.
 .It Ic debug_memory_interval_secs
-Seconds between memory (peak RSS) diagnostic reports.
+Seconds between memory (current and peak RSS) diagnostic reports.
 .Cm 0
 or absent disables them.
 Default
@@ -297,7 +297,7 @@ Booleans are
 .Cm true Ns / Ns Cm false
 or
 .Cm 1 Ns / Ns Cm 0 ;
-.Ic MACS , MDNS_SERVICES , WOL_PORTS , UDP_PORTS ,
+.Ic SOURCE_PEERS , TARGET_PEERS , MACS , MDNS_SERVICES , WOL_PORTS , UDP_PORTS ,
 and
 .Ic UDP_GROUPS
 are comma-separated.

@@ -104,7 +104,7 @@ Shut down gracefully.
 .It Dv SIGUSR1
 Dump diagnostics to the log: the per-interface packet counters
 .Pq see Sx DIAGNOSTICS ,
-each interface's state, and a memory report (peak RSS).
+each interface's state, and a memory report (current and peak RSS).
 This works on demand even when the periodic reports are disabled.
 Under the
 .Xr rc 8
@@ -121,6 +121,7 @@ Every setting has an environment-variable form, named
 .Ev NETFLECTOR_ Ns Ao Ar TAG Ac Ns _ Ns Ao Ar PARAM Ac ,
 plus the globals
 .Ev NETFLECTOR_LOG_LEVEL ,
+.Ev NETFLECTOR_USER ,
 .Ev NETFLECTOR_DEBUG_MEMORY_INTERVAL_SECS ,
 and
 .Ev NETFLECTOR_COUNTERS_INTERVAL_SECS .
