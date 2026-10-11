@@ -975,6 +975,10 @@ fn wg_can_run() -> bool {
         skip(Capability::WireGuard, "interface creation requires root");
         return false;
     }
+    if !sh("command -v wg >/dev/null") {
+        skip(Capability::WireGuard, "wg(8) is not installed");
+        return false;
+    }
     true
 }
 
