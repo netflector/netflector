@@ -47,8 +47,7 @@ ADDRESS_CHANGE_CASES = [
 # (source -> target): recreating the source kills the forward INGRESS (queries no longer enter),
 # the target the forward EGRESS (re-emits no longer leave), proving both halves of the capture
 # rebind. The decoy flavor forces a different-index recreation on FreeBSD, where the plain flavors
-# reuse the freed index (see Phase.decoy) -- pinning both detection paths (index comparison vs the
-# capture attachment probe).
+# reuse the freed index (see Phase.decoy).
 RECREATE_CASES = [
     RecreateCase(
         name="mdns_interface_recreate_source",

@@ -113,10 +113,9 @@ class SearchRecreateCase:
     # the retransmit opens a fresh one; recreating the SOURCE leaves the session intact (the reply leg
     # re-resolves the source at send time), so the retransmit re-reflects on the SAME reserved port. Run
     # each interface both without and with a decoy that grabs the freed index: on FreeBSD (which reuses
-    # the lowest-free index) that is a same-index vs changed-index recreation, pinning both detection
-    # paths (the attached() BIOCGDLT probe vs the index comparison); on Linux the index always changes,
-    # so the decoy is inert there. The wide MX keeps the first session alive until the recreation. This
-    # is the search-session path the passive mDNS and DIAL recreate cases never reach.
+    # the lowest-free index) that is a same-index vs changed-index recreation; on Linux the index always
+    # changes, so the decoy is inert there. The wide MX keeps the first session alive until the
+    # recreation. This is the search-session path the passive mDNS and DIAL recreate cases never reach.
     name: str
     interface: str = "target"  # which netflector interface is destroyed + recreated
     family: int = 4
@@ -198,8 +197,7 @@ class Phase:
     interface: str  # "source" (nf_source) | "target" (nf_target): which netflector interface to toggle
     # Recreate cases only: plant a throwaway interface between the delete and the recreate. It
     # occupies the freed slot, so FreeBSD's lowest-free index allocator is forced to hand the
-    # recreated interface a DIFFERENT index; without it the same index comes back. The two
-    # flavors pin both detection paths (index comparison vs the capture attachment probe).
+    # recreated interface a DIFFERENT index; without it the same index comes back.
     decoy: bool = False
 
 

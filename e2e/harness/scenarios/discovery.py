@@ -261,8 +261,7 @@ class SearchRecreateRunner(RoundTripRunner):
 
     def _recreate(self) -> None:
         # With the decoy, occupy the freed index before recreating so the interface returns on a
-        # different one (the changed-index path); without it, FreeBSD reuses the index (the same-index
-        # path). Both must behave the same, so both variants run.
+        # different one; without it, FreeBSD reuses the index.
         interface = self.rt.interface
         ifname = NETFLECTOR_IFNAMES[interface]
         self.env.backend.delete_interface(interface)
