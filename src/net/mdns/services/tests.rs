@@ -514,6 +514,37 @@ fn a_kept_name_pointing_into_a_dropped_record_is_spelled_out() {
 }
 
 #[test]
+fn a_trim_that_would_grow_the_message_is_malformed() {
+    // A kept owner pointing at a name inside a kept TXT record's opaque rdata: the rdata is
+    // copied verbatim and the owner spelled out, so the trim would outgrow the message.
+    let mut m = response(&[
+        (
+            "_airplay._tcp.local",
+            TYPE_PTR,
+            name("TV._airplay._tcp.local"),
+        ),
+        ("_ipp._tcp.local", TYPE_PTR, name("L._ipp._tcp.local")),
+        (
+            "printer.local",
+            TYPE_TXT,
+            name(&format!("{}.local", "x".repeat(60))),
+        ),
+    ]);
+    let hidden = m.len() - name(&format!("{}.local", "x".repeat(60))).len();
+    m[6..8].copy_from_slice(&4u16.to_be_bytes());
+    m.extend_from_slice(&[
+        0xc0 | u8::try_from(hidden >> 8).unwrap(),
+        u8::try_from(hidden & 0xff).unwrap(),
+    ]);
+    m.extend_from_slice(&TYPE_A.to_be_bytes());
+    m.extend_from_slice(&[0x80, 1, 0, 0, 0, 120, 0, 4, 192, 0, 2, 9]);
+    assert!(matches!(
+        ServiceFilter::new(allow("_ipp._tcp")).decide(&m),
+        Decision::Malformed
+    ));
+}
+
+#[test]
 fn only_a_mixed_response_is_rewritten() {
     let mut filter = ServiceFilter::new(allow("_smb._tcp, _afpovertcp._tcp"));
     assert!(

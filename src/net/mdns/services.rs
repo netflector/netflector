@@ -208,7 +208,8 @@ pub(crate) enum Decision<'a> {
         refused: RefusedServices<'a>,
     },
     /// Not walkable within bounds: truncated, a reserved label type, a looping or overlong name,
-    /// or more work than its length allows. Never relayed while a list is set.
+    /// more work than its length allows, or a trim that would outgrow it. Never relayed while a
+    /// list is set.
     Malformed,
 }
 
@@ -506,7 +507,7 @@ impl ServiceFilter {
             Scope::Pass => Decision::Pass,
             Scope::Refuse => Decision::Refuse(RefusedServices(&self.refused)),
             // `assess` walked every name the rewrite does, within the same budget, so a failure
-            // here is not expected; it fails closed like any other malformed message.
+            // here is a trim that would outgrow the message; it fails closed like any other.
             Scope::Trim => match self.rewrite(payload) {
                 Ok(removed) => Decision::Trim {
                     payload: &self.out,
@@ -541,6 +542,11 @@ impl ServiceFilter {
             }
             self.write_entry(payload, entry, &mut budget)?;
             counts[entry.section as usize] += 1;
+        }
+        // Dropping records only shrinks a message: growth means names spelled out from bytes no
+        // kept name owns, such as opaque rdata.
+        if self.out.len() > payload.len() {
+            return Err(Malformed);
         }
         for (count, at) in counts
             .into_iter()
