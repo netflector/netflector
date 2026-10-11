@@ -471,9 +471,10 @@ A site-local SSDP group (`ff05::c`) is sourced from a routable address when the 
 only a link-local address it is sourced from that, which still reaches the attached segment but will
 not cross a router.
 
-mDNS is relayed as pure multicast. A querier that asks for a unicast answer (the QU bit, or a query
-from an ephemeral source port) is answered off the group, and that answer is not relayed; SSDP and WSD
-instead proxy each searcher's unicast reply.
+A unicast mDNS answer is relayed too: the answer to a QU query reaches netflector rather than the
+group and goes out on the source segment like any other. A legacy querier asking from an ephemeral
+source port is not served: the relayed query leaves from port 5353, so the device answers on the group,
+where that querier does not listen. SSDP and WSD proxy each searcher's unicast reply.
 
 Messages whose advertised addresses are all unreachable are dropped rather than relayed: an mDNS
 response whose A/AAAA records, an SSDP advertisement or search reply whose `LOCATION`, or a WSD
