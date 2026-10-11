@@ -482,7 +482,7 @@ address among them lets
 the message through. A `LOCATION` the DIAL proxy rewrote is exempt: it names netflector's own
 listener on the egress interface, reachable from that link even when the interface's address is
 itself link-local. The DIAL proxy itself refuses to proxy a device whose `LOCATION` or
-`Application-URL` names a never-a-device address. Suppressed messages count as `dropped` and log at
+`Application-URL` names a never-a-device address or an address of this host. Suppressed messages count as `dropped` and log at
 debug level.
 
 netflector reads untagged Ethernet frames carrying IPv4 or IPv6 UDP, and the bare IP packets of a
@@ -535,8 +535,8 @@ App launch (`POST`) and stop (`DELETE`) work end to end.
 `dial = true` requires `ssdp` and is **IPv4-only** (the DIAL spec ties the device authority to an IPv4
 address); an `ipv6`-only entry with `dial = true` is rejected at startup. It is the only DIAL knob;
 every cap and timeout is a fixed constant. The proxy degrades benignly: a `LOCATION`/`Application-URL`
-netflector can't rewrite (an `https` URL, a hostname instead of an IPv4 literal, a listener cap/bind
-failure) is forwarded unchanged and logged, leaving on-subnet discovery unaffected.
+netflector can't rewrite (an `https` URL, a hostname instead of an IPv4 literal, an address of this
+host, a listener cap/bind failure) is forwarded unchanged and logged, leaving on-subnet discovery unaffected.
 
 ### UDP relay
 

@@ -17,7 +17,7 @@ use crate::net::ssdp::dial::{
 use crate::net::tcp::TcpSocket;
 use crate::reactor::Reactor;
 
-use super::proxy::{DialDeviceProxy, Listener};
+use super::proxy::{DialDeviceProxy, Listener, names_this_host};
 
 /// The grace without a `CACHE-CONTROL: max-age`: the UDA-recommended minimum (DIAL's own example
 /// advertises `max-age=1800`).
@@ -41,9 +41,10 @@ pub(crate) struct ProxyPlacement<'a> {
 
 /// Rewrite a DIAL message's `LOCATION` to a source-side description proxy, minting one if none is
 /// live for the device and refreshing its grace either way. `true`: the rewritten datagram is in
-/// `out`. `false`: forward `payload` unchanged (not DIAL, an unrewritable `LOCATION`, the proxy cap,
-/// a mint failure, or a rewrite that didn't fit `out`); a `LOCATION` that can never name a device
-/// ([`is_never_a_peer`]) is also `false`, and the reflector's suppression then drops it.
+/// `out`. `false`: forward `payload` unchanged (not DIAL, an unrewritable `LOCATION`, a device on
+/// this host, the proxy cap, a mint failure, or a rewrite that didn't fit `out`); a `LOCATION` that
+/// can never name a device ([`is_never_a_peer`]) is also `false`, and the reflector's suppression
+/// then drops it.
 pub(crate) fn rewrite_location(
     ctx: &mut DialContext,
     reactor: &mut Reactor,
@@ -105,8 +106,8 @@ pub(crate) fn rewrite_location(
     fits
 }
 
-/// Returns the description-listener address to rewrite `LOCATION` to; `None` (logged) at the cap or
-/// on a listen/register failure.
+/// Returns the description-listener address to rewrite `LOCATION` to; `None` (logged) at the cap,
+/// for a device on this host, or on a listen/register failure.
 fn mint_proxy(
     ctx: &mut DialContext,
     reactor: &mut Reactor,
@@ -117,6 +118,10 @@ fn mint_proxy(
     let endpoint = key.endpoint;
     if !ctx.has_capacity(reactor) {
         log::warn!("dial: proxy cap reached; reflecting {endpoint}'s LOCATION unchanged");
+        return None;
+    }
+    if names_this_host(endpoint) {
+        log::debug!("dial: LOCATION {endpoint} names this host; not minting a proxy");
         return None;
     }
     let desc = listen_or_warn(placement.source, Listener::Description)?;
@@ -367,6 +372,24 @@ mod tests {
             assert!(rewrite_advert(&mut ctx, &mut reactor, advert).is_none());
         }
         assert_eq!(ctx.proxy_count(), 0, "no proxy is minted for a non-device");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "needs a real poll backend")]
+    fn rewrite_location_refuses_a_device_on_this_host() {
+        let own = crate::interface::host_v4_addrs()
+            .expect("getifaddrs")
+            .into_iter()
+            .find(|ip| !is_never_a_peer(IpAddr::V4(*ip)))
+            .expect("a non-loopback IPv4 address on this host");
+        let advert = format!(
+            "NOTIFY * HTTP/1.1\r\nNT: urn:dial-multiscreen-org:service:dial:1\r\n\
+             LOCATION: http://{own}:8008/dd.xml\r\n\r\n"
+        );
+        let mut reactor = Reactor::new().expect("reactor");
+        let mut ctx = DialContext::new();
+        assert!(rewrite_advert(&mut ctx, &mut reactor, advert.as_bytes()).is_none());
+        assert_eq!(ctx.proxy_count(), 0, "no proxy is minted for {own}");
     }
 
     #[test]

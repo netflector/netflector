@@ -282,6 +282,36 @@ pub(crate) fn if_name(index: NonZeroU32) -> Option<String> {
     std::str::from_utf8(&buf[..end]).ok().map(str::to_owned)
 }
 
+/// Every IPv4 address an interface on this host holds.
+///
+/// # Errors
+/// `getifaddrs` failing.
+pub(crate) fn host_v4_addrs() -> io::Result<Vec<Ipv4Addr>> {
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: `getifaddrs` writes a freshly-allocated list into `head` or fails; it is freed below.
+    crate::sys::check(unsafe { libc::getifaddrs(&raw mut head) })?;
+    let mut addrs = Vec::new();
+    let mut node = head;
+    while !node.is_null() {
+        // SAFETY: `node` is a live entry of the list `head` owns until `freeifaddrs`.
+        let ifa = unsafe { &*node };
+        node = ifa.ifa_next;
+        if ifa.ifa_addr.is_null() {
+            continue;
+        }
+        // SAFETY: a non-null `ifa_addr` is a `sockaddr` the list owns; `sa_family` tags its type.
+        if libc::c_int::from(unsafe { (*ifa.ifa_addr).sa_family }) != libc::AF_INET {
+            continue;
+        }
+        // SAFETY: an `AF_INET` address is a `sockaddr_in`; `read_unaligned` takes any alignment.
+        let sin = unsafe { ifa.ifa_addr.cast::<libc::sockaddr_in>().read_unaligned() };
+        addrs.push(Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)));
+    }
+    // SAFETY: `head` came from `getifaddrs` and is freed exactly once.
+    unsafe { libc::freeifaddrs(head) };
+    Ok(addrs)
+}
+
 /// Logged at `info`: the address-change e2e greps these lines. Returns whether the field changed.
 fn log_field_change<A: PartialEq + fmt::Display>(
     iface: &InterfaceName,
@@ -370,6 +400,14 @@ mod tests {
         let name = InterfaceName::loopback();
         let ifindex = if_index(&name).expect("the loopback exists");
         Interface::open(&name, ifindex).expect("the loopback resolves")
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "lists the host's interfaces")]
+    fn the_host_addresses_include_the_loopback_and_nothing_unassigned() {
+        let addrs = host_v4_addrs().expect("getifaddrs");
+        assert!(addrs.contains(&Ipv4Addr::LOCALHOST), "{addrs:?}");
+        assert!(!addrs.contains(&Ipv4Addr::new(192, 0, 2, 77)), "{addrs:?}");
     }
 
     impl InterfaceAddresses {

@@ -9,8 +9,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::{Duration, Instant};
 
-use crate::interface::InterfaceName;
-use crate::logging::log_rate;
+use crate::interface::{InterfaceName, host_v4_addrs};
+use crate::logging::{WARN_WINDOW, log_rate};
 use crate::net::is_never_a_peer;
 use crate::net::tcp::TcpSocket;
 use crate::reactor::{Arena, Handler, HandlerKey, Key, Reactor, ReadyEvent};
@@ -232,23 +232,24 @@ impl DialDeviceProxy {
         }
     }
 
-    /// Refuses an endpoint that can never name a device ([`is_never_a_peer`]): dialing it would reach
-    /// a local service. Link-local is fine on purpose: the dial goes out the target interface,
-    /// on-link.
+    /// Refuses an endpoint that can never name a device ([`is_never_a_peer`]) or names this host:
+    /// dialing it would reach a local service. Link-local is fine on purpose: the dial goes out the
+    /// target interface, on-link.
     fn adopt_rest_endpoint(&mut self, endpoint: SocketAddrV4) {
-        if is_never_a_peer(IpAddr::V4(*endpoint.ip())) {
+        if self.rest_endpoint == Some(endpoint) {
+            return;
+        }
+        if is_never_a_peer(IpAddr::V4(*endpoint.ip())) || names_this_host(endpoint) {
             log::debug!(
-                "dial: ignoring {}'s REST endpoint {endpoint}: it can never name a device",
+                "dial: ignoring {}'s REST endpoint {endpoint}: it can't name a device",
                 self.desc_endpoint
             );
             return;
         }
-        if self.rest_endpoint != Some(endpoint) {
-            log::debug!(
-                "dial: learned {}'s REST endpoint {endpoint}",
-                self.desc_endpoint
-            );
-        }
+        log::debug!(
+            "dial: learned {}'s REST endpoint {endpoint}",
+            self.desc_endpoint
+        );
         self.rest_endpoint = Some(endpoint);
     }
 
@@ -327,6 +328,22 @@ impl Handler for DialDeviceProxy {
     }
 }
 
+/// Whether `endpoint` is one of this host's own addresses. An address list that can't be read
+/// answers yes: refusing a device beats dialing the host.
+pub(super) fn names_this_host(endpoint: SocketAddrV4) -> bool {
+    match host_v4_addrs() {
+        Ok(addrs) => addrs.contains(endpoint.ip()),
+        Err(e) => {
+            log_rate!(
+                log::Level::Warn,
+                WARN_WINDOW,
+                "dial: listing this host's addresses failed: {e}; not proxying {endpoint}"
+            );
+            true
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::thread::sleep;
@@ -372,6 +389,20 @@ mod tests {
         let link_local: SocketAddrV4 = "169.254.9.9:8009".parse().unwrap();
         proxy.adopt_rest_endpoint(link_local);
         assert_eq!(proxy.rest_endpoint, Some(link_local));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "needs a real poll backend")]
+    fn a_rest_endpoint_on_this_host_is_not_adopted() {
+        let mut reactor = Reactor::new().expect("reactor");
+        let (mut proxy, _rest_addr) = watched_proxy(&mut reactor);
+        let own = crate::interface::host_v4_addrs()
+            .expect("getifaddrs")
+            .into_iter()
+            .find(|ip| !is_never_a_peer(IpAddr::V4(*ip)))
+            .expect("a non-loopback IPv4 address on this host");
+        proxy.adopt_rest_endpoint(SocketAddrV4::new(own, 8009));
+        assert_eq!(proxy.rest_endpoint, None);
     }
 
     #[test]
