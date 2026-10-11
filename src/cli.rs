@@ -77,7 +77,7 @@ pub(crate) const HELP: &str = concat!(
     "
 
 Reflects link-local service traffic (Wake-on-LAN, mDNS, SSDP, WS-Discovery, DIAL) between
-two network interfaces.
+two network interfaces, and can relay any other UDP protocol unchanged.
 
 usage: netflector [--check-config] [--no-join] [--] [CONFIG]
 

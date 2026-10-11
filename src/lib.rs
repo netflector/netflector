@@ -1,6 +1,6 @@
 //! netflector: reflects link-local service traffic (Wake-on-LAN, mDNS, SSDP, WS-Discovery,
-//! and an optional DIAL proxy) between two network interfaces. The binary is a thin shim
-//! over [`run`].
+//! and an optional DIAL proxy) between two network interfaces, and can relay any other UDP
+//! protocol unchanged. The binary is a thin shim over [`run`].
 
 mod capture;
 mod cli;
