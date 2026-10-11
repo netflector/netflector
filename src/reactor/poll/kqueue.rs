@@ -12,8 +12,8 @@ use super::PollEvent;
 use crate::reactor::{Key, Readiness};
 use crate::sys::check;
 
-// `udata` is pointer-sized; a 32-bit target would truncate the Key's generation half and
-// alias slots.
+// `udata` is pointer-sized; a 32-bit target would truncate the Key's index half (the high word)
+// and alias slots.
 const _: () = assert!(
     mem::size_of::<*mut libc::c_void>() >= mem::size_of::<u64>(),
     "kqueue backend needs a 64-bit udata to carry the full Key",

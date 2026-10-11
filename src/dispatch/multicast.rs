@@ -1,7 +1,8 @@
 //! Multicast group membership for the capture interfaces: the kernel admits a group's frames to the
 //! raw capture only once the interface joins it. One unbound `SOCK_DGRAM` socket per family per
-//! interface, so Linux's `net.ipv4.igmp_max_memberships` (default 20, unraisable on a locked-down
-//! router) is never reached; unbound, the kernel queues it no datagrams.
+//! interface; unbound, the kernel queues it no datagrams. Linux's `net.ipv4.igmp_max_memberships`
+//! (default 20 per socket, unraisable on a locked-down router) is far above what the discovery
+//! protocols join, but a long `udp_groups` list on one interface can reach it.
 
 use std::fmt;
 use std::io;
