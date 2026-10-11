@@ -44,7 +44,8 @@ pub(super) struct Rebuilt {
 }
 
 pub(super) struct InterfaceLifecycle {
-    /// `None` is a degraded mode: addresses stay at their startup values.
+    /// `None` is a degraded mode: the periodic re-read and reconcile still pick changes up, only
+    /// later.
     monitor: Option<InterfaceMonitor>,
     /// The largest kernel ifindex seen. Where indexes are monotonic, an unknown-index Link event
     /// at or below this is churn on an unwatched interface, not a creation.
@@ -380,7 +381,11 @@ fn open_monitor() -> Option<InterfaceMonitor> {
             Some(monitor)
         }
         Err(e) => {
-            log::warn!("interface monitor unavailable; addresses won't refresh on change: {e}");
+            log::warn!(
+                "interface monitor unavailable; interface changes are picked up every {}s rather \
+                 than as they happen: {e}",
+                RECHECK_INTERVAL.as_secs()
+            );
             None
         }
     }

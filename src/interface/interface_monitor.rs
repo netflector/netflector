@@ -1,7 +1,7 @@
 //! Interface change monitoring: a routing socket whose readiness means an interface's
 //! addresses (or MAC) changed, or an interface came or went. `NETLINK_ROUTE` on Linux,
-//! `PF_ROUTE` on the BSDs. Best-effort: a failed open or a read error degrades to the
-//! startup-resolved addresses, never aborts the daemon.
+//! `PF_ROUTE` on the BSDs. Best-effort: without one the dispatcher's periodic re-read and
+//! reconcile still pick changes up, only later, and a read error never aborts the daemon.
 
 use std::io;
 use std::num::NonZeroU32;
