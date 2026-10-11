@@ -364,9 +364,10 @@ fn the_work_per_message_is_bounded() {
         scope(&pointer_chain_response(3, 4), &allowed),
         Ok(Scope::Pass)
     );
-    // Hundreds of records over a 120-hop chain would walk ~40 steps per byte: refused as
-    // malformed long before, whatever the allow-list says.
-    let heavy = pointer_chain_response(120, 300);
+    // Hundreds of records over a 100-hop chain walk several times the budget. The names stay
+    // under 255 octets and the hop limit, so only the budget refuses it, whatever the allow-list
+    // says.
+    let heavy = pointer_chain_response(100, 300);
     assert_eq!(scope(&heavy, &allowed), Err(Malformed));
     assert!(matches!(
         ServiceFilter::new(allowed).decide(&heavy),
