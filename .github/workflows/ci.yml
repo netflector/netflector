@@ -63,7 +63,8 @@ jobs:
           FORCE_SUPPLY_CHAIN: ${{ inputs.supply-chain }}
         run: |
           if [ -n "${PR_NUMBER}" ]; then
-            gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" --jq '.[].filename' \
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" \
+              --jq '.[] | .filename, (.previous_filename // empty)' \
               | python3 ci/changed_areas.py | tee -a "${GITHUB_OUTPUT}"
           else
             printf 'code=%s\nopnsense=%s\nport=%s\nsupply-chain=%s\n' \
