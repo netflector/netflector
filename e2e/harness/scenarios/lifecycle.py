@@ -13,6 +13,7 @@ from harness.settings import (
     ADDR_CHANGE_REFLECTED_WINDOW,
     ADDR_CHANGE_SILENCE_CONSECUTIVE,
     EXPECT_NONE_BACKSTOP_SECONDS,
+    EXPECT_NONE_SAW_PACKET,
     NETFLECTOR_IFNAMES,
     NETFLECTOR_SOURCE_IFNAME,
     NETFLECTOR_TARGET_IFNAME,
@@ -71,7 +72,13 @@ class AddressChangeRunner:
         probe.start_receiver()
         probe.run_sender()
         if not expect:
-            probe.close_expect_none_window()
+            try:
+                probe.close_expect_none_window()
+            except RuntimeError:
+                out, err = self.env.backend.logs("receiver")
+                if EXPECT_NONE_SAW_PACKET not in f"{out}{err}":
+                    raise
+                return False
         return self.env.backend.wait("receiver") == 0
 
     def _poll_reflected(self, phase: Phase) -> bool:

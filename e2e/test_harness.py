@@ -4,11 +4,14 @@ import argparse
 import contextlib
 import io
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from cases.models import TestCase
+from cases.models import Phase, TestCase
 from harness.environment import Environment
 from harness.scenarios.datagram import DatagramScenario
+from harness.scenarios.lifecycle import AddressChangeRunner
+from harness.settings import RECEIVER_READY_LOG
 
 
 class LifecycleTests(unittest.TestCase):
@@ -84,6 +87,25 @@ class LifecycleTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             scenario.close_expect_none_window()
         backend.stop_probe.assert_not_called()
+
+    def silence_probe(self, receiver_stderr: str) -> bool:
+        backend = Mock()
+        backend.status.return_value = (False, "exited (1)")
+        backend.logs.return_value = (f"{RECEIVER_READY_LOG}\n", receiver_stderr)
+        runner = AddressChangeRunner(self.environment(backend), SimpleNamespace(name="change"))
+        phase = Phase(label="target IPv4", protocol="mdns", family=4, interface="target")
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            return runner._probe(phase, expect=False, timeout=1.0)
+
+    def test_a_packet_while_polling_for_silence_means_still_reflected(self) -> None:
+        self.assertFalse(self.silence_probe("expected no packets, but one was received\n"))
+
+    def test_a_receiver_that_died_otherwise_still_fails_the_silence_poll(self) -> None:
+        with self.assertRaises(RuntimeError):
+            self.silence_probe("Traceback (most recent call last):\n")
 
 
 if __name__ == "__main__":

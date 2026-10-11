@@ -31,6 +31,7 @@ NETFLECTOR_READY_LOG = "running; press Ctrl-C or send SIGTERM to stop"
 # Logged just before the ready line when the user setting switched the account.
 NETFLECTOR_DROPPED_LOG = "dropped root: running as uid"
 RECEIVER_READY_LOG = "receiver ready: UDP socket bound"
+EXPECT_NONE_SAW_PACKET = "expected no packets, but one was received"
 CONTAINER_READY_TIMEOUT_SECONDS = 15.0
 # Every resource a run creates is named with this prefix, so a sweep can find what a killed run left.
 E2E_RESOURCE_PREFIX = "netflector-e2e-"
