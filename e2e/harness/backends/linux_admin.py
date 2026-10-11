@@ -1,5 +1,7 @@
 """Linux interface mutations, shared by Docker and native Linux."""
 
+from __future__ import annotations
+
 from collections.abc import Callable
 
 
