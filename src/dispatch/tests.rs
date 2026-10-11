@@ -1341,6 +1341,45 @@ fn fragments_ahead_of_the_first_wait_for_its_ports() -> io::Result<()> {
     Ok(())
 }
 
+// A first fragment no filter takes settles its datagram: the rest is dropped uncopied, and no
+// fragment of it takes a reassembly slot.
+#[test]
+#[cfg_attr(miri, ignore = "needs a real socket")]
+fn an_unwanted_datagram_takes_no_reassembly_slot() -> io::Result<()> {
+    use crate::net::frame::{LinkHeader, UdpFrames};
+
+    let mut dispatcher = PacketDispatcher::new();
+    let mut reactor = Reactor::new()?;
+    let ingress = dispatcher.add_test_capture();
+    let filter = Filter {
+        dst_port: Some(PortSet::from(3702)),
+        ..Filter::default()
+    };
+    let seen = Rc::default();
+    dispatcher.register(ingress, filter, Box::new(Recorder { seen }));
+    let link = LinkHeader::Ethernet {
+        dst: MacAddr::broadcast(),
+        src: MacAddr::from([0x02, 0, 0, 0, 0, 0x70]),
+    };
+    let src = SocketAddrV4::new(Ipv4Addr::new(10, 0, 70, 70), 3702);
+    let dst = SocketAddrV4::new(Ipv4Addr::new(10, 0, 70, 1), 9);
+    let frames = UdpFrames::ipv4(link, src, dst, 64, 1, &[0x5a; 300], 120).unwrap();
+    for index in 0..frames.count() {
+        let mut frame = [0u8; 256];
+        let n = frames.write(index, &mut frame).unwrap();
+        let Ok(Parsed::Fragment(fragment)) = Parsed::parse(LinkType::Ethernet, &frame[..n]) else {
+            panic!("frame {index} is not a fragment");
+        };
+        dispatcher.reassemble_and_route(ingress, &fragment, &mut reactor);
+        assert_eq!(
+            dispatcher.reassembly.test_collecting(),
+            0,
+            "fragment {index} took a slot"
+        );
+    }
+    Ok(())
+}
+
 /// A reflector that returns a preset [`Outcome`], driving `route`'s outcome fold and per-capture
 /// recording without a real egress.
 struct Outcomer(Outcome);

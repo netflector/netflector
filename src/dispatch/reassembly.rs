@@ -307,6 +307,13 @@ mod tests {
     const SOURCE: Ipv4Addr = Ipv4Addr::new(10, 0, 70, 70);
     const DEST: Ipv4Addr = Ipv4Addr::new(10, 0, 70, 1);
 
+    impl Reassembler {
+        /// Datagrams holding a slot.
+        pub(in crate::dispatch) fn test_collecting(&self) -> usize {
+            self.collecting.len()
+        }
+    }
+
     fn ingress() -> CaptureKey {
         CaptureKey::from_u64(0)
     }
