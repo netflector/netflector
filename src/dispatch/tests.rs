@@ -3,6 +3,8 @@ use super::lifecycle::{RECHECK_INTERVAL, RECONCILE_RETRY};
 use super::multicast::join_unsupported;
 use super::multicast::tests::BEST_EFFORT;
 use super::*;
+#[cfg(any(target_os = "freebsd", target_os = "linux"))]
+use crate::test_support::addr;
 use crate::test_support::{
     Capability, loopback_lock, open_capture_or_skip, open_loopback_or_skip, skip,
 };
@@ -707,9 +709,9 @@ fn group_sends_fan_out_to_the_peers_of_a_raw_ip_link() -> io::Result<()> {
     let mut dispatcher = PacketDispatcher::new();
     let egress = dispatcher.open_capture(&tun.name)?;
     let peers: [IpAddr; 3] = [
-        "10.99.200.2".parse().unwrap(),
-        "10.99.200.3".parse().unwrap(),
-        "fd00:99::2".parse().unwrap(),
+        addr::v4(addr::TUN_PEERS_SLOT, 2).into(),
+        addr::v4(addr::TUN_PEERS_SLOT, 3).into(),
+        addr::v6(addr::TUN_PEERS_SLOT, 2).into(),
     ];
 
     let group: SocketAddr = "239.255.90.90:9003".parse().unwrap();
@@ -727,13 +729,10 @@ fn group_sends_fan_out_to_the_peers_of_a_raw_ip_link() -> io::Result<()> {
         )?;
     }
 
-    let to = |peer: &str| -> SocketAddr { format!("{peer}:9003").parse().unwrap() };
+    let to = |peer: IpAddr| SocketAddr::new(peer, 9003);
     assert_eq!(
         sood_deliveries(&tun)?,
-        [
-            (source, to("10.99.200.2"), 32),
-            (source, to("10.99.200.3"), 32)
-        ]
+        [(source, to(peers[0]), 32), (source, to(peers[1]), 32)]
     );
     Ok(())
 }
@@ -749,7 +748,7 @@ fn overlapping_peer_lists_deliver_to_each_peer_once() -> io::Result<()> {
     };
     let mut dispatcher = PacketDispatcher::new();
     let egress = dispatcher.open_capture(&tun.name)?;
-    let peer = |host: u8| IpAddr::V4(Ipv4Addr::new(10, 99, 200, host));
+    let peer = |host: u8| IpAddr::V4(addr::v4(addr::TUN_PEERS_SLOT, host));
     let (x, y, z) = (peer(2), peer(3), peer(4));
     let group: SocketAddr = "239.255.90.90:9003".parse().unwrap();
     let source: SocketAddr = "192.0.2.7:40001".parse().unwrap();
@@ -821,7 +820,9 @@ fn a_unicast_mdns_answer_from_a_peer_goes_to_the_group() -> io::Result<()> {
     let Some(mut tun) = crate::test_support::Tun::create() else {
         return Ok(());
     };
-    assert!(tun.add_address("10.99.200.1/24"));
+    let own = addr::v4(addr::TUN_PEERS_SLOT, 1);
+    let peer = addr::v4(addr::TUN_PEERS_SLOT, 2);
+    assert!(tun.add_address(&format!("{own}/29")));
     let mut dispatcher = PacketDispatcher::without_group_joins();
     let source = dispatcher.open_capture(&InterfaceName::loopback())?;
     let target = dispatcher.open_capture(&tun.name)?;
@@ -831,7 +832,7 @@ fn a_unicast_mdns_answer_from_a_peer_goes_to_the_group() -> io::Result<()> {
     let entry = crate::config::Config::from_sources(
         Some(&format!(
             "[reflectors.a]\nsource_if = \"{LOOPBACK_IFACE}\"\ntarget_if = \"{}\"\n\
-                 mdns = true\naddress_family = \"ipv4\"\ntarget_peers = [\"10.99.200.2\"]\n",
+                 mdns = true\naddress_family = \"ipv4\"\ntarget_peers = [\"{peer}\"]\n",
             tun.name
         )),
         std::iter::empty(),
@@ -846,8 +847,8 @@ fn a_unicast_mdns_answer_from_a_peer_goes_to_the_group() -> io::Result<()> {
     let answer = [0, 0, 0x84, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     let mut packet = [0u8; 64];
     let n = frame::ipv4_udp(
-        SocketAddrV4::new(Ipv4Addr::new(10, 99, 200, 2), MDNS_PORT),
-        SocketAddrV4::new(Ipv4Addr::new(10, 99, 200, 1), MDNS_PORT),
+        SocketAddrV4::new(peer, MDNS_PORT),
+        SocketAddrV4::new(own, MDNS_PORT),
         255,
         &answer,
         &mut packet,
@@ -902,7 +903,7 @@ fn an_mdns_answer_goes_to_the_source_peers() -> io::Result<()> {
     let Some(mut tun) = crate::test_support::Tun::create() else {
         return Ok(());
     };
-    assert!(tun.add_address("10.99.201.1/24"));
+    assert!(tun.add_address(&format!("{}/29", addr::v4(addr::TUN_SOURCE_PEERS_SLOT, 1))));
     let mut dispatcher = PacketDispatcher::without_group_joins();
     let source = dispatcher.open_capture(&InterfaceName::loopback())?;
     let target = dispatcher.open_capture(&tun.name)?;
@@ -928,7 +929,7 @@ fn an_mdns_answer_goes_to_the_source_peers() -> io::Result<()> {
     let answer = [0, 0, 0x84, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     let mut packet = [0u8; 64];
     let n = frame::ipv4_udp(
-        SocketAddrV4::new(Ipv4Addr::new(10, 99, 201, 2), MDNS_PORT),
+        SocketAddrV4::new(addr::v4(addr::TUN_SOURCE_PEERS_SLOT, 2), MDNS_PORT),
         SocketAddrV4::new(MDNS_GROUP_V4, MDNS_PORT),
         255,
         &answer,
@@ -1051,8 +1052,8 @@ impl WgPeers {
         }
         let this = Self {
             name: wg_create("wg")?,
-            reachable: IpAddr::V4(Ipv4Addr::new(10, 99, 77, 2)),
-            unreachable: IpAddr::V4(Ipv4Addr::new(10, 99, 77, 3)),
+            reachable: IpAddr::V4(addr::v4(addr::WG_PEERS_SLOT, 2)),
+            unreachable: IpAddr::V4(addr::v4(addr::WG_PEERS_SLOT, 3)),
         };
         // The key goes in on stdin: Ubuntu's AppArmor profile for wg(8) lets it read key files
         // under /etc/wireguard only.
@@ -1064,7 +1065,10 @@ impl WgPeers {
             reachable = this.reachable,
             unreachable = this.unreachable,
             endpoint = Self::ENDPOINT,
-            up = wg_address_and_up(&this.name, "10.99.77.1/24"),
+            up = wg_address_and_up(
+                &this.name,
+                &format!("{}/29", addr::v4(addr::WG_PEERS_SLOT, 1))
+            ),
         ));
         assert!(configured, "could not configure {}", this.name);
         Some(this)
@@ -1088,8 +1092,8 @@ struct WgLink {
 
 #[cfg(any(target_os = "freebsd", target_os = "linux"))]
 impl WgLink {
-    const NEAR: Ipv4Addr = Ipv4Addr::new(10, 99, 78, 1);
-    const FAR: Ipv4Addr = Ipv4Addr::new(10, 99, 78, 2);
+    const NEAR: Ipv4Addr = addr::v4(addr::WG_LINK_SLOT, 1);
+    const FAR: Ipv4Addr = addr::v4(addr::WG_LINK_SLOT, 2);
 
     fn create() -> Option<Self> {
         if !wg_can_run() {

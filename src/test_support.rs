@@ -384,6 +384,41 @@ pub(crate) mod frame {
     }
 }
 
+/// The addresses fixtures give host interfaces: TEST-NET-3 (RFC 5737) and the IPv6 documentation
+/// prefix (RFC 3849). The v4 /24 is cut into /29 slots; pairs number theirs from 1, the rest take
+/// the fixed slots above them.
+pub(crate) mod addr {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    const NET: [u8; 3] = [203, 0, 113];
+    pub(crate) const LAST_PAIR_SLOT: u8 = 24;
+    #[cfg(target_os = "linux")]
+    pub(crate) const VLAN_SLOT: u8 = 25;
+    #[cfg(any(target_os = "freebsd", target_os = "linux"))]
+    pub(crate) const WG_LINK_SLOT: u8 = 26;
+    #[cfg(any(target_os = "freebsd", target_os = "linux"))]
+    pub(crate) const WG_PEERS_SLOT: u8 = 27;
+    #[cfg(target_os = "linux")]
+    pub(crate) const TUN_PEERS_SLOT: u8 = 28;
+    #[cfg(target_os = "linux")]
+    pub(crate) const TUN_SOURCE_PEERS_SLOT: u8 = 29;
+    #[cfg(target_os = "linux")]
+    pub(crate) const TUN_STARTUP_SLOT: u8 = 30;
+    #[cfg(target_os = "linux")]
+    pub(crate) const TUN_SEARCH_SLOT: u8 = 31;
+
+    /// Host `host` (1 to 6) of the /29 at `slot`.
+    pub(crate) const fn v4(slot: u8, host: u8) -> Ipv4Addr {
+        assert!(slot < 32 && host >= 1 && host <= 6, "outside the /29 plan");
+        Ipv4Addr::new(NET[0], NET[1], NET[2], slot * 8 + host)
+    }
+
+    /// Host `host` of the /64 at `slot`.
+    pub(crate) const fn v6(slot: u8, host: u16) -> Ipv6Addr {
+        Ipv6Addr::new(0x2001, 0xdb8, 0, slot as u16, 0, 0, 0, host)
+    }
+}
+
 /// A tun device attached to this process: its kernel side is a raw IP link, `far_end` the other
 /// side, where a packet written arrives on the link and one sent on the link comes out. Gone
 /// when the file closes. For the raw IP link tests.

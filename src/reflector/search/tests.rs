@@ -6,6 +6,8 @@ use crate::net::LinkType;
 #[cfg(target_os = "linux")]
 use crate::net::packet::Parsed;
 use crate::reflector::NoRewrite;
+#[cfg(target_os = "linux")]
+use crate::test_support::addr;
 use crate::test_support::{loopback_lock, open_loopback_or_skip};
 
 const TEST_TTL: u8 = 2;
@@ -459,11 +461,12 @@ fn a_session_listens_where_its_search_copies_come_from() -> std::io::Result<()> 
     let Some(tun) = crate::test_support::Tun::create() else {
         return Ok(());
     };
-    assert!(tun.add_address("fe80::1/64") && tun.add_address("fd00:99::1/64"));
+    let own = addr::v6(addr::TUN_SEARCH_SLOT, 1);
+    assert!(tun.add_address("fe80::1/64") && tun.add_address(&format!("{own}/64")));
     let mut dispatcher = PacketDispatcher::new();
     let target = dispatcher.open_capture(&tun.name)?;
     let mut reactor = Reactor::new()?;
-    let peer: IpAddr = "fd00:99::2".parse().unwrap();
+    let peer = IpAddr::V6(addr::v6(addr::TUN_SEARCH_SLOT, 2));
     let mut reflector = SearchReflector::new(
         CaptureKey::from_u64(999),
         target,

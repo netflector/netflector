@@ -265,13 +265,14 @@ mod tests {
     #[cfg_attr(miri, ignore = "needs a real capture device")]
     fn a_default_entry_starts_on_a_host_without_an_ipv6_stack() {
         use crate::interface::LOOPBACK_IFACE;
-        use crate::test_support::{Tun, loopback_lock};
+        use crate::test_support::{Tun, addr, loopback_lock};
 
         let _serial = loopback_lock();
         let Some(tun) = Tun::create() else {
             return;
         };
-        assert!(tun.add_address("10.99.202.1/24"));
+        let own = addr::v4(addr::TUN_STARTUP_SLOT, 1);
+        assert!(tun.add_address(&format!("{own}/29")));
         let mut config = Config::from_sources(
             Some(&format!(
                 "[reflectors.a]\nsource_if = \"{LOOPBACK_IFACE}\"\ntarget_if = \"{}\"\n\

@@ -318,7 +318,7 @@ mod tests {
     use super::*;
     use crate::net::frame::{LinkHeader, UdpFrames};
     use crate::net::mac::MacAddr;
-    use crate::test_support::{Tun, frame, loopback_lock, open_capture, open_or_skip};
+    use crate::test_support::{Tun, addr, frame, loopback_lock, open_capture, open_or_skip};
 
     /// How long a live tun test waits for a packet to cross the device.
     const WAIT_BUDGET: Duration = Duration::from_secs(2);
@@ -347,8 +347,8 @@ mod tests {
     fn bare_datagrams(payload: &[u8]) -> [Vec<u8>; 2] {
         let mut buf = [0u8; 128];
         let v4 = frame::ipv4_udp(
-            SocketAddrV4::new(Ipv4Addr::new(10, 99, 200, 2), 40000),
-            SocketAddrV4::new(Ipv4Addr::new(10, 99, 200, 1), 40001),
+            SocketAddrV4::new(addr::v4(addr::TUN_PEERS_SLOT, 2), 40000),
+            SocketAddrV4::new(addr::v4(addr::TUN_PEERS_SLOT, 1), 40001),
             64,
             payload,
             &mut buf,
@@ -356,8 +356,8 @@ mod tests {
         .expect("build the IPv4 datagram");
         let v4 = buf[..v4].to_vec();
         let v6 = frame::ipv6_udp(
-            SocketAddrV6::new("fd00:99::2".parse().unwrap(), 40000, 0, 0),
-            SocketAddrV6::new("fd00:99::1".parse().unwrap(), 40001, 0, 0),
+            SocketAddrV6::new(addr::v6(addr::TUN_PEERS_SLOT, 2), 40000, 0, 0),
+            SocketAddrV6::new(addr::v6(addr::TUN_PEERS_SLOT, 1), 40001, 0, 0),
             64,
             payload,
             &mut buf,
@@ -414,8 +414,8 @@ mod tests {
         let datagrams = [
             UdpFrames::ipv4(
                 LinkHeader::RawIp,
-                SocketAddrV4::new(Ipv4Addr::new(10, 99, 200, 2), 40000),
-                SocketAddrV4::new(Ipv4Addr::new(10, 99, 200, 1), 40001),
+                SocketAddrV4::new(addr::v4(addr::TUN_PEERS_SLOT, 2), 40000),
+                SocketAddrV4::new(addr::v4(addr::TUN_PEERS_SLOT, 1), 40001),
                 64,
                 1,
                 &payload,
@@ -423,8 +423,8 @@ mod tests {
             ),
             UdpFrames::ipv6(
                 LinkHeader::RawIp,
-                SocketAddrV6::new("fd00:99::2".parse().unwrap(), 40000, 0, 0),
-                SocketAddrV6::new("fd00:99::1".parse().unwrap(), 40001, 0, 0),
+                SocketAddrV6::new(addr::v6(addr::TUN_PEERS_SLOT, 2), 40000, 0, 0),
+                SocketAddrV6::new(addr::v6(addr::TUN_PEERS_SLOT, 1), 40001, 0, 0),
                 64,
                 1,
                 &payload,

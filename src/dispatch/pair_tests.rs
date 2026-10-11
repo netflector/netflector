@@ -21,7 +21,7 @@ use crate::net::packet::Parsed;
 use crate::sys::setsockopt;
 #[cfg(target_os = "linux")]
 use crate::sys::sockaddr_for;
-use crate::test_support::{Capability, open_capture, open_interface, skip};
+use crate::test_support::{Capability, addr, open_capture, open_interface, skip};
 
 use super::CaptureKey;
 use super::datagram::{DatagramSource, build_udp, ethernet_dst};
@@ -71,18 +71,18 @@ struct InterfacePair {
 }
 
 // The address plan. Pairs run concurrently in one network stack (there is no namespace), so
-// every pair gets its own v4 subnet and ULA prefix, keyed by `subnet`: an address shared between
+// every pair gets its own v4 slot and v6 prefix, keyed by `subnet`: an address shared between
 // pairs would make the observer's join-by-address ambiguous and the source asserts unstable.
 // The link-locals can repeat -- `fe80::` is scoped per link by definition.
 impl InterfacePair {
     fn inject_v4(&self) -> Ipv4Addr {
-        Ipv4Addr::new(10, 99, self.subnet, 1)
+        addr::v4(self.subnet, 1)
     }
     fn receive_v4(&self) -> Ipv4Addr {
-        Ipv4Addr::new(10, 99, self.subnet, 2)
+        addr::v4(self.subnet, 2)
     }
-    fn inject_ula(&self) -> Ipv6Addr {
-        Ipv6Addr::new(0xfd00, 0x99, u16::from(self.subnet), 0, 0, 0, 0, 1)
+    fn inject_routable_v6(&self) -> Ipv6Addr {
+        addr::v6(self.subnet, 1)
     }
 }
 
@@ -96,7 +96,12 @@ impl InterfacePair {
         // Held through create + settle so no parallel pair test creates an interface concurrently
         // (see PAIR_LOCK); released when this returns, before the test body runs.
         let _serialize = PAIR_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-        let pair = Self::create_platform(NEXT_SUBNET.fetch_add(1, Ordering::Relaxed))?;
+        let subnet = NEXT_SUBNET.fetch_add(1, Ordering::Relaxed);
+        assert!(
+            subnet <= addr::LAST_PAIR_SLOT,
+            "the address plan has no slot left"
+        );
+        let pair = Self::create_platform(subnet)?;
         pair.settle();
         Some(pair)
     }
@@ -210,7 +215,7 @@ impl InterfacePair {
     #[cfg(target_os = "linux")]
     fn configure(&self) -> bool {
         run(&format!(
-            "ip addr add {}/24 dev {}",
+            "ip addr add {}/29 dev {}",
             self.inject_v4(),
             self.inject
         )) && run(&format!(
@@ -218,10 +223,10 @@ impl InterfacePair {
             self.inject
         )) && run(&format!(
             "ip -6 addr add {}/64 dev {} nodad",
-            self.inject_ula(),
+            self.inject_routable_v6(),
             self.inject
         )) && run(&format!(
-            "ip addr add {}/24 dev {}",
+            "ip addr add {}/29 dev {}",
             self.receive_v4(),
             self.receive
         )) && run(&format!(
@@ -298,7 +303,7 @@ impl InterfacePair {
     fn configure(&self) -> bool {
         run(&format!("ifconfig {} peer {}", self.inject, self.receive))
             && run(&format!(
-                "ifconfig {} inet {}/24 up",
+                "ifconfig {} inet {}/29 up",
                 self.inject,
                 self.inject_v4()
             ))
@@ -309,11 +314,11 @@ impl InterfacePair {
             && run(&format!(
                 "ifconfig {} inet6 {} prefixlen 64",
                 self.inject,
-                self.inject_ula()
+                self.inject_routable_v6()
             ))
             && run(&format!("ifconfig {} up", self.receive))
             && run(&format!(
-                "ifconfig {} inet {}/24",
+                "ifconfig {} inet {}/29",
                 self.receive,
                 self.receive_v4()
             ))
@@ -367,7 +372,7 @@ impl InterfacePair {
     #[cfg(target_os = "freebsd")]
     fn configure(&self) -> bool {
         run(&format!(
-            "ifconfig {} inet {}/24 up",
+            "ifconfig {} inet {}/29 up",
             self.inject,
             self.inject_v4()
         )) && run(&format!(
@@ -376,10 +381,10 @@ impl InterfacePair {
         )) && run(&format!(
             "ifconfig {} inet6 {} prefixlen 64",
             self.inject,
-            self.inject_ula()
+            self.inject_routable_v6()
         )) && run(&format!("ifconfig {} up", self.receive))
             && run(&format!(
-                "ifconfig {} inet {}/24",
+                "ifconfig {} inet {}/29",
                 self.receive,
                 self.receive_v4()
             ))
@@ -728,8 +733,8 @@ fn pair_capture_on_a_vlan_interface_takes_its_traffic() -> io::Result<()> {
         assert!(
             run(&format!(
                 "ip link add link {parent} name {name} type vlan id 10 && \
-                 ip addr add 10.98.{}.{host}/24 dev {name} && ip link set {name} up",
-                pair.subnet
+                 ip addr add {}/29 dev {name} && ip link set {name} up",
+                addr::v4(addr::VLAN_SLOT, host)
             )),
             "could not create {name}"
         );
@@ -1085,8 +1090,8 @@ fn pair_captures_a_jumbo_frame_whole() -> io::Result<()> {
 }
 
 // The per-scope IPv6 source selection on the wire: a site-local-scoped group is sourced from the
-// pair's ULA, a link-local-scoped group from a link-local address, asserted on the frames the
-// peer captures.
+// pair's routable address, a link-local-scoped group from a link-local address, asserted on the
+// frames the peer captures.
 #[test]
 fn pair_sources_v6_multicast_by_destination_scope() -> io::Result<()> {
     let Some(pair) = InterfacePair::create() else {
@@ -1108,7 +1113,7 @@ fn pair_sources_v6_multicast_by_destination_scope() -> io::Result<()> {
         .expect("captured the site-local-scoped datagram");
     assert_eq!(
         site.source.ip(),
-        IpAddr::V6(pair.inject_ula()),
+        IpAddr::V6(pair.inject_routable_v6()),
         "ff05:: sourced from the routable address"
     );
 
