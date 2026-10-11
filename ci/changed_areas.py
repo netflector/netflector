@@ -38,6 +38,8 @@ PORT = CATALOG + (
     ".github/workflows/ci-port.yml",
     # --check runs only here; the code lanes exercise --local.
     "ci/port-sync.py",
+    # Only this pipeline takes its current-main path; the code lanes take the pinned one.
+    "ci/freebsd-ports-tree.sh",
     "ci/port-install.sh",
     "ci/port-e2e.sh",
     "ci/port-into-tree.sh",
@@ -50,7 +52,8 @@ SUPPLY_CHAIN = (
     "ci/supply-chain-pin.sh",
     ".github/workflows/ci-supply-chain.yml",
 )
-# The two distribution trees and the files only a pipeline consumes. Markdown is ignored too.
+# The two distribution trees and the files only a pipeline consumes. Markdown is ignored too, but
+# for the README: a config test loads every TOML example in it.
 CODE_IGNORES = (
     "dist/freebsd/",
     "dist/opnsense/",
@@ -78,7 +81,7 @@ def matches(path: str, patterns: tuple[str, ...]) -> bool:
 
 
 def is_code(path: str) -> bool:
-    return not path.endswith(".md") and not matches(path, CODE_IGNORES)
+    return (path == "README.md" or not path.endswith(".md")) and not matches(path, CODE_IGNORES)
 
 
 def areas(paths: list[str]) -> dict[str, bool]:

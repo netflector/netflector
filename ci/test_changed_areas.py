@@ -16,8 +16,11 @@ def only(*lanes: str) -> dict[str, bool]:
 
 class ChangedAreas(unittest.TestCase):
     def test_markdown_alone_runs_nothing(self) -> None:
-        self.assertEqual(ca.areas(["README.md", "docs/DEVELOP.md"]), NONE)
+        self.assertEqual(ca.areas(["docs/DEVELOP.md", "e2e/README.md"]), NONE)
         self.assertEqual(ca.areas([]), NONE)
+
+    def test_the_readme_runs_the_code_lanes(self) -> None:
+        self.assertEqual(ca.areas(["README.md"]), only("code"))
 
     def test_code_and_unclaimed_paths_run_the_code_lanes(self) -> None:
         self.assertEqual(ca.areas(["src/lib.rs"]), only("code"))
@@ -38,6 +41,7 @@ class ChangedAreas(unittest.TestCase):
         self.assertEqual(ca.areas(["ci/platforms.toml"]), only("code", "opnsense", "port"))
         self.assertEqual(ca.areas(["Cargo.lock"]), only("code", "supply-chain"))
         self.assertEqual(ca.areas(["ci/port-sync.py"]), only("code", "port"))
+        self.assertEqual(ca.areas(["ci/freebsd-ports-tree.sh"]), only("code", "port"))
         self.assertEqual(ca.areas(["ci/freebsd-vm.sh"]), only("code", "opnsense"))
 
     def test_a_mixed_change_runs_each_touched_lane(self) -> None:
