@@ -280,7 +280,7 @@ counters_interval_secs = 0         # optional; seconds between per-interface pac
 
 [reflectors.tv]
 source_if = "en0"                # required; interface to listen on (must differ from target_if)
-target_if = "lo0"                # required; interface to emit reflected traffic on
+target_if = "en1"                # required; interface to emit reflected traffic on
 target_peers = ["10.10.10.2"]    # optional; the hosts behind target_if when a group sent there reaches nobody (see Peers)
 source_peers = ["10.0.0.2"]      # optional; the same for source_if
 macs      = ["B0:37:95:C5:60:BE"] # optional; device(s) to scope to (see below). Omit for a whole network.
@@ -335,7 +335,7 @@ this in the environment:
 ```sh
 NETFLECTOR_LOG_LEVEL=info
 NETFLECTOR_TV_SOURCE_IF=en0
-NETFLECTOR_TV_TARGET_IF=lo0
+NETFLECTOR_TV_TARGET_IF=en1
 NETFLECTOR_TV_MACS=B0:37:95:C5:60:BE
 NETFLECTOR_TV_WOL=true
 NETFLECTOR_TV_MDNS=true
