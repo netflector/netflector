@@ -4,7 +4,7 @@
 # tree turns vulnerable with no commit of ours to fire on.
 #
 # Called from ci.yml when a change touches the manifests, deny.toml or the pins (the list
-# lives in ci/changed_areas.py); ci.yml runs the code lanes on those too.
+# lives in ci/changed_areas.py); ci.yml runs the code lanes on the manifests too.
 name: Supply chain CI
 
 on:
