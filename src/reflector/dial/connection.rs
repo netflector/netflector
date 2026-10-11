@@ -11,6 +11,7 @@ use std::net::SocketAddrV4;
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::{Duration, Instant};
 
+use crate::logging::{WARN_WINDOW, log_rate};
 use crate::net::http::framing::{HttpFraming, Kind, RewritePolicy};
 use crate::net::stream_buffer::StreamBuffer;
 use crate::net::tcp::TcpSocket;
@@ -92,7 +93,11 @@ impl DirectionContext<'_> {
     fn forward(&mut self) -> Forwarded {
         let tail = self.flow.recv.free_tail_mut();
         if tail.is_empty() {
-            log::warn!("dial: receive buffer full of an unframable message; closing");
+            log_rate!(
+                log::Level::Warn,
+                WARN_WINDOW,
+                "dial: receive buffer full of an unframable message; closing"
+            );
             return Forwarded::Failed;
         }
         let n = match self.from.recv(tail) {
@@ -145,7 +150,11 @@ impl DirectionContext<'_> {
             .from_reg
             .expect("an open flow's source keeps its registration");
         if reactor.set_read_interest(reg, false).is_err() {
-            log::warn!("dial: disarming the half-closed source failed; closing");
+            log_rate!(
+                log::Level::Warn,
+                WARN_WINDOW,
+                "dial: disarming the half-closed source failed; closing"
+            );
             return Outcome::Close;
         }
         self.flow.state = FlowState::SourceClosed;
@@ -198,7 +207,11 @@ impl DirectionContext<'_> {
             .to_reg
             .expect("an open flow's destination keeps its registration");
         if reactor.set_write_interest(reg, armed).is_err() {
-            log::warn!("dial: updating write interest failed; closing");
+            log_rate!(
+                log::Level::Warn,
+                WARN_WINDOW,
+                "dial: updating write interest failed; closing"
+            );
             return Outcome::Close;
         }
         Outcome::Keep
@@ -375,7 +388,11 @@ impl Connection {
         if reactor.set_read_interest(disarm_reg, false).is_err()
             || reactor.unwatch(unwatch_reg).is_err()
         {
-            log::warn!("dial: winding down a hung-up peer failed; closing");
+            log_rate!(
+                log::Level::Warn,
+                WARN_WINDOW,
+                "dial: winding down a hung-up peer failed; closing"
+            );
             return Outcome::Close;
         }
         if self.context(direction).settle(reactor) == Outcome::Close {
@@ -463,7 +480,11 @@ fn send_framed(
 
 fn buffer_tail(to_send: &mut StreamBuffer, header: &[u8], body: &[u8]) -> Outcome {
     if to_send.append(header).is_err() || to_send.append(body).is_err() {
-        log::warn!("dial: send buffer overflow; closing");
+        log_rate!(
+            log::Level::Warn,
+            WARN_WINDOW,
+            "dial: send buffer overflow; closing"
+        );
         return Outcome::Close;
     }
     Outcome::Keep

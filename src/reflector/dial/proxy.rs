@@ -7,7 +7,7 @@
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
 use std::os::fd::{AsRawFd, RawFd};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::interface::{InterfaceName, host_v4_addrs};
 use crate::logging::{WARN_WINDOW, log_rate};
@@ -20,10 +20,6 @@ use super::egress;
 
 /// Past it, new clients are dropped.
 const MAX_CONNECTIONS: usize = 64;
-
-/// A source-side host can reach the cap on its own, so a line per rejected client would hand it
-/// the log.
-const CAP_WARN_INTERVAL: Duration = Duration::from_mins(1);
 
 /// A handle into the proxy's connection [`Arena`]. Round-trips through a watched fd's `user_data`:
 /// the reactor echoes it back on every event.
@@ -113,7 +109,9 @@ impl DialDeviceProxy {
             Ok(Some(client)) => client,
             Ok(None) => return None,
             Err(e) => {
-                log::error!(
+                log_rate!(
+                    log::Level::Error,
+                    WARN_WINDOW,
                     "dial: accept on the {what} listener failed: {e}; tearing the proxy down, \
                      {} is unproxied until it advertises again",
                     self.desc_endpoint
@@ -125,7 +123,7 @@ impl DialDeviceProxy {
         if self.conns.iter().count() >= MAX_CONNECTIONS {
             log_rate!(
                 log::Level::Warn,
-                CAP_WARN_INTERVAL,
+                WARN_WINDOW,
                 "dial: connection cap ({MAX_CONNECTIONS}) reached for {}; dropping new clients",
                 self.desc_endpoint
             );
@@ -147,7 +145,9 @@ impl DialDeviceProxy {
             return;
         };
         let Some(device) = self.rest_endpoint else {
-            log::warn!(
+            log_rate!(
+                log::Level::Warn,
+                WARN_WINDOW,
                 "dial: REST request before the device's REST endpoint is known; dropping it"
             );
             return;
@@ -168,7 +168,11 @@ impl DialDeviceProxy {
         let device = match TcpSocket::connect(device_endpoint, self.target, confine) {
             Ok(device) => device,
             Err(e) => {
-                log::warn!("dial: connect to {device_endpoint} failed: {e}");
+                log_rate!(
+                    log::Level::Warn,
+                    WARN_WINDOW,
+                    "dial: connect to {device_endpoint} failed: {e}"
+                );
                 return;
             }
         };
@@ -186,7 +190,11 @@ impl DialDeviceProxy {
         let client_reg = match reactor.watch(key, client_fd, user_data) {
             Ok(reg) => reg,
             Err(e) => {
-                log::warn!("dial: watching the client fd failed: {e}");
+                log_rate!(
+                    log::Level::Warn,
+                    WARN_WINDOW,
+                    "dial: watching the client fd failed: {e}"
+                );
                 self.close_conn(conn_key, reactor);
                 return;
             }
@@ -194,7 +202,11 @@ impl DialDeviceProxy {
         let device_reg = match reactor.watch(key, device_fd, user_data) {
             Ok(reg) => reg,
             Err(e) => {
-                log::warn!("dial: watching the device fd failed: {e}");
+                log_rate!(
+                    log::Level::Warn,
+                    WARN_WINDOW,
+                    "dial: watching the device fd failed: {e}"
+                );
                 reactor.unwatch(client_reg).ok();
                 self.close_conn(conn_key, reactor);
                 return;

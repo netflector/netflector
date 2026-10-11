@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use crate::dispatch::{CaptureKey, DialContext, DialProxyKey};
 use crate::interface::InterfaceName;
+use crate::logging::{WARN_WINDOW, log_rate};
 use crate::net::is_never_a_peer;
 use crate::net::ssdp::dial::{
     dial_location_value, is_dial_service_message, parse_cache_control_max_age,
@@ -98,7 +99,9 @@ pub(crate) fn rewrite_location(
             .write_all(&payload[location.offset + location.len..])
             .is_ok();
     if !fits {
-        log::warn!(
+        log_rate!(
+            log::Level::Warn,
+            WARN_WINDOW,
             "dial: rewritten LOCATION for {} exceeds the scratch buffer; forwarding verbatim",
             location.endpoint
         );
@@ -117,7 +120,11 @@ fn mint_proxy(
 ) -> Option<SocketAddrV4> {
     let endpoint = key.endpoint;
     if !ctx.has_capacity(reactor) {
-        log::warn!("dial: proxy cap reached; reflecting {endpoint}'s LOCATION unchanged");
+        log_rate!(
+            log::Level::Warn,
+            WARN_WINDOW,
+            "dial: proxy cap reached; reflecting {endpoint}'s LOCATION unchanged"
+        );
         return None;
     }
     if names_this_host(endpoint) {
@@ -139,7 +146,11 @@ fn mint_proxy(
     let handler = match reactor.register_with_fds(Box::new(proxy), &watches) {
         Ok(handler) => handler,
         Err(e) => {
-            log::warn!("dial: registering the proxy for {endpoint} failed: {e}");
+            log_rate!(
+                log::Level::Warn,
+                WARN_WINDOW,
+                "dial: registering the proxy for {endpoint} failed: {e}"
+            );
             return None;
         }
     };
@@ -155,7 +166,11 @@ fn listen_or_warn(source: Ipv4Addr, what: Listener) -> Option<TcpSocket> {
     match TcpSocket::listen(source) {
         Ok(listener) => Some(listener),
         Err(e) => {
-            log::warn!("dial: binding the {what} listener on {source} failed: {e}");
+            log_rate!(
+                log::Level::Warn,
+                WARN_WINDOW,
+                "dial: binding the {what} listener on {source} failed: {e}"
+            );
             None
         }
     }
