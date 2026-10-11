@@ -530,7 +530,9 @@ netflector, which opens an upstream connection to the device **bound to `target_
 device sees an on-subnet client and serves it. Along the way it rewrites the four authority-bearing
 headers (`LOCATION`, the description's `Application-URL`, request `Host`, and response `Location`) from
 the device's authority to a netflector authority and back; HTTP bodies stream through untouched.
-App launch (`POST`) and stop (`DELETE`) work end to end.
+App launch (`POST`) and stop (`DELETE`) work end to end. The listeners take new ephemeral ports for
+each device, so a firewall on the netflector host must let `source_if`'s clients reach its address
+on TCP ports in the system's ephemeral range.
 
 `dial = true` requires `ssdp` and is **IPv4-only** (the DIAL spec ties the device authority to an IPv4
 address); an `ipv6`-only entry with `dial = true` is rejected at startup. It is the only DIAL knob;

@@ -190,6 +190,10 @@ HTTP requests go to the TV's address on the other segment, which the client
 may not be able to reach, and some TVs refuse off-subnet clients outright.
 .Ic dial
 closes that gap by proxying those requests between the segments.
+The proxy listens on new ephemeral TCP ports for each device, so a firewall on
+the host must let
+.Ic source_if Ns 's
+clients reach its address on the system's ephemeral port range.
 Requires
 .Ic ssdp
 and, because the DIAL protocol itself is IPv4-only, an IPv4-capable
