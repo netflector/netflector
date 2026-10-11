@@ -267,7 +267,15 @@ impl<C: Classify> PacketHandler for SimpleReflector<C> {
                 Rewrite::Verbatim => (packet.payload, true),
                 Rewrite::Replaced(payload) => (payload, keeps_addresses),
                 Rewrite::Refused => return Outcome::Refused(message_type),
-                Rewrite::Unreadable => return self.unrecognized(packet),
+                Rewrite::Unreadable => {
+                    log::debug!(
+                        "{}: dropping {} from {}: the rewrite cannot read it",
+                        self.name,
+                        self.kind,
+                        packet.source
+                    );
+                    return Outcome::Dropped(message_type);
+                }
             };
         if checked && (self.suppress)(payload) {
             log::debug!(
@@ -597,7 +605,10 @@ mod tests {
                 Rewrite::Refused,
                 Outcome::Refused(MessageType::MdnsResponse),
             ),
-            (Rewrite::Unreadable, Outcome::Filtered),
+            (
+                Rewrite::Unreadable,
+                Outcome::Dropped(MessageType::MdnsResponse),
+            ),
         ] {
             let Some((mut reflector, mut dispatcher, mut reactor)) =
                 reflector_over_loopback(Box::new(FixedRewrite(rewrite)), |_| false)

@@ -653,7 +653,8 @@ counters eth0: recoveries=1; mDNS query reflected=42 skipped=10; SSDP search ref
 Per message type: `reflected` (re-emitted on the other interface), `skipped` (right protocol, wrong
 direction for this leg - normal, this is the loop prevention working), `refused` (right direction,
 refused by the entry's `mdns_services` - normal on a filtered entry), `dropped` (should have been
-reflected but was not: a send error, a resource cap, or the advertisement suppression) and `stalled`
+reflected but was not: a send error, a resource cap, the advertisement suppression, or a message
+`mdns_services` cannot read) and `stalled`
 (the egress had no source address of the packet's family yet). Interface-wide: `filtered`
 (unrecognized traffic on the group), `echoed` (netflector's own re-emits handed back by the link,
 as a hairpin bridge port or an access point re-broadcasting a station's multicast does; dropped

@@ -200,9 +200,12 @@ list
 .Pq Xr netflector.toml 5 .
 This is normal on an entry with a list.
 .It Sy dropped
-Should have been reflected, but was not: a send error, a resource cap, or a
+Should have been reflected, but was not: a send error, a resource cap, a
 message advertising only unreachable addresses (link-local, loopback,
-unspecified, multicast, broadcast), which the other segment could never use.
+unspecified, multicast, broadcast), which the other segment could never use,
+or one an entry's
+.Ic mdns_services
+cannot read.
 .It Sy stalled
 Should have been reflected, but the egress interface had no source address
 of the packet's family yet.
