@@ -398,24 +398,35 @@ fn value_has_chunked(value: &[u8]) -> bool {
 /// `Application-URL` / `Location` on a response. Otherwise a client could send `Application-URL`
 /// and name the endpoint the proxy dials for every later REST request.
 fn rewritable_authority(line: &[u8], kind: Kind) -> Option<(usize, Authority, AuthorityHeader)> {
-    let (value, bare, wrap): (&[u8], bool, fn(SocketAddrV4) -> AuthorityHeader) = match kind {
+    type Wrap = fn(SocketAddrV4) -> AuthorityHeader;
+    let (value, bare, wrap, dialed): (&[u8], bool, Wrap, bool) = match kind {
         Kind::Request => (
             strip_prefix_ignore_ascii_case(line, b"Host:")?,
             true,
             AuthorityHeader::Host,
+            false,
         ),
         Kind::Response => {
             if let Some(rest) = strip_prefix_ignore_ascii_case(line, b"Application-URL:") {
-                (rest, false, AuthorityHeader::ApplicationUrl)
+                (rest, false, AuthorityHeader::ApplicationUrl, true)
             } else {
                 let rest = strip_prefix_ignore_ascii_case(line, b"Location:")?;
-                (rest, false, AuthorityHeader::Location)
+                (rest, false, AuthorityHeader::Location, false)
             }
         }
     };
     let trimmed = value.trim_ascii_start();
     let value_off = line.len() - trimmed.len();
-    let found = parse_authority(trimmed, bare)?;
+    let Some(found) = parse_authority(trimmed, bare) else {
+        if dialed {
+            log::debug!(
+                "dial: Application-URL {} is not a rewritable IPv4 http URL; forwarding it \
+                 unproxied",
+                String::from_utf8_lossy(trimmed.trim_ascii_end())
+            );
+        }
+        return None;
+    };
     let header = wrap(found.endpoint);
     Some((value_off, found, header))
 }
