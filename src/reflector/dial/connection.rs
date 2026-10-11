@@ -313,6 +313,27 @@ impl Connection {
         self.device.shutdown();
     }
 
+    /// On the device socket's first edge, readable or writable: Linux reports a refused or
+    /// unreachable connect readable first.
+    fn finish_device_connect(&mut self) -> Outcome {
+        match self.device.finish_connect() {
+            Ok(()) => {
+                log::debug!("dial: connected to {}", self.device_endpoint);
+                self.deadline = Instant::now() + IDLE_TIMEOUT;
+                Outcome::Keep
+            }
+            Err(e) => {
+                log_rate!(
+                    log::Level::Warn,
+                    WARN_WINDOW,
+                    "dial: device connect to {} failed: {e}",
+                    self.device_endpoint
+                );
+                Outcome::Close
+            }
+        }
+    }
+
     fn context(&mut self, direction: Direction) -> DirectionContext<'_> {
         match direction {
             Direction::ClientToDevice => DirectionContext {
@@ -402,6 +423,12 @@ impl Connection {
     }
 
     fn forward(&mut self, direction: Direction, reactor: &mut Reactor) -> Outcome {
+        if direction == Direction::DeviceToClient
+            && self.device.is_connecting()
+            && self.finish_device_connect() == Outcome::Close
+        {
+            return Outcome::Close;
+        }
         let mut ctx = self.context(direction);
         // A non-Open flow's read was disarmed, so only a hangup/reset wakes it: epoll delivers
         // HUP/ERR regardless of the read mask. A `None` destination reg means a prior peer_gone took
@@ -423,20 +450,11 @@ impl Connection {
     }
 
     fn on_writable(&mut self, direction: Direction, reactor: &mut Reactor) -> Outcome {
-        if direction == Direction::ClientToDevice && self.device.is_connecting() {
-            match self.device.finish_connect() {
-                Ok(()) => {
-                    log::debug!("dial: connected to {}", self.device_endpoint);
-                    self.deadline = Instant::now() + IDLE_TIMEOUT;
-                }
-                Err(e) => {
-                    log::warn!(
-                        "dial: device connect to {} failed: {e}",
-                        self.device_endpoint
-                    );
-                    return Outcome::Close;
-                }
-            }
+        if direction == Direction::ClientToDevice
+            && self.device.is_connecting()
+            && self.finish_device_connect() == Outcome::Close
+        {
+            return Outcome::Close;
         }
         let mut ctx = self.context(direction);
         if ctx.drain() == Outcome::Close {
