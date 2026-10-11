@@ -38,6 +38,8 @@ const _: () =
 
 pub(super) fn open() -> io::Result<OwnedFd> {
     let sock = crate::sys::open_socket(libc::PF_ROUTE, libc::SOCK_RAW, 0)?;
+    // SAFETY: `sock` is a live descriptor.
+    crate::sys::check(unsafe { libc::shutdown(sock.as_raw_fd(), libc::SHUT_WR) })?;
     crate::sys::increase_recv_buffer(sock.as_raw_fd(), RECV_BUFFER);
     // Without SO_RERROR the drain's ENOBUFS recovery never fires; macOS has no equivalent.
     #[cfg(target_os = "freebsd")]
@@ -104,6 +106,7 @@ pub(super) fn sender_ok(_src: &libc::sockaddr_storage, _len: libc::socklen_t) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{Capability, skip};
 
     fn nonzero(index: u32) -> NonZeroU32 {
         NonZeroU32::new(index).unwrap()
@@ -191,5 +194,82 @@ mod tests {
         let mut seen = Vec::new();
         for_each_change(&buf, &mut |e| seen.push(e));
         assert_eq!(seen, []);
+    }
+
+    // macOS lets a route socket created by root change routes for whoever holds it, so a writable
+    // one would outlive the privilege drop. RTM_GET is the one request any socket may send.
+    #[test]
+    #[cfg_attr(miri, ignore = "needs a real routing socket")]
+    fn the_socket_refuses_writes() {
+        let sock = match open() {
+            Ok(sock) => sock,
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                skip(Capability::Monitor, e);
+                return;
+            }
+            Err(e) => panic!("unexpected monitor open failure: {e}"),
+        };
+        let sent = route_get(&sock, std::net::Ipv4Addr::LOCALHOST);
+        assert_eq!(sent.map_err(|e| e.raw_os_error()), Err(Some(libc::EPIPE)));
+    }
+
+    // Closing the write side leaves the read side alone: the kernel's answer to another socket's
+    // RTM_GET goes out to every route socket, this one included.
+    #[test]
+    #[cfg_attr(miri, ignore = "needs a real routing socket")]
+    fn the_socket_still_reads_routing_messages() {
+        let sock = match open() {
+            Ok(sock) => sock,
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                skip(Capability::Monitor, e);
+                return;
+            }
+            Err(e) => panic!("unexpected monitor open failure: {e}"),
+        };
+        let asker = crate::sys::open_socket(libc::PF_ROUTE, libc::SOCK_RAW, 0).unwrap();
+        route_get(&asker, std::net::Ipv4Addr::LOCALHOST).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut buf = [0u8; READ_BUF];
+        loop {
+            // SAFETY: `buf` is writable for its whole length.
+            let n = unsafe { libc::read(sock.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+            if n >= 4 && c_int::from(buf[3]) == libc::RTM_GET {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the monitor never read the RTM_GET answer"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    fn route_get(sock: &OwnedFd, dst: std::net::Ipv4Addr) -> io::Result<usize> {
+        const HEADER: usize = size_of::<libc::rt_msghdr>();
+        const ADDR: usize = size_of::<libc::sockaddr_in>();
+        // SAFETY: plain C structs for which all-zero bytes are valid.
+        let (mut header, mut addr): (libc::rt_msghdr, libc::sockaddr_in) =
+            unsafe { (std::mem::zeroed(), std::mem::zeroed()) };
+        header.rtm_msglen = u16::try_from(HEADER + ADDR).unwrap();
+        header.rtm_version = u8::try_from(libc::RTM_VERSION).unwrap();
+        header.rtm_type = u8::try_from(libc::RTM_GET).unwrap();
+        header.rtm_flags = libc::RTF_UP | libc::RTF_HOST;
+        header.rtm_addrs = libc::RTA_DST;
+        header.rtm_seq = 1;
+        addr.sin_len = u8::try_from(ADDR).unwrap();
+        addr.sin_family = u8::try_from(libc::AF_INET).unwrap();
+        addr.sin_addr.s_addr = u32::from(dst).to_be();
+        let mut msg = Vec::with_capacity(HEADER + ADDR);
+        // SAFETY: each struct is read as its own size in bytes.
+        msg.extend_from_slice(unsafe {
+            std::slice::from_raw_parts((&raw const header).cast::<u8>(), HEADER)
+        });
+        // SAFETY: as above.
+        msg.extend_from_slice(unsafe {
+            std::slice::from_raw_parts((&raw const addr).cast::<u8>(), ADDR)
+        });
+        // SAFETY: `msg` is live for the call and `msg.len()` bytes long.
+        let n = unsafe { libc::write(sock.as_raw_fd(), msg.as_ptr().cast(), msg.len()) };
+        usize::try_from(n).map_err(|_| io::Error::last_os_error())
     }
 }
