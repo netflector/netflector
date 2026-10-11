@@ -50,12 +50,17 @@ impl TcpSocket {
     /// we reached it (see `nothing_to_accept`).
     ///
     /// # Errors
-    /// An `accept` failure that leaves the connection queued, or the `setsockopt` failure.
+    /// An `accept` failure that leaves the connection queued.
     pub(crate) fn accept(&self) -> io::Result<Option<Self>> {
         let Some(fd) = accept_fd(self.fd.as_raw_fd())? else {
             return Ok(None);
         };
-        set_nodelay(fd.as_raw_fd())?;
+        // macOS hands over a connection the client reset before the accept, then refuses the
+        // option on it.
+        if let Err(e) = set_nodelay(fd.as_raw_fd()) {
+            log::debug!("dropping an accepted connection that refused TCP_NODELAY: {e}");
+            return Ok(None);
+        }
         Ok(Some(Self {
             fd,
             local_addr: self.local_addr,
@@ -347,6 +352,34 @@ mod tests {
         let server = spin(|| listener.accept());
         assert!(nodelay(&client), "the outbound socket sets TCP_NODELAY");
         assert!(nodelay(&server), "the accepted socket sets TCP_NODELAY");
+    }
+
+    // A client that resets after the handshake but before the accept leaves a dead connection in
+    // the queue; taking it is no failure of the listener.
+    #[test]
+    #[cfg_attr(miri, ignore = "needs a real socket")]
+    fn a_client_reset_before_the_accept_is_not_a_listener_failure() {
+        let listener = TcpSocket::listen(Ipv4Addr::LOCALHOST).expect("listen on loopback");
+        let mut client = TcpSocket::connect(listener.local_addr(), Ipv4Addr::LOCALHOST, |_| Ok(()))
+            .expect("connect");
+        sleep(Duration::from_millis(50));
+        client.finish_connect().expect("the handshake completed");
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        crate::sys::setsockopt(
+            client.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            &linger,
+        )
+        .expect("SO_LINGER");
+        drop(client); // a zero linger closes with RST
+        sleep(Duration::from_millis(50));
+        listener
+            .accept()
+            .expect("the dead connection is taken, not reported as a failed accept");
     }
 
     #[test]
