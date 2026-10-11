@@ -41,6 +41,7 @@ VALGRIND_STOP_GRACE_SECONDS = 60
 # Ceiling on one setup or teardown command. Well above the slowest of them (a probe run waits at most
 # ~8s), so it only ever fires on a wedge; the emulated arm64 lanes are the slow case to clear.
 COMMAND_TIMEOUT_SECONDS = 120.0
+IMAGE_BUILD_TIMEOUT_SECONDS = 1800.0
 
 NETFLECTOR_SOURCE_IFNAME = "nf_source"
 NETFLECTOR_TARGET_IFNAME = "nf_target"

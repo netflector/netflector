@@ -86,8 +86,9 @@ def docker(
     check: bool = True,
     capture: bool = True,
     echo: bool = True,
+    timeout: float = COMMAND_TIMEOUT_SECONDS,
 ) -> subprocess.CompletedProcess[str]:
-    return run_command(["docker", *args], check=check, capture=capture, echo=echo)
+    return run_command(["docker", *args], check=check, capture=capture, echo=echo, timeout=timeout)
 
 
 def require_command(command: str) -> None:

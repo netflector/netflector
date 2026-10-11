@@ -28,13 +28,14 @@ from harness.scenarios import make_runner
 from harness.settings import (
     DEFAULT_HELPER_IMAGE,
     DEFAULT_NETFLECTOR_IMAGE,
+    IMAGE_BUILD_TIMEOUT_SECONDS,
     VALGRIND_NETFLECTOR_IMAGE,
 )
 
 
 def build_netflector_image(image: str, target: str | None = None) -> None:
     target_args = ["--target", target] if target is not None else []
-    docker(["build", *target_args, "-t", image, "."], capture=False)
+    docker(["build", *target_args, "-t", image, "."], capture=False, timeout=IMAGE_BUILD_TIMEOUT_SECONDS)
 
 
 def select_cases(case_names: list[str]) -> list[
