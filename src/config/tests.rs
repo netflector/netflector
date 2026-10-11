@@ -1043,12 +1043,15 @@ fn udp_relay_on_a_protocols_group_conflicts_either_way_round() {
             udp_ports = [5353]
             udp_groups = ["224.0.0.251"]
         "#;
+    // The error names the leg both relay, not the first entry's own direction.
     assert!(matches!(
         err(text),
         ConfigError::ConflictingReflectors {
             protocol: Protocol::Mdns,
+            ingress,
+            egress,
             ..
-        }
+        } if ingress.as_bytes() == b"iot" && egress.as_bytes() == b"lan"
     ));
 }
 

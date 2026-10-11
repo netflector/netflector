@@ -63,6 +63,9 @@ impl Reach {
     }
 }
 
+/// An ingress interface and the egress it relays to.
+type Leg<'a> = (&'a InterfaceName, &'a InterfaceName);
+
 /// A class of datagrams an entry relays: those to `port` and `reach` arriving on `ingress`,
 /// re-emitted on `egress`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,56 +167,50 @@ impl Reflector {
         flows
     }
 
+    /// The protocol both entries reflect, and the leg they share.
+    ///
     /// Two discovery protocols on one port don't duplicate: each classifier admits only its own
     /// messages. The relay admits everything it captures, so it duplicates any protocol on the
     /// same leg, and the conflict is named after that protocol.
-    fn conflicts_with(&self, other: &Reflector) -> Option<Protocol> {
+    fn conflicts_with<'a>(&'a self, other: &'a Reflector) -> Option<(Protocol, Leg<'a>)> {
         self.shared_protocol(other).or_else(|| {
             self.relay_overlap(other.flows())
                 .or_else(|| other.relay_overlap(self.flows()))
-                .map(|(protocol, _)| protocol)
+                .map(|flow| (flow.protocol, (flow.ingress, flow.egress)))
         })
     }
 
-    fn shared_protocol(&self, other: &Reflector) -> Option<Protocol> {
-        if !self
+    fn shared_protocol<'a>(&'a self, other: &'a Reflector) -> Option<(Protocol, Leg<'a>)> {
+        let leg = self
             .directions()
-            .any(|mine| other.directions().any(|theirs| theirs == mine))
-        {
-            return None;
-        }
+            .find(|mine| other.directions().any(|theirs| theirs == *mine))?;
         if !macs_overlap(self.macs.as_ref(), other.macs.as_ref())
             || !families_overlap(self.address_family, other.address_family)
         {
             return None;
         }
-        if let (Some(a), Some(b)) = (&self.wol, &other.wol)
+        let protocol = if let (Some(a), Some(b)) = (&self.wol, &other.wol)
             && a.ports.iter().any(|port| b.ports.contains(port))
         {
-            return Some(Protocol::Wol);
-        }
-        if self.mdns.is_some() && other.mdns.is_some() {
-            return Some(Protocol::Mdns);
-        }
-        if self.ssdp.is_some() && other.ssdp.is_some() {
-            return Some(Protocol::Ssdp);
-        }
-        if self.wsd && other.wsd {
-            return Some(Protocol::Wsd);
-        }
-        None
+            Protocol::Wol
+        } else if self.mdns.is_some() && other.mdns.is_some() {
+            Protocol::Mdns
+        } else if self.ssdp.is_some() && other.ssdp.is_some() {
+            Protocol::Ssdp
+        } else if self.wsd && other.wsd {
+            Protocol::Wsd
+        } else {
+            return None;
+        };
+        Some((protocol, leg))
     }
 
-    fn relay_overlap<'a>(
-        &self,
-        others: impl IntoIterator<Item = Flow<'a>>,
-    ) -> Option<(Protocol, u16)> {
+    fn relay_overlap<'a>(&self, others: impl IntoIterator<Item = Flow<'a>>) -> Option<Flow<'a>> {
         let mine = self.flows();
         let relay = || mine.iter().filter(|flow| flow.protocol == Protocol::Udp);
         others
             .into_iter()
             .find(|other| relay().any(|mine| mine.overlaps(other)))
-            .map(|other| (other.protocol, other.port))
     }
 
     pub(super) fn relay_duplicates(&self) -> Option<(Protocol, u16)> {
@@ -223,6 +220,7 @@ impl Reflector {
             .copied()
             .filter(|flow| flow.protocol != Protocol::Udp);
         self.relay_overlap(others)
+            .map(|flow| (flow.protocol, flow.port))
     }
 }
 
@@ -247,13 +245,13 @@ pub(super) fn check_conflicts(reflectors: &[Reflector]) -> Result<(), ConfigErro
                     name: a.name.clone(),
                 });
             }
-            if let Some(protocol) = a.conflicts_with(b) {
+            if let Some((protocol, (ingress, egress))) = a.conflicts_with(b) {
                 return Err(ConfigError::ConflictingReflectors {
                     protocol,
                     first: a.name.clone(),
                     second: b.name.clone(),
-                    source_if: a.source_if.clone(),
-                    target_if: a.target_if.clone(),
+                    ingress: ingress.clone(),
+                    egress: egress.clone(),
                 });
             }
         }

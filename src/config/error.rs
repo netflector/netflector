@@ -107,14 +107,14 @@ pub(crate) enum ConfigError {
     DuplicateReflectorName { name: ReflectorName },
 
     #[error(
-        "reflectors \"{first}\" and \"{second}\" both reflect {protocol} on {source_if} -> {target_if} with overlapping MAC selection and address family"
+        "reflectors \"{first}\" and \"{second}\" both reflect {protocol} on {ingress} -> {egress} with overlapping MAC selection and address family"
     )]
     ConflictingReflectors {
         protocol: Protocol,
         first: ReflectorName,
         second: ReflectorName,
-        source_if: InterfaceName,
-        target_if: InterfaceName,
+        ingress: InterfaceName,
+        egress: InterfaceName,
     },
 
     #[error("environment variable \"{var}\" is malformed (expected NETFLECTOR_<tag>_<param>)")]
