@@ -189,7 +189,8 @@ pub(crate) struct CaptureCounters {
     recoveries: u64,
     /// Received frames too large to forward, dropped before parsing.
     oversized: u64,
-    /// Fragmented datagrams given up on: lost fragments, an overlap, past the size limit.
+    /// Fragmented datagrams given up on: a fragment lost, overlapping or malformed, an eviction,
+    /// past the size limit, or a reassembled datagram failing its UDP length or checksum.
     unreassembled: u64,
 }
 

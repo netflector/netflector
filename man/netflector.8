@@ -222,7 +222,10 @@ frames, and this drop catches the echo a link may hand back.
 Received frames too large to forward, dropped before parsing.
 .It Sy unreassembled
 Fragmented datagrams given up on: a fragment that never arrived, fragments
-that overlap, or a datagram past the 9000-byte reassembly limit.
+that overlap or disagree on the length, a malformed fragment, a datagram
+evicted while all reassembly slots were busy, one past the 9000-byte
+reassembly limit, or a reassembled datagram whose UDP length or checksum is
+wrong.
 .It Sy recoveries
 Times the interface was destroyed and recreated, and its capture re-bound.
 .El

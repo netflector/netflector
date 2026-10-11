@@ -495,8 +495,7 @@ and ignore the frame. A datagram
 that arrives as IP fragments is reassembled, up to 9000 bytes, and one larger than the outgoing
 interface's MTU leaves as fragments. Of the IPv6 extension headers only a Fragment header is read.
 Jumbo frames work: netflector takes IP packets of up to 9060 bytes, enough for the usual 9000-byte
-MTU. A larger packet, which only an interface with a larger MTU carries, is dropped and counted as
-`oversized`.
+MTU. A larger packet is dropped and counted as `oversized`.
 
 For SSDP, multicast reflection delivers **passive** discovery: devices' periodic `NOTIFY ssdp:alive`
 advertisements reach the source segment so clients see them. **Active** discovery works end to end as
@@ -656,9 +655,8 @@ reflected but was not: a send error, a resource cap, or the advertisement suppre
 (unrecognized traffic on the group), `echoed` (netflector's own re-emits handed back by the link,
 as a hairpin bridge port or an access point re-broadcasting a station's multicast does; dropped
 before routing), `oversized` (received frames too large to forward), `unreassembled` (fragmented
-datagrams given up on: a fragment that never arrived, overlapping fragments, or past the 9000-byte
-limit) and `recoveries` (the interface was destroyed and recreated, and its capture re-bound). `netflector(8)` carries the full
-definitions.
+datagrams given up on) and `recoveries` (the interface was destroyed and recreated, and its capture
+re-bound). `netflector(8)` carries the full definitions.
 
 `SIGUSR1` also logs each interface's state: what its captures are bound to, and, while it is bound,
 any multicast group it holds no membership of, with the reason:
