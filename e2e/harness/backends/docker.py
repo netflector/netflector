@@ -110,8 +110,11 @@ class DockerBackend(Backend):
                 # v6-routable (ULA) differ, as on a real interface.
                 "--sysctl",
                 "net.ipv6.conf.default.accept_dad=0",
+                "--cap-drop",
+                "ALL",
                 "--cap-add",
                 "NET_RAW",
+                *(["--cap-add", "SETUID", "--cap-add", "SETGID"] if self.args.user else []),
                 "--mount",
                 f"type=bind,source={config_path},target=/etc/netflector/config.toml,readonly",
                 *(["--env", f"NETFLECTOR_USER={self.args.user}"] if self.args.user else []),
