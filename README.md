@@ -489,7 +489,9 @@ netflector reads untagged Ethernet frames carrying IPv4 or IPv6 UDP, and the bar
 link that has no Ethernet header: a loopback, or a WireGuard or tun tunnel (Linux 5.8 or later).
 Other link types are refused at startup. A priority-tagged frame (VLAN ID 0) counts as untagged.
 Frames tagged for a VLAN are ignored, so configure the VLAN as its own interface (`vlan10`,
-`em0.10`) and name that as the entry's `source_if` / `target_if` rather than the trunk. A datagram
+`em0.10`) and name that as the entry's `source_if` / `target_if` rather than the trunk. On Linux
+the VLAN interface needs `reorder_hdr on`, the default: with it off, captures on it see the tag
+and ignore the frame. A datagram
 that arrives as IP fragments is reassembled, up to 9000 bytes, and one larger than the outgoing
 interface's MTU leaves as fragments. Of the IPv6 extension headers only a Fragment header is read.
 
