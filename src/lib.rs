@@ -21,7 +21,7 @@ mod test_support;
 mod unique_list;
 
 pub use self::error::{Error, Result};
-pub use self::logging::init as init_logging;
+pub use self::logging::fallback as fallback_logging;
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -56,6 +56,7 @@ pub fn run(args: &[OsString]) -> Result<()> {
 /// unprivileged on a host without the configured interfaces (and cannot report a missing one).
 /// The log level is left alone so `log_level = "off"` cannot swallow the answer.
 fn check_config(path: Option<&Path>) -> Result<()> {
+    logging::init(config::Logging::default());
     let toml_text = path.map(config::read_config_file).transpose()?;
     let config = Config::from_sources(toml_text.as_deref(), sys::process_env())?;
     let count = config.reflectors.len();
@@ -72,10 +73,10 @@ fn reflect(path: Option<&Path>, join_groups: bool) -> Result<()> {
     let toml_text = path.map(config::read_config_file).transpose()?;
     let env = sys::process_env();
 
-    // Log level first, so the full parse below logs at the configured verbosity.
-    let level = config::resolve_log_level(toml_text.as_deref(), &env)?;
-    logging::set_level(level);
-    log::debug!("log level {level:?}");
+    // Logging first, so the full parse below logs at the configured verbosity and place.
+    let logging = config::resolve_logging(toml_text.as_deref(), &env)?;
+    logging::init(logging);
+    log::debug!("log level {:?}, to {:?}", logging.level, logging.target);
     log::info!("netflector {} starting", env!("CARGO_PKG_VERSION"));
     if let Some(path) = path {
         log::debug!(

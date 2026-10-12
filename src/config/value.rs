@@ -50,6 +50,38 @@ impl<'de> Deserialize<'de> for LogLevel {
     }
 }
 
+/// Where the running daemon's log records go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum LogTarget {
+    #[default]
+    Stderr,
+    Syslog,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("expected one of: stderr, syslog")]
+pub(crate) struct ParseLogTargetError;
+
+impl FromStr for LogTarget {
+    type Err = ParseLogTargetError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "stderr" => Ok(Self::Stderr),
+            "syslog" => Ok(Self::Syslog),
+            _ => Err(ParseLogTargetError),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for LogTarget {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 /// One side of a [`RunAs`]: a name to look up, or a number taken as is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Principal {

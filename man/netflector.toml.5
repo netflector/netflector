@@ -36,6 +36,16 @@ Default
 .Cm trace
 is compiled out of this build and behaves as
 .Cm debug .
+.It Ic log_target
+Where the running daemon logs:
+.Cm stderr ,
+the default, or
+.Cm syslog ,
+as
+.Ql netflector
+on the daemon facility.
+.Fl -check-config
+reports on stderr either way.
 .It Ic user
 The account to run as once the captures are open:
 .Ar user
@@ -289,6 +299,7 @@ Case-insensitive.
 .Pp
 The globals are
 .Ev NETFLECTOR_LOG_LEVEL ,
+.Ev NETFLECTOR_LOG_TARGET ,
 .Ev NETFLECTOR_USER ,
 .Ev NETFLECTOR_DEBUG_MEMORY_INTERVAL_SECS ,
 and

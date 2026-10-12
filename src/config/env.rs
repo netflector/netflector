@@ -6,7 +6,9 @@ use std::str::FromStr;
 
 use super::error::{ConfigError, ParseBoolError, ParseValueError, RequiredField};
 use super::raw::{RawConfig, RawReflector};
-use super::value::{AddressFamily, GroupList, LogLevel, PeerList, PortList, ReflectorName, RunAs};
+use super::value::{
+    AddressFamily, GroupList, LogLevel, LogTarget, PeerList, PortList, ReflectorName, RunAs,
+};
 use crate::interface::InterfaceName;
 use crate::net::mac::MacSet;
 use crate::net::mdns::services::ServiceList;
@@ -125,8 +127,13 @@ pub(super) fn parse_env(
             "LOG_LEVEL" => {
                 log::trace!("env {key} = {value}");
                 // Validated here so `--check-config` rejects a bad level; the value itself is
-                // read by `log_level_from_env` before the full parse.
+                // read by `logging_from_env` before the full parse.
                 env_value::<LogLevel>(&value, &key)?;
+                continue;
+            }
+            "LOG_TARGET" => {
+                log::trace!("env {key} = {value}");
+                env_value::<LogTarget>(&value, &key)?;
                 continue;
             }
             "USER" => {
@@ -172,6 +179,7 @@ pub(super) fn parse_env(
     }
     Ok(RawConfig {
         _log_level: None,
+        _log_target: None,
         user,
         debug_memory_interval_secs,
         counters_interval_secs,
@@ -179,13 +187,23 @@ pub(super) fn parse_env(
     })
 }
 
-pub(super) fn log_level_from_env(
+pub(super) fn logging_from_env(
     vars: &[(String, String)],
-) -> Result<Option<LogLevel>, ConfigError> {
-    vars.iter()
-        .find(|(key, _)| key == "NETFLECTOR_LOG_LEVEL")
-        .map(|(key, value)| env_value::<LogLevel>(value, key))
-        .transpose()
+) -> Result<(Option<LogLevel>, Option<LogTarget>), ConfigError> {
+    fn find<T>(vars: &[(String, String)], var: &str) -> Result<Option<T>, ConfigError>
+    where
+        T: FromStr,
+        T::Err: Into<ParseValueError>,
+    {
+        vars.iter()
+            .find(|(key, _)| key == var)
+            .map(|(key, value)| env_value::<T>(value, key))
+            .transpose()
+    }
+    Ok((
+        find(vars, "NETFLECTOR_LOG_LEVEL")?,
+        find(vars, "NETFLECTOR_LOG_TARGET")?,
+    ))
 }
 
 fn env_value<T>(value: &str, var: &str) -> Result<T, ConfigError>
@@ -219,7 +237,7 @@ fn env_bool(value: &str, var: &str) -> Result<bool, ConfigError> {
 mod tests {
     use crate::config::conflict::Protocol;
     use crate::config::error::{ParseValueError, RequiredField};
-    use crate::config::{Config, ConfigError, LogLevel};
+    use crate::config::{Config, ConfigError, LogLevel, LogTarget};
 
     fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs
@@ -447,6 +465,27 @@ mod tests {
     }
 
     #[test]
+    fn a_bad_log_target_in_the_environment_is_rejected() {
+        let vars = env(&[
+            ("NETFLECTOR_LOG_TARGET", "journald"),
+            ("NETFLECTOR_TV_SOURCE_IF", "a"),
+            ("NETFLECTOR_TV_TARGET_IF", "b"),
+            ("NETFLECTOR_TV_MDNS", "true"),
+        ]);
+        let bad = |e: &ConfigError| {
+            matches!(
+                e,
+                ConfigError::EnvBadValue {
+                    source: ParseValueError::LogTarget(_),
+                    ..
+                }
+            )
+        };
+        assert!(bad(&Config::from_sources(None, vars.clone()).unwrap_err()));
+        assert!(bad(&super::super::resolve_logging(None, &vars).unwrap_err()));
+    }
+
+    #[test]
     fn env_overrides_file_globals() {
         let toml = r#"
             log_level = "info"
@@ -459,12 +498,16 @@ mod tests {
         "#;
         let vars = env(&[
             ("NETFLECTOR_LOG_LEVEL", "error"),
+            ("NETFLECTOR_LOG_TARGET", "syslog"),
             ("NETFLECTOR_USER", "65534:65534"),
             ("NETFLECTOR_DEBUG_MEMORY_INTERVAL_SECS", "20"),
         ]);
         assert_eq!(
-            super::super::resolve_log_level(Some(toml), &vars).unwrap(),
-            LogLevel::Error
+            super::super::resolve_logging(Some(toml), &vars).unwrap(),
+            super::super::Logging {
+                level: LogLevel::Error,
+                target: LogTarget::Syslog,
+            }
         );
         let cfg = Config::from_sources(Some(toml), vars).unwrap();
         assert_eq!(

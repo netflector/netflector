@@ -613,8 +613,8 @@ mod tests {
             .to_string_lossy()
             .parse()
             .expect("NETFLECTOR_TEST_IFACE is an interface name");
-        crate::logging::init();
-        crate::logging::set_level(crate::config::LogLevel::Trace);
+        crate::logging::fallback();
+        log::set_max_level(log::LevelFilter::Trace);
         let ifindex = if_index(&iface).expect("NETFLECTOR_TEST_IFACE names an interface");
         let addrs = Interface::open(&iface, ifindex).expect("open failed").addrs;
         eprintln!("resolved {iface}: {addrs}");

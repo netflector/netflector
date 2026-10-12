@@ -5,7 +5,9 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 
 use super::error::ConfigError;
-use super::value::{AddressFamily, GroupList, LogLevel, PeerList, PortList, ReflectorName, RunAs};
+use super::value::{
+    AddressFamily, GroupList, LogLevel, LogTarget, PeerList, PortList, ReflectorName, RunAs,
+};
 use crate::interface::InterfaceName;
 use crate::net::mac::MacSet;
 use crate::net::mdns::services::ServiceList;
@@ -13,10 +15,12 @@ use crate::net::mdns::services::ServiceList;
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RawConfig {
-    /// Never read: the level is resolved by [`resolve_log_level`](super::resolve_log_level) before
-    /// the full parse. The field only keeps the key in the schema.
+    /// Never read, like `log_target`: both are resolved by [`resolve_logging`](super::resolve_logging)
+    /// before the full parse. The fields only keep the keys in the schema.
     #[serde(rename = "log_level")]
     pub(super) _log_level: Option<LogLevel>,
+    #[serde(rename = "log_target")]
+    pub(super) _log_target: Option<LogTarget>,
     /// The account to run as once the captures are open (`USER[:GROUP]`).
     pub(super) user: Option<RunAs>,
     /// Seconds between memory-footprint diagnostic reports; `0` or absent disables them.

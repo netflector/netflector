@@ -15,7 +15,8 @@ mod value;
 
 pub(crate) use self::error::ConfigError;
 pub(crate) use self::value::{
-    AddressFamily, GroupList, LogLevel, PeerList, PortList, Principal, ReflectorName, RunAs,
+    AddressFamily, GroupList, LogLevel, LogTarget, PeerList, PortList, Principal, ReflectorName,
+    RunAs,
 };
 
 use std::net::IpAddr;
@@ -351,12 +352,21 @@ fn interval_from(secs: Option<u64>, field: &'static str) -> Result<Option<Durati
     }
 }
 
-/// Only the top-level `log_level`, and no `deny_unknown_fields` on purpose: [`resolve_log_level`]
+/// Only the top-level logging keys, and no `deny_unknown_fields` on purpose: [`resolve_logging`]
 /// must not trip on the reflector tables.
 #[derive(Deserialize)]
-struct LogLevelProbe {
+struct LoggingProbe {
     #[serde(default)]
     log_level: Option<LogLevel>,
+    #[serde(default)]
+    log_target: Option<LogTarget>,
+}
+
+/// How the running daemon logs, resolved ahead of the rest of the configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct Logging {
+    pub(crate) level: LogLevel,
+    pub(crate) target: LogTarget,
 }
 
 /// Takes a `Path` so a non-UTF-8 path (valid on Unix) still reads; only the error message renders
@@ -368,28 +378,31 @@ pub(crate) fn read_config_file(path: &Path) -> Result<String, ConfigError> {
     })
 }
 
-/// The log level alone, resolved before the full parse so the logger can be raised to the
-/// configured verbosity while the rest of loading runs. Environment overrides the file, which
-/// overrides the default. Reads nothing but `NETFLECTOR_LOG_LEVEL` and the file's top-level
-/// `log_level`, so a reflector error surfaces (logged) from the full parse rather than here.
+/// The log level and target alone, resolved before the full parse so the rest of loading logs at
+/// the configured verbosity and to the configured place. Environment overrides the file, which
+/// overrides the default, key by key. Reads nothing but `NETFLECTOR_LOG_LEVEL`,
+/// `NETFLECTOR_LOG_TARGET` and the file's matching top-level keys, so a reflector error surfaces
+/// (logged) from the full parse rather than here.
 ///
 /// # Errors
 /// [`ConfigError::Parse`] for malformed TOML, [`ConfigError::EnvBadValue`] for a bad
-/// `NETFLECTOR_LOG_LEVEL`.
-pub(crate) fn resolve_log_level(
+/// `NETFLECTOR_LOG_LEVEL` or `NETFLECTOR_LOG_TARGET`.
+pub(crate) fn resolve_logging(
     toml_text: Option<&str>,
     env: &[(String, String)],
-) -> Result<LogLevel, ConfigError> {
-    if let Some(level) = env::log_level_from_env(env)? {
-        return Ok(level);
-    }
-    if let Some(text) = toml_text {
-        let probe: LogLevelProbe = toml::from_str(text)?;
-        if let Some(level) = probe.log_level {
-            return Ok(level);
-        }
-    }
-    Ok(LogLevel::default())
+) -> Result<Logging, ConfigError> {
+    let (env_level, env_target) = env::logging_from_env(env)?;
+    let file = match toml_text {
+        Some(text) => toml::from_str(text)?,
+        None => LoggingProbe {
+            log_level: None,
+            log_target: None,
+        },
+    };
+    Ok(Logging {
+        level: env_level.or(file.log_level).unwrap_or_default(),
+        target: env_target.or(file.log_target).unwrap_or_default(),
+    })
 }
 
 fn protocol_list(reflector: &Reflector) -> String {

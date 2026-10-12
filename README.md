@@ -265,13 +265,15 @@ pkg install os-netflector
 `config.toml` contains optional top-level settings plus at least one reflector entry. Entries are tables
 under `reflectors`, keyed by name (`[reflectors.<name>]`, the name being the label used in logs), each
 describing one `source_if` → `target_if` bridge that enables one or more of the protocols. The
-top-level settings are `log_level`, `user`, `debug_memory_interval_secs`, and
+top-level settings are `log_level`, `log_target`, `user`, `debug_memory_interval_secs`, and
 `counters_interval_secs` (the summaries the latter enables are described under
 [Diagnostics](#diagnostics)):
 
 ```toml
 log_level = "info"                 # optional; one of off | error | warn | info | debug | trace (default: info)
                                    # release builds compile trace out, where it behaves as debug
+log_target = "stderr"              # optional; stderr | syslog (default: stderr); syslog logs as netflector on the
+                                   # daemon facility
 user = "netflector"                # optional; the account to run as once the captures are open, USER or USER:GROUP,
                                    # each a name or a number (see Dropping root); absent keeps the starting account
 debug_memory_interval_secs = 0     # optional; seconds between memory diagnostic reports; 0 disables (default 0)
@@ -325,7 +327,8 @@ then optional; with none, the environment is the whole configuration. Variables 
   `SOURCE_PEERS`, `TARGET_PEERS`, `MACS`, `WOL`, `MDNS`, `MDNS_SERVICES`, `SSDP`, `WSD`, `DIAL`, `WOL_PORTS`,
   `ADDRESS_FAMILY`, `BIDIRECTIONAL`, `UDP_PORTS`, `UDP_GROUPS`, `UDP_BROADCAST`), case-insensitive.
 
-The globals are `NETFLECTOR_LOG_LEVEL`, `NETFLECTOR_USER`, `NETFLECTOR_DEBUG_MEMORY_INTERVAL_SECS`, and
+The globals are `NETFLECTOR_LOG_LEVEL`, `NETFLECTOR_LOG_TARGET`, `NETFLECTOR_USER`,
+`NETFLECTOR_DEBUG_MEMORY_INTERVAL_SECS`, and
 `NETFLECTOR_COUNTERS_INTERVAL_SECS`; `LOG`, `DEBUG`, and `COUNTERS` are reserved tags, since those globals
 would otherwise read as `<TAG>_<PARAM>`. Booleans are
 `true`/`false` or `1`/`0`; `WOL_PORTS`, `UDP_PORTS`, `UDP_GROUPS`, `SOURCE_PEERS`, `TARGET_PEERS`,
@@ -345,8 +348,8 @@ NETFLECTOR_TV_WSD=true
 ```
 
 When a file and environment variables are both given they are merged: each contributes entries to one
-combined configuration, and each global variable (`NETFLECTOR_LOG_LEVEL`, `NETFLECTOR_USER`,
-`NETFLECTOR_DEBUG_MEMORY_INTERVAL_SECS`, `NETFLECTOR_COUNTERS_INTERVAL_SECS`) overrides its file
+combined configuration, and each global variable (`NETFLECTOR_LOG_LEVEL`, `NETFLECTOR_LOG_TARGET`,
+`NETFLECTOR_USER`, `NETFLECTOR_DEBUG_MEMORY_INTERVAL_SECS`, `NETFLECTOR_COUNTERS_INTERVAL_SECS`) overrides its file
 counterpart. The
 [duplicate detection](#duplicate-detection) below applies across both
 sources. An unknown `<PARAM>`, a non-alphanumeric or reserved tag, and a tag with no parameter are all

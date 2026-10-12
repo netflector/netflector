@@ -589,13 +589,42 @@ fn empty_config_is_rejected() {
 }
 
 #[test]
-fn log_level_resolves_from_the_file_before_the_full_parse() {
-    // The probe reads only the top-level key, so a broken reflector table can't hide the level.
-    assert_eq!(resolve_log_level(None, &[]).unwrap(), LogLevel::Info);
+fn logging_resolves_from_the_file_before_the_full_parse() {
+    // The probe reads only the top-level keys, so a broken reflector table can't hide them.
     assert_eq!(
-        resolve_log_level(Some("log_level = \"DEBUG\"\n[reflectors.x]\n"), &[]).unwrap(),
-        LogLevel::Debug
+        resolve_logging(None, &[]).unwrap(),
+        Logging {
+            level: LogLevel::Info,
+            target: LogTarget::Stderr,
+        }
     );
+    assert_eq!(
+        resolve_logging(
+            Some("log_level = \"DEBUG\"\nlog_target = \"Syslog\"\n[reflectors.x]\n"),
+            &[]
+        )
+        .unwrap(),
+        Logging {
+            level: LogLevel::Debug,
+            target: LogTarget::Syslog,
+        }
+    );
+}
+
+#[test]
+fn invalid_log_target() {
+    let text = r#"
+            log_target = "journald"
+            [reflectors.x]
+            source_if = "a"
+            target_if = "b"
+            mdns = true
+        "#;
+    assert!(matches!(err(text), ConfigError::Parse(_)));
+    assert!(matches!(
+        resolve_logging(Some(text), &[]),
+        Err(ConfigError::Parse(_))
+    ));
 }
 
 #[test]

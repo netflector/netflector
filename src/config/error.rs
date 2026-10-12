@@ -8,8 +8,8 @@ use thiserror::Error;
 
 use super::conflict::Protocol;
 use super::value::{
-    ParseAddressFamilyError, ParseLogLevelError, ParseReflectorNameError, ParseRunAsError,
-    ReflectorName,
+    ParseAddressFamilyError, ParseLogLevelError, ParseLogTargetError, ParseReflectorNameError,
+    ParseRunAsError, ReflectorName,
 };
 use crate::interface::{InterfaceName, ParseInterfaceNameError};
 use crate::net::mac::MacAddr;
@@ -179,6 +179,8 @@ impl fmt::Display for RequiredField {
 pub(crate) enum ParseValueError {
     #[error(transparent)]
     LogLevel(#[from] ParseLogLevelError),
+    #[error(transparent)]
+    LogTarget(#[from] ParseLogTargetError),
     #[error(transparent)]
     AddressFamily(#[from] ParseAddressFamilyError),
     #[error(transparent)]

@@ -1,7 +1,9 @@
-//! Process-wide logging on the [`log`] facade: one line per record on stderr (stdout is
-//! program output), as `<utc> <LEVEL> <target>: <message>`.
+//! Process-wide logging on the [`log`] facade, installed once the configuration names the target:
+//! one line per record on stderr (stdout is program output), as `<utc> <LEVEL> <target>: <message>`,
+//! or one syslog(3) message per record, as `<target>: <message>`.
 
 use std::cell::RefCell;
+use std::ffi::c_int;
 use std::fmt::{self, Write as _};
 use std::io::Write;
 use std::sync::LazyLock;
@@ -10,11 +12,21 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use log::{LevelFilter, Log, Metadata, Record};
 
-use crate::config::LogLevel;
+use crate::config::{LogLevel, LogTarget, Logging};
 
 struct StderrLogger;
 
-static LOGGER: StderrLogger = StderrLogger;
+struct SyslogLogger;
+
+static STDERR: StderrLogger = StderrLogger;
+
+static SYSLOG: SyslogLogger = SyslogLogger;
+
+thread_local! {
+    // A record is formatted into this reused buffer and written once: stderr is unbuffered, so
+    // `write_fmt` would issue a write(2) per fragment.
+    static LINE: RefCell<String> = const { RefCell::new(String::new()) };
+}
 
 impl Log for StderrLogger {
     fn enabled(&self, metadata: &Metadata) -> bool {
@@ -26,11 +38,6 @@ impl Log for StderrLogger {
         if !self.enabled(record.metadata()) {
             return;
         }
-        // Format into a reused buffer and write once: stderr is unbuffered, so `write_fmt` would
-        // issue a write(2) per fragment.
-        thread_local! {
-            static LINE: RefCell<String> = const { RefCell::new(String::new()) };
-        }
         LINE.with(|line| {
             let mut line = line.borrow_mut();
             line.clear();
@@ -41,6 +48,52 @@ impl Log for StderrLogger {
 
     fn flush(&self) {
         std::io::stderr().flush().ok();
+    }
+}
+
+impl Log for SyslogLogger {
+    fn enabled(&self, metadata: &Metadata) -> bool {
+        metadata.level() <= log::max_level()
+    }
+
+    fn log(&self, record: &Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        LINE.with(|line| {
+            let mut line = line.borrow_mut();
+            line.clear();
+            format_syslog(&mut line, record);
+            // SAFETY: `line` is NUL-terminated by `format_syslog`, and "%s" reads one C string.
+            unsafe {
+                libc::syslog(
+                    priority(record.level()),
+                    c"%s".as_ptr(),
+                    line.as_ptr().cast::<libc::c_char>(),
+                );
+            }
+        });
+    }
+
+    fn flush(&self) {}
+}
+
+/// A NUL-terminated syslog message: no stamp or level, which syslog adds.
+fn format_syslog(line: &mut String, record: &Record) {
+    let _ = write!(line, "{}: {}", record.target(), record.args());
+    // An inner NUL would end the C string early; remote text (a LOCATION URL) can carry one.
+    if line.contains('\0') {
+        *line = line.replace('\0', "\\0");
+    }
+    line.push('\0');
+}
+
+fn priority(level: log::Level) -> c_int {
+    match level {
+        log::Level::Error => libc::LOG_ERR,
+        log::Level::Warn => libc::LOG_WARNING,
+        log::Level::Info => libc::LOG_INFO,
+        log::Level::Debug | log::Level::Trace => libc::LOG_DEBUG,
     }
 }
 
@@ -112,18 +165,36 @@ impl fmt::Display for Utc {
     }
 }
 
-/// Install the global logger with the default threshold; `set_level` applies the configured
-/// one once the configuration is loaded.
+/// Install the logger `logging` names, at its level. Syslog logs as `netflector` on the daemon
+/// facility.
 ///
 /// # Panics
-/// If called more than once.
-pub fn init() {
-    log::set_logger(&LOGGER).expect("logging::init called more than once");
-    log::set_max_level(LevelFilter::from(LogLevel::default()));
+/// If a logger is installed already.
+pub(crate) fn init(logging: Logging) {
+    let logger: &'static dyn Log = match logging.target {
+        LogTarget::Stderr => &STDERR,
+        LogTarget::Syslog => {
+            // SAFETY: openlog keeps the ident pointer, and a C string literal lives for the program.
+            unsafe {
+                libc::openlog(
+                    c"netflector".as_ptr(),
+                    libc::LOG_PID | libc::LOG_NDELAY,
+                    libc::LOG_DAEMON,
+                );
+            }
+            &SYSLOG
+        }
+    };
+    log::set_logger(logger).expect("logging::init called more than once");
+    log::set_max_level(LevelFilter::from(logging.level));
 }
 
-pub(crate) fn set_level(level: LogLevel) {
-    log::set_max_level(LevelFilter::from(level));
+/// Stderr at the default level, unless a logger is installed already: for an error raised before
+/// the configuration named one.
+pub fn fallback() {
+    if log::set_logger(&STDERR).is_ok() {
+        log::set_max_level(LevelFilter::from(LogLevel::default()));
+    }
 }
 
 /// Like [`log::log!`], but at most once per `window` per call site (not per entry or
@@ -261,6 +332,29 @@ mod tests {
                 .build(),
         );
         assert_eq!(line, "1970-01-01T00:00:00Z  INFO netflector::test: hello\n");
+    }
+
+    #[test]
+    fn a_syslog_message_carries_no_stamp_and_ends_in_nul() {
+        let mut line = String::new();
+        format_syslog(
+            &mut line,
+            &log::Record::builder()
+                .level(log::Level::Info)
+                .target("netflector::test")
+                .args(format_args!("LOCATION http://a\0b/"))
+                .build(),
+        );
+        assert_eq!(line, "netflector::test: LOCATION http://a\\0b/\0");
+    }
+
+    #[test]
+    fn levels_map_to_syslog_priorities() {
+        assert_eq!(priority(log::Level::Error), libc::LOG_ERR);
+        assert_eq!(priority(log::Level::Warn), libc::LOG_WARNING);
+        assert_eq!(priority(log::Level::Info), libc::LOG_INFO);
+        assert_eq!(priority(log::Level::Debug), libc::LOG_DEBUG);
+        assert_eq!(priority(log::Level::Trace), libc::LOG_DEBUG);
     }
 
     #[test]
