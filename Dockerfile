@@ -8,9 +8,9 @@
 
 # Pin the shared base image by digest for reproducible builds, with the rustc version in the tag:
 # Renovate re-pins the digest to whatever the tag resolves to, so an unversioned tag lets the image's
-# compiler drift off rust-toolchain.toml while the diff shows only a new hash. Keep this version equal
-# to rust-toolchain.toml's channel. Referenced by both the builder and the valgrind runtime below so
-# they stay in lockstep.
+# compiler drift off rust-toolchain.toml while the diff shows only a new hash. CI fails unless this
+# version equals rust-toolchain.toml's channel. Referenced by both the builder and the valgrind
+# runtime below so they stay in lockstep.
 ARG RUST_IMAGE=docker.io/library/rust:1.99.0-slim@sha256:2752b332db73fdbb7dc576f06c82ed1f312005784ef913d7e04a28f5f55dc581
 FROM --platform=$BUILDPLATFORM ${RUST_IMAGE} AS builder
 ARG TARGETARCH

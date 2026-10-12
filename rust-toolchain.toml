@@ -1,7 +1,7 @@
 [toolchain]
 # Pinned (not "stable") so every environment -- host, the Docker builds, and the rustup CI lanes --
 # compiles with one known rustc, and a new stable can't silently change codegen or fail a release
-# build on a fresh warn-by-default lint. Renovate's rust-toolchain manager bumps this via a CI-gated
-# PR; the Dockerfile's RUST_IMAGE tag names the same version and has to move with it.
+# build on a fresh warn-by-default lint. Renovate bumps this and the Dockerfile's RUST_IMAGE tag in
+# one PR, and CI fails while the two differ.
 channel = "1.99.0"
 components = ["rustfmt", "clippy"]

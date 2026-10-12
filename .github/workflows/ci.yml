@@ -84,6 +84,14 @@ jobs:
         run: |
           python3 ci/platforms.py --check
           python3 -m unittest discover -s ci -p 'test_*.py'
+      - name: Docker builds on the pinned toolchain
+        run: |
+          channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          image=$(sed -n 's|^ARG RUST_IMAGE=docker\.io/library/rust:\([0-9.]*\)-.*|\1|p' Dockerfile)
+          if [ -z "$channel" ] || [ "$channel" != "$image" ]; then
+            echo "::error::rust-toolchain.toml pins '$channel', the Dockerfile's RUST_IMAGE '$image'"
+            exit 1
+          fi
 
   code:
     name: Code

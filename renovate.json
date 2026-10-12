@@ -42,6 +42,10 @@
       "matchDepNames": ["freebsd"],
       "matchFileNames": ["ci/freebsd15.env"],
       "allowedVersions": "/^15\\./"
+    },
+    {
+      "matchDepNames": ["rust", "docker.io/library/rust"],
+      "groupName": "Rust"
     }
   ]
 }
