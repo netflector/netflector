@@ -394,7 +394,8 @@ trim keeps them.
   its sender put them. The trim is the one case where mDNS is not relayed verbatim; devices often
   bundle several services in one message, and it stops a refused one riding along.
 - A message that cannot be walked within bounds (truncated, a looping name, or several times
-  more work than its length) is dropped as unrecognized whenever the list is set.
+  more work than its length) is dropped whenever the list is set, and counted as `dropped`, not
+  `filtered`.
 
 The list composes with `macs` (both must admit a response) and with `address_family`. A refusal is
 counted as `refused` and logged at `debug` with the services it names. A trim is logged at `debug`
