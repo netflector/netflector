@@ -222,7 +222,7 @@ jobs:
 
   manifest:
     name: Image manifest -> GHCR
-    needs: image
+    needs: [image, binaries]
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     outputs:
