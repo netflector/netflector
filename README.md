@@ -249,6 +249,10 @@ service netflector start
 `service netflector report` triggers the `SIGUSR1` diagnostics dump; the pid file the service writes
 holds a supervisor, not the daemon, so don't signal that pid directly.
 
+The service logs to syslog: every line at `info` or above lands in `/var/log/daemon.log`, warnings and
+errors in `/var/log/messages` as well, and `debug` lines in `/var/log/debug.log` alone.
+`netflector_log_target=""` in `/etc/rc.conf` leaves it to the configuration's `log_target`.
+
 On a CARP failover pair, `netflector_carp_vhid` confines the service to the MASTER node. A backup
 reflecting too would send a second copy of everything, and on a `bidirectional` entry the two would
 relay each other's re-emits without end; netflector(8) has the details.

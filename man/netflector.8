@@ -167,6 +167,26 @@ from
 .Xr rc.conf 5
 for the configuration path.
 .Pp
+The service logs to
+.Xr syslog 3 :
+it sets
+.Ev NETFLECTOR_LOG_TARGET
+from
+.Va netflector_log_target ,
+.Ql syslog
+unless set, and an empty value leaves
+.Ic log_target
+to the configuration file.
+With the stock
+.Xr syslog.conf 5 ,
+every line at info or above reaches
+.Pa /var/log/daemon.log ,
+warnings and errors reach
+.Pa /var/log/messages
+as well, and debug lines go to
+.Pa /var/log/debug.log
+alone.
+.Pp
 On a
 .Xr carp 4
 failover pair, both nodes reflecting would send two copies of every relayed

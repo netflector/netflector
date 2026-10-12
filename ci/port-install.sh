@@ -20,7 +20,7 @@ HERE="$(dirname "$0")"
 # The status check would then fail, because the supervisor is what it pgreps.
 "$HERE"/freebsd-vm.sh run 'printf "[reflectors.ci]\nsource_if = \"vtnet0\"\ntarget_if = \"lo0\"\nwol = true\n" > /usr/local/etc/netflector.toml'
 "$HERE"/freebsd-vm.sh run 'service netflector start'
-"$HERE"/freebsd-vm.sh run 'service netflector report && sleep 1 && grep -q "dumping diagnostics" /var/log/messages && echo "report reached the log"'
+"$HERE"/freebsd-vm.sh run 'service netflector report && sleep 1 && grep -q "dumping diagnostics" /var/log/daemon.log && echo "report reached the log"'
 "$HERE"/freebsd-vm.sh run 'service netflector status'
 "$HERE"/freebsd-vm.sh run 'service netflector stop'
 "$HERE"/freebsd-vm.sh run 'rm /usr/local/etc/netflector.toml'

@@ -14,6 +14,7 @@
 #   netflector_flags="-r"                          # options for daemon(8), e.g. restart on exit
 #   netflector_carp_vhid="1"                       # only start if this CARP vhid is MASTER
 #   netflector_carp_interface="em0"                # interface holding it; needed if the vhid is reused
+#   netflector_log_target="syslog"                 # the default; empty leaves it to the config file
 
 . /etc/rc.subr
 
@@ -27,6 +28,11 @@ load_rc_config $name
 : ${netflector_config:="%%PREFIX%%/etc/netflector.toml"}
 : ${netflector_carp_vhid:=""}
 : ${netflector_carp_interface:=""}
+: ${netflector_log_target="syslog"}
+
+if [ -n "${netflector_log_target}" ]; then
+    netflector_env="${netflector_env:+${netflector_env} }NETFLECTOR_LOG_TARGET=${netflector_log_target}"
+fi
 
 # The pidfile must hold daemon(8) itself (-P), not the child: stop then terminates the supervisor,
 # which forwards the signal and exits. Killing only the child would let a restarting supervisor
@@ -35,10 +41,8 @@ pidfile="/var/run/${name}.pid"
 child_pidfile="/var/run/${name}_child.pid"
 netflector_bin="%%PREFIX%%/bin/${name}"
 
-# The daemon runs in the foreground and logs to stderr, so daemon(8) backgrounds it and -S routes that
-# stderr into syslog under our own tag rather than /dev/null. -f closes the descriptors daemon(8)
-# inherited: without it the supervisor holds the caller's stdout open for the service's lifetime, so
-# `ssh host service netflector start` never returns. It does not affect -S, which redirects the child.
+# daemon(8) backgrounds netflector. -S sends its stderr to syslog: the log when it stays on stderr,
+# otherwise a panic or a startup error. -f lets go of the caller's stdout.
 command="/usr/sbin/daemon"
 command_args="-f -S -T ${name} -P ${pidfile} -p ${child_pidfile} ${netflector_bin} '${netflector_config}'"
 
@@ -56,8 +60,8 @@ netflector_precmd()
     # Refuse to start on a configuration the daemon would reject, so the failure is one clear message
     # here rather than a service that appears to start and is gone a moment later. --check-config parses
     # and validates only: it opens no interface and needs no privileges.
-    if ! ${netflector_bin} --check-config "${netflector_config}" > /dev/null 2>&1; then
-        ${netflector_bin} --check-config "${netflector_config}" 2>&1 | while read -r line; do
+    if ! env ${netflector_env} ${netflector_bin} --check-config "${netflector_config}" > /dev/null 2>&1; then
+        env ${netflector_env} ${netflector_bin} --check-config "${netflector_config}" 2>&1 | while read -r line; do
             netflector_log err "${line}"
         done
         netflector_log err "refusing to start: ${netflector_config} is not valid"
