@@ -23,7 +23,8 @@ pub(super) const RECONCILE_RETRY: Duration = Duration::from_secs(1);
 
 /// Some address changes come with no notification: a BSD address finishing duplicate address
 /// detection or reaching the end of its lifetime, a MAC change on a BSD virtual interface, a
-/// macOS route socket overflowing without saying so.
+/// macOS IPv4 address added in a subnet the interface already has, a macOS route socket
+/// overflowing without saying so.
 pub(super) const RECHECK_INTERVAL: Duration = Duration::from_secs(30);
 
 /// What a monitor drain or a re-read found, as the captures on the interfaces concerned.
