@@ -273,10 +273,14 @@ mod tests {
         let _serialized = SIGNAL_STATE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // A pipe's read end refuses a write (EBADF), so the handler's write fails the way it would
-        // on a full pipe. No handler is installed: `on_signal` is called directly.
-        let (read, _write) = self_pipe().unwrap();
-        let previous = WRITE_FD.swap(read.as_raw_fd(), Ordering::SeqCst);
+        // A full non-blocking pipe fails the handler's write (EAGAIN). No handler is installed:
+        // `on_signal` is called directly.
+        let (_read, write) = self_pipe().unwrap();
+        let chunk = [0u8; 4096];
+        // SAFETY: `chunk` is readable for its length; the write end is non-blocking, so the loop
+        // stops at EAGAIN.
+        while unsafe { libc::write(write.as_raw_fd(), chunk.as_ptr().cast(), chunk.len()) } > 0 {}
+        let previous = WRITE_FD.swap(write.as_raw_fd(), Ordering::SeqCst);
 
         let location = errno_location();
         // SAFETY: the calling thread's errno cell.
