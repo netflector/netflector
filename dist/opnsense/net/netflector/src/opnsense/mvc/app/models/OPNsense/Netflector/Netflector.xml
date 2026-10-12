@@ -105,11 +105,11 @@
                 </macs>
                 <wol_ports type=".\PortListField">
                     <AsList>Y</AsList>
-                    <ValidationMessage>Enter the UDP ports magic packets arrive on, as numbers between 1 and 65535. The daemon defaults to 7 and 9.</ValidationMessage>
+                    <ValidationMessage>"%s" is not a UDP port. Enter the UDP ports magic packets arrive on, as numbers between 1 and 65535. The daemon defaults to 7 and 9.</ValidationMessage>
                 </wol_ports>
                 <udp_ports type=".\PortListField">
                     <AsList>Y</AsList>
-                    <ValidationMessage>Enter the UDP ports to relay, as numbers between 1 and 65535.</ValidationMessage>
+                    <ValidationMessage>"%s" is not a UDP port. Enter the UDP ports to relay, as numbers between 1 and 65535.</ValidationMessage>
                     <Constraints>
                         <check001>
                             <type>DependConstraint</type>

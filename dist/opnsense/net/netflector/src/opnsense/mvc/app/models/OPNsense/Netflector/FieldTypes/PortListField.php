@@ -55,7 +55,7 @@ class PortListField extends BaseSetField
             $validators[] = new CallbackValidator(["callback" => function ($data) {
                 foreach ($this->iterateInput($data) as $port) {
                     if (!ctype_digit($port) || str_starts_with($port, '0') || (int)$port > 65535) {
-                        return [$this->getValidationMessage()];
+                        return [$this->getValidationMessage($port)];
                     }
                 }
                 return [];

@@ -131,6 +131,11 @@ foreach (
     }
 }
 
+$messages = validation_messages('aa:bb:cc:dd:ee:ff', '7,70000');
+if (count($messages) !== 1 || !str_contains($messages[0], '"70000" is not')) {
+    fail('wol_ports=7,70000 does not name the bad port: ' . implode(' | ', $messages));
+}
+
 /* the relay's and the peers' fields, and the one rule between them */
 function entry_messages(array $values): array
 {
@@ -175,6 +180,11 @@ foreach (
     } elseif (!$expect_valid && $messages === []) {
         fail(sprintf('%s accepted, expected a validation error', json_encode($values)));
     }
+}
+
+$messages = entry_messages(['udp_ports' => '9003,0', 'udp_broadcast' => '1']);
+if (count($messages) !== 1 || !str_contains($messages[0], '"0" is not')) {
+    fail('udp_ports=9003,0 does not name the bad port: ' . implode(' | ', $messages));
 }
 
 if ($failures === 0) {
