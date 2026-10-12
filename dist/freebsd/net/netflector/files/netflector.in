@@ -77,7 +77,8 @@ netflector_precmd()
             ;;
         *)
             netflector_log notice "CARP vhid ${netflector_carp_vhid} is ${state} here; not starting netflector"
-            # A backup idling is no failure: exit, not return, so the start ends with status 0.
+            # A backup idling is no failure: exit, not return, so the start ends with status 0 and
+            # forcestart cannot start a second active node.
             exit 0
             ;;
         esac
