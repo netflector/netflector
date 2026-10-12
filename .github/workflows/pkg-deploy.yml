@@ -225,6 +225,7 @@ jobs:
       # the plugin's OPNsense dependencies come from their mirrors, the daemon
       # from our signed repo.
       - name: Install and exercise the pair
+        shell: bash
         run: |
           ci/freebsd-vm.sh run 'pkg install -y os-netflector' 2>&1 | tee install.log
           if grep -q 'duplicate dependency' install.log; then
