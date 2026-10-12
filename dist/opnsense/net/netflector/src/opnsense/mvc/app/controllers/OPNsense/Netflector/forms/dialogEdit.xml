@@ -60,7 +60,7 @@
         <id>reflector.dial</id>
         <label>DIAL</label>
         <type>checkbox</type>
-        <help>Casting to a TV ("Discovery And Launch"). Needs SSDP, and is IPv4-only, so it cannot be used on an IPv6-only reflector. Clients on the source interface connect to this firewall there on ephemeral TCP ports (1024-65535), which that interface's rules must pass.</help>
+        <help>Casting to a TV ("Discovery And Launch"). Needs SSDP, and is IPv4-only.</help>
         <grid_view>
             <formatter>boolean</formatter>
         </grid_view>
