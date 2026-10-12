@@ -187,6 +187,17 @@ as well, and debug lines go to
 .Pa /var/log/debug.log
 alone.
 .Pp
+The service drops root to the
+.Ql netflector
+account the package creates: it sets
+.Ev NETFLECTOR_USER
+from
+.Va netflector_user ,
+.Ql netflector
+unless set, and an empty value leaves
+.Ic user
+to the configuration file.
+.Pp
 On a
 .Xr carp 4
 failover pair, both nodes reflecting would send two copies of every relayed

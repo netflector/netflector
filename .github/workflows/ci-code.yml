@@ -198,9 +198,7 @@ jobs:
         run: ci/freebsd-ports-tree.sh
       - name: Build and install from this commit
         run: |
-          # scp -r nests into an existing directory; see ci/freebsd-port-package.sh.
-          ci/freebsd-vm.sh run 'rm -rf /usr/ports/net/netflector'
-          ci/freebsd-vm.sh push dist/freebsd/net/netflector /usr/ports/net/netflector
+          ci/port-into-tree.sh
           # DISTFILES lists the cargo crates first and the GH tarball last;
           # provide this commit under the tarball and WRKSRC names the port expects.
           distfile=$(ci/freebsd-vm.sh run 'cd /usr/ports/net/netflector && make -V DISTFILES' | tr ' ' '\n' | grep '_GH0' | cut -d: -f1)

@@ -15,6 +15,7 @@
 #   netflector_carp_vhid="1"                       # only start if this CARP vhid is MASTER
 #   netflector_carp_interface="em0"                # interface holding it; needed if the vhid is reused
 #   netflector_log_target="syslog"                 # the default; empty leaves it to the config file
+#   netflector_user="netflector"                   # the default; empty leaves it to the config file
 
 . /etc/rc.subr
 
@@ -29,10 +30,17 @@ load_rc_config $name
 : ${netflector_carp_vhid:=""}
 : ${netflector_carp_interface:=""}
 : ${netflector_log_target="syslog"}
+: ${netflector_user="netflector"}
 
 if [ -n "${netflector_log_target}" ]; then
     netflector_env="${netflector_env:+${netflector_env} }NETFLECTOR_LOG_TARGET=${netflector_log_target}"
 fi
+
+if [ -n "${netflector_user}" ]; then
+    netflector_env="${netflector_env:+${netflector_env} }NETFLECTOR_USER=${netflector_user}"
+fi
+# rc.subr would run daemon(8) itself as ${name}_user through su(1), and the capture needs root.
+netflector_user=""
 
 # The pidfile must hold daemon(8) itself (-P), not the child: stop then terminates the supervisor,
 # which forwards the signal and exits. Killing only the child would let a restarting supervisor

@@ -43,6 +43,7 @@ class ChangedAreas(unittest.TestCase):
         self.assertEqual(ca.areas(["ci/port-sync.py"]), only("code", "port"))
         self.assertEqual(ca.areas(["ci/freebsd-ports-tree.sh"]), only("code", "port"))
         self.assertEqual(ca.areas(["ci/freebsd-vm.sh"]), only("code", "opnsense"))
+        self.assertEqual(ca.areas(["ci/port-into-tree.sh"]), only("code", "opnsense", "port"))
 
     def test_a_mixed_change_runs_each_touched_lane(self) -> None:
         self.assertEqual(ca.areas(["README.md", "src/main.rs", "dist/opnsense/x"]), only("code", "opnsense"))

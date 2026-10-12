@@ -40,6 +40,9 @@ CARGO_CRATES=	equivalent-1.0.2 \
 
 SUB_FILES=	netflector.toml.sample pkg-message
 
+USERS=		netflector
+GROUPS=		netflector
+
 PLIST_FILES=	bin/netflector \
 		"@sample etc/netflector.toml.sample" \
 		share/man/man5/netflector.toml.5.gz \
