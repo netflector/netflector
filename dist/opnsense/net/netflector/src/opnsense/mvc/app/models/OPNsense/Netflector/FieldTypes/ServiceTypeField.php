@@ -64,7 +64,11 @@ class ServiceTypeField extends BaseSetField
                         return [sprintf(gettext('[%s] names DNS-SD\'s own records, not a service.'), $type)];
                     }
                     if (isset($seen[$key])) {
-                        return [sprintf(gettext('[%s] repeats [%s]: list each service type once.'), $type, $seen[$key])];
+                        return [sprintf(
+                            gettext('[%s] repeats [%s]: list each service type once.'),
+                            $type,
+                            $seen[$key]
+                        )];
                     }
                     $seen[$key] = $type;
                 }

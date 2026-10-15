@@ -83,7 +83,7 @@
                             <addFields>
                                 <field1>mdns_services</field1>
                             </addFields>
-                            <ValidationMessage>mDNS services only apply when mDNS is enabled.</ValidationMessage>
+                            <ValidationMessage>Service types only apply when mDNS is enabled.</ValidationMessage>
                         </check001>
                     </Constraints>
                 </mdns>
