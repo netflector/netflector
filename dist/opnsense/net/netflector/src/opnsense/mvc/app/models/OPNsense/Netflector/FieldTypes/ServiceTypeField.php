@@ -38,12 +38,6 @@ use OPNsense\Base\Validators\CallbackValidator;
  */
 class ServiceTypeField extends BaseSetField
 {
-    public function setValue($value)
-    {
-        $items = array_map('trim', explode($this->internalFieldSeparator, (string)$value));
-        parent::setValue(implode($this->internalFieldSeparator, array_unique($items)));
-    }
-
     protected function defaultValidationMessage()
     {
         return gettext('[%s] is not a DNS-SD service type, such as _ipp._tcp.');
