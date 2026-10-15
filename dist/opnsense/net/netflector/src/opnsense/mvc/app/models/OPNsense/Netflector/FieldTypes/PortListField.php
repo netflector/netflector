@@ -45,7 +45,7 @@ class PortListField extends BaseSetField
 
     protected function defaultValidationMessage()
     {
-        return gettext('Please specify valid port numbers (1-65535).');
+        return gettext('"%s" is not a port number between 1 and 65535.');
     }
 
     public function getValidators()
