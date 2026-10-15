@@ -120,7 +120,7 @@ foreach (
         ['aabb.ccdd.eeff', '7', true],
         ['aa:bb:cc:dd:ee:ff,AA:BB:CC:DD:EE:FF', '7', true],
         ['aa:bb:cc:dd:ee:ff,aabb.ccdd.eeff', '7', true],
-        ['aa:bb:cc:dd:ee:ff', '7,7', true],
+        ['aa:bb:cc:dd:ee:ff', '7,7', false],
     ] as [$macs, $wol_ports, $expect_valid]
 ) {
     $messages = validation_messages($macs, $wol_ports);
@@ -173,7 +173,7 @@ foreach (
         [['source_peers' => 'phone.example'], false],
         [['target_peers' => 'any'], false],
         [['mdns' => '1', 'mdns_services' => '_ipp._tcp,_AirPlay._TCP.local,_hap._udp.'], true],
-        [['mdns' => '1', 'mdns_services' => '_ipp._tcp,_ipp._tcp'], true],
+        [['mdns' => '1', 'mdns_services' => '_ipp._tcp,_ipp._tcp'], false],
         [['mdns' => '1', 'mdns_services' => '_ipp._tcp,printer.local'], false],
         [['mdns' => '1', 'mdns_services' => '_ipp._sctp'], false],
         [['mdns' => '1', 'mdns_services' => '_ipp._tcp.example'], false],
