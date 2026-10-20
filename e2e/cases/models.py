@@ -31,8 +31,8 @@ class TestCase:
     direction: str = "forward"
     # Multicast group to send to and join on the receiver. None keeps the WoL broadcast / all-nodes path.
     group: str | None = None
-    # Exact payload the receiver must see, for protocols relayed verbatim. None falls back to the
-    # magic-packet / expect-none expectation.
+    # Exact payload the receiver must see. None falls back to the magic-packet / expect-none
+    # expectation.
     expect_payload_hex: str | None = None
     # Also require the reflected packet's source to be routable (non-link-local) — the per-scope v6
     # source selection: a site-local group (ff05::c) must not be sourced from a link-local address.

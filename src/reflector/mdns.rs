@@ -13,21 +13,21 @@
 //! relayed query is sourced from port 5353, so the device answers on the group, which that
 //! querier does not listen on.
 //!
-//! An entry's `mdns_services` allow-list ([`ServiceFilter`]) is each leg's rewrite, applied once a
-//! message has passed the direction check: a query goes out unless every question names a refused
-//! service. A response carrying refused services is re-emitted trimmed of them when an answer
-//! naming an allowed service remains, or when it has answers and none names a service, and is
-//! dropped otherwise; the trim is the one place the relay is not verbatim.
+//! A message that passes the direction check may be rewritten. With an `mdns_services` allow-list
+//! ([`ServiceFilter`]), a query goes out unless every question names a refused service, and a
+//! response is trimmed of refused services or dropped, as [`ServiceFilter::decide`] rules. Every
+//! response that gets this far, list or not, then loses its unreachable address records while it
+//! advertises a usable one ([`AddressFilter`]), and is dropped if it advertises only unreachable
+//! ones ([`advertises_only_unreachable`]). The trim and the strip are the only places the relay is
+//! not verbatim.
 
 use std::net::SocketAddr;
 
 use crate::config::Reflector;
 use crate::dispatch::{CaptureKey, Filter, IpSet, MessageType, PacketDispatcher};
+use crate::net::mdns::addresses::{AddressFilter, advertises_only_unreachable};
 use crate::net::mdns::services::{Decision, ServiceFilter, ServiceList};
-use crate::net::mdns::{
-    MDNS_GROUP_V4, MDNS_GROUP_V6, MDNS_PORT, MDNS_TTL, MdnsKind, advertises_only_unreachable,
-    classify,
-};
+use crate::net::mdns::{MDNS_GROUP_V4, MDNS_GROUP_V6, MDNS_PORT, MDNS_TTL, MdnsKind, classify};
 use crate::net::packet::Packet;
 use crate::reactor::Reactor;
 
@@ -108,6 +108,52 @@ impl ReplyRewrite for ServiceGate {
     }
 }
 
+/// The response leg's rewrite: the entry's allow-list if it sets one, then [`AddressFilter`] on
+/// whatever the list lets through.
+struct ResponseGate {
+    services: Option<ServiceGate>,
+    addresses: AddressFilter,
+}
+
+impl ResponseGate {
+    /// [`ReplyRewrite::rewrite`], without the dispatcher and reactor it has no use for.
+    fn judge(&mut self, packet: &Packet) -> Rewrite<'_> {
+        let trimmed = match self
+            .services
+            .as_mut()
+            .map(|services| services.judge(packet))
+        {
+            None | Some(Rewrite::Verbatim) => None,
+            Some(Rewrite::Replaced(payload)) => Some(payload),
+            Some(dropped @ (Rewrite::Refused | Rewrite::Unreadable)) => return dropped,
+        };
+        match self.addresses.strip(trimmed.unwrap_or(packet.payload)) {
+            Some((payload, removed)) => {
+                log::debug!(
+                    "stripping {} from {}: removed {removed} unreachable address record{}",
+                    MessageType::MdnsResponse,
+                    packet.source,
+                    if removed == 1 { "" } else { "s" }
+                );
+                Rewrite::Replaced(payload)
+            }
+            None => trimmed.map_or(Rewrite::Verbatim, Rewrite::Replaced),
+        }
+    }
+}
+
+impl ReplyRewrite for ResponseGate {
+    fn rewrite<'a>(
+        &'a mut self,
+        packet: &Packet,
+        _egress: CaptureKey,
+        _dispatcher: &mut PacketDispatcher,
+        _reactor: &mut Reactor,
+    ) -> Rewrite<'a> {
+        self.judge(packet)
+    }
+}
+
 /// # Errors
 /// As [`open_pair`].
 pub(crate) fn build(
@@ -126,11 +172,14 @@ pub(crate) fn build(
     );
     let (source, target) = open_pair(reflector, interfaces, dispatcher, "mDNS", &groups)?;
     let group_ips: IpSet = groups.iter().map(SocketAddr::ip).collect();
-    let gate = |kind| -> Box<dyn ReplyRewrite> {
-        match &mdns.services {
-            Some(services) => Box::new(ServiceGate::new(kind, services.clone())),
-            None => Box::new(NoRewrite),
-        }
+    let services = |kind| {
+        mdns.services
+            .as_ref()
+            .map(|services| ServiceGate::new(kind, services.clone()))
+    };
+    let queries: Box<dyn ReplyRewrite> = match services(MdnsKind::Query) {
+        Some(gate) => Box::new(gate),
+        None => Box::new(NoRewrite),
     };
     // source → target: queries.
     dispatcher.register(
@@ -149,7 +198,7 @@ pub(crate) fn build(
                 direction(MdnsKind::Query),
                 Emit::fixed(MDNS_PORT, MDNS_TTL),
             )
-            .with_rewrite(gate(MdnsKind::Query)),
+            .with_rewrite(queries),
         ),
     );
     // target → source: responses. `dst_own` takes in an answer sent to this host rather than the
@@ -176,7 +225,10 @@ pub(crate) fn build(
                 direction(MdnsKind::Response),
                 Emit::fixed(MDNS_PORT, MDNS_TTL).unicast_to_group(MDNS_GROUP_V4, MDNS_GROUP_V6),
             )
-            .with_rewrite(gate(MdnsKind::Response))
+            .with_rewrite(Box::new(ResponseGate {
+                services: services(MdnsKind::Response),
+                addresses: AddressFilter::default(),
+            }))
             // Queries carry no advertisement, so only this leg checks.
             .with_suppress(advertises_only_unreachable),
         ),
@@ -193,7 +245,9 @@ pub(crate) fn build(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::dns::{TYPE_PTR, name, query, response};
+    use crate::test_support::dns::{
+        TYPE_A, TYPE_PTR, name, query, response, response_with_additional,
+    };
 
     fn ptr<'a>(owner: &'a str, target: &str) -> (&'a str, u16, Vec<u8>) {
         (owner, TYPE_PTR, name(target))
@@ -229,32 +283,112 @@ mod tests {
         assert_eq!(responses(&[0u8; 4]), Verdict::Junk);
     }
 
+    fn ipp() -> (&'static str, u16, Vec<u8>) {
+        ptr("_ipp._tcp.local", "L._ipp._tcp.local")
+    }
+
+    fn hap() -> (&'static str, u16, Vec<u8>) {
+        ptr("_hap._tcp.local", "L._hap._tcp.local")
+    }
+
+    fn routable() -> (&'static str, u16, Vec<u8>) {
+        ("printer.local", TYPE_A, vec![192, 0, 2, 9])
+    }
+
+    fn link_local() -> (&'static str, u16, Vec<u8>) {
+        ("printer.local", TYPE_A, vec![169, 254, 0, 9])
+    }
+
+    /// A response leg's gate, with an `_ipp._tcp` allow-list if `listed`.
+    fn response_gate(listed: bool) -> ResponseGate {
+        ResponseGate {
+            services: listed
+                .then(|| ServiceGate::new(MdnsKind::Response, "_ipp._tcp".parse().unwrap())),
+            addresses: AddressFilter::default(),
+        }
+    }
+
     #[test]
-    fn the_allow_list_refuses_trims_or_passes() {
-        let services: ServiceList = "_ipp._tcp".parse().unwrap();
-        let mut queries = ServiceGate::new(MdnsKind::Query, services.clone());
-        let mut responses = ServiceGate::new(MdnsKind::Response, services);
-        let refused = query(&["_hap._tcp.local"]);
-        assert_eq!(queries.judge(&packet(&refused)), Rewrite::Refused);
-        let allowed = query(&["_ipp._tcp.local"]);
-        assert_eq!(queries.judge(&packet(&allowed)), Rewrite::Verbatim);
-        let refused = response(&[ptr("_hap._tcp.local", "L._hap._tcp.local")]);
-        assert_eq!(responses.judge(&packet(&refused)), Rewrite::Refused);
-        // A message the allow-list cannot walk is unreadable, not a refusal of some service.
-        let mut truncated = response(&[ptr("_ipp._tcp.local", "L._ipp._tcp.local")]);
-        truncated.truncate(truncated.len() - 3);
-        assert_eq!(responses.judge(&packet(&truncated)), Rewrite::Unreadable);
-        // A mixed response goes out without the refused record.
-        let mixed = response(&[
-            ptr("_hap._tcp.local", "L._hap._tcp.local"),
-            ptr("_ipp._tcp.local", "L._ipp._tcp.local"),
-        ]);
-        let Rewrite::Replaced(trimmed) = responses.judge(&packet(&mixed)) else {
-            panic!("a mixed response is trimmed");
-        };
+    fn the_allow_list_refuses_or_passes_a_query() {
+        let mut queries = ServiceGate::new(MdnsKind::Query, "_ipp._tcp".parse().unwrap());
         assert_eq!(
-            trimmed,
-            response(&[ptr("_ipp._tcp.local", "L._ipp._tcp.local")])
+            queries.judge(&packet(&query(&["_hap._tcp.local"]))),
+            Rewrite::Refused
         );
+        assert_eq!(
+            queries.judge(&packet(&query(&["_ipp._tcp.local"]))),
+            Rewrite::Verbatim
+        );
+    }
+
+    #[test]
+    fn a_response_loses_its_unreachable_addresses() {
+        let mut gate = response_gate(false);
+        assert_eq!(
+            gate.judge(&packet(&response(&[ipp(), routable()]))),
+            Rewrite::Verbatim
+        );
+        assert_eq!(
+            gate.judge(&packet(&response(&[ipp(), routable(), link_local()]))),
+            Rewrite::Replaced(&response(&[ipp(), routable()]))
+        );
+        // Only unreachable addresses: left whole for the suppression to drop.
+        let dead = response(&[ipp(), link_local()]);
+        assert_eq!(gate.judge(&packet(&dead)), Rewrite::Verbatim);
+        assert!(advertises_only_unreachable(&dead));
+    }
+
+    #[test]
+    fn the_strip_runs_on_what_the_allow_list_keeps() {
+        let mut gate = response_gate(true);
+        assert_eq!(
+            gate.judge(&packet(&response(&[
+                hap(),
+                ipp(),
+                routable(),
+                link_local()
+            ]))),
+            Rewrite::Replaced(&response(&[ipp(), routable()]))
+        );
+        assert_eq!(
+            gate.judge(&packet(&response(&[ipp(), routable(), link_local()]))),
+            Rewrite::Replaced(&response(&[ipp(), routable()]))
+        );
+        // The trim keeps the hostname answer, the strip removes it, and the routable address
+        // answers in its place.
+        assert_eq!(
+            gate.judge(&packet(&response_with_additional(
+                &[link_local()],
+                &[hap(), routable()]
+            ))),
+            Rewrite::Replaced(&response(&[routable()]))
+        );
+    }
+
+    #[test]
+    fn the_allow_lists_verdict_stands_when_nothing_is_stripped() {
+        let mut gate = response_gate(true);
+        assert_eq!(
+            gate.judge(&packet(&response(&[ipp(), routable()]))),
+            Rewrite::Verbatim
+        );
+        assert_eq!(
+            gate.judge(&packet(&response(&[hap(), ipp(), routable()]))),
+            Rewrite::Replaced(&response(&[ipp(), routable()]))
+        );
+        let trimmed = response(&[ipp(), link_local()]);
+        assert_eq!(
+            gate.judge(&packet(&response(&[hap(), ipp(), link_local()]))),
+            Rewrite::Replaced(&trimmed)
+        );
+        assert!(advertises_only_unreachable(&trimmed));
+        assert_eq!(
+            gate.judge(&packet(&response(&[hap(), routable(), link_local()]))),
+            Rewrite::Refused
+        );
+        // A message the allow-list cannot walk is unreadable, not a refusal of some service.
+        let mut truncated = response(&[hap(), ipp()]);
+        truncated.truncate(truncated.len() - 3);
+        assert_eq!(gate.judge(&packet(&truncated)), Rewrite::Unreadable);
     }
 }

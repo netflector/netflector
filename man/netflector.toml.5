@@ -159,6 +159,10 @@ is enabled.
 Enable mDNS reflection.
 Boolean, default
 .Cm false .
+A response that carries A or AAAA records, all of them unreachable (link-local,
+loopback, unspecified, multicast, broadcast), is dropped.
+One that also advertises a usable address is relayed without the unreachable
+ones, which a client on the other segment could try and never reach.
 A unicast answer to a QU query reaches
 .Nm netflector
 and is relayed like any other.
@@ -175,12 +179,12 @@ case-insensitive, a trailing
 accepted.
 Omitted, every service is reflected.
 A query is relayed unless every question names a service outside the list.
-A response with nothing refused is relayed as it is.
+A response with nothing refused passes the list.
 Otherwise the refused records are removed, and the response is relayed when an
 answer naming an allowed service remains, or when it has answers and none names
 a service, as in a hostname answer; any other response is dropped.
 Records that name no service, such as address records and reverse lookups,
-are not removed from a relayed response.
+are never refused.
 A refusal counts as
 .Sy refused
 .Pq Xr netflector 8 .

@@ -8,24 +8,34 @@ from fixtures import (
     MDNS_QUERY_HAP_HEX,
     MDNS_QUERY_HEX,
     MDNS_QUERY_IPP_HEX,
+    MDNS_RESPONSE_A_LINK_LOCAL_HEX,
+    MDNS_RESPONSE_A_STRIPPED_HEX,
+    MDNS_RESPONSE_AAAA_ANSWER_STRIPPED_HEX,
+    MDNS_RESPONSE_AAAA_LINK_LOCAL_ANSWER_HEX,
+    MDNS_RESPONSE_AAAA_LINK_LOCAL_HEX,
+    MDNS_RESPONSE_AAAA_STRIPPED_HEX,
     MDNS_RESPONSE_HAP_ANNOUNCEMENT_HEX,
     MDNS_RESPONSE_HAP_HEX,
     MDNS_RESPONSE_HAP_IPP_COMPRESSED_HEX,
     MDNS_RESPONSE_HAP_IPP_HEX,
+    MDNS_RESPONSE_HAP_IPP_HOST_HEX,
     MDNS_RESPONSE_HEX,
     MDNS_RESPONSE_HOSTNAME_HAP_EXTRA_HEX,
     MDNS_RESPONSE_HOSTNAME_HEX,
     MDNS_RESPONSE_IPP_HEX,
+    MDNS_RESPONSE_IPP_HOST_HEX,
     MDNS_RESPONSE_LINK_LOCAL_HEX,
+    MDNS_RESPONSE_LINK_LOCAL_SERVICE_HEX,
     MDNS_RESPONSE_MIXED_HEX,
+    MDNS_RESPONSE_MIXED_STRIPPED_HEX,
     MDNS_SHORT_QUERY_HEX,
     MDNS_WRONG_PORT,
 )
 
 # mDNS reflection is directional: queries relay source->target ("forward"), responses
-# target->source ("reverse"). Both are relayed verbatim, so the receiver asserts the exact bytes
-# it sent. The drop cases assert nothing arrives (the wrong direction, a too-short payload, or a
-# port the dispatcher filter never passes).
+# target->source ("reverse"). The receiver asserts exact bytes: those sent, or the rewrite a case's
+# comment names. The drop cases assert nothing arrives (the wrong direction, a too-short payload,
+# or a port the dispatcher filter never passes).
 MDNS_CASES = [
     TestCase(
         name="reflects_mdns_query",
@@ -88,16 +98,51 @@ MDNS_CASES = [
         family=6,
         direction="reverse",
     ),
-    # A routable address beside the link-local one rescues the response from suppression.
+    # A routable address beside the link-local one rescues the response from suppression, and the
+    # link-local one is stripped.
     TestCase(
-        name="reflects_mdns_response_with_mixed_addresses",
+        name="strips_mdns_link_local_a_beside_a_routable_a",
         send_source_port=MDNS_PORT,
         send_port=MDNS_PORT,
         receive_port=MDNS_PORT,
         expect_mac=None,
         timeout_seconds=5.0,
         send_payload_hex=MDNS_RESPONSE_MIXED_HEX,
-        expect_payload_hex=MDNS_RESPONSE_MIXED_HEX,
+        expect_payload_hex=MDNS_RESPONSE_MIXED_STRIPPED_HEX,
+        group=MDNS_GROUP_V4,
+        direction="reverse",
+    ),
+    # A host whose only address of one family is link-local loses it; over both mDNS groups.
+    *(
+        TestCase(
+            name=f"strips_mdns_link_local_{family_name}{suffix}",
+            send_source_port=MDNS_PORT,
+            send_port=MDNS_PORT,
+            receive_port=MDNS_PORT,
+            expect_mac=None,
+            timeout_seconds=5.0,
+            send_payload_hex=sent,
+            expect_payload_hex=expected,
+            group=group,
+            family=family,
+            direction="reverse",
+        )
+        for family_name, sent, expected in [
+            ("aaaa", MDNS_RESPONSE_AAAA_LINK_LOCAL_HEX, MDNS_RESPONSE_AAAA_STRIPPED_HEX),
+            ("a", MDNS_RESPONSE_A_LINK_LOCAL_HEX, MDNS_RESPONSE_A_STRIPPED_HEX),
+        ]
+        for group, family, suffix in [(MDNS_GROUP_V4, 4, ""), (MDNS_GROUP_V6, 6, "_over_ipv6")]
+    ),
+    # The stripped AAAA was the only answer: the A answers in its place.
+    TestCase(
+        name="strips_mdns_link_local_aaaa_answer",
+        send_source_port=MDNS_PORT,
+        send_port=MDNS_PORT,
+        receive_port=MDNS_PORT,
+        expect_mac=None,
+        timeout_seconds=5.0,
+        send_payload_hex=MDNS_RESPONSE_AAAA_LINK_LOCAL_ANSWER_HEX,
+        expect_payload_hex=MDNS_RESPONSE_AAAA_ANSWER_STRIPPED_HEX,
         group=MDNS_GROUP_V4,
         direction="reverse",
     ),
@@ -123,6 +168,22 @@ MDNS_CASES = [
         send_payload_hex=MDNS_RESPONSE_LINK_LOCAL_HEX,
         group=MDNS_GROUP_V4,
         direction="reverse",
+    ),
+    # Both families link-local only: the announcement is dropped whole, its service record included.
+    *(
+        TestCase(
+            name=f"ignores_mdns_link_local_only_service_response{suffix}",
+            send_source_port=MDNS_PORT,
+            send_port=MDNS_PORT,
+            receive_port=MDNS_PORT,
+            expect_mac=None,
+            timeout_seconds=1.5,
+            send_payload_hex=MDNS_RESPONSE_LINK_LOCAL_SERVICE_HEX,
+            group=group,
+            family=family,
+            direction="reverse",
+        )
+        for group, family, suffix in [(MDNS_GROUP_V4, 4, ""), (MDNS_GROUP_V6, 6, "_over_ipv6")]
     ),
     # Against the one-way directions: a query from the target and a response from the source
     # reflect once the entry relays both ways.
@@ -298,6 +359,20 @@ MDNS_CASES = [
         timeout_seconds=5.0,
         send_payload_hex=MDNS_RESPONSE_HAP_IPP_COMPRESSED_HEX,
         expect_payload_hex=MDNS_RESPONSE_IPP_HEX,
+        group=MDNS_GROUP_V4,
+        direction="reverse",
+    ),
+    # The trim removes the _hap answer, then the strip the host's fe80:: AAAA.
+    TestCase(
+        name="services_strip_link_local_from_what_the_trim_keeps",
+        config="config-services.toml",
+        send_source_port=MDNS_PORT,
+        send_port=MDNS_PORT,
+        receive_port=MDNS_PORT,
+        expect_mac=None,
+        timeout_seconds=5.0,
+        send_payload_hex=MDNS_RESPONSE_HAP_IPP_HOST_HEX,
+        expect_payload_hex=MDNS_RESPONSE_IPP_HOST_HEX,
         group=MDNS_GROUP_V4,
         direction="reverse",
     ),

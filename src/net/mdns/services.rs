@@ -170,8 +170,8 @@ impl fmt::Display for RefusedServices<'_> {
 /// What an allow-list makes of one message.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Decision<'a> {
-    /// Relay it verbatim: nothing in it is refused, or it is a query with a question worth asking.
-    /// See [`ServiceFilter::decide`].
+    /// Nothing for the list to remove: nothing in it is refused, or it is a query with a question
+    /// worth asking. See [`ServiceFilter::decide`].
     Pass,
     /// The list refuses it: do not relay it. See [`ServiceFilter::decide`].
     Refuse(RefusedServices<'a>),
@@ -234,11 +234,15 @@ impl ServiceFilter {
             Scope::Refuse => Decision::Refuse(RefusedServices(&self.refused)),
             // `assess` walked every name the trim does, within the same budget, so a failure here
             // is a trim that would outgrow the message; it fails closed like any other.
-            Scope::Trim => match self.trimmer.trim(payload, |entry, budget| {
-                Ok(entry.section == Section::Question
-                    || entry_service(entry, payload, budget)?
-                        .is_none_or(|service| allows(allowed, service)))
-            }) {
+            Scope::Trim => match self.trimmer.trim(
+                payload,
+                |entry, budget| {
+                    Ok(entry.section == Section::Question
+                        || entry_service(entry, payload, budget)?
+                            .is_none_or(|service| allows(allowed, service)))
+                },
+                |_| false,
+            ) {
                 Ok((payload, removed)) => Decision::Trim {
                     payload,
                     removed,
