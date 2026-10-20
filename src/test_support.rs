@@ -215,6 +215,7 @@ pub(crate) mod dns {
     pub(crate) const TYPE_A: u16 = 1;
     pub(crate) const TYPE_PTR: u16 = 12;
     pub(crate) const TYPE_TXT: u16 = 16;
+    pub(crate) const TYPE_SRV: u16 = 33;
 
     /// `text` in wire form; empty labels (a trailing dot) are skipped.
     pub(crate) fn name(text: &str) -> Vec<u8> {

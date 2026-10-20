@@ -4,6 +4,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use super::{is_link_local, is_never_a_peer};
 
+mod message;
 pub(crate) mod services;
 
 /// RFC 6762.

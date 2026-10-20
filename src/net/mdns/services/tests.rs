@@ -1,9 +1,11 @@
 use std::fmt::Write as _;
 
+use super::super::message::RdataNames;
+use super::super::skip_name;
 use super::super::tests::{MDNS_RESPONSE_BONJOUR, MDNS_RESPONSE_RAOP};
 use super::*;
 use crate::test_support::dns::{
-    TYPE_A, TYPE_TXT, header, name, query, response, response_with_additional, srv,
+    TYPE_A, TYPE_SRV, TYPE_TXT, header, name, query, response, response_with_additional, srv,
 };
 use crate::unique_list::ListError;
 
@@ -400,21 +402,11 @@ fn a_dname_target_pointing_into_a_dropped_record_is_spelled_out() {
     assert_eq!(dname.3, "|local|");
 }
 
-#[test]
-fn the_rewrite_errs_rather_than_panics_on_unvetted_input() {
-    let mut filter = ServiceFilter::new(allow("_ipp._tcp"));
-    // An SRV whose RDLENGTH is shorter than its fixed fields.
-    let mut m = response(&[("_ipp._tcp.local", TYPE_SRV, vec![0, 0])]);
-    assert!(filter.rewrite(&m).is_err());
-    m.truncate(5);
-    assert!(filter.rewrite(&m).is_err());
-}
-
 /// Each record as `(section, owner, type, rdata)`, the rdata's names spelled out so a
 /// recompressed message compares equal to its original.
 fn decode(payload: &[u8]) -> Vec<(Section, String, u16, String)> {
     let text = |at: usize| {
-        Labels::new(payload, at, &mut Budget(usize::MAX))
+        Labels::new(payload, at, &mut Budget::for_message(payload))
             .map(|label| String::from_utf8_lossy(label.unwrap()).into_owned())
             .collect::<Vec<_>>()
             .join(".")
