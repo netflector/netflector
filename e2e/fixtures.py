@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ipaddress
+
 CONFIGURED_MAC = "02:42:ac:11:00:09"
 # A second address in wol-mac's `macs` allow-set, to prove the list admits every member, not just the first.
 SECOND_CONFIGURED_MAC = "02:42:ac:11:00:0c"
@@ -24,14 +26,18 @@ MDNS_QUERY_HEX = "00000000000100000000000074657374"
 MDNS_RESPONSE_HEX = "00008400000100010000000074657374"
 # 8 bytes: below the 12-byte DNS-header minimum, so classify() returns None and drops it.
 MDNS_SHORT_QUERY_HEX = "0000000000010000"
-# Well-formed responses for the advertisement suppression: QR+AA header, ANCOUNT=2, both answers
-# under the name "x." (each record: 3-byte name, TYPE, IN, TTL 120, RDLENGTH, rdata). A response is
-# suppressed only when every A/AAAA it carries is unreachable (here link-local); one routable
-# address rescues it.
+# Well-formed responses for the advertisement suppression. The sent ones: QR+AA header, ANCOUNT=2,
+# both answers under the name "x." (each record: 3-byte name, TYPE, IN, TTL 120, RDLENGTH, rdata). A
+# response is suppressed only when every A/AAAA it carries is unreachable (here link-local); one
+# routable address rescues it, and it goes out stripped of the unreachable ones.
 MDNS_RESPONSE_MIXED_HEX = (
     "000084000000000200000000"  # header
     "01780000010001000000780004a9fe0102"  # A x. -> 169.254.1.2 (link-local)
     "01780000010001000000780004c0a80909"  # A x. -> 192.168.9.9 (routable)
+)
+MDNS_RESPONSE_MIXED_STRIPPED_HEX = (
+    "000084000000000100000000"  # header, ANCOUNT=1
+    "01780000010001000000780004c0a80909"  # A x. -> 192.168.9.9
 )
 MDNS_RESPONSE_LINK_LOCAL_HEX = (
     "000084000000000200000000"  # header
@@ -52,10 +58,12 @@ def _ptr_record_hex(owner: str, target: str) -> str:
     return _dns_name_hex(owner) + "000c0001" + "00000078" + f"{len(rdata) // 2:04x}" + rdata
 
 
-def _a_record_hex(owner: str, address: str) -> str:
-    """An A record, class IN with the cache-flush bit clear, TTL 120."""
-    rdata = bytes(int(octet) for octet in address.split(".")).hex()
-    return _dns_name_hex(owner) + "00010001" + "00000078" + "0004" + rdata
+def _address_hex(owner: str, address: str, flush: bool = True) -> str:
+    """An A or AAAA record, class IN with the cache-flush bit as `flush` says, TTL 120."""
+    packed = ipaddress.ip_address(address).packed
+    rtype = "0001" if len(packed) == 4 else "001c"
+    rclass = "8001" if flush else "0001"
+    return _dns_name_hex(owner) + rtype + rclass + "00000078" + f"{len(packed):04x}" + packed.hex()
 
 
 def _response_hex(answers: list[str], additional: list[str]) -> str:
@@ -95,12 +103,34 @@ MDNS_RESPONSE_HAP_IPP_COMPRESSED_HEX = (
 # A response's answers decide it. A hostname answer carrying a refused service as additional data
 # keeps its answer and loses the extra; an announcement whose only service is refused is dropped,
 # the address record beside it included.
-_PRINTER_A = _a_record_hex("printer.local", "192.0.2.9")
+_PRINTER_A = _address_hex("printer.local", "192.0.2.9", flush=False)
 MDNS_RESPONSE_HOSTNAME_HEX = _response_hex([_PRINTER_A], [])
 MDNS_RESPONSE_HOSTNAME_HAP_EXTRA_HEX = _response_hex([_PRINTER_A], [_ptr_record_hex(*_HAP_ANSWER)])
 MDNS_RESPONSE_HAP_ANNOUNCEMENT_HEX = _response_hex(
-    [_ptr_record_hex(*_HAP_ANSWER), _a_record_hex("lock.local", "192.0.2.10")], []
+    [_ptr_record_hex(*_HAP_ANSWER), _address_hex("lock.local", "192.0.2.10", flush=False)], []
 )
+
+
+# A host whose only address of one family is link-local loses it, and nothing of that family goes
+# out in its place.
+_HOST = "nf.local"
+_HOST_A = _address_hex(_HOST, "192.0.2.20")
+_HOST_A_LINK_LOCAL = _address_hex(_HOST, "169.254.0.20")
+_HOST_AAAA = _address_hex(_HOST, "2001:db8::20")
+_HOST_AAAA_LINK_LOCAL = _address_hex(_HOST, "fe80::20")
+MDNS_RESPONSE_AAAA_LINK_LOCAL_HEX = _response_hex([_HOST_A, _HOST_AAAA_LINK_LOCAL], [])
+MDNS_RESPONSE_AAAA_STRIPPED_HEX = _response_hex([_HOST_A], [])
+MDNS_RESPONSE_A_LINK_LOCAL_HEX = _response_hex([_HOST_A_LINK_LOCAL, _HOST_AAAA], [])
+MDNS_RESPONSE_A_STRIPPED_HEX = _response_hex([_HOST_AAAA], [])
+MDNS_RESPONSE_AAAA_LINK_LOCAL_ANSWER_HEX = _response_hex([_HOST_AAAA_LINK_LOCAL], [_HOST_A])
+MDNS_RESPONSE_AAAA_ANSWER_STRIPPED_HEX = _response_hex([_HOST_A], [])
+MDNS_RESPONSE_LINK_LOCAL_SERVICE_HEX = _response_hex(
+    [_ptr_record_hex(*_IPP_ANSWER), _HOST_A_LINK_LOCAL, _HOST_AAAA_LINK_LOCAL], []
+)
+MDNS_RESPONSE_HAP_IPP_HOST_HEX = _response_hex(
+    [_ptr_record_hex(*_HAP_ANSWER), _ptr_record_hex(*_IPP_ANSWER), _HOST_A, _HOST_AAAA_LINK_LOCAL], []
+)
+MDNS_RESPONSE_IPP_HOST_HEX = _response_hex([_ptr_record_hex(*_IPP_ANSWER), _HOST_A], [])
 
 
 # --- SSDP (UPnP discovery, HTTPU): multicast group 239.255.255.250 / ff02::c on UDP 1900. ---

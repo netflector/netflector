@@ -392,17 +392,17 @@ allows, per the table below).
 nothing else the far side advertises. A type is `_<service>._tcp` or `_<service>._udp`, matched
 case-insensitively; a trailing `.local` is accepted and dropped. Omit the field to reflect every
 service. A record falls under the service type named nearest the domain in its name (for a PTR, the
-name it points to). Address records, reverse lookups and the DNS-SD meta-names name no service, and a
-trim keeps them.
+name it points to). Address records, reverse lookups and the DNS-SD meta-names name no service, so
+the list's trim keeps them.
 
 - **Queries** (source → target) are relayed unless every question names a service outside the list.
-- **Responses** (target → source) with nothing refused are relayed as they are. Otherwise the
+- **Responses** (target → source) with nothing refused pass the list. Otherwise the
   refused records are removed and the answers decide. The response is relayed, trimmed, when an
   answer naming an allowed service remains, or when it has answers and none names a service, as
   with a hostname answer that carries a refused service as additional data. Any other response is
   dropped, so an announcement of a refused service goes whole, address records included, wherever
-  its sender put them. The trim is the one case where mDNS is not relayed verbatim; devices often
-  bundle several services in one message, and it stops a refused one riding along.
+  its sender put them. Devices often bundle several services in one message, and the trim stops a
+  refused one riding along.
 - A message that cannot be walked within bounds (truncated, a looping name, or several times
   more work than its length) is dropped whenever the list is set, and counted as `dropped`, not
   `filtered`.
@@ -475,9 +475,10 @@ matching and forwarded as-is. A wake sent to the source segment's directed broad
 netflector's own address, is re-emitted to the target segment's directed broadcast (to
 `255.255.255.255` while the target's prefix is unknown); one sent to `255.255.255.255` stays a
 limited broadcast. mDNS responses include unsolicited announcements (so they flow
-target→source too); mDNS/SSDP/WSD datagrams are re-emitted verbatim (save an mDNS response trimmed
-by [`mdns_services`](#the-mdns_services-field)) to the same group (mDNS at hop
-limit 255, SSDP at 2, WSD at 1).
+target→source too); mDNS/SSDP/WSD datagrams are re-emitted verbatim to the same group (mDNS at hop
+limit 255, SSDP at 2, WSD at 1), except an mDNS response trimmed by
+[`mdns_services`](#the-mdns_services-field) or stripped of unreachable addresses (below), and an SSDP
+message whose `LOCATION` the [DIAL](#dial) proxy rewrote.
 A site-local SSDP group (`ff05::c`) is sourced from a routable address when the interface has one. With
 only a link-local address it is sourced from that, which still reaches the attached segment but will
 not cross a router.
@@ -492,12 +493,20 @@ response whose A/AAAA records, an SSDP advertisement or search reply whose `LOCA
 message whose `XAddrs` name only such addresses. Unreachable means link-local (`169.254.0.0/16`,
 `fe80::/10`), valid only on the link it came from, or an address that never names a device at all:
 loopback, unspecified (`0.0.0.0`, `::`), multicast, broadcast (`255.255.255.255`). One usable
-address among them lets
-the message through. A `LOCATION` the DIAL proxy rewrote is exempt: it names netflector's own
-listener on the egress interface, reachable from that link even when the interface's address is
-itself link-local. The DIAL proxy itself refuses to proxy a device whose `LOCATION` or
-`Application-URL` names a never-a-device address or an address of this host. Suppressed messages count as `dropped` and log at
-debug level.
+address among them lets the message through. A `LOCATION` the DIAL proxy rewrote is exempt: it names
+netflector's own listener on the egress interface, reachable from that link even when the
+interface's address is itself link-local. The DIAL proxy itself refuses to proxy a device whose
+`LOCATION` or `Application-URL` names a never-a-device address or an address of this host.
+Suppressed messages count as `dropped` and log at debug level.
+
+An mDNS response with a usable address goes out without its unreachable A/AAAA records: offered a
+link-local address, a client may try it and never fall back to the others, as Matter commissioners
+do. Avahi's reflector never reflects link-local address records either. A host whose only addresses of
+one family are unreachable is then relayed with none of that family, and no record says it has none,
+so a resolver asking for that family waits out its timeout (macOS getaddrinfo waits a few seconds
+for an AAAA). When the strip leaves a response with no answer, its usable addresses move into the
+answer section from the others, since Avahi and Android clients discard a response without answers.
+Each strip logs at debug level with the number of records removed.
 
 netflector reads untagged Ethernet frames carrying IPv4 or IPv6 UDP, and the bare IP packets of a
 link that has no Ethernet header: a loopback, or a WireGuard or tun tunnel (Linux 5.8 or later).

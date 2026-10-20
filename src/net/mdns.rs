@@ -1,11 +1,12 @@
-//! mDNS wire constants and the query/response classifier that acts as the reflector's directional gate.
+//! mDNS wire constants and the query/response classifier that acts as the reflector's directional
+//! gate.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-
-use super::{is_link_local, is_never_a_peer};
+pub(crate) mod addresses;
+pub(crate) mod services;
 
 mod message;
-pub(crate) mod services;
+
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 /// RFC 6762.
 pub(crate) const MDNS_PORT: u16 = 5353;
@@ -29,10 +30,6 @@ const DNS_HEADER_LEN: usize = 12;
 /// The high byte of the flags field; the QR bit is its top bit.
 const FLAGS_HIGH: usize = 2;
 const QR_BIT: u8 = 0x80;
-const QDCOUNT_AT: usize = 4;
-const ANCOUNT_AT: usize = 6;
-const NSCOUNT_AT: usize = 8;
-const ARCOUNT_AT: usize = 10;
 
 /// `None` when the payload is too short for a DNS header: anomalous on the mDNS group, so the
 /// caller surfaces it.
@@ -45,75 +42,6 @@ pub(crate) fn classify(payload: &[u8]) -> Option<MdnsKind> {
     } else {
         MdnsKind::Query
     })
-}
-
-/// The A / AAAA record types (RFC 1035 §3.4.1 / RFC 3596 §2.1).
-const TYPE_A: u16 = 1;
-const TYPE_AAAA: u16 = 28;
-
-/// At least one A/AAAA record, and every one link-local or [`is_never_a_peer`]. For responses
-/// only: a query's records are known-answer cache state, not an advertisement. No address records
-/// or a malformed message reads as `false`.
-pub(crate) fn advertises_only_unreachable(payload: &[u8]) -> bool {
-    only_unreachable_records(payload).unwrap_or(false)
-}
-
-/// `None` on truncation or an undefined label type.
-fn only_unreachable_records(payload: &[u8]) -> Option<bool> {
-    if payload.len() < DNS_HEADER_LEN {
-        return None;
-    }
-    let count = |at: usize| usize::from(u16::from_be_bytes([payload[at], payload[at + 1]]));
-    let mut at = DNS_HEADER_LEN;
-    for _ in 0..count(QDCOUNT_AT) {
-        at = skip_name(payload, at)?;
-        at += 4; // QTYPE + QCLASS
-    }
-    // Address records may sit in any of the three record sections.
-    let mut saw_address = false;
-    for _ in 0..count(ANCOUNT_AT) + count(NSCOUNT_AT) + count(ARCOUNT_AT) {
-        // Name, then TYPE(2) CLASS(2) TTL(4) RDLENGTH(2), then rdata (RFC 1035 §4.1.3).
-        at = skip_name(payload, at)?;
-        let fixed = payload.get(at..at + 10)?;
-        let rtype = u16::from_be_bytes([fixed[0], fixed[1]]);
-        let rdlength = usize::from(u16::from_be_bytes([fixed[8], fixed[9]]));
-        at += 10;
-        let rdata = payload.get(at..at + rdlength)?;
-        at += rdlength;
-        let ip: IpAddr = match (rtype, rdata.len()) {
-            (TYPE_A, 4) => {
-                Ipv4Addr::from(<[u8; 4]>::try_from(rdata).expect("length checked")).into()
-            }
-            (TYPE_AAAA, 16) => {
-                Ipv6Addr::from(<[u8; 16]>::try_from(rdata).expect("length checked")).into()
-            }
-            _ => continue,
-        };
-        if !(is_link_local(ip) || is_never_a_peer(ip)) {
-            return Some(false);
-        }
-        saw_address = true;
-    }
-    Some(saw_address)
-}
-
-/// The offset just past the (possibly compressed) name at `at`.
-fn skip_name(payload: &[u8], mut at: usize) -> Option<usize> {
-    loop {
-        let len = *payload.get(at)?;
-        // The top two bits tag the label (RFC 1035 §3.1 / §4.1.4): 00 a plain length, 0 ending
-        // the name; 11 a 2-byte compression pointer, which ends the name in place (the record's
-        // fixed fields follow the 2 bytes, so skipping never chases it); 01 / 10 never shipped.
-        match len {
-            0 => return Some(at + 1),
-            1..=0x3f => at += 1 + usize::from(len),
-            0xc0..=0xff => {
-                payload.get(at + 1)?;
-                return Some(at + 2);
-            }
-            _ => return None,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -212,114 +140,5 @@ mod tests {
         assert_eq!(classify(&MDNS_QUERY_PTR_LINKLOCAL), Some(MdnsKind::Query));
         assert_eq!(classify(&MDNS_RESPONSE_BONJOUR), Some(MdnsKind::Response));
         assert_eq!(classify(&MDNS_RESPONSE_RAOP), Some(MdnsKind::Response));
-    }
-
-    /// A response whose answer section holds `records`, each `(rtype, rdata)` under the name `x.`,
-    /// IN class, TTL 120.
-    fn response_with_records(records: &[(u16, &[u8])]) -> Vec<u8> {
-        let mut m = vec![0u8; DNS_HEADER_LEN];
-        m[FLAGS_HIGH] = QR_BIT;
-        m[ANCOUNT_AT + 1] =
-            u8::try_from(records.len()).expect("test record count fits ANCOUNT's low byte");
-        for (rtype, rdata) in records {
-            m.extend_from_slice(&[0x01, b'x', 0x00]);
-            m.extend_from_slice(&rtype.to_be_bytes());
-            m.extend_from_slice(&[0x00, 0x01]);
-            m.extend_from_slice(&[0, 0, 0, 120]);
-            m.extend_from_slice(&u16::try_from(rdata.len()).unwrap().to_be_bytes());
-            m.extend_from_slice(rdata);
-        }
-        m
-    }
-
-    const A_LINK_LOCAL: (u16, &[u8]) = (TYPE_A, &[169, 254, 1, 2]);
-    const A_ROUTABLE: (u16, &[u8]) = (TYPE_A, &[192, 168, 1, 9]);
-    const AAAA_LINK_LOCAL: (u16, &[u8]) = (
-        TYPE_AAAA,
-        &[0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
-    );
-    const AAAA_ROUTABLE: (u16, &[u8]) = (
-        TYPE_AAAA,
-        &[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
-    );
-    const A_LOOPBACK: (u16, &[u8]) = (TYPE_A, &[127, 0, 0, 1]);
-    const A_UNSPECIFIED: (u16, &[u8]) = (TYPE_A, &[0, 0, 0, 0]);
-    const TXT: (u16, &[u8]) = (16, b"vers=1");
-
-    #[test]
-    fn suppresses_only_when_every_address_is_unreachable() {
-        assert!(advertises_only_unreachable(&response_with_records(&[
-            A_LINK_LOCAL
-        ])));
-        assert!(advertises_only_unreachable(&response_with_records(&[
-            AAAA_LINK_LOCAL
-        ])));
-        assert!(advertises_only_unreachable(&response_with_records(&[
-            A_LINK_LOCAL,
-            AAAA_LINK_LOCAL
-        ])));
-        // One routable address of either family rescues the message: the client can use it.
-        assert!(!advertises_only_unreachable(&response_with_records(&[
-            A_LINK_LOCAL,
-            A_ROUTABLE
-        ])));
-        assert!(!advertises_only_unreachable(&response_with_records(&[
-            AAAA_LINK_LOCAL,
-            AAAA_ROUTABLE
-        ])));
-        // The never-a-peer classes suppress like link-local, and a routable address rescues them too.
-        assert!(advertises_only_unreachable(&response_with_records(&[
-            A_LOOPBACK
-        ])));
-        assert!(advertises_only_unreachable(&response_with_records(&[
-            A_UNSPECIFIED,
-            AAAA_LINK_LOCAL
-        ])));
-        assert!(!advertises_only_unreachable(&response_with_records(&[
-            A_LOOPBACK, A_ROUTABLE
-        ])));
-        // Other record types don't veto: a bundled advertisement (PTR/SRV/TXT beside the
-        // addresses) whose only addresses are link-local is exactly the dead-service case.
-        assert!(advertises_only_unreachable(&response_with_records(&[
-            TXT,
-            A_LINK_LOCAL
-        ])));
-        // No address records at all is not an advertisement of dead endpoints.
-        assert!(!advertises_only_unreachable(&response_with_records(&[TXT])));
-        assert!(!advertises_only_unreachable(&response_with_records(&[])));
-    }
-
-    #[test]
-    fn suppression_skips_names_with_compression_pointers() {
-        // Second record's name is a pointer to the first's (offset 12): the walker must step the
-        // 2-byte pointer, not chase it.
-        let mut m = response_with_records(&[A_LINK_LOCAL]);
-        m[ANCOUNT_AT + 1] = 2;
-        m.extend_from_slice(&[0xc0, 0x0c]);
-        m.extend_from_slice(&TYPE_A.to_be_bytes());
-        m.extend_from_slice(&[0x00, 0x01, 0, 0, 0, 120, 0x00, 0x04, 169, 254, 3, 4]);
-        assert!(advertises_only_unreachable(&m));
-    }
-
-    #[test]
-    fn a_malformed_message_is_never_suppressed() {
-        // Truncated rdata: the record claims 4 bytes and the payload ends.
-        let mut m = response_with_records(&[A_LINK_LOCAL]);
-        m.truncate(m.len() - 2);
-        assert!(!advertises_only_unreachable(&m));
-        // An undefined label type (0x40) aborts the walk.
-        let mut m = response_with_records(&[A_LINK_LOCAL]);
-        m[DNS_HEADER_LEN] = 0x40;
-        assert!(!advertises_only_unreachable(&m));
-        assert!(!advertises_only_unreachable(b""));
-    }
-
-    #[test]
-    fn real_responses_with_a_routable_address_are_not_suppressed() {
-        // Bonjour: fe80:: AAAA + routable A + global AAAA (mixed); RAOP: one routable A.
-        assert!(!advertises_only_unreachable(&MDNS_RESPONSE_BONJOUR));
-        assert!(!advertises_only_unreachable(&MDNS_RESPONSE_RAOP));
-        // The reverse-PTR query carries no address records.
-        assert!(!advertises_only_unreachable(&MDNS_QUERY_PTR_LINKLOCAL));
     }
 }

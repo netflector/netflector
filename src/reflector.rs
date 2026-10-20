@@ -118,7 +118,8 @@ pub(crate) enum Rewrite<'a> {
 }
 
 /// Decides each payload a leg is about to re-emit: forward it as captured, replace it (the SSDP
-/// DIAL `LOCATION` rewrite, the mDNS allow-list's trim), or drop it (the allow-list's refusal).
+/// DIAL `LOCATION` rewrite, the mDNS allow-list's trim, the mDNS address strip), or drop it (the
+/// allow-list's refusal).
 /// A trait rather than a closure: the `Fn` traits can't express that lending signature.
 pub(crate) trait ReplyRewrite {
     fn rewrite<'a>(

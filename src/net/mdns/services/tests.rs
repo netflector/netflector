@@ -1,7 +1,4 @@
-use std::fmt::Write as _;
-
-use super::super::message::RdataNames;
-use super::super::skip_name;
+use super::super::message::tests::decode;
 use super::super::tests::{MDNS_RESPONSE_BONJOUR, MDNS_RESPONSE_RAOP};
 use super::*;
 use crate::test_support::dns::{
@@ -400,42 +397,6 @@ fn a_dname_target_pointing_into_a_dropped_record_is_spelled_out() {
     let trimmed = trim("_ipp._tcp", &m).unwrap();
     let dname = decode(&trimmed).into_iter().find(|r| r.2 == 39).unwrap();
     assert_eq!(dname.3, "|local|");
-}
-
-/// Each record as `(section, owner, type, rdata)`, the rdata's names spelled out so a
-/// recompressed message compares equal to its original.
-fn decode(payload: &[u8]) -> Vec<(Section, String, u16, String)> {
-    let text = |at: usize| {
-        Labels::new(payload, at, &mut Budget::for_message(payload))
-            .map(|label| String::from_utf8_lossy(label.unwrap()).into_owned())
-            .collect::<Vec<_>>()
-            .join(".")
-    };
-    let hex = |bytes: &[u8]| {
-        bytes.iter().fold(String::new(), |mut out, b| {
-            write!(out, "{b:02x}").unwrap();
-            out
-        })
-    };
-    Entries::new(payload)
-        .map(|entry| {
-            let e = entry.unwrap();
-            let rdata = match e.rdata_names() {
-                Some(RdataNames { offset, count }) => {
-                    let mut parts = vec![hex(&payload[e.rdata..e.rdata + offset])];
-                    let mut at = e.rdata + offset;
-                    for _ in 0..count {
-                        parts.push(text(at));
-                        at = skip_name(payload, at).unwrap();
-                    }
-                    parts.push(hex(&payload[at..e.end]));
-                    parts.join("|")
-                }
-                None => hex(&payload[e.rdata..e.end]),
-            };
-            (e.section, text(e.name), e.rtype, rdata)
-        })
-        .collect()
 }
 
 #[test]

@@ -248,7 +248,8 @@ pub(crate) mod dns {
         m
     }
 
-    /// A response whose answer section holds `records`: `(owner, type, rdata)`, IN, TTL 120.
+    /// A response whose answer section holds `records`: `(owner, type, rdata)`, IN with the
+    /// cache-flush bit, TTL 120.
     pub(crate) fn response(records: &[(&str, u16, Vec<u8>)]) -> Vec<u8> {
         response_with_additional(records, &[])
     }
@@ -258,16 +259,33 @@ pub(crate) mod dns {
         answers: &[(&str, u16, Vec<u8>)],
         additional: &[(&str, u16, Vec<u8>)],
     ) -> Vec<u8> {
+        let records = |records: &[(&str, u16, Vec<u8>)]| -> Vec<Vec<u8>> {
+            records
+                .iter()
+                .map(|(owner, rtype, rdata)| record(owner, *rtype, rdata))
+                .collect()
+        };
+        raw_response(&records(answers), &records(additional))
+    }
+
+    /// A response carrying `answers` and `additional`, records already in wire form.
+    pub(crate) fn raw_response(answers: &[Vec<u8>], additional: &[Vec<u8>]) -> Vec<u8> {
         let mut m = header(true, 0, answers.len());
         m[10..12].copy_from_slice(&u16::try_from(additional.len()).unwrap().to_be_bytes());
-        for (owner, rtype, rdata) in answers.iter().chain(additional) {
-            m.extend(name(owner));
-            m.extend_from_slice(&rtype.to_be_bytes());
-            m.extend_from_slice(&[0x80, 0x01, 0, 0, 0, 120]);
-            m.extend_from_slice(&u16::try_from(rdata.len()).unwrap().to_be_bytes());
-            m.extend_from_slice(rdata);
+        for record in answers.iter().chain(additional) {
+            m.extend_from_slice(record);
         }
         m
+    }
+
+    /// `owner`'s record of `rtype`: IN with the cache-flush bit, TTL 120.
+    pub(crate) fn record(owner: &str, rtype: u16, rdata: &[u8]) -> Vec<u8> {
+        let mut r = name(owner);
+        r.extend_from_slice(&rtype.to_be_bytes());
+        r.extend_from_slice(&[0x80, 0x01, 0, 0, 0, 120]);
+        r.extend_from_slice(&u16::try_from(rdata.len()).unwrap().to_be_bytes());
+        r.extend_from_slice(rdata);
+        r
     }
 
     /// SRV rdata for port 631 on `target`.
