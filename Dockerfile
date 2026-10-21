@@ -11,7 +11,7 @@
 # compiler drift off rust-toolchain.toml while the diff shows only a new hash. CI fails unless this
 # version equals rust-toolchain.toml's channel. Referenced by both the builder and the valgrind
 # runtime below so they stay in lockstep.
-ARG RUST_IMAGE=docker.io/library/rust:1.99.1-slim@sha256:4df2ae8cfdfebdfc13a65da7f253b73d68983dc0339f2719bc17a279c913b13d
+ARG RUST_IMAGE=docker.io/library/rust:1.99.1-slim@sha256:00544ccc9431a2fe93e65185d21381b0a039342f5cefcf84fbddac273c9e573d
 FROM --platform=$BUILDPLATFORM ${RUST_IMAGE} AS builder
 ARG TARGETARCH
 ARG TARGETVARIANT
