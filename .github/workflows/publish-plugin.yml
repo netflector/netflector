@@ -51,8 +51,8 @@ jobs:
             echo "tag ${TAG} does not match PLUGIN_VERSION ${plugin}" >&2
             exit 1
           fi
-          echo "$plugin" | grep -qxE '[0-9]+\.[0-9]+\.[0-9]+' \
-            || { echo "PLUGIN_VERSION ${plugin} is not a three-part version" >&2; exit 1; }
+          echo "$plugin" | grep -qxE '[0-9]+\.[0-9]+(\.[0-9]+)?' \
+            || { echo "PLUGIN_VERSION ${plugin} is not an x.y or x.y.z version" >&2; exit 1; }
           port=$(sed -n 's/^DISTVERSION=[[:space:]]*//p' dist/freebsd/net/netflector/Makefile)
           revision=$(sed -n 's/^PORTREVISION=[[:space:]]*//p' dist/freebsd/net/netflector/Makefile)
           if [ -n "$revision" ] && [ "$revision" != 0 ]; then
