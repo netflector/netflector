@@ -21,9 +21,11 @@ CATALOG = (
 )
 OPNSENSE = CATALOG + (
     "dist/opnsense/",
+    "dist/freebsd/",
     ".github/workflows/ci-opnsense.yml",
     *PACKAGE_PINS,
     "ci/freebsd-port-package.sh",
+    "ci/freebsd-ports-tree.sh",
     "ci/port-into-tree.sh",
     "ci/freebsd-plugin-package.sh",
     "ci/freebsd-to-opnsense.sh",

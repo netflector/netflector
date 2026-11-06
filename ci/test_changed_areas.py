@@ -32,7 +32,6 @@ class ChangedAreas(unittest.TestCase):
         self.assertEqual(ca.areas(["ci/modelcheck.php"]), only("opnsense"))
         for pin in ca.PACKAGE_PINS:
             self.assertEqual(ca.areas([pin]), only("opnsense"), pin)
-        self.assertEqual(ca.areas(["dist/freebsd/net/netflector/Makefile"]), only("port"))
         self.assertEqual(ca.areas([".github/workflows/ci-supply-chain.yml"]), only("supply-chain"))
         self.assertEqual(ca.areas(["deny.toml"]), only("supply-chain"))
         self.assertEqual(ca.areas(["ci/supply-chain.env"]), only("supply-chain"))
@@ -41,9 +40,10 @@ class ChangedAreas(unittest.TestCase):
         self.assertEqual(ca.areas(["ci/platforms.toml"]), only("code", "opnsense", "port"))
         self.assertEqual(ca.areas(["Cargo.lock"]), only("code", "supply-chain"))
         self.assertEqual(ca.areas(["ci/port-sync.py"]), only("code", "port"))
-        self.assertEqual(ca.areas(["ci/freebsd-ports-tree.sh"]), only("code", "port"))
+        self.assertEqual(ca.areas(["ci/freebsd-ports-tree.sh"]), only("code", "opnsense", "port"))
         self.assertEqual(ca.areas(["ci/freebsd-vm.sh"]), only("code", "opnsense"))
         self.assertEqual(ca.areas(["ci/port-into-tree.sh"]), only("code", "opnsense", "port"))
+        self.assertEqual(ca.areas(["dist/freebsd/net/netflector/Makefile"]), only("opnsense", "port"))
 
     def test_a_mixed_change_runs_each_touched_lane(self) -> None:
         self.assertEqual(ca.areas(["README.md", "src/main.rs", "dist/opnsense/x"]), only("code", "opnsense"))
