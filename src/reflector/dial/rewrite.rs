@@ -1,6 +1,6 @@
 //! The SSDP-side entry to the DIAL proxy: [`rewrite_location`] rewrites a discovery message's
 //! `LOCATION` to a source-side description proxy, minting and registering one (via the
-//! [`DialContext`] registry) if none is live for the device, and refreshing its grace either way.
+//! [`DialContext`] registry) if none is live for the device, and extending its grace either way.
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
@@ -41,7 +41,7 @@ pub(crate) struct ProxyPlacement<'a> {
 }
 
 /// Rewrite a DIAL message's `LOCATION` to a source-side description proxy, minting one if none is
-/// live for the device and refreshing its grace either way. `true`: the rewritten datagram is in
+/// live for the device and extending its grace either way. `true`: the rewritten datagram is in
 /// `out`. `false`: forward `payload` unchanged (not DIAL, an unrewritable `LOCATION`, a device on
 /// this host, the proxy cap, a mint failure, or a rewrite that didn't fit `out`); a `LOCATION` that
 /// can never name a device ([`is_never_a_peer`]) is also `false`, and the reflector's suppression
@@ -83,7 +83,7 @@ pub(crate) fn rewrite_location(
     };
     let desc_addr = if let Some(addr) = ctx.lookup(key, reactor, desc_grace) {
         log::trace!(
-            "dial: reusing the proxy for {}; grace refreshed to {max_age:?}",
+            "dial: reusing the proxy for {}; grace at least {max_age:?} from now",
             location.endpoint
         );
         addr
@@ -440,6 +440,23 @@ mod tests {
             !reactor.is_registered(key),
             "and torn down from the reactor"
         );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "needs a real poll backend")]
+    fn a_max_age_of_zero_does_not_evict_a_live_proxy() {
+        let mut reactor = Reactor::new().expect("reactor");
+        let mut ctx = DialContext::new();
+        assert!(rewrite_advert(&mut ctx, &mut reactor, DIAL_ADVERT).is_some());
+        let key = advert_key(ADVERT_ENDPOINT.parse().unwrap());
+        let granted = ctx.grace_of(key).expect("a grace was recorded");
+        // Anyone on the device's segment can send its advertisement with max-age=0.
+        let spoofed = b"NOTIFY * HTTP/1.1\r\nNT: urn:dial-multiscreen-org:service:dial:1\r\n\
+            LOCATION: http://10.0.0.5:8008/dd.xml\r\nCACHE-CONTROL: max-age=0\r\n\r\n";
+        assert!(rewrite_advert(&mut ctx, &mut reactor, spoofed).is_some());
+        assert_eq!(ctx.grace_of(key), Some(granted), "the grace is not cut");
+        ctx.sweep(Instant::now(), &mut reactor);
+        assert_eq!(ctx.proxy_count(), 1, "the proxy outlives the sweep");
     }
 
     #[test]
