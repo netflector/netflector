@@ -14,6 +14,13 @@ use crate::sys::{
 /// A DIAL listener fields a few short-lived client fetches; 16 is ample.
 const LISTEN_BACKLOG: c_int = 16;
 
+/// `<netinet/in.h>`'s option for the range an ephemeral port comes from, and its high (dynamic)
+/// range; libc has neither.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+const IP_PORTRANGE: c_int = 19;
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+const IP_PORTRANGE_HIGH: c_int = 1;
+
 /// A listener, an accepted connection, or an outbound connection still completing its
 /// non-blocking `connect`.
 pub(crate) struct TcpSocket {
@@ -25,12 +32,21 @@ pub(crate) struct TcpSocket {
 impl TcpSocket {
     /// Listen on an ephemeral port at `addr` rather than `0.0.0.0`, so the listener is not offered
     /// on every interface. That doesn't stop another segment routing to the address; only a
-    /// firewall does.
+    /// firewall does. On macOS and FreeBSD the port comes from the high range (49152-65535 by
+    /// default), so that firewall rule can be narrower than Linux's 32768-60999; FreeBSD's default
+    /// range starts at 10000, or lower where `net.inet.ip.portrange.first` is lowered.
     ///
     /// # Errors
-    /// The socket / `bind` / `listen` failure.
+    /// The socket / `setsockopt` / `bind` / `listen` failure.
     pub(crate) fn listen(addr: Ipv4Addr) -> io::Result<Self> {
         let fd = open_socket(libc::AF_INET, libc::SOCK_STREAM, 0)?;
+        #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+        setsockopt(
+            fd.as_raw_fd(),
+            libc::IPPROTO_IP,
+            IP_PORTRANGE,
+            &IP_PORTRANGE_HIGH,
+        )?;
         crate::sys::bind(fd.as_raw_fd(), IpAddr::V4(addr), 0, 0)?;
         // SAFETY: `fd` is a valid bound socket; `listen` marks it passive.
         check(unsafe { libc::listen(fd.as_raw_fd(), LISTEN_BACKLOG) })?;
@@ -292,6 +308,17 @@ mod tests {
             sleep(Duration::from_millis(1));
         }
         panic!("operation did not complete on loopback within the timeout");
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    #[cfg_attr(miri, ignore = "needs a real socket")]
+    fn a_listener_takes_its_port_from_the_high_range() {
+        let listener = TcpSocket::listen(Ipv4Addr::LOCALHOST).expect("listen on loopback");
+        let range =
+            crate::sys::getsockopt_int(listener.as_raw_fd(), libc::IPPROTO_IP, IP_PORTRANGE)
+                .expect("getsockopt(IP_PORTRANGE) failed");
+        assert_eq!(range, IP_PORTRANGE_HIGH);
     }
 
     #[test]

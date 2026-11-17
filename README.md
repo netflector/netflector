@@ -565,8 +565,9 @@ headers (`LOCATION`, the description's `Application-URL`, request `Host`, and re
 the device's authority to a netflector authority and back; HTTP bodies stream through untouched.
 App launch (`POST`) and stop (`DELETE`) work end to end. The listeners take new ephemeral ports for
 each device, so a firewall on the netflector host must let `source_if`'s clients reach its address
-on TCP ports in the system's ephemeral range. With `bidirectional = true`, the same holds for
-`target_if`'s clients.
+on TCP ports in the system's ephemeral range: `net.ipv4.ip_local_port_range` on Linux (32768-60999
+by default), and on macOS and FreeBSD the high range, `net.inet.ip.portrange.hifirst` to `hilast`
+(49152-65535 by default). With `bidirectional = true`, the same holds for `target_if`'s clients.
 
 `dial = true` requires `ssdp` and is **IPv4-only** (the DIAL spec ties the device authority to an IPv4
 address); an `ipv6`-only entry with `dial = true` is rejected at startup. It is the only DIAL knob;

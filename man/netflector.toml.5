@@ -210,7 +210,11 @@ closes that gap by proxying those requests between the segments.
 The proxy listens on new ephemeral TCP ports for each device, so a firewall on
 the host must let
 .Ic source_if Ns 's
-clients reach its address on the system's ephemeral port range.
+clients reach its address on the high ephemeral port range,
+.Va net.inet.ip.portrange.hifirst
+to
+.Va net.inet.ip.portrange.hilast
+(49152 to 65535 by default).
 With
 .Ic bidirectional ,
 the same holds for
