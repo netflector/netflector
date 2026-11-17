@@ -33,6 +33,7 @@ reflected protocols and the relay; the DIAL proxy layers onto SSDP.
 - [Platform support](#platform-support)
 - [Run](#run): [privileges](#runtime-privileges), [Docker](#run-in-docker), [MikroTik](#on-mikrotik-routeros), [FreeBSD/OPNsense packages](#install-on-freebsd-and-opnsense)
 - [Configuration](#configuration): [env vars](#environment-variables), [`macs`](#the-macs-field), [`mdns_services`](#the-mdns_services-field), [`address_family`](#address_family), [per-protocol behavior](#per-protocol-behavior), [DIAL](#dial), [UDP relay](#udp-relay), [duplicate detection](#duplicate-detection)
+- [Trust between segments](#trust-between-segments)
 - [Diagnostics](#diagnostics)
 - [Developing](#developing)
 - [License](#license)
@@ -675,6 +676,39 @@ share at least one device, or when either omits its MAC filter (any device). Add
 handle the same IP version: an `ipv4`-only and an `ipv6`-only entry never overlap, while `default`/`dual`
 overlap with either. Entries that differ in interface, MAC, address family (or WoL ports), or that
 enable *different* protocols, coexist.
+
+## Trust between segments
+
+netflector carries one segment's discovery traffic onto another, so every host on a reflected
+segment is trusted with what that segment may send. The relay directions in
+[per-protocol behavior](#per-protocol-behavior) decide what that is, and `bidirectional` adds
+their mirror image:
+
+- Hosts on `target_if` answer for the other side: mDNS responses, SSDP `NOTIFY`s, WSD `Hello`s,
+  SSDP and WSD search replies, and the `LOCATION`s the [DIAL](#dial) proxy follows. An mDNS response
+  can claim any name, another host's `.local` hostname included, or withdraw one with a goodbye
+  record (TTL 0). Address records name no service, so [`mdns_services`](#the-mdns_services-field)
+  keeps them, and [`macs`](#the-macs-field) matches a source MAC the sender sets itself. Both lists
+  choose what honest devices show; neither stops a hostile one.
+- Hosts on `source_if` only ask: their mDNS queries, SSDP and WSD searches and magic packets cross,
+  their answers, advertisements and `LOCATION`s do not. Two features go further. With `dial = true`,
+  the [DIAL](#dial) proxy forwards any request, whatever its method (`HEAD` aside) or path, to the
+  ports the device's `LOCATION` and `Application-URL` name, and the device sees it come from this
+  host's address on `target_if`. A device may serve more than DIAL on those ports. The
+  [UDP relay](#udp-relay) copies whatever arrives on its ports with the source address as sent, and
+  on Linux and FreeBSD its frame is injected below the host's IP firewall, so a host on `source_if`
+  can send it with any source address, including that of another host on either segment or of this
+  host.
+
+Where one segment is less trusted, such as guest Wi-Fi or an IoT VLAN, make it `source_if` when it
+holds the clients, and leave `bidirectional` off. Where it holds the devices, their answers have to
+cross: a name resolved from it is only as trustworthy as that segment. Where the protocol allows
+it, relay UDP one way, from the trusted segment to the less trusted one.
+
+The DIAL listeners need a firewall rule letting `source_if`'s clients in (see [DIAL](#dial)). Scope
+it to netflector's address on `source_if`, not every address of the host (on OPNsense, the
+interface's address rather than "This Firewall"): anything else listening on that address in the
+port range is reachable through it too.
 
 ## Diagnostics
 
