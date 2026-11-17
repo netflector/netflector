@@ -104,8 +104,10 @@ looked up at startup.
 On Linux netflector then keeps no capability, except `CAP_NET_RAW` where the kernel still needs it
 to pin DIAL connections to their interface (before 5.7, unless backported). It tries the pin at
 startup and logs which way it went. Where `CAP_NET_RAW` stays, a compromised process could still
-open captures on any interface; with no DIAL entry the drop is complete. A start as the account with
-file capabilities (`setcap`, below) sheds them the same way. The switch needs `CAP_SETUID` and
+open captures on any interface. Without it, the process can open no new capture, but the ones it
+holds stay open: the kernel lets their owner re-bind them to any interface and send on it, so a
+compromised process can still capture and inject on any interface it can see. A start as the account
+with file capabilities (`setcap`, below) sheds them the same way. The switch needs `CAP_SETUID` and
 `CAP_SETGID`; where a container runtime withholds them, netflector exits at startup, so leave `user`
 unset there.
 
@@ -140,8 +142,10 @@ each DIAL connect the proxy looks up the route to the device and refuses one tha
 interface; that needs no privilege. BPF devices are root-only by default, so out of the box netflector must run as root. To run
 unprivileged, grant a group read/write on `/dev/bpf*` with a devfs ruleset (`/etc/devfs.rules` +
 `devfs_system_ruleset` in `/etc/rc.conf`) and add the user to that group. Or start it as root with
-`user` set: it drops to that account once its captures are open and holds only those, where a devfs
-group can capture on every interface.
+`user` set: it drops to that account once its captures are open and can open no new one. The ones
+it holds can still be re-attached to any interface without privilege (netflector does so itself
+when an interface is recreated), so a compromised process can capture and inject on any interface
+it can see either way.
 
 ### Run in Docker
 
@@ -385,6 +389,9 @@ Omit `macs` for a network-level entry: WoL proxies every valid magic packet, and
 every device's traffic rather than a chosen set (only the message kinds the corresponding direction
 allows, per the table below).
 
+`macs` chooses which devices are reflected; it is not an access control. A host can send frames from
+any MAC it likes, so the list keeps other honest devices out, not a hostile one.
+
 ### The `mdns_services` field
 
 `mdns_services` scopes an mDNS entry to DNS-SD service types, where `macs` scopes it to devices: with
@@ -410,6 +417,9 @@ the list's trim keeps them.
 The list composes with `macs` (both must admit a response) and with `address_family`. A refusal is
 counted as `refused` and logged at `debug` with the services it names. A trim is logged at `debug`
 too, with the number of records it removed.
+
+Like `macs`, the list scopes what is reflected and is not an access control: a host on the far side
+can advertise anything under an allowed type.
 
 ### `address_family`
 
