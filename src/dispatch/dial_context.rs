@@ -28,7 +28,7 @@ struct DialEntry {
     handler: HandlerKey,
     /// The source-side description listener spliced into the device's `LOCATION`.
     desc_addr: SocketAddrV4,
-    /// Eviction deadline, refreshed to each advertisement's `max-age`.
+    /// Eviction deadline, extended by each advertisement's `max-age`, never cut short.
     desc_grace: Instant,
 }
 
@@ -44,8 +44,10 @@ impl DialContext {
         }
     }
 
-    /// The live proxy's listener address for `key`, its grace refreshed to `desc_grace`; a stale
-    /// entry (proxy evicted) is pruned and reads as absent.
+    /// The live proxy's listener address for `key`, its grace extended to `desc_grace` if that is
+    /// later; a stale entry (proxy evicted) is pruned and reads as absent. Never earlier: anyone on
+    /// the device's segment can send its advertisement with `max-age=0`, which would evict the
+    /// proxy and drop its connections.
     pub(crate) fn lookup(
         &mut self,
         key: DialProxyKey,
@@ -55,7 +57,7 @@ impl DialContext {
         if let Some(entry) = self.proxies.get_mut(&key)
             && reactor.is_registered(entry.handler)
         {
-            entry.desc_grace = desc_grace;
+            entry.desc_grace = entry.desc_grace.max(desc_grace);
             return Some(entry.desc_addr);
         }
         if self.proxies.remove(&key).is_some() {
@@ -147,7 +149,7 @@ mod tests {
             self.proxies.iter().map(|(_, p)| p.handler).collect()
         }
 
-        /// The recorded grace for `key`: a seam to assert a re-advertisement refreshed it.
+        /// The recorded grace for `key`: a seam to assert what a re-advertisement did to it.
         pub(crate) fn grace_of(&self, key: DialProxyKey) -> Option<Instant> {
             self.proxies.get(&key).map(|p| p.desc_grace)
         }
@@ -193,7 +195,7 @@ mod tests {
         let base = Instant::now();
         ctx.insert(key(0, 1, ep(1)), hk, ep(9), base);
 
-        // Live: found, and its grace is refreshed to the new deadline.
+        // Live: found, and its grace is extended to the later deadline.
         let refreshed = base + Duration::from_secs(30);
         assert_eq!(
             ctx.lookup(key(0, 1, ep(1)), &reactor, refreshed),
