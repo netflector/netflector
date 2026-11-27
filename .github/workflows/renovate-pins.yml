@@ -1,0 +1,86 @@
+# Completes a Renovate bump of a CI pin. Renovate edits only the version line of
+# ci/supply-chain.env or ci/freebsd<major>.env; this job runs the pin script on the bump's branch,
+# which rewrites the hashes (and the supply-chain URLs), and pushes the result.
+#
+# A push made with GITHUB_TOKEN starts no pull_request run, so CI is dispatched on the branch with
+# the lanes the pull request's paths select: workflow_dispatch is exempt from that rule.
+name: Renovate pins
+
+on:
+  pull_request:
+    paths:
+      - ci/supply-chain.env
+      - ci/freebsd[0-9]*.env
+
+permissions:
+  contents: read
+
+concurrency:
+  group: renovate-pins-${{ github.head_ref }}
+  cancel-in-progress: true
+
+jobs:
+  repin:
+    name: Re-pin
+    if: github.actor == 'renovate[bot]'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: write
+      pull-requests: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      GH_TOKEN: ${{ github.token }}
+      HEAD_REF: ${{ github.head_ref }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+    steps:
+      - name: Check out the bump's branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.head_ref }}
+
+      # With nothing but pin files changed, the scripts that run here with a write token are
+      # main's, and the version lines are the only text Renovate wrote. The scripts source them.
+      - name: Check the bump
+        run: |
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" \
+            --jq '.[].filename' > "${RUNNER_TEMP}/files"
+          if grep -vxE 'ci/(supply-chain|freebsd[0-9]+)\.env' "${RUNNER_TEMP}/files"; then
+            echo "::error::The bump touches more than Renovate's pins; re-pin its branch by hand."
+            exit 1
+          fi
+          mapfile -t files < "${RUNNER_TEMP}/files"
+          if grep -hE '^(AUDIT_VERSION|DENY_VERSION|RELEASE)=' "${files[@]}" |
+              grep -vxE '[A-Z_]+=[0-9]+(\.[0-9]+)*'; then
+            echo "::error::A pinned version is not a plain version number."
+            exit 1
+          fi
+
+      - name: Re-pin
+        run: |
+          while read -r file; do
+            case "$file" in
+              ci/supply-chain.env) ci/supply-chain-pin.sh ;;
+              *) ci/freebsd-pin.sh "$(sed -n 's/^RELEASE=//p' "$file")" ;;
+            esac
+          done < "${RUNNER_TEMP}/files"
+
+      # The lanes go through a file: a classifier failure must stop here, not dispatch the
+      # defaults, which leave the supply-chain lane out and let Success pass without it.
+      - name: Push and run CI
+        run: |
+          if git diff --quiet; then
+            echo "The pins already match upstream."
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -qam 'ci: re-hash the bumped pins'
+          git push origin "HEAD:refs/heads/${HEAD_REF}"
+          python3 ci/changed_areas.py < "${RUNNER_TEMP}/files" > "${RUNNER_TEMP}/lanes"
+          lanes=()
+          while read -r lane; do lanes+=(-f "$lane"); done < "${RUNNER_TEMP}/lanes"
+          gh workflow run ci.yml --ref "${HEAD_REF}" "${lanes[@]}"

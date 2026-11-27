@@ -2,9 +2,9 @@
 # Regenerate a ci/freebsd<major>[-opnsense].env pin file: a FreeBSD release plus
 # the SHA pins for its artifacts (amd64 + arm64 VM images and base.txz link
 # sysroots), fetched from the official CHECKSUM.SHA512 / MANIFEST files. With no
-# argument it refreshes every pin file at its current release -- the way to
-# complete a Renovate bump PR, which can only edit RELEASE and leaves the hashes
-# stale (the checksum gates keep CI red until this runs).
+# argument it refreshes every pin file at its current release. A Renovate bump
+# PR can only edit RELEASE; renovate-pins.yml completes it by running this with
+# the new release on its branch (the checksum gates keep CI red until then).
 #
 #   ci/freebsd-pin.sh                 # refresh the hashes of every pinned release
 #   ci/freebsd-pin.sh 14.5            # move the 14 pin to 14.5 (the file follows the major)
@@ -47,8 +47,8 @@ header_ci() {
 # ${1%%.*}.x point release ships (custom manager in renovate.json; majors move by
 # hand: the oldest supported major gives static binaries the widest reach).
 # The URLs follow RELEASE, the hashes do not: a bump fetches the new release
-# and stays red on the checksum gates until \`ci/freebsd-pin.sh\` runs on its
-# branch.
+# and stays red on the checksum gates until renovate-pins.yml runs
+# \`ci/freebsd-pin.sh\` on its branch.
 # renovate: datasource=endoflife-date depName=freebsd
 EOF
 }
