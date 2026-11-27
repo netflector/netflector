@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Regenerate ci/supply-chain.env: the cargo-audit and cargo-deny releases the supply-chain lane
 # runs, each with the URL of the linux-musl tarball and its SHA256. With no argument it re-hashes
-# the versions already pinned -- the way to complete a Renovate bump PR, which can only edit the
-# VERSION lines and leaves the hashes stale (the checksum gate keeps the lane red until this runs).
+# the versions already pinned. A Renovate bump PR can only edit the VERSION lines; renovate-pins.yml
+# completes it by running this on its branch (the checksum gate keeps the lane red until then).
 #
 #   ci/supply-chain-pin.sh            # re-hash the pinned versions
 #   ci/supply-chain-pin.sh --latest   # move both tools to their newest release, then hash
@@ -58,8 +58,8 @@ cat > supply-chain.env <<EOF
 # with no checksum, so pinning the action pins its Dockerfile and not what it executes.
 #
 # Renovate bumps the versions (custom manager in renovate.json). It cannot refresh the hashes or
-# the URLs, so its PR stays red on the checksum gate until \`ci/supply-chain-pin.sh\` runs on its
-# branch.
+# the URLs; renovate-pins.yml runs \`ci/supply-chain-pin.sh\` on its branch for that, and the
+# checksum gate keeps the PR red until it has.
 # renovate: datasource=github-releases depName=rustsec/rustsec
 AUDIT_VERSION=$audit_version
 AUDIT_URL=$audit_url
